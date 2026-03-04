@@ -15,7 +15,18 @@ The generated code is self-contained — no runtime dependencies, no imports. Yo
 
 ## Monte Carlo Analysis
 
-Specter can run the generated code thousands of times with randomized inputs to explore execution paths. It classifies variables by their role (status codes, flags, counters, dates, etc.) and generates domain-appropriate random values for each. The output is an aggregated report showing call frequencies, display patterns, and error rates.
+Specter can run the generated code thousands of times with randomized inputs to explore execution paths. The pipeline works as follows:
+
+1. **Variable classification** — the variable extractor analyzes the AST to discover all variables and classify each as `input`, `internal`, `status`, or `flag` based on naming conventions and access patterns (e.g., read-before-write = input).
+
+2. **Domain-aware input generation** — each iteration generates randomized values tailored to each variable's classification:
+   - **Status variables** receive realistic status codes: file status (`00`, `10`, `21`...), IMS (`GE`, `GB`, `II`...), SQLCODE (`0`, `100`, `-803`...), CICS EIBRESP codes, EIBAID key values.
+   - **Flags** get `True`/`False`.
+   - **Input variables** use name-based heuristics: DATE-like names get random dates, AMT/AMOUNT get random dollar amounts, KEY/ID get random numeric identifiers, CNT/COUNT get small integers, FLAG/FLG get `Y`/`N`, etc.
+
+3. **Execution** — the generated module is dynamically loaded and its `run()` function is called with the randomized initial state. Each paragraph function operates on the shared `state` dict, and the runtime captures DISPLAY output, external CALLs, EXEC SQL/CICS/DLI blocks, file reads/writes, and abend signals.
+
+4. **Aggregation** — results across all iterations are combined into a report showing call/exec frequencies, display message patterns (with counts), error rates, and abend counts. This reveals which execution paths are reachable under different input conditions.
 
 ## Usage
 
