@@ -47,8 +47,19 @@ def main(argv: list[str] | None = None) -> int:
         metavar="DIR",
         help="Directory for analysis deliverables (default: /tmp)",
     )
+    parser.add_argument(
+        "--guided",
+        action="store_true",
+        help="Use coverage-guided fuzzing (implies --analyze, default 10000 iterations)",
+    )
 
     args = parser.parse_args(argv)
+
+    # --guided implies --analyze and a higher default iteration count
+    if args.guided:
+        args.analyze = True
+        if not args.monte_carlo:
+            args.monte_carlo = 10000
 
     # --analyze implies --monte-carlo
     if args.analyze and not args.monte_carlo:
@@ -106,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             var_report=var_report,
             instrument=args.analyze,
             all_paragraphs=all_para_names,
+            guided=args.guided,
         )
         print()
         print(report.summary())

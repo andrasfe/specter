@@ -60,6 +60,7 @@ class VariableInfo:
     write_count: int = 0
     first_access: str = ""  # "read" or "write"
     classification: str = ""  # "input", "internal", "status", "flag"
+    condition_literals: list = field(default_factory=list)
 
 
 @dataclass
@@ -134,6 +135,117 @@ def _extract_from_condition(report: VariableReport, condition: str):
         _record_read(report, name)
 
 
+# Figurative constant mapping for literal harvesting
+_FIGURATIVE_LITERALS: dict[str, str | int] = {
+    "SPACES": " ", "SPACE": " ",
+    "ZEROS": 0, "ZERO": 0, "ZEROES": 0,
+    "LOW-VALUES": "", "LOW-VALUE": "",
+    "HIGH-VALUES": "\xff", "HIGH-VALUE": "\xff",
+}
+
+# Pattern for comparison operators in COBOL conditions
+_CMP_RE = re.compile(
+    r"\bNOT\s+EQUAL(?:\s+TO)?\b|\bEQUAL(?:\s+TO)?\b"
+    r"|\bNOT\s+=\b|\bGREATER(?:\s+THAN)?\b|\bLESS(?:\s+THAN)?\b"
+    r"|[><=]+|=",
+    re.IGNORECASE,
+)
+
+
+def _harvest_condition_literals(
+    report: VariableReport, condition: str,
+):
+    """Extract (variable, literal) pairs from a COBOL condition string."""
+    if not condition:
+        return
+    text = condition.strip()
+    if text.upper().startswith("UNTIL "):
+        text = text[6:].strip()
+
+    # Split on logical AND/OR at the top level, but only when they separate
+    # full comparisons (not multi-value lists).  We process each comparison
+    # individually.
+    #
+    # Strategy: split by comparison operators to get LHS / RHS pairs, then
+    # parse the RHS for literal values.
+
+    # Split into segments around comparison operators
+    parts = _CMP_RE.split(text)
+    ops = _CMP_RE.findall(text)
+
+    for idx, op in enumerate(ops):
+        lhs_raw = parts[idx].strip() if idx < len(parts) else ""
+        rhs_raw = parts[idx + 1].strip() if idx + 1 < len(parts) else ""
+
+        if not lhs_raw or not rhs_raw:
+            continue
+
+        # Extract the variable name from LHS (last token, since earlier tokens
+        # may be leftover logical connectors)
+        lhs_tokens = re.findall(r"[A-Z][A-Z0-9-]*(?:\([^)]*\))?|'[^']*'|-?\d+\.?\d*", lhs_raw, re.IGNORECASE)
+        if not lhs_tokens:
+            continue
+
+        # The variable is the last identifier-looking token on the LHS
+        var_name = None
+        for tok in reversed(lhs_tokens):
+            tok_upper = tok.upper()
+            if (tok_upper not in _KEYWORDS
+                    and tok_upper not in ("AND", "OR", "NOT")
+                    and tok_upper not in _FIGURATIVE_LITERALS
+                    and not tok.startswith("'")
+                    and not re.match(r"^-?\d+\.?\d*$", tok)):
+                var_name = _clean_var_name(tok_upper)
+                break
+
+        if not var_name or len(var_name) < 2:
+            continue
+
+        # Parse RHS for literal values.  RHS may contain multi-value lists
+        # like "'00' OR '04' OR '05'" or "'00' AND '04'" (for NOT EQUAL).
+        # Split on OR/AND that separate bare literals.
+        rhs_tokens = re.findall(r"'[^']*'|-?\d+\.?\d*|[A-Z][A-Z0-9-]*(?:\([^)]*\))?", rhs_raw, re.IGNORECASE)
+
+        literals: list[str | int | float] = []
+        for tok in rhs_tokens:
+            tok_upper = tok.upper()
+            if tok_upper in ("AND", "OR", "NOT", "IS", "NUMERIC"):
+                continue
+            if tok_upper in _FIGURATIVE_LITERALS:
+                literals.append(_FIGURATIVE_LITERALS[tok_upper])
+            elif tok.startswith("'") and tok.endswith("'"):
+                literals.append(tok[1:-1])  # strip quotes
+            elif re.match(r"^-?\d+$", tok):
+                literals.append(int(tok))
+            elif re.match(r"^-?\d+\.\d+$", tok):
+                literals.append(float(tok))
+            # else: it's a variable reference — skip
+
+        if not literals:
+            continue
+
+        # For ordering comparisons (> < >= <=), also add boundary values
+        op_upper = op.upper().strip()
+        is_ordering = any(c in op_upper for c in (">", "<", "GREATER", "LESS"))
+
+        # Ensure variable exists in report
+        if var_name not in report.variables:
+            report.variables[var_name] = VariableInfo(name=var_name, first_access="read")
+
+        info = report.variables[var_name]
+        existing = set(info.condition_literals)
+        for lit in literals:
+            if lit not in existing:
+                info.condition_literals.append(lit)
+                existing.add(lit)
+            # For ordering comparisons with numeric literals, add boundary
+            if is_ordering and isinstance(lit, int):
+                for boundary in (lit - 1, lit, lit + 1):
+                    if boundary not in existing:
+                        info.condition_literals.append(boundary)
+                        existing.add(boundary)
+
+
 def _walk_statement(report: VariableReport, stmt: Statement):
     """Process a single statement for variable extraction."""
     attrs = stmt.attributes
@@ -193,7 +305,9 @@ def _walk_statement(report: VariableReport, stmt: Statement):
             _record_write(report, m.group(1))
 
     elif stype == "IF":
-        _extract_from_condition(report, attrs.get("condition", ""))
+        cond = attrs.get("condition", "")
+        _extract_from_condition(report, cond)
+        _harvest_condition_literals(report, cond)
 
     elif stype == "EVALUATE":
         subject = attrs.get("subject", "")
@@ -204,6 +318,8 @@ def _walk_statement(report: VariableReport, stmt: Statement):
         # WHEN values may contain variable references
         for name in _extract_names_from_text(stmt.text):
             _record_read(report, name)
+        # Harvest literals from WHEN conditions too
+        _harvest_condition_literals(report, stmt.text)
 
     elif stype in ("PERFORM_THRU", "PERFORM_INLINE"):
         cond = attrs.get("condition", "")
