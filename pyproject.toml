@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "specter"
+version = "0.1.0"
+description = "COBOL AST to executable Python code generator"
+requires-python = ">=3.10"
+
+[project.scripts]
+specter = "specter.__main__:main"
