@@ -37,8 +37,22 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Verify generated code compiles",
     )
+    parser.add_argument(
+        "--analyze",
+        action="store_true",
+        help="Run dynamic analysis (implies --monte-carlo 100 if not set)",
+    )
+    parser.add_argument(
+        "--analysis-output",
+        metavar="DIR",
+        help="Directory for analysis deliverables (default: /tmp)",
+    )
 
     args = parser.parse_args(argv)
+
+    # --analyze implies --monte-carlo
+    if args.analyze and not args.monte_carlo:
+        args.monte_carlo = 100
 
     ast_path = Path(args.ast_file)
     if not ast_path.exists():
@@ -67,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Generate code
     print(f"Generating {output_path} ...")
-    code = generate_code(program, var_report)
+    code = generate_code(program, var_report, instrument=args.analyze)
     output_path.write_text(code)
     print(f"  Written {len(code)} bytes")
 
@@ -84,14 +98,29 @@ def main(argv: list[str] | None = None) -> int:
     # Monte Carlo
     if args.monte_carlo:
         print(f"Running Monte Carlo ({args.monte_carlo} iterations, seed={args.seed}) ...")
+        all_para_names = [p.name for p in program.paragraphs]
         report = run_monte_carlo(
             output_path,
             n_iterations=args.monte_carlo,
             seed=args.seed,
             var_report=var_report,
+            instrument=args.analyze,
+            all_paragraphs=all_para_names,
         )
         print()
         print(report.summary())
+
+        if args.analyze and report.analysis_report is not None:
+            analysis_text = report.analysis_report.summary()
+            print()
+            print(analysis_text)
+
+            # Write analysis report to file
+            analysis_dir = Path(args.analysis_output) if args.analysis_output else Path("/tmp")
+            analysis_dir.mkdir(parents=True, exist_ok=True)
+            report_file = analysis_dir / f"{ast_path.stem}_analysis.txt"
+            report_file.write_text(analysis_text + "\n")
+            print(f"\nAnalysis report written to {report_file}")
 
     return 0
 

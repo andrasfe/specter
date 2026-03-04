@@ -127,7 +127,7 @@ class TestResolveWhenValue(unittest.TestCase):
 
     def test_variable_value(self):
         result = resolve_when_value("DFHENTER", is_evaluate_true=False)
-        self.assertIn("state['DFHENTER']", result)
+        self.assertEqual(result, "'DFHENTER'")
 
     def test_condition_for_true(self):
         result = resolve_when_value(

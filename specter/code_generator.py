@@ -48,9 +48,9 @@ def _resolve_source(source: str) -> str:
     if s.startswith("'") and s.endswith("'"):
         return s
 
-    # Numeric literal
+    # Numeric literal — strip leading zeros
     if re.match(r"^-?\d+\.?\d*$", s):
-        return s
+        return str(int(s)) if "." not in s else str(float(s))
 
     # LENGTH OF variable
     m = re.match(r"LENGTH\s+OF\s+(.+)", s, re.IGNORECASE)
@@ -154,18 +154,107 @@ def _gen_compute(cb: _CodeBuilder, stmt: Statement):
             cb.line(f"pass  # COMPUTE: {stmt.text[:60]}")
             return
 
-    # Convert COBOL expression to Python
-    # Replace variable references, wrapping in _to_num for safe arithmetic
+    # Preprocess: resolve complex COBOL constructs to Python snippets,
+    # stash them as placeholders so replace_var won't mangle them.
+    expr = expression
+    _placeholders: dict[str, str] = {}
+    _ph_counter = 0
+
+    def _ph(py_code: str) -> str:
+        nonlocal _ph_counter
+        key = f"__PH{_ph_counter}__"
+        _ph_counter += 1
+        _placeholders[key] = py_code
+        return key
+
+    # LENGTH OF <var>
+    expr = re.sub(
+        r"LENGTH\s+OF\s+([A-Z][A-Z0-9-]*)",
+        lambda m: _ph(f"len(str(state.get('{m.group(1).upper()}', '')))"),
+        expr, flags=re.IGNORECASE,
+    )
+
+    # FUNCTION <name>(<balanced-parens>) — handles nested parens properly
+    def _extract_function_call(text: str, start: int) -> tuple[str, str, int] | None:
+        """Find FUNCTION name(...) starting at `start`. Returns (name, inner, end)."""
+        m = re.match(r"FUNCTION\s+([\w-]+)\s*\(", text[start:], re.IGNORECASE)
+        if not m:
+            return None
+        name = m.group(1)
+        paren_start = start + m.end() - 1  # index of '('
+        depth = 0
+        for i in range(paren_start, len(text)):
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    inner = text[paren_start + 1:i]
+                    return name, inner, i + 1
+        return None
+
+    def _resolve_function(text: str) -> str:
+        """Resolve all FUNCTION calls in text, innermost first."""
+        while True:
+            # Find the last FUNCTION keyword (innermost call)
+            positions = [m.start() for m in re.finditer(r"FUNCTION\s+", text, re.IGNORECASE)]
+            if not positions:
+                break
+            resolved_any = False
+            for pos in reversed(positions):
+                result = _extract_function_call(text, pos)
+                if not result:
+                    continue
+                fname, inner, end = result
+                upper_fname = fname.upper()
+                if "INTEGER-OF-DATE" in upper_fname:
+                    inner_var = re.search(r"([A-Z][A-Z0-9-]*)", inner, re.IGNORECASE)
+                    varname = inner_var.group(1).upper() if inner_var else "0"
+                    replacement = _ph(f"_to_num(state.get('{varname}', 0))")
+                elif "DATE-OF-INTEGER" in upper_fname:
+                    replacement = _ph(_resolve_function(inner))
+                elif "NUMVAL" in upper_fname:
+                    cleaned = re.sub(r"\s+OF\s+\S+", "", inner, flags=re.IGNORECASE).strip()
+                    varname = cleaned.upper()
+                    replacement = _ph(f"_to_num(state.get('{varname}', 0))")
+                else:
+                    replacement = _ph("0")
+                text = text[:pos] + replacement + text[end:]
+                resolved_any = True
+                break  # restart after replacement
+            if not resolved_any:
+                break
+        return text
+
+    expr = _resolve_function(expr)
+
+    # Strip remaining bare FUNCTION keyword
+    expr = re.sub(r"\bFUNCTION\b\s*", "", expr, flags=re.IGNORECASE)
+
+    # VAR OF QUALIFIER → use the first identifier
+    expr = re.sub(
+        r"([A-Z][A-Z0-9-]*)\s+OF\s+[A-Z][A-Z0-9-]*",
+        r"\1", expr, flags=re.IGNORECASE,
+    )
+
+    # Convert remaining variable references to Python
     def replace_var(m):
-        name = m.group(0)
+        name = m.group(1)  # base identifier (without subscript)
         upper = name.upper()
-        if re.match(r"^-?\d+\.?\d*$", name):
+        if re.match(r"^__PH\d+__$", name):
             return name
+        if re.match(r"^-?\d+\.?\d*$", name):
+            return str(int(name)) if "." not in name else str(float(name))
         if upper in _FIGURATIVE_SOURCES:
             return str(_FIGURATIVE_SOURCES[upper])
         return f"_to_num(state.get('{upper}', 0))"
 
-    py_expr = re.sub(r"[A-Z][A-Z0-9-]*(?:\([^)]*\))?", replace_var, expression, flags=re.IGNORECASE)
+    py_expr = re.sub(r"([A-Z_][A-Z0-9_-]*)(?:\s*\([^)]*\))?", replace_var, expr, flags=re.IGNORECASE)
+
+    # Restore placeholders
+    for key, val in _placeholders.items():
+        py_expr = py_expr.replace(key, val)
+
     cb.line(f"state['{target.upper()}'] = {py_expr}")
 
 
@@ -196,15 +285,15 @@ def _gen_subtract(cb: _CodeBuilder, stmt: Statement):
         targets_str = m.group(2).strip().rstrip(".")
 
         if re.match(r"^-?\d+\.?\d*$", subtrahend):
-            val = subtrahend
+            val = str(int(subtrahend)) if "." not in subtrahend else str(float(subtrahend))
         else:
-            val = f"state.get('{subtrahend.upper()}', 0)"
+            val = f"_to_num(state.get('{subtrahend.upper()}', 0))"
 
         for target in re.split(r"\s+", targets_str):
             target = target.strip()
             if target and target.upper() not in ("GIVING", "ROUNDED"):
                 tname = target.upper()
-                cb.line(f"state['{tname}'] = state.get('{tname}', 0) - {val}")
+                cb.line(f"state['{tname}'] = _to_num(state.get('{tname}', 0)) - {val}")
     else:
         cb.line(f"pass  # SUBTRACT: {stmt.text[:60]}")
 
@@ -593,14 +682,14 @@ def _gen_statement(cb: _CodeBuilder, stmt: Statement):
             factor = m.group(1).strip()
             targets_str = m.group(2).strip().rstrip(".")
             if re.match(r"^-?\d+\.?\d*$", factor):
-                val = factor
+                val = str(int(factor)) if "." not in factor else str(float(factor))
             else:
-                val = f"state.get('{factor.upper()}', 0)"
+                val = f"_to_num(state.get('{factor.upper()}', 0))"
             for target in re.split(r"\s+", targets_str):
                 target = target.strip()
                 if target and target.upper() not in ("GIVING", "ROUNDED"):
                     tname = target.upper()
-                    cb.line(f"state['{tname}'] = state.get('{tname}', 0) * {val}")
+                    cb.line(f"state['{tname}'] = _to_num(state.get('{tname}', 0)) * {val}")
         else:
             cb.line(f"pass  # MULTIPLY: {stmt.text[:60]}")
     elif stype == "DIVIDE":
@@ -609,14 +698,14 @@ def _gen_statement(cb: _CodeBuilder, stmt: Statement):
             divisor = m.group(1).strip()
             targets_str = m.group(2).strip().rstrip(".")
             if re.match(r"^-?\d+\.?\d*$", divisor):
-                val = divisor
+                val = str(int(divisor)) if "." not in divisor else str(float(divisor))
             else:
-                val = f"state.get('{divisor.upper()}', 0)"
+                val = f"_to_num(state.get('{divisor.upper()}', 0))"
             for target in re.split(r"\s+", targets_str):
                 target = target.strip()
                 if target and target.upper() not in ("GIVING", "REMAINDER", "ROUNDED"):
                     tname = target.upper()
-                    cb.line(f"state['{tname}'] = state.get('{tname}', 0) // ({val} or 1)")
+                    cb.line(f"state['{tname}'] = _to_num(state.get('{tname}', 0)) // ({val} or 1)")
         else:
             cb.line(f"pass  # DIVIDE: {stmt.text[:60]}")
     else:
@@ -627,8 +716,17 @@ def _gen_statement(cb: _CodeBuilder, stmt: Statement):
 # Top-level code generation
 # ---------------------------------------------------------------------------
 
-def generate_code(program: Program, var_report: VariableReport | None = None) -> str:
+def generate_code(
+    program: Program,
+    var_report: VariableReport | None = None,
+    instrument: bool = False,
+) -> str:
     """Generate a standalone Python module from a COBOL Program AST.
+
+    Args:
+        program: Parsed COBOL program AST.
+        var_report: Optional variable report (extracted if not given).
+        instrument: If True, emit instrumented state tracking code.
 
     Returns the complete Python source code as a string.
     """
@@ -713,6 +811,65 @@ def generate_code(program: Program, var_report: VariableReport | None = None) ->
     cb.blank()
     cb.blank()
 
+    if instrument:
+        cb.line("class _InstrumentedState(dict):")
+        cb.indent()
+        cb.line('"""Dict subclass that records variable reads/writes and paragraph trace."""')
+        cb.blank()
+        cb.line("def __init__(self, *args, **kwargs):")
+        cb.indent()
+        cb.line("super().__init__(*args, **kwargs)")
+        cb.line("self._current_para = ''")
+        cb.line("super().__setitem__('_trace', [])")
+        cb.line("super().__setitem__('_var_writes', [])")
+        cb.line("super().__setitem__('_var_reads', [])")
+        cb.dedent()
+        cb.blank()
+        cb.line("def _enter_para(self, name):")
+        cb.indent()
+        cb.line("self._current_para = name")
+        cb.line("super().__getitem__('_trace').append(name)")
+        cb.dedent()
+        cb.blank()
+        cb.line("def __setitem__(self, key, value):")
+        cb.indent()
+        cb.line("if not key.startswith('_'):")
+        cb.indent()
+        cb.line("super().__getitem__('_var_writes').append((key, self._current_para))")
+        cb.dedent()
+        cb.line("super().__setitem__(key, value)")
+        cb.dedent()
+        cb.blank()
+        cb.line("def get(self, key, default=None):")
+        cb.indent()
+        cb.line("if not key.startswith('_'):")
+        cb.indent()
+        cb.line("super().__getitem__('_var_reads').append((key, self._current_para))")
+        cb.dedent()
+        cb.line("return super().get(key, default)")
+        cb.dedent()
+        cb.blank()
+        cb.line("def __getitem__(self, key):")
+        cb.indent()
+        cb.line("if not key.startswith('_'):")
+        cb.indent()
+        cb.line("super().__getitem__('_var_reads').append((key, self._current_para))")
+        cb.dedent()
+        cb.line("return super().__getitem__(key)")
+        cb.dedent()
+        cb.blank()
+        cb.line("def setdefault(self, key, default=None):")
+        cb.indent()
+        cb.line("if key not in self:")
+        cb.indent()
+        cb.line("self[key] = default")
+        cb.dedent()
+        cb.line("return super().__getitem__(key)")
+        cb.dedent()
+        cb.dedent()
+        cb.blank()
+        cb.blank()
+
     # Default state
     cb.line("def _default_state():")
     cb.indent()
@@ -776,8 +933,12 @@ def generate_code(program: Program, var_report: VariableReport | None = None) ->
         cb.indent()
         cb.line(f'"""Paragraph {para.name} (lines {para.line_start}-{para.line_end})."""')
 
+        if instrument:
+            cb.line(f"state._enter_para('{para.name}')")
+
         if not para.statements:
-            cb.line("pass")
+            if not instrument:
+                cb.line("pass")
         else:
             for stmt in para.statements:
                 _gen_statement(cb, stmt)
@@ -787,27 +948,40 @@ def generate_code(program: Program, var_report: VariableReport | None = None) ->
         cb.blank()
 
     # Entry point — find first paragraph
-    first_para = program.paragraphs[0].name if program.paragraphs else "MAIN-PARA"
-    entry_func = _sanitize_name(first_para)
-
     cb.line("def run(initial_state=None):")
     cb.indent()
     cb.line('"""Execute the program with optional initial state overrides."""')
-    cb.line("state = {**_default_state(), **(initial_state or {})}")
+    if instrument:
+        cb.line("state = _InstrumentedState({**_default_state(), **(initial_state or {})})")
+    else:
+        cb.line("state = {**_default_state(), **(initial_state or {})}")
     cb.line("state.setdefault('_display', [])")
     cb.line("state.setdefault('_calls', [])")
     cb.line("state.setdefault('_execs', [])")
     cb.line("state.setdefault('_reads', [])")
     cb.line("state.setdefault('_writes', [])")
     cb.line("state.setdefault('_abended', False)")
-    cb.line("try:")
-    cb.indent()
-    cb.line(f"{entry_func}(state)")
-    cb.dedent()
-    cb.line("except _GobackSignal:")
-    cb.indent()
-    cb.line("pass")
-    cb.dedent()
+    if instrument:
+        cb.line("dict.__setitem__(state, '_initial_snapshot', {k: v for k, v in state.items() if not k.startswith('_')})")
+    if program.paragraphs:
+        entry_func = _sanitize_name(program.paragraphs[0].name)
+        cb.line("try:")
+        cb.indent()
+        cb.line(f"{entry_func}(state)")
+        cb.dedent()
+        cb.line("except _GobackSignal:")
+        cb.indent()
+        cb.line("pass")
+        cb.dedent()
+    if instrument:
+        cb.line("_snap = dict.__getitem__(state, '_initial_snapshot')")
+        cb.line("state['_state_diffs'] = {")
+        cb.indent()
+        cb.line("k: {'from': _snap[k], 'to': dict.__getitem__(state, k)}")
+        cb.dedent()
+        cb.line("    for k in _snap")
+        cb.line("    if _snap[k] != dict.get(state, k)")
+        cb.line("}")
     cb.line("return state")
     cb.dedent()
     cb.blank()

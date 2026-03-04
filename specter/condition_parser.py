@@ -55,6 +55,16 @@ _DFHRESP = {
     "NOTAUTH": "70",
 }
 
+# CICS AID key constants — resolve as string literals
+_CICS_AID_KEYS = frozenset({
+    "DFHENTER", "DFHCLEAR",
+    "DFHPF1", "DFHPF2", "DFHPF3", "DFHPF4", "DFHPF5", "DFHPF6",
+    "DFHPF7", "DFHPF8", "DFHPF9", "DFHPF10", "DFHPF11", "DFHPF12",
+    "DFHPF13", "DFHPF14", "DFHPF15", "DFHPF16", "DFHPF17", "DFHPF18",
+    "DFHPF19", "DFHPF20", "DFHPF21", "DFHPF22", "DFHPF23", "DFHPF24",
+    "DFHPA1", "DFHPA2", "DFHPA3",
+})
+
 # Comparison operator words
 _CMP_WORDS = frozenset({
     "=", ">", "<", ">=", "<=",
@@ -93,6 +103,10 @@ def _resolve_value(token: str) -> str:
     if upper in _FIGURATIVE:
         return _FIGURATIVE[upper]
 
+    # CICS AID key constants
+    if upper in _CICS_AID_KEYS:
+        return f"'{upper}'"
+
     # DFHRESP(...)
     m = re.match(r"DFHRESP\((\w+)\)", token, re.IGNORECASE)
     if m:
@@ -103,13 +117,9 @@ def _resolve_value(token: str) -> str:
     if token.startswith("'") and token.endswith("'"):
         return token
 
-    # Negative number
-    if re.match(r"^-?\d+$", token):
-        return token
-
-    # Numeric literal
+    # Numeric literal — strip leading zeros to avoid Python syntax errors
     if re.match(r"^-?\d+\.?\d*$", token):
-        return token
+        return str(int(token)) if "." not in token else str(float(token))
 
     # Variable reference (with optional subscript)
     return f"state['{token.upper()}']"
@@ -124,6 +134,15 @@ def _is_value_token(token: str) -> bool:
     if upper in _CMP_WORDS:
         return False
     return True
+
+
+def _is_numeric_literal(resolved: str) -> bool:
+    """Check if a resolved Python expression is a numeric literal."""
+    try:
+        float(resolved)
+        return True
+    except (ValueError, TypeError):
+        return False
 
 
 def _looks_like_bare_value(token: str) -> bool:
@@ -303,6 +322,13 @@ class _Parser:
             py_op = _negate_op(op)
         else:
             py_op = op
+
+        # For ordering comparisons against numeric values, coerce LHS
+        # to avoid TypeError (str vs int).
+        if py_op in ("<", ">", "<=", ">=") and all(
+            _is_numeric_literal(v) for v in values
+        ):
+            lhs = f"_to_num({lhs})"
 
         if len(values) == 1:
             return f"{lhs} {py_op} {values[0]}"

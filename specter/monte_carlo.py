@@ -28,6 +28,10 @@ class IterationResult:
     writes: list[str]
     abended: bool
     error: str | None = None
+    trace: list[str] | None = None
+    var_writes: list[tuple[str, str]] | None = None
+    var_reads: list[tuple[str, str]] | None = None
+    state_diffs: dict | None = None
 
 
 @dataclass
@@ -44,6 +48,7 @@ class MonteCarloReport:
     variable_distributions: dict[str, Counter] = field(default_factory=dict)
     error_messages: list[str] = field(default_factory=list)
     iterations: list[IterationResult] = field(default_factory=list)
+    analysis_report: object | None = None
 
     def summary(self) -> str:
         lines = [
@@ -161,6 +166,8 @@ def run_monte_carlo(
     n_iterations: int = 1000,
     seed: int = 42,
     var_report=None,
+    instrument: bool = False,
+    all_paragraphs: list[str] | None = None,
 ) -> MonteCarloReport:
     """Run Monte Carlo analysis on a generated Python module.
 
@@ -169,6 +176,8 @@ def run_monte_carlo(
         n_iterations: Number of random iterations.
         seed: Random seed for reproducibility.
         var_report: Optional VariableReport for input generation.
+        instrument: If True, collect instrumentation data from each run.
+        all_paragraphs: All paragraph names (for dead-paragraph detection).
 
     Returns:
         MonteCarloReport with aggregated results.
@@ -205,6 +214,13 @@ def run_monte_carlo(
                 writes=writes,
                 abended=abended,
             )
+
+            if instrument:
+                iteration.trace = result_state.get("_trace", [])
+                iteration.var_writes = result_state.get("_var_writes", [])
+                iteration.var_reads = result_state.get("_var_reads", [])
+                iteration.state_diffs = result_state.get("_state_diffs", {})
+
             report.iterations.append(iteration)
             report.n_successful += 1
 
@@ -241,5 +257,20 @@ def run_monte_carlo(
                 abended=False,
                 error=str(e),
             ))
+
+    if instrument:
+        from .analysis import build_analysis_report
+        inst_data = []
+        for it in report.iterations:
+            if it.trace is not None:
+                inst_data.append({
+                    "trace": it.trace,
+                    "var_writes": it.var_writes or [],
+                    "var_reads": it.var_reads or [],
+                    "state_diffs": it.state_diffs or {},
+                })
+        report.analysis_report = build_analysis_report(
+            inst_data, all_paragraphs or [],
+        )
 
     return report

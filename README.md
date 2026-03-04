@@ -28,6 +28,40 @@ Specter can run the generated code thousands of times with randomized inputs to 
 
 4. **Aggregation** — results across all iterations are combined into a report showing call/exec frequencies, display message patterns (with counts), error rates, and abend counts. This reveals which execution paths are reachable under different input conditions.
 
+## Dynamic Analysis
+
+The `--analyze` flag enables instrumented code generation for deeper runtime analysis. When active, the generated code uses a dict subclass (`_InstrumentedState`) that automatically records every variable read and write, along with paragraph-level execution tracing. This is opt-in — normal code generation has zero overhead.
+
+After running Monte Carlo iterations with instrumentation, Specter produces an analysis report covering:
+
+- **Paragraph coverage** — which paragraphs were reached across all iterations, and which are dead code.
+- **Call graph** — paragraph-to-paragraph call relationships observed at runtime.
+- **Variable activity** — read/write counts per variable, identification of dead writes (written but never read) and read-only variables (read but never written).
+- **State change tracking** — which variables changed in every run, sometimes, or never, with common final values.
+
+Example output:
+
+```
+=== Dynamic Analysis (100 iterations) ===
+
+Paragraph Coverage: 87/120 (72.5%)
+  Dead: 9999-ABEND, 8000-ERROR-HANDLER, ...
+
+Call Graph (top callers):
+  0000-MAIN -> 1000-INIT, 2000-PROCESS, 9000-CLEANUP
+  2000-PROCESS -> 2100-VALIDATE, 2200-COMPUTE
+
+Variable Activity:
+  Most written: WS-STATUS (450), WS-AMOUNT (320)
+  Read-only: CUSTOMER-ID, ACCOUNT-NUM
+  Dead writes: WS-TEMP-1
+
+State Changes:
+  Always changed: WS-STATUS (100/100), WS-RETURN-CODE (100/100)
+  Sometimes: WS-AMOUNT (73/100), WS-ERROR-MSG (12/100)
+  Never: WS-FILLER, WS-PROGRAM-NAME
+```
+
 ## Usage
 
 ```
@@ -36,6 +70,9 @@ specter program.ast -o out.py                # custom output path
 specter program.ast --verify                 # check generated code compiles
 specter program.ast --monte-carlo 1000       # run 1000 random iterations
 specter program.ast -m 5000 --seed 7         # custom iteration count and seed
+specter program.ast --analyze                # dynamic analysis (100 MC iterations)
+specter program.ast --analyze -m 500         # analysis with custom iteration count
+specter program.ast --analyze --analysis-output ./reports  # write report to custom dir
 ```
 
 ## Requirements
