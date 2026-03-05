@@ -364,13 +364,21 @@ def _classify_variables(report: VariableReport):
             info.classification = "status"
             continue
 
-        # PCB status fields
-        if "PCB-STATUS" in upper:
+        # PCB status fields (STATUS-CODE-PCBn, *-PCB-STATUS, etc.)
+        if "PCB-STATUS" in upper or upper.startswith("STATUS-CODE-"):
+            info.classification = "status"
+            continue
+
+        # File status variables (FILE-STATUS-*, FS-*)
+        if upper.startswith("FILE-STATUS-") or (
+            upper.startswith("FS-") and len(upper) > 3
+        ):
             info.classification = "status"
             continue
 
         # Boolean flags (88-level patterns)
         if (upper.endswith("-ON") or upper.endswith("-OFF") or
+                upper.endswith("-ERROR") or upper.endswith("-ERRORS") or
                 upper.startswith("END-") or upper.startswith("NO-MORE-") or
                 upper.endswith("-SUCCESS") or upper.endswith("-FAILED") or
                 "FLG" in upper or "FLAG" in upper or
@@ -397,3 +405,189 @@ def extract_variables(program: Program) -> VariableReport:
 
     _classify_variables(report)
     return report
+
+
+def extract_stub_status_mapping(
+    program: Program,
+    var_report: VariableReport,
+) -> dict[str, list[str]]:
+    """Map external operation keys to the status variables they affect.
+
+    Walks paragraphs linearly: after each EXEC_SQL/EXEC_CICS/READ/WRITE,
+    looks at the next IF statement to see which status variable it checks.
+
+    Returns e.g. {"SQL": ["SQLCODE"], "READ:MY-FILE": ["MY-FILE-STATUS"]}.
+    """
+    mapping: dict[str, list[str]] = {}
+
+    # Collect all known status variable names
+    status_vars = {
+        name for name, info in var_report.variables.items()
+        if info.classification == "status"
+    }
+
+    for para in program.paragraphs:
+        stmts = para.statements
+        for i, stmt in enumerate(stmts):
+            op_key = None
+            if stmt.type == "EXEC_SQL":
+                op_key = "SQL"
+            elif stmt.type == "EXEC_CICS":
+                op_key = "CICS"
+            elif stmt.type == "EXEC_DLI":
+                op_key = "DLI"
+            elif stmt.type == "CALL":
+                target = stmt.attributes.get("target", "")
+                if target:
+                    op_key = f"CALL:{target}"
+            elif stmt.type == "READ":
+                m = re.search(r"READ\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+                fname = m.group(1).upper() if m else "UNKNOWN"
+                op_key = f"READ:{fname}"
+            elif stmt.type == "WRITE":
+                m = re.search(r"WRITE\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+                recname = m.group(1).upper() if m else "UNKNOWN"
+                op_key = f"WRITE:{recname}"
+            elif (stmt.type == "START"
+                  or (stmt.type == "UNKNOWN"
+                      and stmt.text.strip().upper().startswith("START "))):
+                m = re.search(r"START\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+                if m:
+                    op_key = f"START:{m.group(1).upper()}"
+            elif stmt.type == "OPEN":
+                # Extract file names from OPEN text (may have multiple)
+                m = re.findall(
+                    r"(?:INPUT|OUTPUT|I-O|EXTEND)\s+([A-Z][A-Z0-9-]*(?:\s+[A-Z][A-Z0-9-]*)*)",
+                    stmt.text, re.IGNORECASE,
+                )
+                # Use the LAST file name as the op_key (most specific)
+                fnames = []
+                for group in m:
+                    fnames.extend(group.upper().split())
+                if fnames:
+                    # Check if next IF references a status var for one of these files
+                    op_key = f"OPEN:{fnames[-1]}"
+            elif stmt.type == "CLOSE":
+                m = re.search(r"CLOSE\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+                if m:
+                    op_key = f"CLOSE:{m.group(1).upper()}"
+
+            if op_key is None:
+                continue
+
+            # Look at the next few statements for an IF checking a status var
+            is_call = stmt.type == "CALL"
+            for j in range(i + 1, min(i + 4, len(stmts))):
+                next_stmt = stmts[j]
+                if next_stmt.type == "IF":
+                    cond = next_stmt.attributes.get("condition", "")
+                    if cond:
+                        found = _find_status_vars_in_condition(cond, status_vars)
+                        # For CALL stmts, also check any variable in condition
+                        # (e.g. RETURN-CODE, PL10-O-RETURN-CODE)
+                        if not found and is_call:
+                            found = _find_return_vars_in_condition(cond)
+                        if found:
+                            mapping.setdefault(op_key, []).extend(
+                                v for v in found if v not in mapping.get(op_key, [])
+                            )
+                    break
+
+    # Apply fallback defaults for common operations
+    if "SQL" not in mapping:
+        for sv in status_vars:
+            if "SQLCODE" in sv:
+                mapping.setdefault("SQL", []).append(sv)
+                break
+    if "CICS" not in mapping:
+        for sv in status_vars:
+            if "EIBRESP" in sv and "EIBRESP2" not in sv:
+                mapping.setdefault("CICS", []).append(sv)
+                break
+
+    # For READ/WRITE keys without explicit mapping, look for *-STATUS vars
+    for key in list(mapping.keys()):
+        pass  # already mapped
+
+    # Add generic file status fallbacks for unmapped READ/WRITE
+    for para in program.paragraphs:
+        for stmt in para.statements:
+            if stmt.type == "READ":
+                m = re.search(r"READ\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+                if m:
+                    fname = m.group(1).upper()
+                    key = f"READ:{fname}"
+                    if key not in mapping:
+                        # Look for <fname>-STATUS or any *STATUS* var
+                        candidate = f"{fname}-STATUS"
+                        if candidate in status_vars:
+                            mapping[key] = [candidate]
+                        else:
+                            for sv in status_vars:
+                                if "STATUS" in sv and sv not in (
+                                    "SQLCODE", "SQLSTATE",
+                                ) and "EIB" not in sv:
+                                    mapping[key] = [sv]
+                                    break
+            elif stmt.type == "WRITE":
+                m = re.search(r"WRITE\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+                if m:
+                    recname = m.group(1).upper()
+                    key = f"WRITE:{recname}"
+                    if key not in mapping:
+                        candidate = f"{recname}-STATUS"
+                        if candidate in status_vars:
+                            mapping[key] = [candidate]
+
+    return mapping
+
+
+def _find_return_vars_in_condition(condition: str) -> list[str]:
+    """Find return-code-like variable names in a condition after a CALL.
+
+    Looks for variables containing RETURN-CODE, -RC, or similar patterns.
+    Falls back to the first non-keyword variable in the condition.
+    """
+    tokens = re.findall(r"[A-Z][A-Z0-9-]*", condition, re.IGNORECASE)
+    found = []
+    fallback = None
+    for tok in tokens:
+        upper = tok.upper()
+        if upper in _KEYWORDS or upper in ("AND", "OR", "NOT", "IS"):
+            continue
+        if len(upper) < 2:
+            continue
+        if "RETURN-CODE" in upper or upper.endswith("-RC"):
+            if upper not in found:
+                found.append(upper)
+        elif fallback is None:
+            fallback = upper
+    if found:
+        return found
+    if fallback:
+        return [fallback]
+    return []
+
+
+def _find_status_vars_in_condition(
+    condition: str, status_vars: set[str],
+) -> list[str]:
+    """Find status variable names referenced in a condition string.
+
+    Checks both the explicit status_vars set and common status-like patterns.
+    """
+    found = []
+    tokens = re.findall(r"[A-Z][A-Z0-9-]*", condition, re.IGNORECASE)
+    for tok in tokens:
+        upper = tok.upper()
+        if upper in found:
+            continue
+        if upper in status_vars:
+            found.append(upper)
+        elif (upper.startswith("STATUS-CODE-")
+              or upper.endswith("-STATUS")
+              or "PCB-STATUS" in upper
+              or upper.startswith("FILE-STATUS-")
+              or (upper.startswith("FS-") and len(upper) > 3)):
+            found.append(upper)
+    return found

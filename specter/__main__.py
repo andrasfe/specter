@@ -9,7 +9,14 @@ from pathlib import Path
 from .ast_parser import parse_ast
 from .code_generator import generate_code
 from .monte_carlo import run_monte_carlo
-from .variable_extractor import extract_variables
+from .static_analysis import (
+    build_static_call_graph,
+    extract_equality_constraints,
+    extract_gating_conditions,
+    extract_sequential_gates,
+    augment_gating_with_sequential_gates,
+)
+from .variable_extractor import extract_stub_status_mapping, extract_variables
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -106,6 +113,34 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  Compilation FAILED: {e}", file=sys.stderr)
             return 1
 
+    # Static analysis + stub mapping (when guided or analyze)
+    call_graph = None
+    gating_conds = None
+    stub_mapping = None
+    eq_constraints = None
+    if args.guided or args.analyze:
+        call_graph = build_static_call_graph(program)
+        gating_conds = extract_gating_conditions(program, call_graph)
+        stub_mapping = extract_stub_status_mapping(program, var_report)
+        print(f"  Reachable: {len(call_graph.reachable)}/{len(call_graph.all_paragraphs)}")
+        if stub_mapping:
+            print(f"  Stub mappings: {len(stub_mapping)} operations")
+
+        # Sequential gate detection
+        seq_gates = extract_sequential_gates(program)
+        if seq_gates:
+            print(f"  Sequential gates detected: {len(seq_gates)}")
+            for sg in seq_gates:
+                print(f"    {sg.paragraph}: {sg.gate_count} gates")
+            gating_conds = augment_gating_with_sequential_gates(
+                gating_conds, seq_gates, call_graph,
+            )
+
+        # Equality constraint detection
+        eq_constraints = extract_equality_constraints(program)
+        if eq_constraints:
+            print(f"  Equality constraints: {len(eq_constraints)}")
+
     # Monte Carlo
     if args.monte_carlo:
         print(f"Running Monte Carlo ({args.monte_carlo} iterations, seed={args.seed}) ...")
@@ -118,6 +153,10 @@ def main(argv: list[str] | None = None) -> int:
             instrument=args.analyze,
             all_paragraphs=all_para_names,
             guided=args.guided,
+            call_graph=call_graph,
+            gating_conditions=gating_conds,
+            stub_mapping=stub_mapping,
+            equality_constraints=eq_constraints,
         )
         print()
         print(report.summary())

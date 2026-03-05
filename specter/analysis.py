@@ -19,15 +19,34 @@ class AnalysisReport:
     read_only_vars: list[str] = field(default_factory=list)
     state_diffs: dict[str, dict] = field(default_factory=dict)
     n_iterations: int = 0
+    structurally_unreachable: list[str] = field(default_factory=list)
+    reachable_uncovered: list[str] = field(default_factory=list)
+    max_theoretical_coverage: float = 0.0
 
     def summary(self) -> str:
         lines = []
         total_paras = len(self.paragraph_hit_counts) + len(self.dead_paragraphs)
         covered = len(self.paragraph_hit_counts)
-        pct = (covered / total_paras * 100) if total_paras else 0
-        lines.append(f"=== Dynamic Analysis ({self.n_iterations} iterations) ===")
-        lines.append("")
-        lines.append(f"Paragraph Coverage: {covered}/{total_paras} ({pct:.1f}%)")
+
+        if self.structurally_unreachable:
+            n_reachable = total_paras - len(self.structurally_unreachable)
+            pct = (covered / n_reachable * 100) if n_reachable else 0
+            lines.append(f"=== Dynamic Analysis ({self.n_iterations} iterations) ===")
+            lines.append("")
+            lines.append(
+                f"Paragraph Coverage: {covered}/{n_reachable} reachable ({pct:.1f}%), "
+                f"{len(self.structurally_unreachable)} structurally unreachable"
+            )
+        else:
+            pct = (covered / total_paras * 100) if total_paras else 0
+            lines.append(f"=== Dynamic Analysis ({self.n_iterations} iterations) ===")
+            lines.append("")
+            lines.append(f"Paragraph Coverage: {covered}/{total_paras} ({pct:.1f}%)")
+
+        if self.reachable_uncovered:
+            lines.append(f"  Reachable uncovered: {', '.join(self.reachable_uncovered[:10])}")
+            if len(self.reachable_uncovered) > 10:
+                lines.append(f"  ... and {len(self.reachable_uncovered) - 10} more")
         if self.dead_paragraphs:
             lines.append(f"  Dead: {', '.join(self.dead_paragraphs[:10])}")
             if len(self.dead_paragraphs) > 10:

@@ -381,15 +381,40 @@ def _gen_perform(cb: _CodeBuilder, stmt: Statement):
     cb.line(f"{func_name}(state)")
 
 
+_PARAGRAPH_ORDER: list[str] = []
+
+
+def _get_thru_range(target: str, thru: str) -> list[str]:
+    """Get the list of paragraph names from target through thru (inclusive)."""
+    if not _PARAGRAPH_ORDER:
+        return [target]
+    try:
+        start = _PARAGRAPH_ORDER.index(target)
+    except ValueError:
+        return [target]
+    try:
+        end = _PARAGRAPH_ORDER.index(thru)
+    except ValueError:
+        return [target]
+    if end < start:
+        return [target]
+    return _PARAGRAPH_ORDER[start:end + 1]
+
+
 def _gen_perform_thru(cb: _CodeBuilder, stmt: Statement):
     target = stmt.attributes.get("target", "")
+    thru = stmt.attributes.get("thru", "")
     condition = stmt.attributes.get("condition", "")
 
     if not target:
         cb.line(f"pass  # PERFORM_THRU: {stmt.text[:60]}")
         return
 
-    func_name = _sanitize_name(target)
+    # Determine all paragraphs in the THRU range
+    if thru and thru != target:
+        range_paras = _get_thru_range(target, thru)
+    else:
+        range_paras = [target]
 
     if condition:
         py_cond = cobol_condition_to_python(condition)
@@ -397,7 +422,8 @@ def _gen_perform_thru(cb: _CodeBuilder, stmt: Statement):
         cb.line(f"{lv} = 0")
         cb.line(f"while not ({py_cond}):")
         cb.indent()
-        cb.line(f"{func_name}(state)")
+        for para_name in range_paras:
+            cb.line(f"{_sanitize_name(para_name)}(state)")
         cb.line(f"{lv} += 1")
         cb.line(f"if {lv} >= 100:")
         cb.indent()
@@ -405,7 +431,8 @@ def _gen_perform_thru(cb: _CodeBuilder, stmt: Statement):
         cb.dedent()
         cb.dedent()
     else:
-        cb.line(f"{func_name}(state)")
+        for para_name in range_paras:
+            cb.line(f"{_sanitize_name(para_name)}(state)")
 
 
 def _gen_perform_inline(cb: _CodeBuilder, stmt: Statement):
@@ -567,8 +594,10 @@ def _gen_read(cb: _CodeBuilder, stmt: Statement):
     if m:
         fname = m.group(1).upper()
         cb.line(f"state['_reads'].append('{fname}')")
+        cb.line(f"_apply_stub_outcome(state, 'READ:{fname}')")
     else:
         cb.line(f"state['_reads'].append('UNKNOWN')")
+        cb.line(f"_apply_stub_outcome(state, 'READ:UNKNOWN')")
 
 
 def _gen_write(cb: _CodeBuilder, stmt: Statement):
@@ -576,15 +605,25 @@ def _gen_write(cb: _CodeBuilder, stmt: Statement):
     if m:
         recname = m.group(1).upper()
         cb.line(f"state['_writes'].append('{recname}')")
+        cb.line(f"_apply_stub_outcome(state, 'WRITE:{recname}')")
     else:
         cb.line(f"state['_writes'].append('UNKNOWN')")
+        cb.line(f"_apply_stub_outcome(state, 'WRITE:UNKNOWN')")
 
 
 def _gen_open(cb: _CodeBuilder, stmt: Statement):
+    m = re.search(r"OPEN\s+(?:INPUT|OUTPUT|I-O|EXTEND)\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+    if m:
+        fname = m.group(1).upper()
+        cb.line(f"_apply_stub_outcome(state, 'OPEN:{fname}')")
     cb.line(f"pass  # {stmt.text[:70]}")
 
 
 def _gen_close(cb: _CodeBuilder, stmt: Statement):
+    m = re.search(r"CLOSE\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+    if m:
+        fname = m.group(1).upper()
+        cb.line(f"_apply_stub_outcome(state, 'CLOSE:{fname}')")
     cb.line(f"pass  # {stmt.text[:70]}")
 
 
@@ -708,7 +747,31 @@ def _gen_statement(cb: _CodeBuilder, stmt: Statement):
                     cb.line(f"state['{tname}'] = _to_num(state.get('{tname}', 0)) // ({val} or 1)")
         else:
             cb.line(f"pass  # DIVIDE: {stmt.text[:60]}")
+    elif stype == "START":
+        m = re.search(r"START\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+        if m:
+            fname = m.group(1).upper()
+            cb.line(f"_apply_stub_outcome(state, 'START:{fname}')")
+        cb.line(f"pass  # {stmt.text[:70]}")
+    elif stype == "DELETE":
+        m = re.search(r"DELETE\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+        if m:
+            fname = m.group(1).upper()
+            cb.line(f"_apply_stub_outcome(state, 'DELETE:{fname}')")
+        cb.line(f"pass  # {stmt.text[:70]}")
     else:
+        # Check for UNKNOWN statements that are actually START/DELETE
+        text_upper = stmt.text.strip().upper()
+        if text_upper.startswith("START "):
+            m = re.search(r"START\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+            if m:
+                fname = m.group(1).upper()
+                cb.line(f"_apply_stub_outcome(state, 'START:{fname}')")
+        elif text_upper.startswith("DELETE "):
+            m = re.search(r"DELETE\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+            if m:
+                fname = m.group(1).upper()
+                cb.line(f"_apply_stub_outcome(state, 'DELETE:{fname}')")
         cb.line(f"pass  # {stype}: {stmt.text[:60]}")
 
 
@@ -733,6 +796,9 @@ def generate_code(
     if var_report is None:
         var_report = extract_variables(program)
 
+    global _PARAGRAPH_ORDER
+    _PARAGRAPH_ORDER = [p.name for p in program.paragraphs]
+
     cb = _CodeBuilder()
 
     # Module docstring
@@ -744,6 +810,9 @@ def generate_code(
 
     # Runtime helpers
     cb.line("# --- Runtime helpers ---")
+    cb.blank()
+    cb.line("_CALL_DEPTH_LIMIT = 200")
+    cb.blank()
     cb.blank()
     cb.line("class _GobackSignal(Exception):")
     cb.indent()
@@ -795,10 +864,35 @@ def generate_code(
     cb.blank()
     cb.blank()
 
+    cb.line("def _apply_stub_outcome(state, key):")
+    cb.indent()
+    cb.line('"""Apply a queued stub outcome (set status variables after external op)."""')
+    cb.line("_ol = state.get('_stub_outcomes', {}).get(key, [])")
+    cb.line("if _ol:")
+    cb.indent()
+    cb.line("_entry = _ol.pop(0)")
+    cb.line("if isinstance(_entry, list):")
+    cb.indent()
+    cb.line("for _var, _val in _entry:")
+    cb.indent()
+    cb.line("state[_var] = _val")
+    cb.dedent()
+    cb.dedent()
+    cb.line("else:")
+    cb.indent()
+    cb.line("_var, _val = _entry")
+    cb.line("state[_var] = _val")
+    cb.dedent()
+    cb.dedent()
+    cb.dedent()
+    cb.blank()
+    cb.blank()
+
     cb.line("def _dummy_call(name, state, *args):")
     cb.indent()
     cb.line('"""Stub for external CALL."""')
     cb.line("state['_calls'].append({'name': name, 'args': list(args)})")
+    cb.line("_apply_stub_outcome(state, 'CALL:' + name)")
     cb.dedent()
     cb.blank()
     cb.blank()
@@ -807,12 +901,31 @@ def generate_code(
     cb.indent()
     cb.line('"""Stub for EXEC SQL/CICS/DLI."""')
     cb.line("state['_execs'].append({'kind': kind, 'text': raw_text})")
+    cb.line("_apply_stub_outcome(state, kind)")
+    cb.dedent()
+    cb.blank()
+    cb.blank()
+
+    # Safe dict that returns '' for missing keys (COBOL default)
+    cb.line("class _SafeDict(dict):")
+    cb.indent()
+    cb.line("def __getitem__(self, key):")
+    cb.indent()
+    cb.line("try:")
+    cb.indent()
+    cb.line("return super().__getitem__(key)")
+    cb.dedent()
+    cb.line("except KeyError:")
+    cb.indent()
+    cb.line("return ''")
+    cb.dedent()
+    cb.dedent()
     cb.dedent()
     cb.blank()
     cb.blank()
 
     if instrument:
-        cb.line("class _InstrumentedState(dict):")
+        cb.line("class _InstrumentedState(_SafeDict):")
         cb.indent()
         cb.line('"""Dict subclass that records variable reads/writes and paragraph trace."""')
         cb.blank()
@@ -827,6 +940,10 @@ def generate_code(
         cb.blank()
         cb.line("def _enter_para(self, name):")
         cb.indent()
+        cb.line("if len(self['_trace']) > 50000:")
+        cb.indent()
+        cb.line("raise _GobackSignal()")
+        cb.dedent()
         cb.line("self._current_para = name")
         cb.line("super().__getitem__('_trace').append(name)")
         cb.dedent()
@@ -853,7 +970,7 @@ def generate_code(
         cb.indent()
         cb.line("if not key.startswith('_'):")
         cb.indent()
-        cb.line("super().__getitem__('_var_reads').append((key, self._current_para))")
+        cb.line("dict.__getitem__(self, '_var_reads').append((key, self._current_para))")
         cb.dedent()
         cb.line("return super().__getitem__(key)")
         cb.dedent()
@@ -933,6 +1050,17 @@ def generate_code(
         cb.indent()
         cb.line(f'"""Paragraph {para.name} (lines {para.line_start}-{para.line_end})."""')
 
+        # Call-depth guard to prevent unbounded recursion
+        cb.line("_d = state.get('_call_depth', 0) + 1")
+        cb.line("state['_call_depth'] = _d")
+        cb.line("if _d > _CALL_DEPTH_LIMIT:")
+        cb.indent()
+        cb.line("state['_call_depth'] = _d - 1")
+        cb.line("return")
+        cb.dedent()
+        cb.line("try:")
+        cb.indent()
+
         if instrument:
             cb.line(f"state._enter_para('{para.name}')")
 
@@ -944,6 +1072,11 @@ def generate_code(
                 _gen_statement(cb, stmt)
 
         cb.dedent()
+        cb.line("finally:")
+        cb.indent()
+        cb.line("state['_call_depth'] = state.get('_call_depth', 1) - 1")
+        cb.dedent()
+        cb.dedent()
         cb.blank()
         cb.blank()
 
@@ -954,7 +1087,7 @@ def generate_code(
     if instrument:
         cb.line("state = _InstrumentedState({**_default_state(), **(initial_state or {})})")
     else:
-        cb.line("state = {**_default_state(), **(initial_state or {})}")
+        cb.line("state = _SafeDict({**_default_state(), **(initial_state or {})})")
     cb.line("state.setdefault('_display', [])")
     cb.line("state.setdefault('_calls', [])")
     cb.line("state.setdefault('_execs', [])")
@@ -972,6 +1105,10 @@ def generate_code(
         cb.line("except _GobackSignal:")
         cb.indent()
         cb.line("pass")
+        cb.dedent()
+        cb.line("except ZeroDivisionError:")
+        cb.indent()
+        cb.line("state['_abended'] = True")
         cb.dedent()
     if instrument:
         cb.line("_snap = dict.__getitem__(state, '_initial_snapshot')")

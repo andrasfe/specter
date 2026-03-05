@@ -13,13 +13,25 @@ from specter.monte_carlo import (
     _FuzzerState,
     _add_to_corpus,
     _fingerprint_state,
+    _generate_all_success_state,
+    _generate_all_success_stubs,
+    _generate_directed_input,
     _generate_random_value,
+    _generate_stub_outcomes,
     _is_recursion_prone,
     _mutate_state,
+    _pick_target,
     _select_seed,
     _should_add_to_corpus,
     _update_energy,
     run_monte_carlo,
+)
+from specter.static_analysis import (
+    GatingCondition,
+    PathConstraints,
+    build_static_call_graph,
+    compute_path_constraints,
+    extract_gating_conditions,
 )
 from specter.variable_extractor import VariableInfo, VariableReport, extract_variables
 
@@ -185,7 +197,7 @@ class TestMutation(unittest.TestCase):
         # Run many mutations — at least some should differ
         changed = False
         for _ in range(50):
-            mutated = _mutate_state(parent, var_report, rng, fuzzer)
+            mutated, _ = _mutate_state(parent, var_report, rng, fuzzer)
             if mutated != parent:
                 changed = True
                 break
@@ -432,6 +444,344 @@ class TestGuidedIntegration(unittest.TestCase):
             # Summary should be valid
             text = report.analysis_report.summary()
             self.assertIn("Dynamic Analysis", text)
+        finally:
+            path.unlink(missing_ok=True)
+
+
+class TestStubFlipMutation(unittest.TestCase):
+
+    def test_stub_flip_changes_outcomes(self):
+        var_report = VariableReport()
+        var_report.variables = {
+            "X": VariableInfo(name="X", classification="input"),
+            "SQLCODE": VariableInfo(name="SQLCODE", classification="status",
+                                    condition_literals=[0, -803, 100]),
+        }
+        stub_mapping = {"SQL": ["SQLCODE"]}
+        parent = {"X": "A", "SQLCODE": 0}
+        parent_stub = {"SQL": [("SQLCODE", 0)]}
+        fuzzer = _FuzzerState()
+        rng = random.Random(42)
+
+        # Run many mutations — at least some should flip stubs
+        flipped = False
+        for _ in range(100):
+            _, new_stubs = _mutate_state(
+                parent, var_report, rng, fuzzer,
+                stub_mapping=stub_mapping,
+                parent_stub_outcomes=parent_stub,
+            )
+            if new_stubs and new_stubs != parent_stub:
+                flipped = True
+                break
+        self.assertTrue(flipped)
+
+
+class TestDirectedFuzzing(unittest.TestCase):
+
+    def test_pick_target_weighted_by_path_length(self):
+        rng = random.Random(42)
+        uncovered = {"SHORT", "LONG"}
+        # SHORT has path len 2, LONG has path len 5
+        path_constraints = {
+            "SHORT": PathConstraints(target="SHORT", path=["A", "SHORT"], constraints=[]),
+            "LONG": PathConstraints(target="LONG", path=["A", "B", "C", "D", "LONG"], constraints=[]),
+        }
+        picks = [_pick_target(uncovered, path_constraints, rng) for _ in range(200)]
+        # SHORT should be picked more often (1/2 vs 1/5 weight)
+        self.assertGreater(picks.count("SHORT"), picks.count("LONG"))
+
+    def test_pick_target_empty_uncovered(self):
+        rng = random.Random(42)
+        self.assertIsNone(_pick_target(set(), {}, rng))
+
+    def test_generate_directed_input_satisfies_constraints(self):
+        rng = random.Random(42)
+        var_report = VariableReport()
+        var_report.variables = {
+            "WS-CODE": VariableInfo(name="WS-CODE", classification="input",
+                                    condition_literals=["A", "B", "C"]),
+        }
+        pc = PathConstraints(
+            target="DEEP",
+            path=["MAIN", "STEP-1", "DEEP"],
+            constraints=[
+                GatingCondition(variable="WS-CODE", values=["A"], negated=False),
+            ],
+        )
+        fuzzer = _FuzzerState()
+
+        state, _ = _generate_directed_input("DEEP", pc, var_report, None, rng, fuzzer)
+        self.assertEqual(state.get("WS-CODE"), "A")
+
+    def test_generate_directed_input_with_stubs(self):
+        rng = random.Random(42)
+        var_report = VariableReport()
+        var_report.variables = {
+            "SQLCODE": VariableInfo(name="SQLCODE", classification="status",
+                                    condition_literals=[0, -803]),
+        }
+        pc = PathConstraints(target="ERR", path=["MAIN", "ERR"], constraints=[])
+        stub_mapping = {"SQL": ["SQLCODE"]}
+        fuzzer = _FuzzerState()
+
+        state, stub_out = _generate_directed_input(
+            "ERR", pc, var_report, stub_mapping, rng, fuzzer,
+        )
+        self.assertIsNotNone(stub_out)
+        self.assertIn("SQL", stub_out)
+
+    def test_guided_with_static_analysis(self):
+        """End-to-end: guided fuzzing with static analysis should reach
+        error-handling paragraphs gated behind SQLCODE checks."""
+        prog = _make_program([
+            {
+                "name": "MAIN-PARA", "line_start": 1, "line_end": 10,
+                "statements": [
+                    {
+                        "type": "EXEC_SQL",
+                        "text": "EXEC SQL SELECT 1 END-EXEC",
+                        "line_start": 1, "line_end": 1,
+                        "attributes": {"raw_text": "SELECT 1"},
+                        "children": [],
+                    },
+                    {
+                        "type": "IF",
+                        "text": "IF SQLCODE NOT = 0",
+                        "line_start": 2, "line_end": 5,
+                        "attributes": {"condition": "SQLCODE NOT = 0"},
+                        "children": [
+                            {
+                                "type": "PERFORM",
+                                "text": "PERFORM SQL-ERROR",
+                                "line_start": 3, "line_end": 3,
+                                "attributes": {"target": "SQL-ERROR"},
+                                "children": [],
+                            },
+                            {
+                                "type": "ELSE", "text": "ELSE",
+                                "line_start": 4, "line_end": 5,
+                                "attributes": {},
+                                "children": [{
+                                    "type": "PERFORM",
+                                    "text": "PERFORM SQL-OK",
+                                    "line_start": 5, "line_end": 5,
+                                    "attributes": {"target": "SQL-OK"},
+                                    "children": [],
+                                }],
+                            },
+                        ],
+                    },
+                ],
+            },
+            {
+                "name": "SQL-ERROR", "line_start": 11, "line_end": 15,
+                "statements": [{
+                    "type": "MOVE", "text": "MOVE 'ERROR' TO WS-RESULT",
+                    "line_start": 12, "line_end": 12,
+                    "attributes": {"source": "'ERROR'", "targets": "WS-RESULT"},
+                    "children": [],
+                }],
+            },
+            {
+                "name": "SQL-OK", "line_start": 16, "line_end": 20,
+                "statements": [{
+                    "type": "MOVE", "text": "MOVE 'OK' TO WS-RESULT",
+                    "line_start": 17, "line_end": 17,
+                    "attributes": {"source": "'OK'", "targets": "WS-RESULT"},
+                    "children": [],
+                }],
+            },
+        ])
+        var_report = extract_variables(prog)
+        call_graph = build_static_call_graph(prog)
+        gating_conds = extract_gating_conditions(prog, call_graph)
+        from specter.variable_extractor import extract_stub_status_mapping
+        stub_mapping = extract_stub_status_mapping(prog, var_report)
+
+        code = generate_code(prog, var_report=var_report, instrument=True)
+        tmp = tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w")
+        tmp.write(code)
+        tmp.close()
+        path = Path(tmp.name)
+        try:
+            all_paras = [p.name for p in prog.paragraphs]
+            report = run_monte_carlo(
+                path, n_iterations=2000, seed=42,
+                var_report=var_report, instrument=True,
+                all_paragraphs=all_paras, guided=True,
+                call_graph=call_graph,
+                gating_conditions=gating_conds,
+                stub_mapping=stub_mapping,
+            )
+            hit = set(report.analysis_report.paragraph_hit_counts.keys())
+            # Both branches should be hit: stub diversification sets SQLCODE != 0
+            self.assertIn("SQL-ERROR", hit)
+            self.assertIn("SQL-OK", hit)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_reachability_in_report(self):
+        """Analysis report should include reachability info when call_graph given."""
+        prog = _make_program([
+            {
+                "name": "MAIN", "line_start": 1, "line_end": 5,
+                "statements": [{
+                    "type": "PERFORM", "text": "PERFORM A",
+                    "line_start": 1, "line_end": 1,
+                    "attributes": {"target": "A"}, "children": [],
+                }],
+            },
+            {
+                "name": "A", "line_start": 6, "line_end": 10,
+                "statements": [],
+            },
+            {
+                "name": "ORPHAN", "line_start": 11, "line_end": 15,
+                "statements": [],
+            },
+        ])
+        var_report = extract_variables(prog)
+        call_graph = build_static_call_graph(prog)
+        gating_conds = extract_gating_conditions(prog, call_graph)
+
+        code = generate_code(prog, var_report=var_report, instrument=True)
+        tmp = tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w")
+        tmp.write(code)
+        tmp.close()
+        path = Path(tmp.name)
+        try:
+            all_paras = [p.name for p in prog.paragraphs]
+            report = run_monte_carlo(
+                path, n_iterations=100, seed=42,
+                var_report=var_report, instrument=True,
+                all_paragraphs=all_paras, guided=True,
+                call_graph=call_graph,
+                gating_conditions=gating_conds,
+            )
+            analysis = report.analysis_report
+            self.assertIn("ORPHAN", analysis.structurally_unreachable)
+            summary = analysis.summary()
+            self.assertIn("structurally unreachable", summary)
+        finally:
+            path.unlink(missing_ok=True)
+
+
+class TestAllSuccessGeneration(unittest.TestCase):
+
+    def test_all_success_state_has_success_values(self):
+        report = VariableReport()
+        report.variables = {
+            "FS-INPUT": VariableInfo(name="FS-INPUT", classification="status",
+                                     condition_literals=["00", "10", "35"]),
+            "FS-OUTPUT": VariableInfo(name="FS-OUTPUT", classification="status"),
+            "WS-RETURN-CODE": VariableInfo(name="WS-RETURN-CODE", classification="status",
+                                            condition_literals=[0, 4, 8]),
+            "WS-FLAG": VariableInfo(name="WS-FLAG", classification="flag",
+                                     condition_literals=["Y", "N"]),
+            "WS-DATA": VariableInfo(name="WS-DATA", classification="input"),
+        }
+        state = _generate_all_success_state(report)
+        # Status vars should have first harvested literal or default success
+        self.assertEqual(state["FS-INPUT"], "00")
+        self.assertEqual(state["FS-OUTPUT"], "00")
+        self.assertEqual(state["WS-RETURN-CODE"], 0)
+        # Flag should have first harvested literal
+        self.assertEqual(state["WS-FLAG"], "Y")
+        # Input should have a value
+        self.assertIn("WS-DATA", state)
+
+    def test_all_success_stubs_all_succeed(self):
+        report = VariableReport()
+        report.variables = {
+            "SQLCODE": VariableInfo(name="SQLCODE", classification="status",
+                                    condition_literals=[0, -803, 100]),
+            "FS-FILE1": VariableInfo(name="FS-FILE1", classification="status",
+                                      condition_literals=["00", "10"]),
+        }
+        stub_mapping = {"SQL": ["SQLCODE"], "OPEN_FILE1": ["FS-FILE1"]}
+        stubs = _generate_all_success_stubs(stub_mapping, report)
+        # SQL gets multiple success outcome entries + EOF (SQLCODE=100)
+        # Each entry is a list of (var, val) pairs
+        sql_stubs = stubs["SQL"]
+        for entry in sql_stubs[:-1]:
+            self.assertIsInstance(entry, list)
+            self.assertTrue(all(v == 0 for _, v in entry))
+        # Last entry is EOF
+        self.assertEqual(sql_stubs[-1], [("SQLCODE", 100)])
+        # Non-READ/SQL operations get multiple outcome entries
+        self.assertTrue(len(stubs["OPEN_FILE1"]) >= 1)
+        self.assertEqual(stubs["OPEN_FILE1"][0], [("FS-FILE1", "00")])
+
+
+class TestGatePreservingMutation(unittest.TestCase):
+
+    def test_gate_preserving_only_changes_non_status(self):
+        report = VariableReport()
+        report.variables = {
+            "FS-INPUT": VariableInfo(name="FS-INPUT", classification="status"),
+            "FS-OUTPUT": VariableInfo(name="FS-OUTPUT", classification="status"),
+            "WS-DATA": VariableInfo(name="WS-DATA", classification="input",
+                                     condition_literals=["A", "B"]),
+            "WS-FLAG": VariableInfo(name="WS-FLAG", classification="flag"),
+        }
+        parent = {"FS-INPUT": "00", "FS-OUTPUT": "00", "WS-DATA": "A", "WS-FLAG": True}
+        fuzzer = _FuzzerState()
+
+        # Force the gate-preserving branch (r in [0.48, 0.60))
+        # Run many mutations and check that when gate-preserving fires,
+        # status vars are unchanged
+        rng = random.Random(42)
+        gate_preserving_fired = False
+        for _ in range(500):
+            rng_state = rng.getstate()
+            r = rng.random()
+            if 0.48 <= r < 0.60:
+                # This would be the gate-preserving branch
+                gate_preserving_fired = True
+                # Restore state and run the actual mutation
+                rng.setstate(rng_state)
+                mutated, _ = _mutate_state(parent, report, rng, fuzzer)
+                # Status vars should be unchanged
+                self.assertEqual(mutated["FS-INPUT"], "00")
+                self.assertEqual(mutated["FS-OUTPUT"], "00")
+                break
+        self.assertTrue(gate_preserving_fired)
+
+
+class TestSeedInjection(unittest.TestCase):
+
+    def test_seed_injection_populates_corpus(self):
+        """All-success seed injection should add entries to corpus before main loop."""
+        prog = _make_program([
+            {
+                "name": "MAIN-PARA", "line_start": 1, "line_end": 10,
+                "statements": [
+                    {"type": "MOVE", "text": "MOVE 'A' TO WS-RESULT",
+                     "line_start": 1, "line_end": 1,
+                     "attributes": {"source": "'A'", "targets": "WS-RESULT"},
+                     "children": []},
+                ],
+            },
+        ])
+        var_report = extract_variables(prog)
+        code = generate_code(prog, var_report=var_report, instrument=True)
+        tmp = tempfile.NamedTemporaryFile(suffix=".py", delete=False, mode="w")
+        tmp.write(code)
+        tmp.close()
+        path = Path(tmp.name)
+        try:
+            all_paras = [p.name for p in prog.paragraphs]
+            # Run with just 1 iteration — seeds should already be in corpus
+            report = run_monte_carlo(
+                path, n_iterations=1, seed=42,
+                var_report=var_report, instrument=True,
+                all_paragraphs=all_paras, guided=True,
+            )
+            # Should have successful runs from seed injection
+            self.assertGreater(report.n_successful, 0)
+            self.assertIn("MAIN-PARA",
+                          report.analysis_report.paragraph_hit_counts)
         finally:
             path.unlink(missing_ok=True)
 

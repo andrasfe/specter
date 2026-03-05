@@ -117,8 +117,8 @@ def _resolve_value(token: str) -> str:
     if token.startswith("'") and token.endswith("'"):
         return token
 
-    # Numeric literal — strip leading zeros to avoid Python syntax errors
-    if re.match(r"^-?\d+\.?\d*$", token):
+    # Numeric literal — strip leading sign/zeros to avoid Python syntax errors
+    if re.match(r"^[+-]?\d+\.?\d*$", token):
         return str(int(token)) if "." not in token else str(float(token))
 
     # Variable reference (with optional subscript)
@@ -323,12 +323,15 @@ class _Parser:
         else:
             py_op = op
 
-        # For ordering comparisons against numeric values, coerce LHS
-        # to avoid TypeError (str vs int).
-        if py_op in ("<", ">", "<=", ">=") and all(
-            _is_numeric_literal(v) for v in values
-        ):
-            lhs = f"_to_num({lhs})"
+        # For ordering comparisons, coerce both sides to avoid
+        # TypeError (str vs int) at runtime.
+        if py_op in ("<", ">", "<=", ">="):
+            if all(_is_numeric_literal(v) for v in values):
+                lhs = f"_to_num({lhs})"
+            elif len(values) == 1 and not _is_numeric_literal(values[0]):
+                # Variable-to-variable comparison: wrap both
+                lhs = f"_to_num({lhs})"
+                values = [f"_to_num({values[0]})"]
 
         if len(values) == 1:
             return f"{lhs} {py_op} {values[0]}"
