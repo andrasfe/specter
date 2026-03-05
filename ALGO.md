@@ -96,7 +96,8 @@ Select a seed from the corpus (weighted by energy), then apply one mutation:
 
 A new entry is added to the corpus when it discovers:
 - A **new paragraph** (not yet in global coverage), or
-- A **new edge** (caller -> callee transition not yet seen)
+- A **new edge** (caller -> callee transition not yet seen), or
+- A **new branch** (IF true/else or EVALUATE WHEN not yet taken)
 
 The corpus is capped at 500 entries. When full, the lowest-energy entry whose coverage is fully redundant (subset of other entries' combined coverage) is evicted.
 
@@ -145,6 +146,28 @@ Repetition counts per operation type:
 | OPEN/CLOSE | 3 | Typically invoked once or twice |
 
 Random stub generation uses a 60% success bias. All-success stubs use 100% success with explicit EOF terminators.
+
+## Branch-Level Coverage
+
+In addition to paragraph and edge coverage, the fuzzer tracks **branch-level coverage**. Each IF statement in the generated code is assigned a unique branch ID. When the true branch is taken, the positive ID is recorded; when the else branch is taken, the negative ID is recorded. Similarly, each WHEN clause in an EVALUATE statement gets its own branch ID.
+
+This provides finer-grained feedback than paragraph coverage alone — two executions may reach the same paragraph but take different branches within it. The corpus accepts new entries that discover previously unseen branch IDs.
+
+## COBOL Statement Coverage
+
+### SEARCH (Table Lookup)
+
+COBOL SEARCH statements (sequential table lookup with VARYING index, AT END, and WHEN clauses) are stubbed similarly to external operations. Each SEARCH generates a stub key (`SEARCH:<table_name>`) whose outcomes are boolean found/not-found values. The AT END and WHEN branches are extracted from the statement text and translated to Python assignments, PERFORM calls, and GO TO jumps.
+
+SEARCH outcomes are generated using a separate RNG to avoid disrupting the main fuzzing sequence.
+
+### REWRITE (Record Update)
+
+REWRITE statements are handled identically to WRITE — they apply a stub outcome for the associated file operation, setting the file status variable.
+
+### PERFORM VARYING (Counted Loops)
+
+PERFORM VARYING statements (`PERFORM paragraph VARYING var FROM x BY y UNTIL condition`) generate proper loop initialization and increment logic. The loop variable is set to the FROM value before the loop, and incremented by the BY value after each iteration.
 
 ## Generated Code Resilience
 

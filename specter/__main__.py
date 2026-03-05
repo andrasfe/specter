@@ -157,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
             gating_conditions=gating_conds,
             stub_mapping=stub_mapping,
             equality_constraints=eq_constraints,
+            program=program,
         )
         print()
         print(report.summary())

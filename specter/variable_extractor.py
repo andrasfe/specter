@@ -538,6 +538,15 @@ def extract_stub_status_mapping(
                         candidate = f"{recname}-STATUS"
                         if candidate in status_vars:
                             mapping[key] = [candidate]
+            elif stmt.type == "REWRITE":
+                m = re.search(r"REWRITE\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+                if m:
+                    recname = m.group(1).upper()
+                    key = f"REWRITE:{recname}"
+                    if key not in mapping:
+                        candidate = f"{recname}-STATUS"
+                        if candidate in status_vars:
+                            mapping[key] = [candidate]
 
     return mapping
 

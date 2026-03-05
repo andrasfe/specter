@@ -82,6 +82,12 @@ class _CodeBuilder:
         self.lines: list[str] = []
         self._indent = 0
         self._loop_counter = 0
+        self._branch_counter = 0
+
+    def next_branch_id(self) -> int:
+        """Return a unique branch ID for instrumentation."""
+        self._branch_counter += 1
+        return self._branch_counter
 
     def next_loop_var(self) -> str:
         """Return a unique loop counter variable name."""
@@ -300,12 +306,14 @@ def _gen_subtract(cb: _CodeBuilder, stmt: Statement):
 
 def _gen_if(cb: _CodeBuilder, stmt: Statement):
     condition = stmt.attributes.get("condition", "")
+    bid = cb.next_branch_id()
     if not condition:
         cb.line(f"if True:  # IF: {stmt.text[:60]}")
     else:
         py_cond = cobol_condition_to_python(condition)
         cb.line(f"if {py_cond}:")
     cb.indent()
+    cb.line(f"state.get('_branches', set()).add({bid})")
 
     # Split children into before-ELSE and ELSE
     else_node = None
@@ -326,6 +334,7 @@ def _gen_if(cb: _CodeBuilder, stmt: Statement):
     if else_node:
         cb.line("else:")
         cb.indent()
+        cb.line(f"state.get('_branches', set()).add(-{bid})")
         if not else_node.children:
             cb.line("pass")
         else:
@@ -363,6 +372,8 @@ def _gen_evaluate(cb: _CodeBuilder, stmt: Statement):
             first_when = False
 
         cb.indent()
+        bid = cb.next_branch_id()
+        cb.line(f"state.get('_branches', set()).add({bid})")
         when_body = [c for c in child.children if c.type != "WHEN"]
         if not when_body:
             cb.line("pass")
@@ -439,14 +450,31 @@ def _gen_perform_inline(cb: _CodeBuilder, stmt: Statement):
     condition = stmt.attributes.get("condition", "")
     varying = stmt.attributes.get("varying", "")
     lv = cb.next_loop_var()
+    vary_increment = None  # (loop_var, by_val) if VARYING parsed
 
     if condition:
         py_cond = cobol_condition_to_python(condition)
         cb.line(f"{lv} = 0")
         cb.line(f"while not ({py_cond}):")
     elif varying:
-        cb.line(f"{lv} = 0")
-        cb.line(f"while True:  # VARYING: {varying[:50]}")
+        # Parse VARYING <var> FROM <start> BY <step> UNTIL <cond>
+        m_vary = re.match(
+            r"VARYING\s+([A-Z][A-Z0-9-]*)\s+FROM\s+(\S+)\s+BY\s+(\S+)\s+UNTIL\s+(.+)",
+            varying, re.IGNORECASE,
+        )
+        if m_vary:
+            loop_var = m_vary.group(1).upper()
+            from_val = _resolve_source(m_vary.group(2).strip())
+            by_val = _resolve_source(m_vary.group(3).strip())
+            until_cond = m_vary.group(4).strip()
+            py_until = cobol_condition_to_python(until_cond)
+            cb.line(f"state['{loop_var}'] = _to_num({from_val})")
+            cb.line(f"{lv} = 0")
+            cb.line(f"while not ({py_until}):")
+            vary_increment = (loop_var, by_val)
+        else:
+            cb.line(f"{lv} = 0")
+            cb.line(f"while True:  # VARYING: {varying[:50]}")
     else:
         cb.line(f"{lv} = 0")
         cb.line(f"while True:  # PERFORM_INLINE")
@@ -457,6 +485,9 @@ def _gen_perform_inline(cb: _CodeBuilder, stmt: Statement):
     else:
         for child in stmt.children:
             _gen_statement(cb, child)
+    if vary_increment:
+        loop_var, by_val = vary_increment
+        cb.line(f"state['{loop_var}'] = _to_num(state.get('{loop_var}', 0)) + _to_num({by_val})")
     cb.line(f"{lv} += 1")
     cb.line(f"if {lv} >= 100:")
     cb.indent()
@@ -611,6 +642,16 @@ def _gen_write(cb: _CodeBuilder, stmt: Statement):
         cb.line(f"_apply_stub_outcome(state, 'WRITE:UNKNOWN')")
 
 
+def _gen_rewrite(cb: _CodeBuilder, stmt: Statement):
+    m = re.search(r"REWRITE\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+    if m:
+        recname = m.group(1).upper()
+        cb.line(f"state['_writes'].append('{recname}')")
+        cb.line(f"_apply_stub_outcome(state, 'REWRITE:{recname}')")
+    else:
+        cb.line(f"state['_writes'].append('UNKNOWN')")
+
+
 def _gen_open(cb: _CodeBuilder, stmt: Statement):
     m = re.search(r"OPEN\s+(?:INPUT|OUTPUT|I-O|EXTEND)\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
     if m:
@@ -625,6 +666,134 @@ def _gen_close(cb: _CodeBuilder, stmt: Statement):
         fname = m.group(1).upper()
         cb.line(f"_apply_stub_outcome(state, 'CLOSE:{fname}')")
     cb.line(f"pass  # {stmt.text[:70]}")
+
+
+def _gen_search(cb: _CodeBuilder, stmt: Statement):
+    """Generate code for COBOL SEARCH statement.
+
+    SEARCH <table> [VARYING <index>] AT END <stmts> WHEN <cond> <stmts>
+
+    Since we don't have table data, the search result is controlled by a
+    stub outcome flag.  If found (default 70%), execute WHEN branch and set
+    the index variable; otherwise execute AT END branch.
+    """
+    text = stmt.text.strip()
+
+    # Extract table name
+    m_table = re.match(r"SEARCH\s+([A-Z][A-Z0-9-]*)", text, re.IGNORECASE)
+    if not m_table:
+        cb.line(f"pass  # SEARCH (unparsed): {text[:60]}")
+        return
+    table_name = m_table.group(1).upper()
+
+    # Extract VARYING index
+    m_vary = re.search(r"VARYING\s+([A-Z][A-Z0-9-]*)", text, re.IGNORECASE)
+    index_var = m_vary.group(1).upper() if m_vary else None
+
+    # Split into AT END and WHEN sections
+    at_end_body = ""
+    when_body = ""
+    at_end_pos = re.search(r"\bAT\s+END\b", text, re.IGNORECASE)
+    when_pos = re.search(r"\bWHEN\b", text, re.IGNORECASE)
+
+    if at_end_pos and when_pos:
+        at_end_body = text[at_end_pos.end():when_pos.start()].strip()
+        when_body = text[when_pos.end():].strip()
+    elif when_pos:
+        when_body = text[when_pos.end():].strip()
+    elif at_end_pos:
+        at_end_body = text[at_end_pos.end():].strip()
+
+    # Generate branching code
+    stub_key = f"SEARCH:{table_name}"
+    cb.line(f"_sl = state.get('_stub_outcomes', {{}}).get('{stub_key}', [])")
+    cb.line(f"_search_found = _sl.pop(0) if _sl else True")
+    cb.line("if _search_found:")
+    cb.indent()
+    # WHEN branch: set index and execute extracted statements
+    if index_var:
+        cb.line(f"state['{index_var}'] = 1")
+    _gen_search_body(cb, when_body)
+    cb.dedent()
+    if at_end_body:
+        cb.line("else:")
+        cb.indent()
+        _gen_search_body(cb, at_end_body)
+        cb.dedent()
+
+
+def _gen_search_body(cb: _CodeBuilder, body: str):
+    """Generate Python code for extracted SEARCH body text (AT END / WHEN)."""
+    if not body:
+        cb.line("pass")
+        return
+
+    generated = False
+
+    # Extract and generate MOVE statements
+    for m in re.finditer(
+        r"MOVE\s+(.+?)\s+TO\s+([A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?)",
+        body, re.IGNORECASE,
+    ):
+        source = m.group(1).strip()
+        target = m.group(2).strip().rstrip(".")
+        resolved = _resolve_source(source)
+        tname = target.upper()
+        # Strip subscript for state key but keep for context
+        clean = re.sub(r"\s*\([^)]*\)", "", tname)
+        cb.line(f"state['{clean}'] = {resolved}")
+        generated = True
+
+    # Extract GO TO
+    m_goto = re.search(r"GO\s+TO\s+([A-Z][A-Z0-9-]*)", body, re.IGNORECASE)
+    if m_goto:
+        func_name = _sanitize_name(m_goto.group(1))
+        cb.line(f"{func_name}(state)")
+        cb.line("return")
+        generated = True
+
+    # Extract PERFORM [THRU]
+    for m in re.finditer(
+        r"PERFORM\s+([A-Z][A-Z0-9-]*)(?:\s+THRU\s+([A-Z][A-Z0-9-]*))?",
+        body, re.IGNORECASE,
+    ):
+        func_name = _sanitize_name(m.group(1))
+        cb.line(f"{func_name}(state)")
+        generated = True
+
+    # Extract DISPLAY
+    for m in re.finditer(r"DISPLAY\s+'([^']*)'", body, re.IGNORECASE):
+        cb.line(f"state['_display'].append('{m.group(1)}')")
+        generated = True
+
+    # Extract ADD ... TO ...
+    for m in re.finditer(
+        r"ADD\s+(\S+)\s+TO\s+([A-Z][A-Z0-9-]*)", body, re.IGNORECASE,
+    ):
+        val = m.group(1).strip()
+        target = m.group(2).strip().upper()
+        resolved = _resolve_source(val)
+        cb.line(f"state['{target}'] = _to_num(state.get('{target}', 0)) + _to_num({resolved})")
+        generated = True
+
+    # Extract COMPUTE
+    for m in re.finditer(
+        r"COMPUTE\s+([A-Z][A-Z0-9-]*)\s*=\s*([^.]+)",
+        body, re.IGNORECASE,
+    ):
+        target = m.group(1).upper()
+        expr = m.group(2).strip()
+        # Simple variable-only expression
+        py_expr = re.sub(
+            r"([A-Z][A-Z0-9-]+)",
+            lambda mv: f"_to_num(state.get('{mv.group(1).upper()}', 0))",
+            expr,
+        )
+        cb.line(f"state['{target}'] = {py_expr}")
+        generated = True
+
+    if not generated:
+        cb.line("pass")
 
 
 def _gen_goto(cb: _CodeBuilder, stmt: Statement):
@@ -698,7 +867,7 @@ def _gen_statement(cb: _CodeBuilder, stmt: Statement):
     elif stype == "WRITE":
         _gen_write(cb, stmt)
     elif stype == "REWRITE":
-        cb.line(f"pass  # REWRITE: {stmt.text[:60]}")
+        _gen_rewrite(cb, stmt)
     elif stype == "ACCEPT":
         _gen_accept(cb, stmt)
     elif stype == "STRING":
@@ -708,7 +877,7 @@ def _gen_statement(cb: _CodeBuilder, stmt: Statement):
     elif stype == "INSPECT":
         cb.line(f"pass  # INSPECT: {stmt.text[:60]}")
     elif stype == "SEARCH":
-        cb.line(f"pass  # SEARCH: {stmt.text[:60]}")
+        _gen_search(cb, stmt)
     elif stype == "SORT":
         cb.line(f"pass  # SORT: {stmt.text[:60]}")
     elif stype == "GO_TO":
@@ -882,6 +1051,18 @@ def generate_code(
     cb.indent()
     cb.line("_var, _val = _entry")
     cb.line("state[_var] = _val")
+    cb.dedent()
+    cb.dedent()
+    cb.line("elif key.startswith('READ:') or key.startswith('START:'):")
+    cb.indent()
+    cb.line("# Default to EOF when stub outcomes exhausted — prevents infinite loops")
+    cb.line("_dm = state.get('_stub_defaults', {}).get(key)")
+    cb.line("if _dm:")
+    cb.indent()
+    cb.line("for _var, _val in _dm:")
+    cb.indent()
+    cb.line("state[_var] = _val")
+    cb.dedent()
     cb.dedent()
     cb.dedent()
     cb.dedent()
@@ -1094,6 +1275,7 @@ def generate_code(
     cb.line("state.setdefault('_reads', [])")
     cb.line("state.setdefault('_writes', [])")
     cb.line("state.setdefault('_abended', False)")
+    cb.line("state.setdefault('_branches', set())")
     if instrument:
         cb.line("dict.__setitem__(state, '_initial_snapshot', {k: v for k, v in state.items() if not k.startswith('_')})")
     if program.paragraphs:

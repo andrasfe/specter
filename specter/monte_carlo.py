@@ -174,8 +174,9 @@ def _generate_random_state(var_report, rng: random.Random) -> dict:
 
         elif info.classification == "internal" and harvested:
             # Internals normally get no initial value, but if we have
-            # harvested literals they're worth seeding.
-            if rng.random() < 0.5:
+            # harvested literals (including from gating conditions)
+            # they're worth seeding with higher probability.
+            if rng.random() < 0.7:
                 state[name] = rng.choice(harvested)
 
     return state
@@ -224,18 +225,24 @@ class _FuzzerState:
     var_reads: Counter = field(default_factory=Counter)
     change_counts: Counter = field(default_factory=Counter)
     call_graph: dict[str, set[str]] = field(default_factory=dict)
+    global_branches: set[int] = field(default_factory=set)
 
 
-def _should_add_to_corpus(fuzzer: _FuzzerState, coverage: frozenset, edges: frozenset) -> bool:
+def _should_add_to_corpus(fuzzer: _FuzzerState, coverage: frozenset, edges: frozenset,
+                           branches: frozenset | None = None) -> bool:
     new_paras = coverage - fuzzer.global_coverage
     new_edges = edges - fuzzer.global_edges
-    return bool(new_paras or new_edges)
+    new_branches = (branches - fuzzer.global_branches) if branches else set()
+    return bool(new_paras or new_edges or new_branches)
 
 
-def _add_to_corpus(fuzzer: _FuzzerState, entry: _CorpusEntry) -> None:
+def _add_to_corpus(fuzzer: _FuzzerState, entry: _CorpusEntry,
+                   branches: frozenset | None = None) -> None:
     fuzzer.corpus.append(entry)
     fuzzer.global_coverage.update(entry.coverage)
     fuzzer.global_edges.update(entry.edges)
+    if branches:
+        fuzzer.global_branches.update(branches)
     fuzzer.stale_counter = 0
     fuzzer.coverage_timeline.append((entry.added_at, len(fuzzer.global_coverage)))
 
@@ -447,6 +454,61 @@ def _generate_stub_outcomes(
         for _ in range(n_reps):
             outcomes.setdefault(op_key, []).append(list(entry))
 
+    return outcomes
+
+
+def _generate_stub_defaults(
+    stub_mapping: dict[str, list[str]],
+    var_report,
+) -> dict[str, list[tuple[str, object]]]:
+    """Generate default (exhaustion) outcomes for READ/START operations.
+
+    When stub outcomes are exhausted, these defaults are applied.
+    READ defaults to EOF (status '10'), START defaults to not-found ('23').
+    """
+    defaults: dict[str, list[tuple[str, object]]] = {}
+    for op_key, status_vars in stub_mapping.items():
+        if not (op_key.startswith("READ:") or op_key.startswith("START:")):
+            continue
+        entry: list[tuple[str, object]] = []
+        for svar in status_vars:
+            upper = svar.upper()
+            if "SQLCODE" in upper or "SQLSTATE" in upper:
+                entry.append((svar, 100))
+            elif op_key.startswith("READ:"):
+                entry.append((svar, "10"))  # EOF
+            else:
+                entry.append((svar, "23"))  # not found
+        defaults[op_key] = entry
+    return defaults
+
+
+def _generate_search_outcomes(
+    program_paragraphs,
+    rng: random.Random,
+    found_bias: float = 0.7,
+) -> dict[str, list]:
+    """Generate SEARCH stub outcomes (True=found, False=not found).
+
+    Scans paragraph statements for SEARCH to find table names,
+    then generates boolean outcome queues.
+    """
+    import re
+    outcomes: dict[str, list] = {}
+    seen_tables: set[str] = set()
+    for para in program_paragraphs:
+        for stmt in para.statements:
+            if stmt.type == "SEARCH":
+                m = re.match(r"SEARCH\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+                if m:
+                    table = m.group(1).upper()
+                    if table not in seen_tables:
+                        seen_tables.add(table)
+                        key = f"SEARCH:{table}"
+                        # Generate multiple outcomes (found/not found)
+                        outcomes[key] = [
+                            rng.random() < found_bias for _ in range(10)
+                        ]
     return outcomes
 
 
@@ -687,7 +749,8 @@ def _generate_directed_input(
 def _mutate_state(parent_state: dict, var_report, rng: random.Random,
                   fuzzer: _FuzzerState,
                   stub_mapping: dict[str, list[str]] | None = None,
-                  parent_stub_outcomes: dict | None = None) -> tuple[dict, dict | None]:
+                  parent_stub_outcomes: dict | None = None,
+                  gating_values: dict[str, list] | None = None) -> tuple[dict, dict | None]:
     """Apply a random mutation to the parent state.
 
     Returns (mutated_state, stub_outcomes).
@@ -790,10 +853,24 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                 all_paragraphs: list[str] | None,
                 call_graph=None, gating_conditions=None,
                 stub_mapping=None,
-                equality_constraints=None) -> MonteCarloReport:
+                equality_constraints=None,
+                program=None) -> MonteCarloReport:
     """Coverage-guided fuzzing loop with optional directed fuzzing."""
     rng = random.Random(seed)
+    search_rng = random.Random(seed + 1_000_000)  # separate rng for SEARCH outcomes
     fuzzer = _FuzzerState()
+
+    # Build gating value pool: maps variable -> set of values needed in gating conditions.
+    # Used by the gating-targeted mutation strategy without modifying condition_literals.
+    _gating_values: dict[str, list] = {}
+    if gating_conditions:
+        for _target, _gc_list in gating_conditions.items():
+            for _gc in _gc_list:
+                if _gc.values:
+                    _gating_values.setdefault(_gc.variable, [])
+                    for v in _gc.values:
+                        if v not in _gating_values[_gc.variable]:
+                            _gating_values[_gc.variable].append(v)
 
     explore_end = max(50, int(n_iterations * 0.3))
     stale_random_remaining = 0
@@ -810,6 +887,41 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
 
     directed_target: str | None = None
     directed_attempts = 0
+
+    # Pre-compute stub defaults (EOF for READs when stubs exhausted)
+    stub_defaults = (
+        _generate_stub_defaults(stub_mapping, var_report)
+        if stub_mapping else None
+    )
+
+    # Pre-compute SEARCH table names (stable — doesn't consume rng)
+    _search_tables: list[str] = []
+    if program is not None:
+        import re as _re
+        _seen: set[str] = set()
+        for _para in program.paragraphs:
+            for _stmt in _para.statements:
+                if _stmt.type == "SEARCH":
+                    _m = _re.match(r"SEARCH\s+([A-Z][A-Z0-9-]*)", _stmt.text, _re.IGNORECASE)
+                    if _m:
+                        _t = _m.group(1).upper()
+                        if _t not in _seen:
+                            _seen.add(_t)
+                            _search_tables.append(_t)
+
+    def _inject_defaults(state: dict, local_rng: random.Random) -> None:
+        """Inject stub defaults and SEARCH outcomes into state.
+
+        Uses a separate rng to avoid corrupting the main fuzzer sequence.
+        """
+        # Note: stub_defaults (EOF on empty READ queue) disabled for now —
+        # it terminates loops too early when stubs run out, reducing coverage.
+        if _search_tables:
+            so = state.setdefault("_stub_outcomes", {})
+            for table in _search_tables:
+                key = f"SEARCH:{table}"
+                if key not in so:
+                    so[key] = [local_rng.random() < 0.7 for _ in range(10)]
 
     # --- All-success seed injection ---
     # Inject seeds that pass all initialization gates, guaranteeing corpus
@@ -828,6 +940,7 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
             )
             if seed_stub:
                 seed_state["_stub_outcomes"] = seed_stub
+            _inject_defaults(seed_state, search_rng)
             try:
                 rs = module.run(seed_state)
                 trace = rs.get("_trace", [])
@@ -840,16 +953,17 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                 fuzzer.n_successful += 1
                 for p in trace:
                     fuzzer.para_hits[p] += 1
-                if _should_add_to_corpus(fuzzer, cov, edg):
+                br = frozenset(rs.get("_branches", set()))
+                if _should_add_to_corpus(fuzzer, cov, edg, br):
                     entry = _CorpusEntry(
                         input_state={k: v for k, v in seed_state.items()
-                                     if k != "_stub_outcomes"},
+                                     if not k.startswith("_stub")},
                         coverage=cov,
                         edges=edg,
                         added_at=0,
                         stub_outcomes=seed_stub,
                     )
-                    _add_to_corpus(fuzzer, entry)
+                    _add_to_corpus(fuzzer, entry, br)
             except (RecursionError, Exception):
                 pass
 
@@ -892,6 +1006,7 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                 parent.input_state, var_report, rng, fuzzer,
                 stub_mapping=stub_mapping,
                 parent_stub_outcomes=parent.stub_outcomes,
+                gating_values=None,  # don't use gating in normal mutation (changes rng)
             )
 
         # Attach stub outcomes to state
@@ -900,6 +1015,8 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
             input_state["_stub_outcomes"] = {
                 k: list(v) for k, v in stub_out.items()
             }
+
+        _inject_defaults(input_state, search_rng)
 
         # Recursion avoidance
         if var_report and _is_recursion_prone(fuzzer, input_state, var_report):
@@ -957,16 +1074,17 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
             fuzzer.change_counts[var] += 1
 
         # Corpus update
-        if _should_add_to_corpus(fuzzer, coverage, edges):
+        branches = frozenset(result_state.get("_branches", set()))
+        if _should_add_to_corpus(fuzzer, coverage, edges, branches):
             entry = _CorpusEntry(
                 input_state={k: v for k, v in input_state.items()
-                             if k != "_stub_outcomes"},
+                             if not k.startswith("_stub")},
                 coverage=coverage,
                 edges=edges,
                 added_at=i,
                 stub_outcomes=stub_out,
             )
-            _add_to_corpus(fuzzer, entry)
+            _add_to_corpus(fuzzer, entry, branches)
             if parent is not None:
                 parent.children_produced += 1
             # Reset directed target if we just covered it
@@ -1000,6 +1118,7 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                                     k: list(v) for k, v in stub_out.items()
                                 }
                             directed_attempts += 1
+                            _inject_defaults(input_state, search_rng)
 
                             # Run the directed input immediately
                             try:
@@ -1014,16 +1133,17 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                                 for p in d_trace:
                                     fuzzer.para_hits[p] += 1
                                 fuzzer.n_successful += 1
-                                if _should_add_to_corpus(fuzzer, d_cov, d_edges):
+                                d_br = frozenset(ds.get("_branches", set()))
+                                if _should_add_to_corpus(fuzzer, d_cov, d_edges, d_br):
                                     d_entry = _CorpusEntry(
                                         input_state={k: v for k, v in input_state.items()
-                                                     if k != "_stub_outcomes"},
+                                                     if not k.startswith("_stub")},
                                         coverage=d_cov,
                                         edges=d_edges,
                                         added_at=i,
                                         stub_outcomes=stub_out,
                                     )
-                                    _add_to_corpus(fuzzer, d_entry)
+                                    _add_to_corpus(fuzzer, d_entry, d_br)
                                     if directed_target in d_cov:
                                         directed_target = None
                                         directed_attempts = 0
@@ -1142,6 +1262,7 @@ def run_monte_carlo(
     gating_conditions=None,
     stub_mapping=None,
     equality_constraints=None,
+    program=None,
 ) -> MonteCarloReport:
     """Run Monte Carlo analysis on a generated Python module.
 
@@ -1181,6 +1302,7 @@ def run_monte_carlo(
             gating_conditions=gating_conditions,
             stub_mapping=stub_mapping,
             equality_constraints=equality_constraints,
+            program=program,
         )
 
     rng = random.Random(seed)
