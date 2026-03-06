@@ -62,6 +62,34 @@ State Changes:
   Never: WS-FILLER, WS-PROGRAM-NAME
 ```
 
+## Execution Diagrams
+
+The `--diagram` flag generates Mermaid sequence and flow diagrams from actual execution traces. These show the runtime call flow between paragraphs — not a static approximation, but the real paths taken during Monte Carlo iterations.
+
+Three diagram types are produced:
+
+- **Sequence diagram** (`_sequence.mmd`) — shows the call/return flow of a single representative iteration, with proper nesting depth. Useful for understanding the exact order of paragraph execution.
+- **Flow diagram** (`_flow.mmd`) — shows paragraph call relationships with hit counts for one iteration. A compact view of which paragraphs called which.
+- **Aggregated flow** (`_aggregated_flow.mmd`) — combines call relationships across all coverage-expanding iterations with cumulative counts. Shows the most-exercised paths and hot paragraphs across the full analysis run.
+
+All diagrams are output as `.mmd` (Mermaid markdown) files. Render them with any Mermaid-compatible tool: the [Mermaid Live Editor](https://mermaid.live), VS Code extensions, GitHub markdown preview, or `mmdc` CLI.
+
+Example sequence diagram output:
+
+```mermaid
+sequenceDiagram
+    participant Entry as Program Entry
+    participant MAIN as 0000-MAIN
+    participant INIT as 1000-INIT
+    participant PROC as 2000-PROCESS
+    Entry->>+MAIN:
+    MAIN->>+INIT:
+    INIT-->>-MAIN:
+    MAIN->>+PROC:
+    PROC-->>-MAIN:
+    MAIN-->>-Entry:
+```
+
 ## Usage
 
 ```
@@ -72,8 +100,21 @@ specter program.ast --monte-carlo 1000       # run 1000 random iterations
 specter program.ast -m 5000 --seed 7         # custom iteration count and seed
 specter program.ast --analyze                # dynamic analysis (100 MC iterations)
 specter program.ast --analyze -m 500         # analysis with custom iteration count
-specter program.ast --analyze --analysis-output ./reports  # write report to custom dir
+specter program.ast --guided -m 10000        # coverage-guided fuzzing (best mode)
+specter program.ast --diagram                # generate execution diagrams (implies --analyze)
+specter program.ast --guided --diagram       # guided fuzzing + diagrams
+specter program.ast --analyze --analysis-output ./reports  # write output to custom dir
 ```
+
+## GnuCOBOL Validation
+
+The `tests/cobol_validation/` directory contains 58 COBOL test programs that validate Specter's code generation against GnuCOBOL. Each test compiles and runs with GnuCOBOL, then parses the same source through ProLeap and Specter, comparing DISPLAY output. Run with:
+
+```
+python3 tests/cobol_validation/run_validation.py
+```
+
+Requires GnuCOBOL (`cobc`) and the ProLeap wrapper JAR.
 
 ## Requirements
 

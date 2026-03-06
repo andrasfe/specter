@@ -32,6 +32,7 @@ class IterationResult:
     var_writes: list[tuple[str, str]] | None = None
     var_reads: list[tuple[str, str]] | None = None
     state_diffs: dict | None = None
+    call_events: list[tuple] | None = None
 
 
 @dataclass
@@ -49,6 +50,7 @@ class MonteCarloReport:
     error_messages: list[str] = field(default_factory=list)
     iterations: list[IterationResult] = field(default_factory=list)
     analysis_report: object | None = None
+    sample_call_events: list[list[tuple]] = field(default_factory=list)
 
     def summary(self) -> str:
         lines = [
@@ -226,6 +228,7 @@ class _FuzzerState:
     change_counts: Counter = field(default_factory=Counter)
     call_graph: dict[str, set[str]] = field(default_factory=dict)
     global_branches: set[int] = field(default_factory=set)
+    sample_call_events: list[list[tuple]] = field(default_factory=list)
 
 
 def _should_add_to_corpus(fuzzer: _FuzzerState, coverage: frozenset, edges: frozenset,
@@ -1085,6 +1088,10 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                 stub_outcomes=stub_out,
             )
             _add_to_corpus(fuzzer, entry, branches)
+            # Save call events from coverage-expanding runs (up to 20 samples)
+            call_events = result_state.get("_call_events", [])
+            if call_events and len(fuzzer.sample_call_events) < 20:
+                fuzzer.sample_call_events.append(call_events)
             if parent is not None:
                 parent.children_produced += 1
             # Reset directed target if we just covered it
@@ -1196,6 +1203,8 @@ def _build_report_from_fuzzer(fuzzer: _FuzzerState, n_iterations: int,
         display_patterns=dict(fuzzer.display_patterns),
         error_messages=fuzzer.error_messages,
     )
+
+    report.sample_call_events = fuzzer.sample_call_events
 
     # Store corpus entries as representative iterations (for compatibility)
     for idx, entry in enumerate(fuzzer.corpus):
@@ -1358,6 +1367,7 @@ def run_monte_carlo(
                 iteration.var_writes = result_state.get("_var_writes", [])
                 iteration.var_reads = result_state.get("_var_reads", [])
                 iteration.state_diffs = result_state.get("_state_diffs", {})
+                iteration.call_events = result_state.get("_call_events", [])
 
             report.iterations.append(iteration)
             report.n_successful += 1

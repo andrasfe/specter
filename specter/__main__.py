@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .ast_parser import parse_ast
 from .code_generator import generate_code
+from .diagram import write_diagrams
 from .monte_carlo import run_monte_carlo
 from .static_analysis import (
     build_static_call_graph,
@@ -59,8 +60,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Use coverage-guided fuzzing (implies --analyze, default 10000 iterations)",
     )
+    parser.add_argument(
+        "--diagram",
+        action="store_true",
+        help="Generate Mermaid sequence and flow diagrams (implies --analyze)",
+    )
 
     args = parser.parse_args(argv)
+
+    # --diagram implies --analyze
+    if args.diagram:
+        args.analyze = True
 
     # --guided implies --analyze and a higher default iteration count
     if args.guided:
@@ -173,6 +183,33 @@ def main(argv: list[str] | None = None) -> int:
             report_file = analysis_dir / f"{ast_path.stem}_analysis.txt"
             report_file.write_text(analysis_text + "\n")
             print(f"\nAnalysis report written to {report_file}")
+
+        # Generate diagrams
+        if args.diagram and args.analyze:
+            analysis_dir = Path(args.analysis_output) if args.analysis_output else Path("/tmp")
+
+            # Collect call events from iterations
+            all_call_events = report.sample_call_events or []
+            if not all_call_events:
+                # Fall back to non-guided iteration data
+                for it in report.iterations:
+                    if it.call_events:
+                        all_call_events.append(it.call_events)
+
+            if all_call_events:
+                # Use first sample for single-iteration diagrams
+                first_events = all_call_events[0]
+                created = write_diagrams(
+                    first_events,
+                    analysis_dir,
+                    ast_path.stem,
+                    all_iterations_events=all_call_events,
+                )
+                print(f"\nDiagrams generated:")
+                for path in created:
+                    print(f"  {path}")
+            else:
+                print("\nNo call events captured for diagrams (run with --analyze)")
 
     return 0
 
