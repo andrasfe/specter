@@ -45,21 +45,21 @@ Example output:
 === Dynamic Analysis (100 iterations) ===
 
 Paragraph Coverage: 87/120 (72.5%)
-  Dead: 9999-ABEND, 8000-ERROR-HANDLER, ...
+  Dead: PARA-ERROR-HANDLER, PARA-ABEND-ROUTINE, ...
 
 Call Graph (top callers):
-  0000-MAIN -> 1000-INIT, 2000-PROCESS, 9000-CLEANUP
-  2000-PROCESS -> 2100-VALIDATE, 2200-COMPUTE
+  PARA-MAIN -> PARA-SETUP, PARA-PROCESS, PARA-TEARDOWN
+  PARA-PROCESS -> PARA-VALIDATE, PARA-CALCULATE
 
 Variable Activity:
-  Most written: WS-STATUS (450), WS-AMOUNT (320)
-  Read-only: CUSTOMER-ID, ACCOUNT-NUM
+  Most written: WS-RESULT (450), WS-TOTAL (320)
+  Read-only: WS-INPUT-KEY, WS-ACCT-NUM
   Dead writes: WS-TEMP-1
 
 State Changes:
-  Always changed: WS-STATUS (100/100), WS-RETURN-CODE (100/100)
-  Sometimes: WS-AMOUNT (73/100), WS-ERROR-MSG (12/100)
-  Never: WS-FILLER, WS-PROGRAM-NAME
+  Always changed: WS-RESULT (100/100), WS-RC (100/100)
+  Sometimes: WS-TOTAL (73/100), WS-ERR-MSG (12/100)
+  Never: WS-FILLER, WS-PGM-NAME
 ```
 
 ## Execution Diagrams
@@ -79,12 +79,12 @@ Example sequence diagram output:
 ```mermaid
 sequenceDiagram
     participant Entry as Program Entry
-    participant MAIN as 0000-MAIN
-    participant INIT as 1000-INIT
-    participant PROC as 2000-PROCESS
+    participant MAIN as PARA-MAIN
+    participant SETUP as PARA-SETUP
+    participant PROC as PARA-PROCESS
     Entry->>+MAIN:
-    MAIN->>+INIT:
-    INIT-->>-MAIN:
+    MAIN->>+SETUP:
+    SETUP-->>-MAIN:
     MAIN->>+PROC:
     PROC-->>-MAIN:
     MAIN-->>-Entry:
