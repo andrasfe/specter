@@ -91,11 +91,11 @@ class VariableReport:
 
 
 def _clean_var_name(name: str) -> str:
-    """Strip subscripts from variable name."""
+    """Strip subscripts and trailing punctuation from variable name."""
     paren = name.find("(")
     if paren >= 0:
-        return name[:paren]
-    return name
+        name = name[:paren]
+    return name.rstrip(".,;:'")
 
 
 def _record_read(report: VariableReport, name: str):
