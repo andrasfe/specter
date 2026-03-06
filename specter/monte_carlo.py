@@ -1165,13 +1165,26 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                 and fuzzer.corpus and all_paragraphs):
             _update_energy(fuzzer, all_paragraphs)
 
+    # Count total branch points from the generated module source
+    total_branches = 0
+    try:
+        import re as _re2
+        src = __import__("inspect").getsource(module)
+        total_branches = len(set(
+            int(m) for m in _re2.findall(r"_branches.*?\.add\((-?\d+)\)", src)
+        ))
+    except Exception:
+        pass
+
     return _build_report_from_fuzzer(fuzzer, n_iterations, all_paragraphs,
-                                    call_graph=call_graph)
+                                    call_graph=call_graph,
+                                    total_branches=total_branches)
 
 
 def _build_report_from_fuzzer(fuzzer: _FuzzerState, n_iterations: int,
                               all_paragraphs: list[str] | None,
-                              call_graph=None) -> MonteCarloReport:
+                              call_graph=None,
+                              total_branches: int = 0) -> MonteCarloReport:
     """Build MonteCarloReport from aggregated fuzzer state."""
     report = MonteCarloReport(
         n_iterations=n_iterations,
@@ -1229,6 +1242,9 @@ def _build_report_from_fuzzer(fuzzer: _FuzzerState, n_iterations: int,
         analysis.max_theoretical_coverage = (
             (n_reachable / len(all_para_set) * 100) if all_para_set else 0.0
         )
+
+    analysis.branch_hits = len(fuzzer.global_branches)
+    analysis.total_branches = total_branches
 
     report.analysis_report = analysis
     return report

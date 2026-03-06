@@ -22,6 +22,8 @@ class AnalysisReport:
     structurally_unreachable: list[str] = field(default_factory=list)
     reachable_uncovered: list[str] = field(default_factory=list)
     max_theoretical_coverage: float = 0.0
+    branch_hits: int = 0
+    total_branches: int = 0
 
     def summary(self) -> str:
         lines = []
@@ -42,6 +44,12 @@ class AnalysisReport:
             lines.append(f"=== Dynamic Analysis ({self.n_iterations} iterations) ===")
             lines.append("")
             lines.append(f"Paragraph Coverage: {covered}/{total_paras} ({pct:.1f}%)")
+
+        if self.total_branches > 0:
+            br_pct = (self.branch_hits / self.total_branches * 100)
+            lines.append(
+                f"Branch Coverage: {self.branch_hits}/{self.total_branches} ({br_pct:.1f}%)"
+            )
 
         if self.reachable_uncovered:
             lines.append(f"  Reachable uncovered: {', '.join(self.reachable_uncovered[:10])}")

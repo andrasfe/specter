@@ -497,17 +497,30 @@ def _gen_perform_inline(cb: _CodeBuilder, stmt: Statement):
 
 
 def _gen_set(cb: _CodeBuilder, stmt: Statement):
-    m = re.search(r"SET\s+([A-Z][A-Z0-9-]*)\s+TO\s+TRUE", stmt.text, re.IGNORECASE)
+    _VN = r"[A-Z0-9][A-Z0-9-]*"
+    m = re.search(rf"SET\s+({_VN})\s+TO\s+TRUE", stmt.text, re.IGNORECASE)
     if m:
         varname = m.group(1).upper()
         cb.line(f"state['{varname}'] = True")
         return
-    m = re.search(r"SET\s+([A-Z][A-Z0-9-]*)\s+TO\s+FALSE", stmt.text, re.IGNORECASE)
+    m = re.search(rf"SET\s+({_VN})\s+TO\s+FALSE", stmt.text, re.IGNORECASE)
     if m:
         varname = m.group(1).upper()
         cb.line(f"state['{varname}'] = False")
         return
-    m = re.search(r"SET\s+([A-Z][A-Z0-9-]*)\s+TO\s+(.+)", stmt.text, re.IGNORECASE)
+    m = re.search(rf"SET\s+({_VN})\s+UP\s+BY\s+(.+)", stmt.text, re.IGNORECASE)
+    if m:
+        varname = m.group(1).upper()
+        value = m.group(2).strip().rstrip(".")
+        cb.line(f"state['{varname}'] = _to_num(state.get('{varname}', 0)) + {_resolve_source(value)}")
+        return
+    m = re.search(rf"SET\s+({_VN})\s+DOWN\s+BY\s+(.+)", stmt.text, re.IGNORECASE)
+    if m:
+        varname = m.group(1).upper()
+        value = m.group(2).strip().rstrip(".")
+        cb.line(f"state['{varname}'] = _to_num(state.get('{varname}', 0)) - {_resolve_source(value)}")
+        return
+    m = re.search(rf"SET\s+({_VN})\s+TO\s+(.+)", stmt.text, re.IGNORECASE)
     if m:
         varname = m.group(1).upper()
         value = m.group(2).strip().rstrip(".")
