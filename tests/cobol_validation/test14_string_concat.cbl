@@ -1,0 +1,17 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TEST14.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-FIRST       PIC X(10) VALUE 'HELLO'.
+       01 WS-SECOND      PIC X(10) VALUE 'WORLD'.
+       01 WS-RESULT      PIC X(30) VALUE SPACES.
+       01 WS-PTR         PIC 9(4) VALUE 1.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           STRING WS-FIRST DELIMITED BY SPACE
+                  ' ' DELIMITED BY SIZE
+                  WS-SECOND DELIMITED BY SPACE
+                  INTO WS-RESULT
+                  WITH POINTER WS-PTR
+           DISPLAY 'RESULT:' WS-RESULT
+           STOP RUN.

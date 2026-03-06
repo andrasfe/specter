@@ -1,0 +1,15 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TEST31.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-RATE        PIC 9(4) VALUE 100.
+       01 WS-FACTOR      PIC 9(4) VALUE 3.
+       01 WS-RESULT      PIC 9(8) VALUE 0.
+       01 WS-R2          PIC 9(8) VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           COMPUTE WS-RESULT = WS-RATE / WS-FACTOR
+           DISPLAY 'DIV:' WS-RESULT
+           COMPUTE WS-R2 = WS-RATE - WS-FACTOR * 10
+           DISPLAY 'PREC:' WS-R2
+           STOP RUN.

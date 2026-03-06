@@ -1,0 +1,13 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TEST43.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-N           PIC 9(4) VALUE 4.
+       01 WS-COUNT       PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           PERFORM ADD-ONE WS-N TIMES
+           DISPLAY 'COUNT:' WS-COUNT
+           STOP RUN.
+       ADD-ONE.
+           ADD 1 TO WS-COUNT.

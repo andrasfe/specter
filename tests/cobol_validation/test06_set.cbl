@@ -1,0 +1,17 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TEST06.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-INDEX      PIC 9(4) VALUE 0.
+       01 WS-OTHER      PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           SET WS-INDEX TO 5
+           DISPLAY 'INDEX:' WS-INDEX
+           SET WS-INDEX UP BY 3
+           DISPLAY 'UP-BY:' WS-INDEX
+           SET WS-INDEX DOWN BY 2
+           DISPLAY 'DOWN-BY:' WS-INDEX
+           SET WS-OTHER TO WS-INDEX
+           DISPLAY 'OTHER:' WS-OTHER
+           STOP RUN.

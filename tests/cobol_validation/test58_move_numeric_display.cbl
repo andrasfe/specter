@@ -1,0 +1,16 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TEST58.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-NUM         PIC 9(4) VALUE 42.
+       01 WS-STR         PIC X(10) VALUE SPACES.
+       01 WS-NUM2        PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           MOVE WS-NUM TO WS-STR
+           DISPLAY 'STR:' WS-STR
+           MOVE 'ABCD' TO WS-STR
+           DISPLAY 'ALPHA:' WS-STR
+           MOVE 999 TO WS-NUM2
+           DISPLAY 'NUM2:' WS-NUM2
+           STOP RUN.

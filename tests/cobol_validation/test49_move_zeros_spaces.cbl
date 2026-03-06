@@ -1,0 +1,15 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TEST49.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-NUM         PIC 9(4) VALUE 1234.
+       01 WS-STR         PIC X(10) VALUE 'ABCDEF'.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           DISPLAY 'BEFORE-N:' WS-NUM
+           DISPLAY 'BEFORE-S:' WS-STR
+           MOVE ZEROS TO WS-NUM
+           MOVE SPACES TO WS-STR
+           DISPLAY 'AFTER-N:' WS-NUM
+           DISPLAY 'AFTER-S:' WS-STR
+           STOP RUN.

@@ -1,0 +1,21 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TEST40.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-PATH        PIC X(20) VALUE SPACES.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           STRING 'M' DELIMITED BY SIZE INTO WS-PATH
+           GO TO PARA-A.
+       PARA-A.
+           STRING 'A' DELIMITED BY SIZE INTO WS-PATH
+           GO TO PARA-C.
+       PARA-B.
+           STRING 'B' DELIMITED BY SIZE INTO WS-PATH
+           GO TO PARA-END.
+       PARA-C.
+           STRING 'C' DELIMITED BY SIZE INTO WS-PATH
+           GO TO PARA-B.
+       PARA-END.
+           DISPLAY 'PATH:' WS-PATH
+           STOP RUN.

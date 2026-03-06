@@ -1,0 +1,14 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TEST51.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-I           PIC 9(4) VALUE 0.
+       01 WS-COUNT       PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           PERFORM COUNT-IT VARYING WS-I FROM 1 BY 1
+               UNTIL WS-I > 3
+           DISPLAY 'TOTAL:' WS-COUNT
+           STOP RUN.
+       COUNT-IT.
+           ADD 10 TO WS-COUNT.

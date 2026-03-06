@@ -1,0 +1,15 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TEST35.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-NUM         PIC 9(4) VALUE 42.
+       01 WS-ALPHA       PIC X(10) VALUE SPACES.
+       01 WS-STR         PIC X(5) VALUE 'HELLO'.
+       01 WS-OUT         PIC X(5) VALUE SPACES.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           MOVE WS-NUM TO WS-ALPHA
+           DISPLAY 'NUM-TO-ALPHA:' WS-ALPHA
+           MOVE WS-STR TO WS-OUT
+           DISPLAY 'STR-COPY:' WS-OUT
+           STOP RUN.

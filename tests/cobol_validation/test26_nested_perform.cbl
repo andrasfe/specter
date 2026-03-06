@@ -1,0 +1,18 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TEST26.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-OUTER       PIC 9(4) VALUE 0.
+       01 WS-INNER       PIC 9(4) VALUE 0.
+       01 WS-TOTAL       PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           PERFORM OUTER-LOOP 3 TIMES
+           DISPLAY 'TOTAL:' WS-TOTAL
+           STOP RUN.
+       OUTER-LOOP.
+           ADD 1 TO WS-OUTER
+           PERFORM INNER-LOOP 2 TIMES.
+       INNER-LOOP.
+           ADD 1 TO WS-INNER
+           ADD 1 TO WS-TOTAL.

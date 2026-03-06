@@ -1,0 +1,18 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TEST18.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-VAL         PIC 9(4) VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           PERFORM STEP-A
+           DISPLAY 'AFTER-A:' WS-VAL
+           PERFORM STEP-B
+           DISPLAY 'AFTER-B:' WS-VAL
+           PERFORM STEP-A THRU STEP-B
+           DISPLAY 'AFTER-THRU:' WS-VAL
+           STOP RUN.
+       STEP-A.
+           ADD 10 TO WS-VAL.
+       STEP-B.
+           MULTIPLY 2 BY WS-VAL.

@@ -1,0 +1,18 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. TEST19.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-TABLE.
+           05 WS-ITEM PIC 9(4) OCCURS 3 TIMES.
+       01 WS-IDX         PIC 9(4) VALUE 2.
+       01 WS-RESULT      PIC 9(8) VALUE 0.
+       PROCEDURE DIVISION.
+       MAIN-PARA.
+           MOVE 10 TO WS-ITEM(1)
+           MOVE 20 TO WS-ITEM(2)
+           MOVE 30 TO WS-ITEM(3)
+           COMPUTE WS-RESULT = WS-ITEM(1) + WS-ITEM(2)
+           DISPLAY 'SUM-12:' WS-RESULT
+           COMPUTE WS-ITEM(3) = WS-ITEM(1) * 5
+           DISPLAY 'ITEM3:' WS-ITEM(3)
+           STOP RUN.

@@ -239,7 +239,7 @@ class _Parser:
 
         lhs = _resolve_value(lhs_token)
 
-        # Check for IS NUMERIC / IS NOT NUMERIC
+        # Check for IS NUMERIC / IS NOT NUMERIC / IS GREATER/LESS/EQUAL
         if self.match("IS"):
             self.advance()
             if self.match("NOT"):
@@ -247,11 +247,29 @@ class _Parser:
                 if self.match("NUMERIC"):
                     self.advance()
                     return f"not _is_numeric({lhs})"
+                # IS NOT <operator> — fall through to operator parsing with negation
+                negated = True
+                op = self._parse_operator()
+                if op is not None:
+                    # Continue to rhs parsing below
+                    rhs_token = self._primary_token()
+                    if rhs_token is None:
+                        return f"not ({lhs})"
+                    rhs = _resolve_value(rhs_token)
+                    py_op = _negate_op(op)
+                    if py_op in ("<", ">", "<=", ">="):
+                        lhs = f"_to_num({lhs})"
+                        rhs = f"_to_num({rhs})"
+                    return f"{lhs} {py_op} {rhs}"
                 return f"not ({lhs})"
             if self.match("NUMERIC"):
                 self.advance()
                 return f"_is_numeric({lhs})"
-            return lhs
+            # IS GREATER/LESS/EQUAL — fall through to operator parsing
+            if self.peek() and self.peek().upper() in ("GREATER", "LESS", "EQUAL", ">", "<", ">=", "<=", "="):
+                pass  # fall through to operator parsing below
+            else:
+                return lhs
 
         # Check for comparison operators
         negated = False
