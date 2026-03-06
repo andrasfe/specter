@@ -157,6 +157,9 @@ def _resolve_source(source: str) -> str:
     """Resolve a MOVE source to a Python expression."""
     s = source.strip()
 
+    # Strip leading ALL (MOVE ALL 'X' etc.)
+    s = re.sub(r"^ALL\s+", "", s, flags=re.IGNORECASE).strip()
+
     # Figurative constant
     upper = s.upper()
     if upper in _FIGURATIVE_SOURCES:
@@ -246,8 +249,10 @@ def _gen_move(cb: _CodeBuilder, stmt: Statement):
             cb.line(f"pass  # MOVE: {_oneline(stmt.text)}")
             return
 
-    # Detect MOVE ALL 'x' — ProLeap strips ALL from source attribute
+    # Detect MOVE ALL 'x' — strip ALL prefix from source if present
     is_move_all = bool(re.search(r"MOVE\s+ALL\s+", stmt.text, re.IGNORECASE))
+    if is_move_all:
+        source = re.sub(r"^ALL\s+", "", source, flags=re.IGNORECASE).strip()
 
     resolved = _resolve_source(source)
     for target_tok in _tokenize_cobol_vars(_strip_cobol_comments(targets)):
@@ -333,7 +338,7 @@ def _gen_compute(cb: _CodeBuilder, stmt: Statement):
     # LENGTH OF <var>
     expr = re.sub(
         r"LENGTH\s+OF\s+([A-Z][A-Z0-9-]*)",
-        lambda m: _ph(f"len(str(state.get('{m.group(1).upper()}', '')))"),
+        lambda m: _ph(f"len(str(state.get('{_vk(m.group(1))}', '')))"),
         expr, flags=re.IGNORECASE,
     )
 
@@ -378,7 +383,7 @@ def _gen_compute(cb: _CodeBuilder, stmt: Statement):
                     replacement = _ph(_resolve_function(inner))
                 elif "NUMVAL" in upper_fname:
                     cleaned = re.sub(r"\s+OF\s+\S+", "", inner, flags=re.IGNORECASE).strip()
-                    varname = cleaned.upper()
+                    varname = _vk(cleaned)
                     replacement = _ph(f"_to_num(state.get('{varname}', 0))")
                 else:
                     replacement = _ph("0")
@@ -555,7 +560,7 @@ def _gen_evaluate(cb: _CodeBuilder, stmt: Statement):
     is_true = subject.upper() == "TRUE"
 
     if not is_true:
-        subj_expr = f"state.get('{subject.upper()}', '')"
+        subj_expr = f"state.get('{_vk(subject)}', '')"
         cb.line(f"_eval_subject = {subj_expr}")
         # Check if WHEN values are numeric — if so, coerce subject to number
         _has_numeric_when = False
@@ -801,7 +806,7 @@ def _gen_display(cb: _CodeBuilder, stmt: Statement):
     text = stmt.text.strip()
     m = re.match(r"DISPLAY\s+(.*)", text, re.IGNORECASE)
     if not m:
-        cb.line(f"state['_display'].append('{text}')")
+        cb.line(f"state['_display'].append('{_sq(_oneline(text))}')")
         return
 
     content = m.group(1).rstrip(".")
@@ -832,7 +837,7 @@ def _gen_display(cb: _CodeBuilder, stmt: Statement):
 
 def _gen_call(cb: _CodeBuilder, stmt: Statement):
     target = stmt.attributes.get("target", "UNKNOWN")
-    cb.line(f"_dummy_call('{target}', state)")
+    cb.line(f"_dummy_call('{_sq(target)}', state)")
 
 
 def _gen_exec(cb: _CodeBuilder, stmt: Statement, kind: str):
@@ -937,7 +942,7 @@ def _gen_open(cb: _CodeBuilder, stmt: Statement):
     if m:
         files_str = m.group(1).strip().rstrip(".")
         for tok in re.split(r"\s+", files_str):
-            tok = tok.strip().upper()
+            tok = _vk(tok.strip())
             if tok and tok not in ("INPUT", "OUTPUT", "I-O", "EXTEND"):
                 cb.line(f"_apply_stub_outcome(state, 'OPEN:{tok}')")
     cb.line(f"pass  # {_oneline(stmt.text, 70)}")
@@ -948,7 +953,7 @@ def _gen_close(cb: _CodeBuilder, stmt: Statement):
     if m:
         files_str = m.group(1).strip().rstrip(".")
         for tok in re.split(r"\s+", files_str):
-            tok = tok.strip().upper()
+            tok = _vk(tok.strip())
             if tok:
                 cb.line(f"_apply_stub_outcome(state, 'CLOSE:{tok}')")
     cb.line(f"pass  # {_oneline(stmt.text, 70)}")
@@ -968,7 +973,7 @@ def _gen_search(cb: _CodeBuilder, stmt: Statement):
     # Extract table name
     m_table = re.match(r"SEARCH\s+([A-Z][A-Z0-9-]*)", text, re.IGNORECASE)
     if not m_table:
-        cb.line(f"pass  # SEARCH (unparsed): {text[:60]}")
+        cb.line(f"pass  # SEARCH (unparsed): {_oneline(text)}")
         return
     table_name = m_table.group(1).upper()
 
@@ -1067,12 +1072,12 @@ def _gen_search_body(cb: _CodeBuilder, body: str):
         r"COMPUTE\s+([A-Z][A-Z0-9-]*)\s*=\s*([^.]+)",
         body, re.IGNORECASE,
     ):
-        target = m.group(1).upper()
+        target = _vk(m.group(1))
         expr = m.group(2).strip()
         # Simple variable-only expression
         py_expr = re.sub(
             r"([A-Z][A-Z0-9-]+)",
-            lambda mv: f"_to_num(state.get('{mv.group(1).upper()}', 0))",
+            lambda mv: f"_to_num(state.get('{_vk(mv.group(1))}', 0))",
             expr,
         )
         cb.line(f"state['{target}'] = {py_expr}")
@@ -1092,7 +1097,7 @@ def _gen_unstring(cb: _CodeBuilder, stmt: Statement):
     # Extract source
     m_src = re.match(r"UNSTRING\s+([A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?)", text, re.IGNORECASE)
     if not m_src:
-        cb.line(f"pass  # UNSTRING (unparsed): {text[:60]}")
+        cb.line(f"pass  # UNSTRING (unparsed): {_oneline(text)}")
         return
 
     src_raw = m_src.group(1).strip()
@@ -1114,7 +1119,7 @@ def _gen_unstring(cb: _CodeBuilder, stmt: Statement):
     # Extract INTO targets
     m_into = re.search(r"\bINTO\s+(.+?)(?:\s+END-UNSTRING|\s*$)", text, re.IGNORECASE)
     if not m_into:
-        cb.line(f"pass  # UNSTRING (no INTO): {text[:60]}")
+        cb.line(f"pass  # UNSTRING (no INTO): {_oneline(text)}")
         return
 
     targets_str = m_into.group(1).strip()
@@ -1126,7 +1131,7 @@ def _gen_unstring(cb: _CodeBuilder, stmt: Statement):
             targets.append(clean)
 
     if not targets:
-        cb.line(f"pass  # UNSTRING (no targets): {text[:60]}")
+        cb.line(f"pass  # UNSTRING (no targets): {_oneline(text)}")
         return
 
     cb.line(f"_us_src = str(state.get('{src_var}', ''))")
@@ -1151,8 +1156,8 @@ def _gen_inspect(cb: _CodeBuilder, stmt: Statement):
         text, re.IGNORECASE,
     )
     if m:
-        src_var = re.sub(r"\s*\(.*\)", "", m.group(1).strip()).upper()
-        counter = m.group(2).strip().upper()
+        src_var = _vk(re.sub(r"\s*\(.*\)", "", m.group(1).strip()))
+        counter = _vk(m.group(2).strip())
         what = m.group(3).strip().upper().rstrip(".")
         if what in ("SPACES", "SPACE"):
             char = " "
@@ -1184,10 +1189,10 @@ def _gen_inspect(cb: _CodeBuilder, stmt: Statement):
     if m:
         src_var = re.sub(r"\s*\(.*\)", "", m.group(1).strip()).upper()
         # Best-effort: just emit a comment — REPLACING is complex
-        cb.line(f"pass  # INSPECT REPLACING: {text[:60]}")
+        cb.line(f"pass  # INSPECT REPLACING: {_oneline(text)}")
         return
 
-    cb.line(f"pass  # INSPECT: {text[:60]}")
+    cb.line(f"pass  # INSPECT: {_oneline(text)}")
 
 
 def _gen_goto(cb: _CodeBuilder, stmt: Statement):
@@ -1327,15 +1332,15 @@ def _gen_statement(cb: _CodeBuilder, stmt: Statement):
                 v = re.sub(r"\s+ROUNDED$", "", v, flags=re.IGNORECASE)
                 if re.match(r"^[+-]?\d+\.?\d*$", v):
                     return v
-                vn = re.sub(r"\s*\(.*", "", v).upper()
+                vn = _vk(re.sub(r"\s*\(.*", "", v))
                 return f"_to_num(state.get('{vn}', 0))"
             dividend = _div_val(m_by.group(1))
             divisor = _div_val(m_by.group(2))
-            tname = re.sub(r"\s*\(.*", "", m_by.group(3).strip().rstrip(".")).upper()
+            tname = _vk(re.sub(r"\s*\(.*", "", m_by.group(3).strip().rstrip(".")))
             tname = re.sub(r"\s+ROUNDED$", "", tname, flags=re.IGNORECASE)
             cb.line(f"state['{tname}'] = _to_num({dividend}) // ({divisor} or 1)")
             if m_by.group(4):
-                rname = re.sub(r"\s*\(.*", "", m_by.group(4).strip().rstrip(".")).upper()
+                rname = _vk(re.sub(r"\s*\(.*", "", m_by.group(4).strip().rstrip(".")))
                 cb.line(f"state['{rname}'] = _to_num({dividend}) % ({divisor} or 1)")
         elif m_into_giving:
             # DIVIDE x INTO y GIVING z [REMAINDER r]
@@ -1345,15 +1350,15 @@ def _gen_statement(cb: _CodeBuilder, stmt: Statement):
                 v = re.sub(r"\s+ROUNDED$", "", v, flags=re.IGNORECASE)
                 if re.match(r"^[+-]?\d+\.?\d*$", v):
                     return v
-                vn = re.sub(r"\s*\(.*", "", v).upper()
+                vn = _vk(re.sub(r"\s*\(.*", "", v))
                 return f"_to_num(state.get('{vn}', 0))"
             divisor = _div_val2(m_into_giving.group(1))
             dividend = _div_val2(m_into_giving.group(2))
-            tname = re.sub(r"\s*\(.*", "", m_into_giving.group(3).strip().rstrip(".")).upper()
+            tname = _vk(re.sub(r"\s*\(.*", "", m_into_giving.group(3).strip().rstrip(".")))
             tname = re.sub(r"\s+ROUNDED$", "", tname, flags=re.IGNORECASE)
             cb.line(f"state['{tname}'] = _to_num({dividend}) // ({divisor} or 1)")
             if m_into_giving.group(4):
-                rname = re.sub(r"\s*\(.*", "", m_into_giving.group(4).strip().rstrip(".")).upper()
+                rname = _vk(re.sub(r"\s*\(.*", "", m_into_giving.group(4).strip().rstrip(".")))
                 cb.line(f"state['{rname}'] = _to_num({dividend}) % ({divisor} or 1)")
         elif m_into:
             divisor = m_into.group(1).strip()
@@ -1710,7 +1715,7 @@ def generate_code(
         cb.indent()
 
         if instrument:
-            cb.line(f"state._enter_para('{para.name}')")
+            cb.line(f"state._enter_para('{_sq(para.name)}')")
 
         if not para.statements:
             if not instrument:
@@ -1723,7 +1728,7 @@ def generate_code(
         cb.line("finally:")
         cb.indent()
         if instrument:
-            cb.line(f"state._exit_para('{para.name}')")
+            cb.line(f"state._exit_para('{_sq(para.name)}')")
         cb.line("state['_call_depth'] = state.get('_call_depth', 1) - 1")
         cb.dedent()
         cb.dedent()
