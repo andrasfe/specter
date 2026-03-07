@@ -875,9 +875,33 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
     # LLM coverage state
     _llm_state = None
     _llm_suggestions: list = []
+    # LLM-guided fuzzer state (adaptive strategy selection)
+    _session_memory = None
+    _active_decision = None  # current StrategyDecision
+    _decision_iter_start = 0  # iteration when current decision started
+    _decision_coverage_start = 0  # coverage count at decision start
+    _decision_branch_start = 0
+    _decision_edge_start = 0
+    _decision_errors = 0
+    _last_coverage_for_milestone = 0
     if llm_provider is not None:
         from .llm_coverage import LLMCoverageState
         _llm_state = LLMCoverageState()
+
+        # Initialize LLM-guided fuzzer with variable semantics inference
+        from .llm_fuzzer import (
+            SessionMemory, infer_variable_semantics,
+            should_consult_llm, get_strategy_decision,
+            apply_strategy_to_state, record_strategy_result,
+            record_error, record_coverage_checkpoint,
+        )
+        _session_memory = SessionMemory()
+        if var_report is not None:
+            profiles = infer_variable_semantics(
+                llm_provider, var_report, model=llm_model,
+            )
+            _session_memory.semantic_profiles = profiles
+            _session_memory.llm_calls += 1
 
     # Build gating value pool: maps variable -> set of values needed in gating conditions.
     # Used by the gating-targeted mutation strategy without modifying condition_literals.
@@ -987,12 +1011,89 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                 pass
 
     for i in range(n_iterations):
-        # --- LLM-guided suggestion injection ---
-        # Periodically query LLM for coverage-maximizing inputs when
-        # coverage has stalled or at regular intervals.
+        # --- LLM-guided strategy decision ---
+        # Use adaptive LLM strategist when available; fall back to
+        # original LLM suggestion injection otherwise.
+        if (llm_provider is not None and _session_memory is not None
+                and var_report is not None and i > 0):
+            from .llm_fuzzer import (
+                should_consult_llm, get_strategy_decision,
+                apply_strategy_to_state, record_strategy_result,
+                record_coverage_checkpoint,
+            )
+
+            # Record result of previous strategy batch
+            if (_active_decision is not None
+                    and i >= _decision_iter_start + _active_decision.iterations):
+                record_strategy_result(
+                    _session_memory,
+                    _active_decision.strategy,
+                    i - _decision_iter_start,
+                    len(fuzzer.global_coverage) - _decision_coverage_start,
+                    len(fuzzer.global_branches) - _decision_branch_start,
+                    len(fuzzer.global_edges) - _decision_edge_start,
+                    _decision_errors,
+                )
+                _active_decision = None
+                _decision_errors = 0
+
+            # Check if we should consult the LLM
+            reason = should_consult_llm(
+                i, _session_memory, fuzzer.stale_counter,
+                _STALE_THRESHOLD, llm_interval,
+                _last_coverage_for_milestone,
+                len(fuzzer.global_coverage),
+            )
+
+            if reason and _active_decision is None:
+                record_coverage_checkpoint(
+                    _session_memory, i,
+                    len(fuzzer.global_coverage),
+                    len(fuzzer.global_branches),
+                )
+                _last_coverage_for_milestone = len(fuzzer.global_coverage)
+
+                # Compute frontier for LLM context
+                _frontier: set[str] = set()
+                if call_graph is not None:
+                    uncov = set(call_graph.reachable) - fuzzer.global_coverage
+                    for caller, callees in fuzzer.call_graph.items():
+                        if caller in fuzzer.global_coverage and callees & uncov:
+                            _frontier.add(caller)
+
+                total_br = 0
+                try:
+                    import re as _re3, inspect as _insp
+                    _src = _insp.getsource(module)
+                    total_br = len(set(
+                        int(m) for m in _re3.findall(
+                            r"_branches.*?\.add\((-?\d+)\)", _src)
+                    ))
+                except Exception:
+                    pass
+
+                _all_paras = set(all_paragraphs) if all_paragraphs else set()
+                decision = get_strategy_decision(
+                    llm_provider, _session_memory,
+                    fuzzer.global_coverage, _all_paras, _frontier,
+                    total_br, len(fuzzer.global_branches),
+                    var_report, model=llm_model,
+                )
+                if decision:
+                    _active_decision = decision
+                    _decision_iter_start = i
+                    _decision_coverage_start = len(fuzzer.global_coverage)
+                    _decision_branch_start = len(fuzzer.global_branches)
+                    _decision_edge_start = len(fuzzer.global_edges)
+                    _decision_errors = 0
+
+        # --- LLM-guided suggestion injection (original path) ---
+        # Falls back to gap-based suggestions when no active strategy decision,
+        # or when the active strategy is directed_walk.
         if (llm_provider is not None and _llm_state is not None
                 and call_graph is not None and path_constraints_map
-                and i > 0 and i % llm_interval == 0):
+                and i > 0 and i % llm_interval == 0
+                and _active_decision is None):
             uncovered_for_llm = set(call_graph.reachable) - fuzzer.global_coverage
             if uncovered_for_llm:
                 from .llm_coverage import (
@@ -1016,7 +1117,7 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                     _llm_suggestions = []
 
         # Try pending LLM suggestions as inputs
-        if _llm_suggestions and _llm_state is not None:
+        if _llm_suggestions and _llm_state is not None and _active_decision is None:
             suggestion = _llm_suggestions.pop(0)
             _llm_state.suggestions_tried += 1
             from .llm_coverage import apply_suggestion
@@ -1071,7 +1172,22 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
 
         stub_out = None
 
-        if in_explore:
+        # --- LLM strategy-driven input generation ---
+        if (_active_decision is not None and _session_memory is not None
+                and var_report is not None
+                and _active_decision.strategy not in ("directed_walk",)):
+            from .llm_fuzzer import apply_strategy_to_state
+            base = (_generate_all_success_state(var_report, equality_constraints)
+                    if var_report else {})
+            input_state = apply_strategy_to_state(
+                _active_decision, base, var_report, _session_memory, rng,
+                fuzzer_corpus=fuzzer.corpus,
+            )
+            if stub_mapping:
+                stub_out = _generate_stub_outcomes(stub_mapping, var_report, rng)
+            parent = None
+
+        elif in_explore:
             # During exploration, use all-success states 30% of the time
             # to keep the corpus fed with diverse post-initialization states.
             if (var_report is not None and i < explore_end
@@ -1121,14 +1237,28 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
             result_state = module.run(input_state)
         except RecursionError:
             fuzzer.n_errors += 1
+            if _active_decision is not None:
+                _decision_errors += 1
             if var_report and len(fuzzer.recursion_fingerprints) < _MAX_FINGERPRINTS:
                 fp = _fingerprint_state(input_state, var_report)
                 fuzzer.recursion_fingerprints.add(fp)
             fuzzer.error_messages.append(f"Iteration {i}: RecursionError")
+            if _session_memory is not None:
+                from .llm_fuzzer import record_error
+                record_error(_session_memory, "RecursionError", input_state)
             continue
         except Exception as e:
             fuzzer.n_errors += 1
+            if _active_decision is not None:
+                _decision_errors += 1
             fuzzer.error_messages.append(f"Iteration {i}: {type(e).__name__}: {e}")
+            if _session_memory is not None:
+                from .llm_fuzzer import record_error
+                record_error(
+                    _session_memory, f"{type(e).__name__}: {e}", input_state,
+                    focus_variables=(_active_decision.focus_variables
+                                     if _active_decision else None),
+                )
             continue
 
         # Aggregate stats
