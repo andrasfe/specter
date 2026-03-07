@@ -103,8 +103,70 @@ specter program.ast --analyze -m 500         # analysis with custom iteration co
 specter program.ast --guided -m 10000        # coverage-guided fuzzing (best mode)
 specter program.ast --diagram                # generate execution diagrams (implies --analyze)
 specter program.ast --guided --diagram       # guided fuzzing + diagrams
+specter program.ast --llm-guided             # LLM-guided adaptive fuzzing
+specter program.ast --llm-guided -m 20000 --llm-interval 300  # custom LLM settings
 specter program.ast --analyze --analysis-output ./reports  # write output to custom dir
 ```
+
+## LLM-Guided Fuzzing
+
+The `--llm-guided` flag enables an adaptive Monte Carlo mode where an LLM steers the fuzzer's strategy selection. Instead of fixed mutation weights, the LLM analyzes coverage gaps, infers variable semantics from names, and decides which fuzzing strategy to apply next.
+
+### How it works
+
+1. **Variable semantics inference** — at session start, the LLM receives all variable names and infers their meaning (e.g., `WS-CUSTOMER-ID` is a numeric identifier, `ACCT-BALANCE` is a monetary amount). This replaces hardcoded regex heuristics with domain-aware value generation.
+
+2. **Adaptive strategy selection** — periodically (every N iterations, on plateau, or on coverage milestones), the LLM reviews coverage progress, recent strategy effectiveness, and error patterns, then selects from seven strategies: random exploration, single-variable mutation, literal-guided, directed walk, stub outcome variation, crossover, and error avoidance replay.
+
+3. **Fallback** — if the LLM is unavailable or returns invalid responses, the fuzzer falls back to standard coverage-guided mode automatically.
+
+### Configuration
+
+The LLM provider is configured via environment variables from the `llm_providers` package:
+
+```bash
+# Anthropic
+export LLM_PROVIDER=anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# OpenAI
+export LLM_PROVIDER=openai
+export OPENAI_API_KEY=sk-...
+
+# OpenRouter
+export LLM_PROVIDER=openrouter
+export OPENROUTER_API_KEY=sk-or-...
+```
+
+### Running
+
+```bash
+# Basic LLM-guided run (10000 iterations default)
+specter program.ast --llm-guided
+
+# Custom iteration count and LLM query interval
+specter program.ast --llm-guided -m 20000 --llm-interval 300
+
+# Override provider/model from command line
+specter program.ast --llm-guided --llm-provider anthropic --llm-model claude-sonnet-4-20250514
+
+# With diagrams
+specter program.ast --llm-guided --diagram
+
+# Write reports to a specific directory
+specter program.ast --llm-guided --analysis-output ./reports
+```
+
+### CLI options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--llm-guided` | off | Enable LLM-guided mode (implies `--guided`) |
+| `--llm-provider NAME` | `$LLM_PROVIDER` env var | LLM provider: `anthropic`, `openai`, `openrouter` |
+| `--llm-model MODEL` | provider default | Override the LLM model |
+| `--llm-interval N` | 500 | Query the LLM every N iterations |
+
+See [LLM_GUIDED_FUZZER.md](LLM_GUIDED_FUZZER.md) for the full design document.
 
 ## GnuCOBOL Validation
 
