@@ -852,6 +852,53 @@ def _mutate_state(parent_state: dict, var_report, rng: random.Random,
 _DIRECTED_ATTEMPT_LIMIT = 200
 
 
+def _run_paragraph_directly(module, para_name: str, input_state: dict) -> dict:
+    """Invoke a single paragraph function directly, bypassing run().
+
+    This allows the fuzzer to exercise paragraphs that are structurally
+    unreachable from the program's entry point (disconnected call graphs).
+    Sets up the same instrumented state that run() would, then calls the
+    paragraph function and collects trace/branch/coverage data.
+    """
+    func_name = "para_" + para_name.replace("-", "_")
+    para_func = getattr(module, func_name, None)
+    if para_func is None:
+        return {}
+
+    # Build state the same way run() does
+    default_state_fn = getattr(module, "_default_state", None)
+    base = default_state_fn() if default_state_fn else {}
+    base.update(input_state)
+
+    # Use InstrumentedState if available
+    instrumented_cls = getattr(module, "_InstrumentedState", None)
+    if instrumented_cls:
+        state = instrumented_cls(base)
+    else:
+        state = base
+
+    state.setdefault("_display", [])
+    state.setdefault("_calls", [])
+    state.setdefault("_execs", [])
+    state.setdefault("_reads", [])
+    state.setdefault("_writes", [])
+    state.setdefault("_abended", False)
+    state.setdefault("_branches", set())
+    goback_cls = getattr(module, "_GobackSignal", None)
+
+    try:
+        para_func(state)
+    except Exception as e:
+        if goback_cls and isinstance(e, goback_cls):
+            pass
+        elif isinstance(e, ZeroDivisionError):
+            state["_abended"] = True
+        else:
+            raise
+
+    return state
+
+
 def _run_guided(module, n_iterations: int, seed: int, var_report,
                 all_paragraphs: list[str] | None,
                 call_graph=None, gating_conditions=None,
@@ -922,8 +969,9 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
     path_constraints_map: dict[str, object] = {}
     if call_graph is not None and gating_conditions is not None:
         from .static_analysis import compute_path_constraints
-        reachable = call_graph.reachable
-        for para in reachable:
+        # Compute for ALL paragraphs — not just statically reachable ones.
+        # The fuzzer can directly invoke unreachable paragraph functions.
+        for para in call_graph.all_paragraphs:
             pc = compute_path_constraints(para, call_graph, gating_conditions)
             if pc is not None:
                 path_constraints_map[para] = pc
@@ -1053,10 +1101,10 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                 )
                 _last_coverage_for_milestone = len(fuzzer.global_coverage)
 
-                # Compute frontier for LLM context
+                # Compute frontier for LLM context (use all paragraphs)
                 _frontier: set[str] = set()
                 if call_graph is not None:
-                    uncov = set(call_graph.reachable) - fuzzer.global_coverage
+                    uncov = set(call_graph.all_paragraphs) - fuzzer.global_coverage
                     for caller, callees in fuzzer.call_graph.items():
                         if caller in fuzzer.global_coverage and callees & uncov:
                             _frontier.add(caller)
@@ -1094,7 +1142,7 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                 and call_graph is not None and path_constraints_map
                 and i > 0 and i % llm_interval == 0
                 and _active_decision is None):
-            uncovered_for_llm = set(call_graph.reachable) - fuzzer.global_coverage
+            uncovered_for_llm = set(call_graph.all_paragraphs) - fuzzer.global_coverage
             if uncovered_for_llm:
                 from .llm_coverage import (
                     generate_llm_suggestions,
@@ -1324,9 +1372,9 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
             fuzzer.stale_counter += 1
             if fuzzer.stale_counter >= _STALE_THRESHOLD:
                 if path_constraints_map and call_graph is not None:
-                    # Directed fuzzing: pick an uncovered target
-                    uncovered = (set(call_graph.reachable)
-                                 - fuzzer.global_coverage)
+                    # Directed fuzzing: pick any uncovered paragraph
+                    all_paras = set(call_graph.all_paragraphs)
+                    uncovered = all_paras - fuzzer.global_coverage
                     if uncovered:
                         if (directed_target is None
                                 or directed_attempts >= _DIRECTED_ATTEMPT_LIMIT
@@ -1336,12 +1384,22 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                             )
                             directed_attempts = 0
 
-                        if directed_target and directed_target in path_constraints_map:
-                            pc = path_constraints_map[directed_target]
-                            input_state, stub_out = _generate_directed_input(
-                                directed_target, pc, var_report,
-                                stub_mapping, rng, fuzzer,
-                            )
+                        if directed_target:
+                            is_unreachable = directed_target not in call_graph.reachable
+                            if directed_target in path_constraints_map:
+                                pc = path_constraints_map[directed_target]
+                                input_state, stub_out = _generate_directed_input(
+                                    directed_target, pc, var_report,
+                                    stub_mapping, rng, fuzzer,
+                                )
+                            else:
+                                # No path constraints — use random state
+                                input_state = (_generate_all_success_state(
+                                    var_report, equality_constraints)
+                                    if var_report else {})
+                                stub_out = (_generate_stub_outcomes(
+                                    stub_mapping, var_report, rng)
+                                    if stub_mapping else None)
                             if stub_out:
                                 input_state["_stub_outcomes"] = {
                                     k: list(v) for k, v in stub_out.items()
@@ -1349,9 +1407,13 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                             directed_attempts += 1
                             _inject_defaults(input_state, search_rng)
 
-                            # Run the directed input immediately
+                            # Run: directly invoke unreachable paragraphs
                             try:
-                                ds = module.run(input_state)
+                                if is_unreachable:
+                                    ds = _run_paragraph_directly(
+                                        module, directed_target, input_state)
+                                else:
+                                    ds = module.run(input_state)
                                 d_trace = ds.get("_trace", [])
                                 d_cov = frozenset(d_trace)
                                 d_edges = frozenset(
@@ -1379,7 +1441,7 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                             except (RecursionError, Exception):
                                 pass
                     else:
-                        # All reachable paragraphs covered
+                        # All paragraphs covered
                         stale_random_remaining = _STALE_RANDOM_BURST
                 else:
                     # No static analysis — fall back to random burst

@@ -122,6 +122,15 @@ def build_static_call_graph(program: Program) -> StaticCallGraph:
         for stmt in para.statements:
             _collect(para.name, stmt)
 
+    # If the program has an unnamed driver section (entry_statements),
+    # collect edges from a synthetic _ENTRY_ node and use it as the entry.
+    if program.entry_statements:
+        entry_node = "_ENTRY_"
+        graph.all_paragraphs.add(entry_node)
+        for stmt in program.entry_statements:
+            _collect(entry_node, stmt)
+        graph.entry = entry_node
+
     return graph
 
 

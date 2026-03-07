@@ -1753,10 +1753,20 @@ def generate_code(
     if instrument:
         cb.line("dict.__setitem__(state, '_initial_snapshot', {k: v for k, v in state.items() if not k.startswith('_')})")
     if program.paragraphs:
-        entry_func = _sanitize_name(program.paragraphs[0].name)
+        # If the program has an entry_statements list (from the unnamed
+        # PROCEDURE DIVISION driver section), generate those as the entry
+        # point.  Otherwise fall through all paragraphs sequentially
+        # (standard COBOL fall-through semantics).
+        entry_stmts = getattr(program, "entry_statements", None)
         cb.line("try:")
         cb.indent()
-        cb.line(f"{entry_func}(state)")
+        if entry_stmts:
+            for stmt in entry_stmts:
+                _gen_statement(cb, stmt)
+        else:
+            for para in program.paragraphs:
+                func_name = _sanitize_name(para.name)
+                cb.line(f"{func_name}(state)")
         cb.dedent()
         cb.line("except _GobackSignal:")
         cb.indent()

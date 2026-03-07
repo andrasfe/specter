@@ -40,3 +40,4 @@ class Program:
     program_id: str
     paragraphs: list[Paragraph] = field(default_factory=list)
     paragraph_index: dict[str, Paragraph] = field(default_factory=dict)
+    entry_statements: list[Statement] | None = None

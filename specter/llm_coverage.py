@@ -18,8 +18,8 @@ import logging
 import random
 from dataclasses import dataclass, field
 
-from llm_providers import Message, create_provider, get_provider_from_env
-from llm_providers.protocol import LLMProvider
+from .llm_providers import Message, create_provider, get_provider_from_env
+from .llm_providers.protocol import LLMProvider
 
 logger = logging.getLogger(__name__)
 

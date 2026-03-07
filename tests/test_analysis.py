@@ -162,6 +162,11 @@ class TestInstrumentedCodeGeneration(unittest.TestCase):
                           "children": []},
                      ]},
                 ],
+            }, {
+                "type": "GOBACK", "text": "GOBACK",
+                "line_start": 6, "line_end": 6,
+                "attributes": {},
+                "children": [],
             }],
         }, {
             "name": "BRANCH-A",

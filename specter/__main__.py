@@ -6,6 +6,10 @@ import argparse
 import sys
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from .ast_parser import parse_ast
 from .code_generator import generate_code
 from .diagram import write_diagrams

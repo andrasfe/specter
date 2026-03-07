@@ -43,8 +43,15 @@ def parse_ast(source: str | Path | dict) -> Program:
 
     paragraphs = [_parse_paragraph(p) for p in data.get("paragraphs", [])]
     index = {p.name: p for p in paragraphs}
+
+    # Parse optional unnamed PROCEDURE DIVISION driver statements
+    entry_stmts = None
+    if "entry_statements" in data:
+        entry_stmts = [_parse_statement(s) for s in data["entry_statements"]]
+
     return Program(
         program_id=data.get("program_id", "UNKNOWN"),
         paragraphs=paragraphs,
         paragraph_index=index,
+        entry_statements=entry_stmts,
     )
