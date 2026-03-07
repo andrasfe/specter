@@ -65,12 +65,36 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Generate Mermaid sequence and flow diagrams (implies --analyze)",
     )
+    parser.add_argument(
+        "--llm-guided",
+        action="store_true",
+        help="Use LLM-guided coverage maximization (requires LLM provider config via env vars, implies --guided)",
+    )
+    parser.add_argument(
+        "--llm-provider",
+        metavar="NAME",
+        help="LLM provider name: anthropic, openai, openrouter (default: from LLM_PROVIDER env var)",
+    )
+    parser.add_argument(
+        "--llm-model",
+        metavar="MODEL",
+        help="LLM model override (default: provider default)",
+    )
+    parser.add_argument(
+        "--llm-interval",
+        type=int, default=500, metavar="N",
+        help="Query LLM every N iterations for coverage suggestions (default: 500)",
+    )
 
     args = parser.parse_args(argv)
 
     # --diagram implies --analyze
     if args.diagram:
         args.analyze = True
+
+    # --llm-guided implies --guided
+    if args.llm_guided:
+        args.guided = True
 
     # --guided implies --analyze and a higher default iteration count
     if args.guided:
@@ -152,7 +176,21 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  Equality constraints: {len(eq_constraints)}")
 
     # Monte Carlo
+    llm_provider_instance = None
     if args.monte_carlo:
+        # Set up LLM provider if --llm-guided
+        if args.llm_guided:
+            from .llm_coverage import get_llm_provider
+            try:
+                llm_provider_instance = get_llm_provider(
+                    provider_name=args.llm_provider,
+                    model=args.llm_model,
+                )
+                print(f"  LLM provider: {type(llm_provider_instance).__name__}")
+            except Exception as e:
+                print(f"  Warning: LLM provider init failed: {e}", file=sys.stderr)
+                print("  Continuing with standard guided mode", file=sys.stderr)
+
         print(f"Running Monte Carlo ({args.monte_carlo} iterations, seed={args.seed}) ...")
         all_para_names = [p.name for p in program.paragraphs]
         report = run_monte_carlo(
@@ -168,6 +206,9 @@ def main(argv: list[str] | None = None) -> int:
             stub_mapping=stub_mapping,
             equality_constraints=eq_constraints,
             program=program,
+            llm_provider=llm_provider_instance,
+            llm_model=args.llm_model,
+            llm_interval=args.llm_interval,
         )
         print()
         print(report.summary())
