@@ -857,11 +857,27 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                 call_graph=None, gating_conditions=None,
                 stub_mapping=None,
                 equality_constraints=None,
-                program=None) -> MonteCarloReport:
-    """Coverage-guided fuzzing loop with optional directed fuzzing."""
+                program=None,
+                llm_provider=None,
+                llm_model=None,
+                llm_interval: int = 500) -> MonteCarloReport:
+    """Coverage-guided fuzzing loop with optional directed fuzzing.
+
+    When *llm_provider* is given, the loop periodically queries an LLM
+    (via war_rig's llm_providers) for input suggestions targeting
+    uncovered paragraphs, combining static analysis with LLM reasoning
+    to maximize path coverage.
+    """
     rng = random.Random(seed)
     search_rng = random.Random(seed + 1_000_000)  # separate rng for SEARCH outcomes
     fuzzer = _FuzzerState()
+
+    # LLM coverage state
+    _llm_state = None
+    _llm_suggestions: list = []
+    if llm_provider is not None:
+        from .llm_coverage import LLMCoverageState
+        _llm_state = LLMCoverageState()
 
     # Build gating value pool: maps variable -> set of values needed in gating conditions.
     # Used by the gating-targeted mutation strategy without modifying condition_literals.
@@ -971,6 +987,82 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                 pass
 
     for i in range(n_iterations):
+        # --- LLM-guided suggestion injection ---
+        # Periodically query LLM for coverage-maximizing inputs when
+        # coverage has stalled or at regular intervals.
+        if (llm_provider is not None and _llm_state is not None
+                and call_graph is not None and path_constraints_map
+                and i > 0 and i % llm_interval == 0):
+            uncovered_for_llm = set(call_graph.reachable) - fuzzer.global_coverage
+            if uncovered_for_llm:
+                from .llm_coverage import (
+                    generate_llm_suggestions,
+                    apply_suggestion,
+                )
+                try:
+                    _llm_suggestions = generate_llm_suggestions(
+                        llm_provider,
+                        fuzzer.global_coverage,
+                        uncovered_for_llm,
+                        path_constraints_map,
+                        gating_conditions,
+                        var_report,
+                        _llm_state,
+                        model=llm_model,
+                    )
+                except Exception as _llm_err:
+                    import logging as _log
+                    _log.getLogger(__name__).debug("LLM query error: %s", _llm_err)
+                    _llm_suggestions = []
+
+        # Try pending LLM suggestions as inputs
+        if _llm_suggestions and _llm_state is not None:
+            suggestion = _llm_suggestions.pop(0)
+            _llm_state.suggestions_tried += 1
+            from .llm_coverage import apply_suggestion
+            base = (_generate_all_success_state(var_report, equality_constraints)
+                    if var_report else {})
+            input_state = apply_suggestion(suggestion, base, var_report, stub_mapping)
+            if stub_mapping:
+                stub_out = _generate_all_success_stubs(stub_mapping, var_report)
+                input_state["_stub_outcomes"] = {
+                    k: list(v) for k, v in stub_out.items()
+                }
+            _inject_defaults(input_state, search_rng)
+
+            try:
+                rs = module.run(input_state)
+                trace = rs.get("_trace", [])
+                cov = frozenset(trace)
+                edg = frozenset(
+                    (trace[j], trace[j + 1])
+                    for j in range(len(trace) - 1)
+                    if trace[j] != trace[j + 1]
+                )
+                fuzzer.n_successful += 1
+                for p in trace:
+                    fuzzer.para_hits[p] += 1
+                br = frozenset(rs.get("_branches", set()))
+                if _should_add_to_corpus(fuzzer, cov, edg, br):
+                    entry = _CorpusEntry(
+                        input_state={k: v for k, v in input_state.items()
+                                     if not k.startswith("_stub")},
+                        coverage=cov,
+                        edges=edg,
+                        added_at=i,
+                        stub_outcomes=stub_out,
+                    )
+                    _add_to_corpus(fuzzer, entry, br)
+                    _llm_state.suggestions_hit += 1
+                    if suggestion.target in cov:
+                        # Mark gap as resolved
+                        for gap in _llm_state.gaps:
+                            if gap.target == suggestion.target:
+                                gap.resolved = True
+            except (RecursionError, Exception):
+                pass
+            continue  # consumed this iteration with the LLM suggestion
+
         in_explore = (i < explore_end or not fuzzer.corpus
                       or stale_random_remaining > 0)
 
@@ -1288,6 +1380,9 @@ def run_monte_carlo(
     stub_mapping=None,
     equality_constraints=None,
     program=None,
+    llm_provider=None,
+    llm_model: str | None = None,
+    llm_interval: int = 500,
 ) -> MonteCarloReport:
     """Run Monte Carlo analysis on a generated Python module.
 
@@ -1302,6 +1397,11 @@ def run_monte_carlo(
         call_graph: Optional StaticCallGraph for directed fuzzing.
         gating_conditions: Optional gating conditions map.
         stub_mapping: Optional stub-to-status-variable mapping.
+        llm_provider: Optional LLMProvider instance (from war_rig llm_providers)
+            for LLM-guided coverage maximization.
+        llm_model: Optional model override for the LLM provider.
+        llm_interval: How often (in iterations) to query the LLM for
+            coverage suggestions (default 500).
 
     Returns:
         MonteCarloReport with aggregated results.
@@ -1328,6 +1428,9 @@ def run_monte_carlo(
             stub_mapping=stub_mapping,
             equality_constraints=equality_constraints,
             program=program,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            llm_interval=llm_interval,
         )
 
     rng = random.Random(seed)
