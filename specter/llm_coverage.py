@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import random
+import time
 from dataclasses import dataclass, field
 
 from .llm_providers import Message, create_provider, get_provider_from_env
@@ -308,6 +309,10 @@ def get_llm_provider(
     return get_provider_from_env(provider_name)
 
 
+_LLM_RETRY_PAUSE = 60  # seconds between retries
+_LLM_MAX_RETRIES = 3   # default max retry attempts
+
+
 def generate_llm_suggestions(
     provider: LLMProvider,
     covered_paragraphs: set[str],
@@ -318,6 +323,7 @@ def generate_llm_suggestions(
     llm_state: LLMCoverageState,
     model: str | None = None,
     max_targets: int = 5,
+    max_retries: int = _LLM_MAX_RETRIES,
 ) -> list[LLMSuggestion]:
     """Query the LLM for input suggestions to cover uncovered paragraphs.
 
@@ -344,12 +350,27 @@ def generate_llm_suggestions(
     if not prompt:
         return []
 
-    try:
-        response_text, tokens = _query_llm_sync(provider, prompt, model)
-        llm_state.llm_calls += 1
-        llm_state.tokens_used += tokens
-    except Exception as e:
-        logger.warning("LLM query failed: %s", e)
+    response_text = None
+    tokens = 0
+    for attempt in range(1, max_retries + 1):
+        try:
+            response_text, tokens = _query_llm_sync(provider, prompt, model)
+            llm_state.llm_calls += 1
+            llm_state.tokens_used += tokens
+            break
+        except Exception as e:
+            logger.warning(
+                "LLM query failed (attempt %d/%d): %s",
+                attempt, max_retries, e,
+            )
+            if attempt < max_retries:
+                logger.info("Retrying in %d seconds...", _LLM_RETRY_PAUSE)
+                time.sleep(_LLM_RETRY_PAUSE)
+            else:
+                logger.error("All %d LLM retry attempts exhausted", max_retries)
+                return []
+
+    if response_text is None:
         return []
 
     suggestions = _parse_llm_response(response_text)
