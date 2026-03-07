@@ -89,6 +89,11 @@ def main(argv: list[str] | None = None) -> int:
         type=int, default=500, metavar="N",
         help="Query LLM every N iterations for coverage suggestions (default: 500)",
     )
+    parser.add_argument(
+        "--llm-walk-rounds",
+        type=int, default=100, metavar="N",
+        help="Random walk rounds per LLM suggestion to maximize coverage (default: 100)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -213,6 +218,7 @@ def main(argv: list[str] | None = None) -> int:
             llm_provider=llm_provider_instance,
             llm_model=args.llm_model,
             llm_interval=args.llm_interval,
+            llm_walk_rounds=args.llm_walk_rounds,
         )
         print()
         print(report.summary())

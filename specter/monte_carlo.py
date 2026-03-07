@@ -850,6 +850,7 @@ def _mutate_state(parent_state: dict, var_report, rng: random.Random,
 
 
 _DIRECTED_ATTEMPT_LIMIT = 200
+_LLM_WALK_ROUNDS = 100  # max random walk rounds per LLM suggestion
 
 
 def _run_paragraph_directly(module, para_name: str, input_state: dict) -> dict:
@@ -899,6 +900,93 @@ def _run_paragraph_directly(module, para_name: str, input_state: dict) -> dict:
     return state
 
 
+def _random_walk_suggestion(
+    module, base_state: dict, var_report, rng: random.Random,
+    fuzzer: _FuzzerState, stub_mapping, search_rng: random.Random,
+    inject_defaults_fn, max_rounds: int = _LLM_WALK_ROUNDS,
+    call_graph=None,
+) -> int:
+    """Random-walk around an LLM suggestion to maximize paragraph coverage.
+
+    Starting from *base_state*, performs up to *max_rounds* mutations.
+    Each round mutates the current best state, runs the program, and
+    keeps the mutation if it discovers new paragraph coverage.  Stops
+    early after 10 consecutive rounds with no improvement.
+
+    Returns the number of new paragraphs covered across all rounds.
+    """
+    import logging as _log
+    log = _log.getLogger(__name__)
+
+    best_state = dict(base_state)
+    best_stubs = {k: list(v) for k, v in base_state.get("_stub_outcomes", {}).items()}
+    coverage_before = len(fuzzer.global_coverage)
+    stale = 0
+    _MAX_STALE = 10
+    new_total = 0
+
+    for walk_round in range(max_rounds):
+        # Mutate from best known state
+        mutated, mut_stubs = _mutate_state(
+            {k: v for k, v in best_state.items() if not k.startswith("_stub")},
+            var_report, rng, fuzzer,
+            stub_mapping=stub_mapping,
+            parent_stub_outcomes=best_stubs if best_stubs else None,
+        )
+        if mut_stubs:
+            mutated["_stub_outcomes"] = {k: list(v) for k, v in mut_stubs.items()}
+        inject_defaults_fn(mutated, search_rng)
+
+        try:
+            rs = module.run(mutated)
+        except (RecursionError, Exception):
+            stale += 1
+            if stale >= _MAX_STALE:
+                break
+            continue
+
+        trace = rs.get("_trace", [])
+        cov = frozenset(trace)
+        edges = frozenset(
+            (trace[j], trace[j + 1])
+            for j in range(len(trace) - 1)
+            if trace[j] != trace[j + 1]
+        )
+        fuzzer.n_successful += 1
+        for p in trace:
+            fuzzer.para_hits[p] += 1
+        branches = frozenset(rs.get("_branches", set()))
+
+        if _should_add_to_corpus(fuzzer, cov, edges, branches):
+            entry = _CorpusEntry(
+                input_state={k: v for k, v in mutated.items()
+                             if not k.startswith("_stub")},
+                coverage=cov,
+                edges=edges,
+                added_at=0,
+                stub_outcomes=mut_stubs,
+            )
+            _add_to_corpus(fuzzer, entry, branches)
+            # Adopt this mutation as the new base for further walks
+            best_state = dict(mutated)
+            best_stubs = dict(mut_stubs) if mut_stubs else {}
+            stale = 0
+        else:
+            stale += 1
+            if stale >= _MAX_STALE:
+                break
+
+    new_total = len(fuzzer.global_coverage) - coverage_before
+    if new_total > 0:
+        log.info(
+            "LLM walk: +%d paragraphs in %d rounds (total %d/%s)",
+            new_total, walk_round + 1,
+            len(fuzzer.global_coverage),
+            len(call_graph.all_paragraphs) if call_graph else "?",
+        )
+    return new_total
+
+
 def _run_guided(module, n_iterations: int, seed: int, var_report,
                 all_paragraphs: list[str] | None,
                 call_graph=None, gating_conditions=None,
@@ -907,7 +995,8 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                 program=None,
                 llm_provider=None,
                 llm_model=None,
-                llm_interval: int = 500) -> MonteCarloReport:
+                llm_interval: int = 500,
+                llm_walk_rounds: int = _LLM_WALK_ROUNDS) -> MonteCarloReport:
     """Coverage-guided fuzzing loop with optional directed fuzzing.
 
     When *llm_provider* is given, the loop periodically queries an LLM
@@ -1055,6 +1144,14 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                         stub_outcomes=seed_stub,
                     )
                     _add_to_corpus(fuzzer, entry, br)
+                    # Walk around the successful seed to find more coverage
+                    if var_report is not None and llm_walk_rounds > 0:
+                        _random_walk_suggestion(
+                            module, seed_state, var_report, rng, fuzzer,
+                            stub_mapping, search_rng, _inject_defaults,
+                            max_rounds=llm_walk_rounds,
+                            call_graph=call_graph,
+                        )
             except (RecursionError, Exception):
                 pass
 
@@ -1164,7 +1261,7 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                     _log.getLogger(__name__).debug("LLM query error: %s", _llm_err)
                     _llm_suggestions = []
 
-        # Try pending LLM suggestions as inputs
+        # Try pending LLM suggestions as inputs, then random-walk around them
         if _llm_suggestions and _llm_state is not None and _active_decision is None:
             suggestion = _llm_suggestions.pop(0)
             _llm_state.suggestions_tried += 1
@@ -1204,12 +1301,25 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                     _add_to_corpus(fuzzer, entry, br)
                     _llm_state.suggestions_hit += 1
                     if suggestion.target in cov:
-                        # Mark gap as resolved
                         for gap in _llm_state.gaps:
                             if gap.target == suggestion.target:
                                 gap.resolved = True
             except (RecursionError, Exception):
                 pass
+
+            # Random-walk around this suggestion to find more coverage
+            if var_report is not None and llm_walk_rounds > 0:
+                _random_walk_suggestion(
+                    module, input_state, var_report, rng, fuzzer,
+                    stub_mapping, search_rng, _inject_defaults,
+                    max_rounds=llm_walk_rounds,
+                    call_graph=call_graph,
+                )
+                # Update resolved gaps after walk
+                for gap in _llm_state.gaps:
+                    if gap.target in fuzzer.global_coverage:
+                        gap.resolved = True
+
             continue  # consumed this iteration with the LLM suggestion
 
         in_explore = (i < explore_end or not fuzzer.corpus
@@ -1435,6 +1545,15 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                                         stub_outcomes=stub_out,
                                     )
                                     _add_to_corpus(fuzzer, d_entry, d_br)
+                                    # Walk around successful directed input
+                                    if var_report is not None and llm_walk_rounds > 0:
+                                        _random_walk_suggestion(
+                                            module, input_state, var_report,
+                                            rng, fuzzer, stub_mapping,
+                                            search_rng, _inject_defaults,
+                                            max_rounds=llm_walk_rounds,
+                                            call_graph=call_graph,
+                                        )
                                     if directed_target in d_cov:
                                         directed_target = None
                                         directed_attempts = 0
@@ -1575,6 +1694,7 @@ def run_monte_carlo(
     llm_provider=None,
     llm_model: str | None = None,
     llm_interval: int = 500,
+    llm_walk_rounds: int = _LLM_WALK_ROUNDS,
 ) -> MonteCarloReport:
     """Run Monte Carlo analysis on a generated Python module.
 
@@ -1622,6 +1742,7 @@ def run_monte_carlo(
             program=program,
             llm_provider=llm_provider,
             llm_model=llm_model,
+            llm_walk_rounds=llm_walk_rounds,
             llm_interval=llm_interval,
         )
 
