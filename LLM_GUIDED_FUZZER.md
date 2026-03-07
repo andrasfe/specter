@@ -13,6 +13,30 @@ This replaces the current hardcoded mutation weights and mechanical stale detect
 3. **Record** what happened — append to a structured session log
 4. **Reflect** — periodically ask the LLM to analyze the log and decide what to do next
 
+## Variable Semantics Inference
+
+The LLM should **infer the semantic meaning of each variable from its name** before generating values. The current system uses regex patterns (e.g., `*DATE*` -> date, `*FLAG*` -> Y/N) which are brittle and miss domain context.
+
+The LLM sees the full variable list with names like:
+
+- `WS-CUSTOMER-ID` — the LLM understands this is a customer identifier, likely numeric, probably 6-10 digits
+- `ACCT-BALANCE` — a monetary amount, possibly negative, needs decimal precision
+- `FILE-STATUS-CODE` — a COBOL file status, standard 2-char values (00, 10, 35, etc.)
+- `WS-PROCESS-DATE` — a date field, format likely YYYYMMDD or YYMMDD
+- `TX-TYPE-IND` — a transaction type indicator, probably a short code like 'C', 'D', 'R'
+- `DB2-SQLCODE` — SQL return code, standard values (0, 100, -805, etc.)
+- `WS-EOF-SW` — an end-of-file switch, 'Y' or 'N'
+- `WS-NUM-RECORDS` — a count, non-negative integer
+
+This is a **first-class LLM task** — done once at session start:
+
+1. The LLM receives the complete variable list (names + classifications from `variable_extractor.py` + any harvested condition literals)
+2. It returns a **semantic profile** for each variable: inferred data type, valid value ranges, realistic example values, and any relationships between variables (e.g., `START-DATE` should be before `END-DATE`)
+3. This profile is stored in session memory and used by all subsequent strategies for value generation
+4. On plateau, the LLM can **revise** its understanding — e.g., "I assumed WS-ACTION was a single char but the error suggests it expects a 3-char code"
+
+This replaces the hardcoded heuristics in `_generate_random_state()` with LLM-inferred domain knowledge.
+
 ## The LLM's Role
 
 The LLM acts as a **strategist**, not a line-by-line executor. It receives:
