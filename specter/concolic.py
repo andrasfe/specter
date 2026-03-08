@@ -87,9 +87,9 @@ _TOKEN_RE = re.compile(
 # Configuration
 # ---------------------------------------------------------------------------
 
-_CONCOLIC_TIMEOUT_MS = 500
-_CONCOLIC_MAX_BRANCHES = 50
-_CONCOLIC_COOLDOWN = 1000  # iterations before retrying a failed branch
+_CONCOLIC_TIMEOUT_MS = 2000
+_CONCOLIC_MAX_BRANCHES = 200
+_CONCOLIC_COOLDOWN = 500  # iterations before retrying a failed branch
 
 
 @dataclass

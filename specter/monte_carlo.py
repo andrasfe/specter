@@ -191,7 +191,7 @@ def _generate_random_state(var_report, rng: random.Random) -> dict:
 
 _MAX_CORPUS = 500
 _MAX_FINGERPRINTS = 10000
-_STALE_THRESHOLD = 1000
+_STALE_THRESHOLD = 300
 _STALE_RANDOM_BURST = 50
 _ENERGY_UPDATE_INTERVAL = 100
 
@@ -417,8 +417,8 @@ def _generate_stub_outcomes(
                 harvested = var_report.variables[svar].condition_literals
 
             upper = svar.upper()
-            # 60% success bias for stub outcomes
-            if rng.random() < 0.6:
+            # 40% success bias for stub outcomes — lower bias explores more error paths
+            if rng.random() < 0.4:
                 if harvested:
                     val = harvested[0]
                 elif "SQLCODE" in upper or "SQLSTATE" in upper:
@@ -450,13 +450,13 @@ def _generate_stub_outcomes(
         is_sql = op_key == "SQL"
         is_call = op_key.startswith("CALL:")
         if is_read:
-            n_reps = 5
+            n_reps = 10
         elif is_sql:
-            n_reps = 20
+            n_reps = 50
         elif is_start or is_call:
-            n_reps = 5
+            n_reps = 10
         else:
-            n_reps = 3
+            n_reps = 5
         for _ in range(n_reps):
             outcomes.setdefault(op_key, []).append(list(entry))
 
@@ -467,24 +467,34 @@ def _generate_stub_defaults(
     stub_mapping: dict[str, list[str]],
     var_report,
 ) -> dict[str, list[tuple[str, object]]]:
-    """Generate default (exhaustion) outcomes for READ/START operations.
+    """Generate default (exhaustion) outcomes for all stub operations.
 
     When stub outcomes are exhausted, these defaults are applied.
-    READ defaults to EOF (status '10'), START defaults to not-found ('23').
+    READ → EOF ('10'), START → not-found ('23'), SQL → SQLCODE 100,
+    others → success (so the program continues past the stub).
     """
     defaults: dict[str, list[tuple[str, object]]] = {}
     for op_key, status_vars in stub_mapping.items():
-        if not (op_key.startswith("READ:") or op_key.startswith("START:")):
-            continue
         entry: list[tuple[str, object]] = []
         for svar in status_vars:
             upper = svar.upper()
             if "SQLCODE" in upper or "SQLSTATE" in upper:
-                entry.append((svar, 100))
+                if op_key.startswith("READ:") or op_key == "SQL":
+                    entry.append((svar, 100))  # end of cursor / not found
+                else:
+                    entry.append((svar, 0))  # success
             elif op_key.startswith("READ:"):
                 entry.append((svar, "10"))  # EOF
-            else:
+            elif op_key.startswith("START:"):
                 entry.append((svar, "23"))  # not found
+            elif "EIBRESP" in upper:
+                entry.append((svar, 0))  # NORMAL
+            elif "STATUS" in upper or upper.startswith("FS-"):
+                entry.append((svar, "00"))  # success
+            elif "RETURN-CODE" in upper or upper.endswith("-RC"):
+                entry.append((svar, 0))
+            else:
+                entry.append((svar, 0))  # success default
         defaults[op_key] = entry
     return defaults
 
@@ -636,23 +646,23 @@ def _generate_all_success_stubs(
 
         is_call = op_key.startswith("CALL:")
         if is_read:
-            for _ in range(5):
+            for _ in range(10):
                 outcomes.setdefault(op_key, []).append(list(success_entry))
             outcomes.setdefault(op_key, []).append(list(eof_entry))
         elif is_start:
-            for _ in range(10):
+            for _ in range(15):
                 outcomes.setdefault(op_key, []).append(list(success_entry))
         elif is_sql:
-            for _ in range(50):
+            for _ in range(100):
                 outcomes.setdefault(op_key, []).append(list(success_entry))
             outcomes.setdefault(op_key, []).append(list(eof_entry))
         elif is_call:
             # CALLs may be invoked multiple times; provide enough outcomes
-            for _ in range(10):
+            for _ in range(20):
                 outcomes.setdefault(op_key, []).append(list(success_entry))
         else:
             # OPEN/CLOSE/etc — typically invoked once or twice
-            for _ in range(3):
+            for _ in range(5):
                 outcomes.setdefault(op_key, []).append(list(success_entry))
     return outcomes
 
@@ -845,7 +855,7 @@ def _mutate_state(parent_state: dict, var_report, rng: random.Random,
             name = rng.choice(var_names)
             state[name] = _generate_random_value(name, var_report.variables[name], rng)
 
-    elif r < 0.85:
+    elif r < 0.82:
         # Reset one variable to zero/empty default
         name = rng.choice(var_names)
         info = var_report.variables[name]
@@ -856,20 +866,25 @@ def _mutate_state(parent_state: dict, var_report, rng: random.Random,
         else:
             state[name] = ""
 
-    elif r < 0.95 and stub_mapping:
-        # Stub-flip: change one operation's status outcome
+    elif r < 0.90 and stub_mapping:
+        # Multi-stub-flip: change 1-3 operations' status outcomes
         op_keys = list(stub_mapping.keys())
         if op_keys:
-            op_key = rng.choice(op_keys)
-            new_outcomes = _generate_stub_outcomes(
-                {op_key: stub_mapping[op_key]}, var_report, rng,
-            )
-            if stub_out is None:
-                stub_out = {}
-            stub_out.update(new_outcomes)
+            n_ops = rng.randint(1, min(3, len(op_keys)))
+            for op_key in rng.sample(op_keys, n_ops):
+                new_outcomes = _generate_stub_outcomes(
+                    {op_key: stub_mapping[op_key]}, var_report, rng,
+                )
+                if stub_out is None:
+                    stub_out = {}
+                stub_out.update(new_outcomes)
+
+    elif r < 0.95 and stub_mapping:
+        # Full stub regeneration — explore completely different stub combos
+        stub_out = _generate_stub_outcomes(stub_mapping, var_report, rng)
 
     else:
-        # Full stub regeneration or single-var flip fallback
+        # Full stub regen or single-var flip fallback
         if stub_mapping:
             stub_out = _generate_stub_outcomes(stub_mapping, var_report, rng)
         else:
@@ -1769,10 +1784,10 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                 and fuzzer.corpus and all_paragraphs):
             _update_energy(fuzzer, all_paragraphs)
 
-        # Periodic concolic phase — runs every 1000 iterations
+        # Periodic concolic phase — runs every 500 iterations
         # independent of stale counter, to continuously target
         # uncovered branches
-        _CONCOLIC_INTERVAL = 1000
+        _CONCOLIC_INTERVAL = 500
         if (concolic and var_report is not None
                 and i > 0 and i % _CONCOLIC_INTERVAL == 0):
             _branch_meta = getattr(module, '_BRANCH_META', {})
