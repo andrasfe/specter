@@ -1186,6 +1186,83 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
             except (RecursionError, Exception):
                 pass
 
+    # --- Early concolic seeding ---
+    # Run concolic immediately to deterministically solve gating branches.
+    # This stabilizes coverage by ensuring the initial corpus covers key
+    # branch points regardless of random seed.
+    if concolic and var_report is not None:
+        _branch_meta = getattr(module, '_BRANCH_META', {})
+        if _branch_meta and fuzzer.corpus:
+            _clog = logging.getLogger("specter.monte_carlo")
+            try:
+                from .concolic import solve_for_uncovered_branches
+                observed = [e.input_state for e in fuzzer.corpus[-10:]]
+                solutions = solve_for_uncovered_branches(
+                    _branch_meta, fuzzer.global_branches,
+                    var_report, observed,
+                    stub_mapping=stub_mapping,
+                    corpus_entries=fuzzer.corpus,
+                )
+                _early_hits = 0
+                for sol in solutions:
+                    target_para = _branch_meta.get(
+                        abs(sol.branch_id), {},
+                    ).get("paragraph", "")
+                    base, base_stubs = _pick_concolic_base(
+                        fuzzer, target_para,
+                    )
+                    base.update(sol.assignments)
+                    merged_stubs = dict(base_stubs) if base_stubs else {}
+                    if sol.stub_outcomes:
+                        merged_stubs.update(sol.stub_outcomes)
+                    if merged_stubs:
+                        base["_stub_outcomes"] = {
+                            k: list(v) for k, v in merged_stubs.items()
+                        }
+                    _inject_defaults(base, search_rng)
+                    try:
+                        cs = module.run(base)
+                        c_trace = cs.get("_trace", [])
+                        c_cov = frozenset(c_trace)
+                        c_edges = frozenset(
+                            (c_trace[j], c_trace[j + 1])
+                            for j in range(len(c_trace) - 1)
+                            if c_trace[j] != c_trace[j + 1]
+                        )
+                        for p in c_trace:
+                            fuzzer.para_hits[p] += 1
+                        fuzzer.n_successful += 1
+                        c_br = frozenset(cs.get("_branches", set()))
+                        if _should_add_to_corpus(fuzzer, c_cov, c_edges, c_br):
+                            _early_hits += 1
+                            c_entry = _CorpusEntry(
+                                input_state={k: v for k, v in base.items()
+                                             if not k.startswith("_stub")},
+                                coverage=c_cov,
+                                edges=c_edges,
+                                added_at=0,
+                                stub_outcomes=merged_stubs if merged_stubs else None,
+                            )
+                            _add_to_corpus(fuzzer, c_entry, c_br)
+                            if var_report is not None and llm_walk_rounds > 0:
+                                _random_walk_suggestion(
+                                    module, base, var_report,
+                                    rng, fuzzer, stub_mapping,
+                                    search_rng, _inject_defaults,
+                                    max_rounds=llm_walk_rounds,
+                                    call_graph=call_graph,
+                                )
+                    except (RecursionError, Exception):
+                        pass
+                if _early_hits:
+                    _clog.info("Concolic seed: %d/%d solutions -> new coverage "
+                               "(branches=%d, paras=%d)",
+                               _early_hits, len(solutions),
+                               len(fuzzer.global_branches),
+                               len(fuzzer.global_coverage))
+            except ImportError:
+                pass
+
     for i in range(n_iterations):
         # --- LLM-guided strategy decision ---
         # Use adaptive LLM strategist when available; fall back to

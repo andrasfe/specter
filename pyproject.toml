@@ -13,3 +13,7 @@ concolic = ["z3-solver>=4.12"]
 
 [project.scripts]
 specter = "specter.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["specter*"] (edited)
