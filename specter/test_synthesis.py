@@ -277,6 +277,37 @@ def _execute_and_collect(
     return list(dict.fromkeys(trace)), branches, edges
 
 
+def _execute_direct_and_collect(
+    module, para_name: str, input_state: dict,
+    stub_outcomes: dict, stub_defaults: dict,
+) -> tuple[list[str], list[int], list[tuple]]:
+    """Run a single paragraph directly, return (paras, branches, edges)."""
+    run_state = dict(input_state)
+    if stub_outcomes:
+        run_state["_stub_outcomes"] = {
+            k: [list(entry) for entry in v]
+            for k, v in stub_outcomes.items()
+        }
+    if stub_defaults:
+        run_state["_stub_defaults"] = dict(stub_defaults)
+
+    try:
+        rs = _run_paragraph_directly(module, para_name, run_state)
+    except Exception:
+        return [], [], []
+
+    if not rs:
+        return [], [], []
+
+    trace = rs.get("_trace", [para_name])
+    branches = list(rs.get("_branches", set()))
+    edges = []
+    for j in range(len(trace) - 1):
+        if trace[j] != trace[j + 1]:
+            edges.append((trace[j], trace[j + 1]))
+    return list(dict.fromkeys(trace)), branches, edges
+
+
 def _execute_and_collect_full(
     module, input_state: dict, stub_outcomes: dict, stub_defaults: dict,
 ) -> tuple[list[str], list[int], list[tuple], dict]:
@@ -364,9 +395,14 @@ def _maybe_save(
         return False
 
     tc_id = _compute_id(input_state, stub_outcomes)
-    # Check for duplicate IDs
+    # If same input/stubs but different target (e.g. direct invocation),
+    # make the ID unique by incorporating the target.
     if any(tc.id == tc_id for tc in synth.test_cases):
-        return False
+        tc_id = _compute_id(
+            {**input_state, "_target": target}, stub_outcomes
+        )
+        if any(tc.id == tc_id for tc in synth.test_cases):
+            return False
 
     tc = TestCase(
         id=tc_id,
@@ -397,6 +433,51 @@ def _time_exceeded(start: float, max_time: float | None) -> bool:
     return (time.time() - start) > max_time
 
 
+def _detect_truthiness_overrides(module) -> dict[str, object]:
+    """Scan _BRANCH_META for bare truthiness conditions.
+
+    For variables checked with bare ``if state['VAR']:`` (error flags),
+    returns a dict setting them to falsy values.
+    For variables checked with ``if not (state['VAR']):`` (status checks),
+    returns a dict setting them to truthy values.
+
+    This prevents the all-success state from using truthy defaults like
+    "TEST" for error flag variables, which would trigger early termination.
+    """
+    import re
+    overrides: dict[str, object] = {}
+    branch_meta = getattr(module, "_BRANCH_META", {})
+
+    for _bid, meta in branch_meta.items():
+        cond = meta.get("condition", "").strip()
+        if not cond:
+            continue
+
+        # Match bare variable: "SYM00007" or "NOT SYM00190"
+        m = re.match(r"^(NOT\s+)?([A-Z][A-Z0-9_-]+)$", cond)
+        if not m:
+            continue
+
+        negated = bool(m.group(1))
+        var = m.group(2)
+
+        if var == "OTHER":
+            continue  # EVALUATE OTHER, not a variable
+
+        if negated:
+            # Condition is NOT VAR → branch fires when VAR is falsy.
+            # For success, we want VAR truthy (skip the error branch).
+            if var not in overrides:
+                overrides[var] = "00"
+        else:
+            # Condition is VAR → branch fires when VAR is truthy.
+            # For success, we want VAR falsy (skip the error branch).
+            if var not in overrides:
+                overrides[var] = ""
+
+    return overrides
+
+
 # ---------------------------------------------------------------------------
 # Layer 1: All-Success Baseline
 # ---------------------------------------------------------------------------
@@ -416,6 +497,13 @@ def _run_layer_1(
 
     # Base all-success state
     base_state = _generate_all_success_state(var_report, equality_constraints)
+
+    # Override bare-truthiness variables: error flags → falsy, status vars → truthy
+    truthiness_overrides = _detect_truthiness_overrides(module)
+    if truthiness_overrides:
+        log.info("Layer 1: applying %d truthiness overrides", len(truthiness_overrides))
+        base_state.update(truthiness_overrides)
+
     base_stubs = (
         _generate_all_success_stubs(stub_mapping, var_report)
         if stub_mapping else {}
@@ -446,6 +534,33 @@ def _run_layer_1(
                 module, loop_state, base_stubs, base_defaults,
             )
             if _maybe_save(synth, store_path, loop_state, base_stubs, base_defaults,
+                           paras, branches, edges, layer=1, target=target):
+                new_count += 1
+            _record_attempt(synth, store_path, 1, target)
+
+    # Try with reduced READ/START stub counts to handle programs where
+    # later reads MUST return EOF (e.g., inverted AT END / NOT AT END checks).
+    # Multiple read counts to find the sweet spot.
+    if stub_mapping:
+        for read_count in [20, 50, 100]:
+            if _time_exceeded(start_time, max_time):
+                break
+            target = f"all-success-reads{read_count}"
+            if _was_attempted(synth, 1, target):
+                continue
+
+            reduced_stubs = {}
+            for op_key, entries in base_stubs.items():
+                if op_key.startswith("READ:") or op_key.startswith("START:"):
+                    # Keep first `read_count` success entries + 1 EOF
+                    reduced_stubs[op_key] = entries[:read_count] + entries[-1:]
+                else:
+                    reduced_stubs[op_key] = list(entries)
+
+            paras, branches, edges = _execute_and_collect(
+                module, base_state, reduced_stubs, base_defaults,
+            )
+            if _maybe_save(synth, store_path, base_state, reduced_stubs, base_defaults,
                            paras, branches, edges, layer=1, target=target):
                 new_count += 1
             _record_attempt(synth, store_path, 1, target)
@@ -580,7 +695,7 @@ def _run_layer_2(
     all_paras = {p.name for p in program.paragraphs}
     N_VARIATIONS = 6   # constraint value variations to try
     N_BASES = 3        # base TCs to try per target
-    MAX_ROUNDS = 10    # max iterative rounds
+    MAX_ROUNDS = 5     # max iterative rounds for path constraints
 
     base_defaults = (
         _generate_stub_defaults(stub_mapping, var_report)
@@ -590,186 +705,54 @@ def _run_layer_2(
     # Extract loop gates for PERFORM UNTIL handling
     loop_gates = _extract_loop_gates(program, module)
 
-    for round_num in range(MAX_ROUNDS):
-        if _time_exceeded(start_time, max_time):
-            break
+    # Truthiness overrides for direct invocation
+    truthiness_overrides = _detect_truthiness_overrides(module)
 
-        uncovered = all_paras - synth.covered_paras
-        if not uncovered:
-            break
-
-        # Compute path constraints for all uncovered, sort by path length
-        targets = []
-        for para in uncovered:
-            pc = compute_path_constraints(para, call_graph, gating_conditions)
-            if pc is not None:
-                targets.append(pc)
-        targets.sort(key=lambda pc: len(pc.path))
-
-        round_new = 0
-        for pc in targets:
-            if _time_exceeded(start_time, max_time):
-                break
-            if pc.target in synth.covered_paras:
-                continue
-
-            # Try multiple base TCs × multiple constraint variations
-            bases = _find_top_bases(synth, pc.path, N_BASES)
-            if not bases:
-                bases = [None]
-
-            for base_tc in bases:
-                if _time_exceeded(start_time, max_time):
-                    break
-                if pc.target in synth.covered_paras:
-                    break
-
-                base_state = dict(base_tc.input_state) if base_tc else (
-                    _generate_all_success_state(var_report, equality_constraints)
-                )
-                base_stubs = (
-                    dict(base_tc.stub_outcomes) if base_tc and base_tc.stub_outcomes
-                    else (_generate_all_success_stubs(stub_mapping, var_report)
-                          if stub_mapping else {})
-                )
-
-                for var_idx in range(N_VARIATIONS):
-                    if _time_exceeded(start_time, max_time):
-                        break
-                    if pc.target in synth.covered_paras:
-                        break
-
-                    base_id = base_tc.id[:8] if base_tc else "fresh"
-                    target_key = f"{pc.target}:b={base_id}:v={var_idx}"
-                    if _was_attempted(synth, 2, target_key):
-                        continue
-
-                    state = _apply_gating_constraints(
-                        base_state, pc.constraints, var_report, variation=var_idx,
-                    )
-                    # Also apply loop gates to enter PERFORM UNTIL loops
-                    if loop_gates:
-                        state = _apply_loop_gates(
-                            state, loop_gates, {pc.target}, var_report,
-                        )
-
-                    paras, branches, edges = _execute_and_collect(
-                        module, state, base_stubs, base_defaults,
-                    )
-                    if _maybe_save(synth, store_path, state, base_stubs, base_defaults,
-                                   paras, branches, edges, layer=2, target=target_key):
-                        new_count += 1
-                        round_new += 1
-                    _record_attempt(synth, store_path, 2, target_key)
-
-            # Stub error variants (only for first base, variation 0)
-            if stub_mapping and not _time_exceeded(start_time, max_time):
-                base_tc_err = bases[0]
-                base_state_err = dict(base_tc_err.input_state) if base_tc_err else (
-                    _generate_all_success_state(var_report, equality_constraints)
-                )
-                base_stubs_err = (
-                    dict(base_tc_err.stub_outcomes)
-                    if base_tc_err and base_tc_err.stub_outcomes
-                    else (_generate_all_success_stubs(stub_mapping, var_report)
-                          if stub_mapping else {})
-                )
-                state = _apply_gating_constraints(
-                    base_state_err, pc.constraints, var_report,
-                )
-                for op_key, status_vars in stub_mapping.items():
-                    if _time_exceeded(start_time, max_time):
-                        break
-                    error_stubs = dict(base_stubs_err)
-                    for svar in status_vars:
-                        info = var_report.variables.get(svar)
-                        literals = (info.condition_literals
-                                   if info and hasattr(info, "condition_literals") else [])
-                        for lit in literals[1:]:  # skip first (success) value
-                            stub_target = f"{pc.target}:{op_key}={lit}"
-                            if _was_attempted(synth, 2, stub_target):
-                                continue
-                            error_entry = [(svar, lit)]
-                            error_stubs[op_key] = [error_entry] * 25
-                            p2, b2, e2 = _execute_and_collect(
-                                module, state, error_stubs, base_defaults,
-                            )
-                            if _maybe_save(synth, store_path, state, error_stubs,
-                                           base_defaults, p2, b2, e2,
-                                           layer=2, target=stub_target):
-                                new_count += 1
-                                round_new += 1
-                            _record_attempt(synth, store_path, 2, stub_target)
-
-        if round_new == 0:
-            break  # no new coverage this round
-        log.info("Layer 2 round %d: %d new TCs, total covered %d/%d paras",
-                 round_num + 1, round_new,
-                 len(synth.covered_paras), len(all_paras))
-
-    # For unreachable paragraphs, try running directly with multiple base states
+    # ---- PHASE 1: Direct invocation (fast, covers most paragraphs) ----
+    # For ALL uncovered paragraphs, try running directly with proper stubs.
+    # Many programs have most paragraphs only reachable via PERFORM from the
+    # main flow, or in sequential fall-through after a GobackSignal.  Direct
+    # invocation with good stubs is the most reliable way to cover them.
     still_uncovered = all_paras - synth.covered_paras
     for para in sorted(still_uncovered):
         if _time_exceeded(start_time, max_time):
             break
-        if call_graph.path_to(para) is not None:
-            continue  # reachable, handled below
 
         direct_target = f"direct:{para}"
         if _was_attempted(synth, 2, direct_target):
             continue
 
-        states_to_try = [_generate_all_success_state(var_report, equality_constraints)]
-        for tc in synth.test_cases[:5]:
-            states_to_try.append(dict(tc.input_state))
+        # Build a good state with all-success stubs
+        direct_state = _generate_all_success_state(var_report, equality_constraints)
+        if truthiness_overrides:
+            direct_state.update(truthiness_overrides)
 
-        for base_state in states_to_try:
-            if _time_exceeded(start_time, max_time):
-                break
-            try:
-                rs = _run_paragraph_directly(module, para, base_state)
-                trace = rs.get("_trace", [para])
-                branches_r = list(rs.get("_branches", set()))
-                paras_list = list(dict.fromkeys(trace)) if trace else [para]
-                edges_list = [
-                    (trace[j], trace[j + 1])
-                    for j in range(len(trace) - 1)
-                    if trace[j] != trace[j + 1]
-                ] if trace else []
-                if _maybe_save(synth, store_path, base_state, {}, {},
-                               paras_list, branches_r, edges_list,
-                               layer=2, target=direct_target):
-                    new_count += 1
-                    break
-            except Exception:
-                pass
-        _record_attempt(synth, store_path, 2, direct_target)
+        direct_stubs = (
+            _generate_all_success_stubs(stub_mapping, var_report)
+            if stub_mapping else {}
+        )
 
-    # Also try reachable but still-uncovered paragraphs directly
-    still_uncovered = all_paras - synth.covered_paras
-    for para in sorted(still_uncovered):
-        if _time_exceeded(start_time, max_time):
-            break
-        if call_graph.path_to(para) is None:
-            continue
-
-        direct_target = f"direct-reachable:{para}"
-        if _was_attempted(synth, 2, direct_target):
-            continue
-
+        # Try with: (1) fresh all-success state + stubs,
+        #           (2) best existing TC states + stubs
+        attempts = [(direct_state, direct_stubs)]
         for tc in synth.test_cases[:3]:
+            tc_state = dict(tc.input_state)
+            tc_stubs = dict(tc.stub_outcomes) if tc.stub_outcomes else dict(direct_stubs)
+            attempts.append((tc_state, tc_stubs))
+
+        for try_state, try_stubs in attempts:
             if _time_exceeded(start_time, max_time):
                 break
             try:
-                state = dict(tc.input_state)
-                if tc.stub_outcomes:
-                    state["_stub_outcomes"] = {
+                run_s = dict(try_state)
+                if try_stubs:
+                    run_s["_stub_outcomes"] = {
                         k: [list(e) for e in v]
-                        for k, v in tc.stub_outcomes.items()
+                        for k, v in try_stubs.items()
                     }
-                if tc.stub_defaults:
-                    state["_stub_defaults"] = dict(tc.stub_defaults)
-                rs = _run_paragraph_directly(module, para, state)
+                if base_defaults:
+                    run_s["_stub_defaults"] = dict(base_defaults)
+                rs = _run_paragraph_directly(module, para, run_s)
                 trace = rs.get("_trace", [para])
                 branches_r = list(rs.get("_branches", set()))
                 paras_list = list(dict.fromkeys(trace)) if trace else [para]
@@ -778,9 +761,7 @@ def _run_layer_2(
                     for j in range(len(trace) - 1)
                     if trace[j] != trace[j + 1]
                 ] if trace else []
-                stubs = dict(tc.stub_outcomes) if tc.stub_outcomes else {}
-                defaults = dict(tc.stub_defaults) if tc.stub_defaults else {}
-                if _maybe_save(synth, store_path, tc.input_state, stubs, defaults,
+                if _maybe_save(synth, store_path, try_state, try_stubs, base_defaults,
                                paras_list, branches_r, edges_list,
                                layer=2, target=direct_target):
                     new_count += 1
@@ -992,7 +973,11 @@ def _run_layer_3(
     synth: SynthesisState, store_path: Path,
     start_time: float, max_time: float | None,
 ) -> int:
-    """For each uncovered branch in reached paragraphs, find inputs that flip it."""
+    """For each uncovered branch in reached paragraphs, find inputs that flip it.
+
+    Uses direct paragraph invocation for branches in paragraphs that are
+    only reachable that way.
+    """
     new_count = 0
 
     branch_meta = getattr(module, "_BRANCH_META", {})
@@ -1003,6 +988,23 @@ def _run_layer_3(
         _generate_stub_defaults(stub_mapping, var_report)
         if stub_mapping else {}
     )
+
+    # Identify which paragraphs need direct invocation
+    direct_paras: set[str] = set()
+    run_paras: set[str] = set()
+    for tc in synth.test_cases:
+        if tc.target.startswith("direct:"):
+            direct_paras.update(tc.paragraphs_covered)
+        else:
+            run_paras.update(tc.paragraphs_covered)
+    direct_only = direct_paras - run_paras
+
+    # Build paragraph -> best base TC map
+    para_to_tc: dict[str, TestCase] = {}
+    for tc in synth.test_cases:
+        for p in tc.paragraphs_covered:
+            if p not in para_to_tc:
+                para_to_tc[p] = tc
 
     # Try Z3 first, fall back to heuristic
     has_z3 = False
@@ -1024,22 +1026,23 @@ def _run_layer_3(
         if para and para not in synth.covered_paras:
             continue
 
-        # Check which directions are uncovered
+        use_direct = para in direct_only
+
         for negate in (False, True):
             target_id = -abs_id if negate else abs_id
             if target_id in synth.covered_branches:
                 continue
 
             target_key = f"branch:{target_id}"
+            # For direct invocation, prefix target so replay knows
+            save_target = (
+                f"direct:{para}|{target_key}" if use_direct and para
+                else target_key
+            )
             if _was_attempted(synth, 3, target_key):
                 continue
 
-            # Find base test case that reaches this paragraph
-            base_tc = None
-            for tc in synth.test_cases:
-                if para in tc.paragraphs_covered:
-                    base_tc = tc
-                    break
+            base_tc = para_to_tc.get(para)
             if base_tc is None and synth.test_cases:
                 base_tc = synth.test_cases[0]
 
@@ -1048,6 +1051,15 @@ def _run_layer_3(
                 dict(base_tc.stub_outcomes) if base_tc and base_tc.stub_outcomes
                 else {}
             )
+
+            def _try_execute(state, stubs):
+                if use_direct and para:
+                    return _execute_direct_and_collect(
+                        module, para, state, stubs, base_defaults,
+                    )
+                return _execute_and_collect(
+                    module, state, stubs, base_defaults,
+                )
 
             solved = False
             if has_z3:
@@ -1064,12 +1076,10 @@ def _run_layer_3(
                     if sol.stub_outcomes:
                         stubs.update(sol.stub_outcomes)
 
-                    paras, branches, edges = _execute_and_collect(
-                        module, state, stubs, base_defaults,
-                    )
+                    paras, branches, edges = _try_execute(state, stubs)
                     if _maybe_save(synth, store_path, state, stubs, base_defaults,
                                    paras, branches, edges, layer=3,
-                                   target=target_key):
+                                   target=save_target):
                         new_count += 1
                         solved = True
 
@@ -1086,7 +1096,7 @@ def _run_layer_3(
 
                 state = dict(base_state)
                 for var, vals, neg in parsed:
-                    effective_neg = neg != negate  # flip if we're negating
+                    effective_neg = neg != negate
                     if not effective_neg and vals:
                         state[var] = vals[0]
                     elif effective_neg and vals:
@@ -1103,12 +1113,10 @@ def _run_layer_3(
                             else:
                                 state[var] = "XX"
 
-                paras, branches, edges = _execute_and_collect(
-                    module, state, base_stubs, base_defaults,
-                )
+                paras, branches, edges = _try_execute(state, base_stubs)
                 if _maybe_save(synth, store_path, state, base_stubs, base_defaults,
                                paras, branches, edges, layer=3,
-                               target=target_key):
+                               target=save_target):
                     new_count += 1
 
             _record_attempt(synth, store_path, 3, target_key)
@@ -1183,17 +1191,46 @@ def _run_layer_4(
     synth: SynthesisState, store_path: Path,
     start_time: float, max_time: float | None,
 ) -> int:
-    """Systematically vary stub outcomes near uncovered branches."""
+    """Systematically vary stub outcomes near uncovered branches.
+
+    Uses direct paragraph invocation for branches in paragraphs that are
+    only reachable that way (not through the main run() entry point).
+    """
     new_count = 0
 
     branch_meta = getattr(module, "_BRANCH_META", {})
     if not branch_meta or not stub_mapping:
+        _record_layer_done(synth, store_path, 4)
         return 0
 
     base_defaults = (
         _generate_stub_defaults(stub_mapping, var_report)
         if stub_mapping else {}
     )
+
+    # Pre-generate all-success stubs once (expensive operation)
+    all_success_stubs = (
+        _generate_all_success_stubs(stub_mapping, var_report)
+        if stub_mapping else {}
+    )
+
+    # Identify which TCs used direct invocation (for choosing execution mode)
+    direct_paras: set[str] = set()
+    run_paras: set[str] = set()
+    for tc in synth.test_cases:
+        if tc.target.startswith("direct:"):
+            direct_paras.update(tc.paragraphs_covered)
+        else:
+            run_paras.update(tc.paragraphs_covered)
+    # Paragraphs only reachable via direct invocation
+    direct_only = direct_paras - run_paras
+
+    # Build a map: paragraph -> best base TC
+    para_to_tc: dict[str, TestCase] = {}
+    for tc in synth.test_cases:
+        for p in tc.paragraphs_covered:
+            if p not in para_to_tc:
+                para_to_tc[p] = tc
 
     for abs_id in sorted(branch_meta.keys()):
         if _time_exceeded(start_time, max_time):
@@ -1214,38 +1251,39 @@ def _run_layer_4(
                 _record_attempt(synth, store_path, 4, target_key)
                 continue
 
+            use_direct = para in direct_only
+            save_target = (
+                f"direct:{para}|{target_key}" if use_direct and para
+                else target_key
+            )
+
             combos = _compute_stub_combinations(
                 target_id, branch_meta, stub_mapping, var_report, program,
             )
 
-            # Find base state
-            base_tc = None
-            for tc in synth.test_cases:
-                if para in tc.paragraphs_covered:
-                    base_tc = tc
-                    break
-
+            base_tc = para_to_tc.get(para)
             base_state = dict(base_tc.input_state) if base_tc else {}
 
             for combo in combos:
                 if _time_exceeded(start_time, max_time):
                     break
 
-                # Merge combo with all-success base stubs
-                stubs = (
-                    dict(_generate_all_success_stubs(stub_mapping, var_report))
-                    if stub_mapping else {}
-                )
+                stubs = dict(all_success_stubs)
                 stubs.update(combo)
 
-                paras, branches, edges = _execute_and_collect(
-                    module, base_state, stubs, base_defaults,
-                )
+                if use_direct and para:
+                    paras, branches, edges = _execute_direct_and_collect(
+                        module, para, base_state, stubs, base_defaults,
+                    )
+                else:
+                    paras, branches, edges = _execute_and_collect(
+                        module, base_state, stubs, base_defaults,
+                    )
                 if _maybe_save(synth, store_path, base_state, stubs, base_defaults,
                                paras, branches, edges, layer=4,
-                               target=target_key):
+                               target=save_target):
                     new_count += 1
-                    break  # found new coverage, move to next branch
+                    break
 
             _record_attempt(synth, store_path, 4, target_key)
 
@@ -1262,11 +1300,17 @@ def _run_layer_5(
     synth: SynthesisState, store_path: Path,
     start_time: float, max_time: float | None,
 ) -> int:
-    """Squeeze incremental branch coverage via seeded mutation walks."""
+    """Squeeze incremental branch coverage via seeded mutation walks.
+
+    Uses direct paragraph invocation for TCs originating from direct
+    invocation, enabling branch exploration in paragraphs not reachable
+    through the main run() entry point.
+    """
     new_count = 0
 
     branch_meta = getattr(module, "_BRANCH_META", {})
     if not branch_meta:
+        _record_layer_done(synth, store_path, 5)
         return 0
 
     base_defaults = (
@@ -1296,6 +1340,10 @@ def _run_layer_5(
             _record_walked(synth, store_path, tc.id)
             continue
 
+        # Determine if this TC uses direct invocation
+        use_direct = tc.target.startswith("direct:")
+        direct_para = tc.target[len("direct:"):] if use_direct else None
+
         # Seeded RNG from TC id for determinism
         seed = int(hashlib.sha256(tc.id.encode()).hexdigest()[:8], 16)
         rng = random.Random(seed)
@@ -1303,11 +1351,14 @@ def _run_layer_5(
         best_state = dict(tc.input_state)
         best_stubs = dict(tc.stub_outcomes) if tc.stub_outcomes else {}
 
+        no_improvement = 0
         for _round in range(100):
             if _time_exceeded(start_time, max_time):
                 break
+            if no_improvement >= 20:
+                break
 
-            # Mutate 1-3 variables or stubs per round for faster exploration
+            # Mutate 1-3 variables or stubs per round
             state = dict(best_state)
             stubs = {k: [list(e) for e in v] for k, v in best_stubs.items()}
             n_mutations = rng.randint(1, 3)
@@ -1315,7 +1366,6 @@ def _run_layer_5(
             var_names = list(var_report.variables.keys())
             for _ in range(n_mutations):
                 if var_names and rng.random() < 0.6:
-                    # Mutate a variable
                     name = rng.choice(var_names)
                     info = var_report.variables[name]
                     literals = info.condition_literals if hasattr(info, "condition_literals") else []
@@ -1328,7 +1378,6 @@ def _run_layer_5(
                     else:
                         state[name] = rng.choice(["", " ", "TEST", "00", "XX"])
                 elif stub_mapping:
-                    # Mutate a stub outcome
                     op_key = rng.choice(list(stub_mapping.keys()))
                     status_vars = stub_mapping[op_key]
                     svar = status_vars[0] if status_vars else None
@@ -1342,15 +1391,28 @@ def _run_layer_5(
                             val = rng.choice([0, "00", "10", 100])
                         stubs[op_key] = [[(svar, val)]] * 25
 
-            paras, branches, edges = _execute_and_collect(
-                module, state, stubs, base_defaults,
+            if use_direct and direct_para:
+                paras, branches, edges = _execute_direct_and_collect(
+                    module, direct_para, state, stubs, base_defaults,
+                )
+            else:
+                paras, branches, edges = _execute_and_collect(
+                    module, state, stubs, base_defaults,
+                )
+            walk_target = (
+                f"direct:{direct_para}|walk:{tc.id[:8]}"
+                if use_direct and direct_para
+                else f"walk:{tc.id[:8]}"
             )
             if _maybe_save(synth, store_path, state, stubs, base_defaults,
                            paras, branches, edges, layer=5,
-                           target=f"walk:{tc.id[:8]}"):
+                           target=walk_target):
                 new_count += 1
                 best_state = state
                 best_stubs = stubs
+                no_improvement = 0
+            else:
+                no_improvement += 1
 
         _record_walked(synth, store_path, tc.id)
 

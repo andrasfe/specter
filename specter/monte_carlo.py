@@ -478,6 +478,12 @@ def _generate_stub_defaults(
         entry: list[tuple[str, object]] = []
         for svar in status_vars:
             upper = svar.upper()
+
+            # Check condition_literals first (most reliable for scrambled names)
+            harvested = []
+            if var_report and svar in var_report.variables:
+                harvested = var_report.variables[svar].condition_literals
+
             if "SQLCODE" in upper or "SQLSTATE" in upper:
                 if op_key.startswith("READ:") or op_key == "SQL":
                     entry.append((svar, 100))  # end of cursor / not found
@@ -493,8 +499,13 @@ def _generate_stub_defaults(
                 entry.append((svar, "00"))  # success
             elif "RETURN-CODE" in upper or upper.endswith("-RC"):
                 entry.append((svar, 0))
+            elif harvested:
+                # Use first condition_literal (typically the success value)
+                entry.append((svar, harvested[0]))
             else:
-                entry.append((svar, 0))  # success default
+                # Default: use string "00" for safety (matches file status checks
+                # which are the most common pattern in COBOL programs)
+                entry.append((svar, "00"))
         defaults[op_key] = entry
     return defaults
 
@@ -646,23 +657,25 @@ def _generate_all_success_stubs(
 
         is_call = op_key.startswith("CALL:")
         if is_read:
-            for _ in range(10):
+            # Generous count: programs may have multiple sequential loops
+            # reading from the same file (e.g., 4 loops × 60 reads each).
+            for _ in range(500):
                 outcomes.setdefault(op_key, []).append(list(success_entry))
             outcomes.setdefault(op_key, []).append(list(eof_entry))
         elif is_start:
-            for _ in range(15):
+            for _ in range(500):
                 outcomes.setdefault(op_key, []).append(list(success_entry))
         elif is_sql:
             for _ in range(100):
                 outcomes.setdefault(op_key, []).append(list(success_entry))
             outcomes.setdefault(op_key, []).append(list(eof_entry))
         elif is_call:
-            # CALLs may be invoked multiple times; provide enough outcomes
-            for _ in range(20):
+            # CALLs may be invoked from loops; provide generous outcomes
+            for _ in range(100):
                 outcomes.setdefault(op_key, []).append(list(success_entry))
         else:
-            # OPEN/CLOSE/etc — typically invoked once or twice
-            for _ in range(5):
+            # OPEN/CLOSE/etc — typically invoked once or twice per file
+            for _ in range(20):
                 outcomes.setdefault(op_key, []).append(list(success_entry))
     return outcomes
 

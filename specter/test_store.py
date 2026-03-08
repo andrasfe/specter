@@ -187,7 +187,15 @@ class TestStore:
         for tc in test_cases:
             try:
                 state = _build_run_state(module, tc)
-                rs = module.run(state)
+                # Direct invocation TCs target a specific paragraph
+                # Format: "direct:<para>" or "direct:<para>|<rest>"
+                if tc.target.startswith("direct:"):
+                    rest = tc.target[len("direct:"):]
+                    para_name = rest.split("|", 1)[0]
+                    from .monte_carlo import _run_paragraph_directly
+                    rs = _run_paragraph_directly(module, para_name, state)
+                else:
+                    rs = module.run(state)
                 trace = rs.get("_trace", [])
                 covered_paras.update(trace)
                 covered_branches.update(rs.get("_branches", set()))
