@@ -204,6 +204,8 @@ class _CodeBuilder:
         self._indent = 0
         self._loop_counter = 0
         self._branch_counter = 0
+        self.branch_meta: dict[int, dict] = {}
+        self.current_para: str = ""
 
     def next_branch_id(self) -> int:
         """Return a unique branch ID for instrumentation."""
@@ -519,6 +521,11 @@ def _gen_subtract(cb: _CodeBuilder, stmt: Statement):
 def _gen_if(cb: _CodeBuilder, stmt: Statement):
     condition = stmt.attributes.get("condition", "")
     bid = cb.next_branch_id()
+    cb.branch_meta[bid] = {
+        "condition": condition,
+        "paragraph": cb.current_para,
+        "type": "IF",
+    }
     if not condition:
         cb.line(f"if True:  # IF: {_oneline(stmt.text)}")
     else:
@@ -595,6 +602,12 @@ def _gen_evaluate(cb: _CodeBuilder, stmt: Statement):
 
         cb.indent()
         bid = cb.next_branch_id()
+        cb.branch_meta[bid] = {
+            "condition": value_text if not is_other else "OTHER",
+            "paragraph": cb.current_para,
+            "type": "EVALUATE",
+            "subject": subject,
+        }
         cb.line(f"state.get('_branches', set()).add({bid})")
         when_body = [c for c in child.children if c.type != "WHEN"]
         if not when_body:
@@ -1698,6 +1711,7 @@ def generate_code(
 
     # One function per paragraph
     for para in program.paragraphs:
+        cb.current_para = para.name
         func_name = _sanitize_name(para.name)
         cb.line(f"def {func_name}(state):")
         cb.indent()
@@ -1734,6 +1748,11 @@ def generate_code(
         cb.dedent()
         cb.blank()
         cb.blank()
+
+    # Branch metadata for concolic engine (maps branch ID -> condition info)
+    cb.line(f"_BRANCH_META = {repr(cb.branch_meta)}")
+    cb.blank()
+    cb.blank()
 
     # Entry point — find first paragraph
     cb.line("def run(initial_state=None):")

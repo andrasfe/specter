@@ -8,5 +8,8 @@ version = "0.1.0"
 description = "COBOL AST to executable Python code generator"
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+concolic = ["z3-solver>=4.12"]
+
 [project.scripts]
 specter = "specter.__main__:main"

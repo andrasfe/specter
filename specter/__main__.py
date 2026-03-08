@@ -94,12 +94,26 @@ def main(argv: list[str] | None = None) -> int:
         type=int, default=100, metavar="N",
         help="Random walk rounds per LLM suggestion to maximize coverage (default: 100)",
     )
+    parser.add_argument(
+        "--concolic",
+        action="store_true",
+        help="Use Z3 concolic engine to solve for uncovered branches (requires z3-solver, implies --guided)",
+    )
 
     args = parser.parse_args(argv)
 
     # --diagram implies --analyze
     if args.diagram:
         args.analyze = True
+
+    # --concolic implies --guided
+    if args.concolic:
+        args.guided = True
+        try:
+            import z3  # noqa: F401
+        except ImportError:
+            print("Error: --concolic requires z3-solver (pip install z3-solver)", file=sys.stderr)
+            return 1
 
     # --llm-guided implies --guided
     if args.llm_guided:
@@ -219,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
             llm_model=args.llm_model,
             llm_interval=args.llm_interval,
             llm_walk_rounds=args.llm_walk_rounds,
+            concolic=args.concolic,
         )
         print()
         print(report.summary())

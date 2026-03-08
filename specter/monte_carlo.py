@@ -229,6 +229,8 @@ class _FuzzerState:
     call_graph: dict[str, set[str]] = field(default_factory=dict)
     global_branches: set[int] = field(default_factory=set)
     sample_call_events: list[list[tuple]] = field(default_factory=list)
+    concolic_failed: set[int] = field(default_factory=set)
+    concolic_cooldown: dict[int, int] = field(default_factory=dict)
 
 
 def _should_add_to_corpus(fuzzer: _FuzzerState, coverage: frozenset, edges: frozenset,
@@ -996,7 +998,8 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                 llm_provider=None,
                 llm_model=None,
                 llm_interval: int = 500,
-                llm_walk_rounds: int = _LLM_WALK_ROUNDS) -> MonteCarloReport:
+                llm_walk_rounds: int = _LLM_WALK_ROUNDS,
+                concolic: bool = False) -> MonteCarloReport:
     """Coverage-guided fuzzing loop with optional directed fuzzing.
 
     When *llm_provider* is given, the loop periodically queries an LLM
@@ -1565,6 +1568,57 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                 else:
                     # No static analysis — fall back to random burst
                     stale_random_remaining = _STALE_RANDOM_BURST
+
+                # Concolic phase: use Z3 to solve for uncovered branches
+                if concolic and var_report is not None:
+                    _branch_meta = getattr(module, '_BRANCH_META', {})
+                    if _branch_meta:
+                        try:
+                            from .concolic import solve_for_uncovered_branches
+                            observed = [e.input_state for e in fuzzer.corpus[-10:]] if fuzzer.corpus else [{}]
+                            solutions = solve_for_uncovered_branches(
+                                _branch_meta, fuzzer.global_branches,
+                                var_report, observed,
+                            )
+                            for sol in solutions:
+                                base = dict(fuzzer.corpus[0].input_state) if fuzzer.corpus else {}
+                                base.update(sol.assignments)
+                                _inject_defaults(base, search_rng)
+                                try:
+                                    cs = module.run(base)
+                                    c_trace = cs.get("_trace", [])
+                                    c_cov = frozenset(c_trace)
+                                    c_edges = frozenset(
+                                        (c_trace[j], c_trace[j + 1])
+                                        for j in range(len(c_trace) - 1)
+                                        if c_trace[j] != c_trace[j + 1]
+                                    )
+                                    for p in c_trace:
+                                        fuzzer.para_hits[p] += 1
+                                    fuzzer.n_successful += 1
+                                    c_br = frozenset(cs.get("_branches", set()))
+                                    if _should_add_to_corpus(fuzzer, c_cov, c_edges, c_br):
+                                        c_entry = _CorpusEntry(
+                                            input_state={k: v for k, v in base.items()
+                                                         if not k.startswith("_stub")},
+                                            coverage=c_cov,
+                                            edges=c_edges,
+                                            added_at=i,
+                                        )
+                                        _add_to_corpus(fuzzer, c_entry, c_br)
+                                        if var_report is not None and llm_walk_rounds > 0:
+                                            _random_walk_suggestion(
+                                                module, base, var_report,
+                                                rng, fuzzer, stub_mapping,
+                                                search_rng, _inject_defaults,
+                                                max_rounds=llm_walk_rounds,
+                                                call_graph=call_graph,
+                                            )
+                                except (RecursionError, Exception):
+                                    pass
+                        except ImportError:
+                            pass  # z3 not installed — skip concolic
+
                 fuzzer.stale_counter = 0
 
         if parent is not None:
@@ -1695,6 +1749,7 @@ def run_monte_carlo(
     llm_model: str | None = None,
     llm_interval: int = 500,
     llm_walk_rounds: int = _LLM_WALK_ROUNDS,
+    concolic: bool = False,
 ) -> MonteCarloReport:
     """Run Monte Carlo analysis on a generated Python module.
 
@@ -1714,6 +1769,8 @@ def run_monte_carlo(
         llm_model: Optional model override for the LLM provider.
         llm_interval: How often (in iterations) to query the LLM for
             coverage suggestions (default 500).
+        concolic: If True, use Z3 concolic engine to solve for uncovered
+            branches when the fuzzer stalls (requires z3-solver).
 
     Returns:
         MonteCarloReport with aggregated results.
@@ -1744,6 +1801,7 @@ def run_monte_carlo(
             llm_model=llm_model,
             llm_walk_rounds=llm_walk_rounds,
             llm_interval=llm_interval,
+            concolic=concolic,
         )
 
     rng = random.Random(seed)
