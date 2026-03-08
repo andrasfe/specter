@@ -499,8 +499,8 @@ def build_var_env(var_report, observed_state: dict | None = None,
         for status_vars in stub_mapping.values():
             for sv in status_vars:
                 stub_controlled.add(sv.upper())
-        log.info("Concolic: %d stub-controlled vars: %s",
-                 len(stub_controlled), sorted(stub_controlled)[:10])
+        log.debug("Concolic: %d stub-controlled vars: %s",
+                  len(stub_controlled), sorted(stub_controlled)[:10])
 
     n_free = 0
     n_fixed = 0
@@ -531,8 +531,8 @@ def build_var_env(var_report, observed_state: dict | None = None,
             else:
                 env[upper] = z3.StringVal(str(val))
 
-    log.info("Concolic var env: %d free, %d fixed, %d total",
-             n_free, n_fixed, len(env))
+    log.debug("Concolic var env: %d free, %d fixed, %d total",
+              n_free, n_fixed, len(env))
     return env
 
 
@@ -627,12 +627,12 @@ def solve_for_branch(
 
     result = solver.check()
     if result != z3.sat:
-        log.debug("Concolic: branch %d UNSAT/TIMEOUT (condition: %s)",
-                  branch_id, condition[:60])
+        log.debug("Concolic: branch %d unsat/timeout: %s",
+                  branch_id, condition[:40])
         return None
 
-    log.debug("Concolic: branch %d SAT (condition: %s, negate=%s)",
-              branch_id, condition[:60], negate)
+    log.debug("Concolic: branch %d sat (negate=%s): %s",
+              branch_id, negate, condition[:40])
     model = solver.model()
     assignments: dict[str, object] = {}
     for name, var in local_env.items():
@@ -762,8 +762,8 @@ def solve_for_uncovered_branches(
         for entry in corpus_entries:
             for para in entry.coverage:
                 _para_to_states.setdefault(para, []).append(entry.input_state)
-        log.info("Concolic: indexed %d corpus entries covering %d paragraphs",
-                 len(corpus_entries), len(_para_to_states))
+        log.debug("Concolic: indexed %d corpus entries covering %d paras",
+                  len(corpus_entries), len(_para_to_states))
 
     # Default observed state for var env
     default_observed = observed_states[-1] if observed_states else {}
@@ -792,10 +792,9 @@ def solve_for_uncovered_branches(
         all_branch_ids.add(bid)
         all_branch_ids.add(-bid)
     total_covered = len(covered_branches & all_branch_ids)
-    log.info("Concolic: %d/%d branch directions covered, "
-             "%d half-covered, %d fully uncovered, %d candidates to solve",
-             total_covered, len(all_branch_ids),
-             n_half, n_uncovered, len(candidates))
+    log.debug("Concolic: %d/%d covered, %d half, %d uncovered, %d candidates",
+              total_covered, len(all_branch_ids),
+              n_half, n_uncovered, len(candidates))
 
     solutions: list[ConcolicSolution] = []
     n_sat = 0
@@ -827,15 +826,11 @@ def solve_for_uncovered_branches(
             n_sat += 1
             n_stub_keys = len(sol.stub_outcomes)
             n_input_keys = len(sol.assignments)
-            log.info("Concolic: branch %d solved (%d input vars, %d stub ops) "
-                     "para=%s cond='%s'",
-                     target_id, n_input_keys, n_stub_keys,
-                     target_para or "?",
-                     branch_meta.get(abs_id, {}).get("condition", "?")[:50])
+            log.debug("Concolic: branch %d solved (%d inputs, %d stubs) %s",
+                      target_id, n_input_keys, n_stub_keys, target_para)
             solutions.append(sol)
         else:
             n_unsat += 1
 
-    log.info("Concolic: %d solutions found, %d unsat/timeout",
-             n_sat, n_unsat)
+    log.debug("Concolic: %d sat, %d unsat", n_sat, n_unsat)
     return solutions

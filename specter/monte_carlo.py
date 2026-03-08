@@ -1602,11 +1602,10 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                     _branch_meta = getattr(module, '_BRANCH_META', {})
                     if _branch_meta:
                         _clog = logging.getLogger("specter.monte_carlo")
-                        _clog.info("Concolic phase triggered at iteration %d "
-                                   "(stale=%d, branches=%d/%d)",
-                                   i, _STALE_THRESHOLD,
-                                   len(fuzzer.global_branches),
-                                   len(_branch_meta) * 2)
+                        _clog.debug("Concolic stale-trigger at iter %d "
+                                    "(branches=%d/%d)",
+                                    i, len(fuzzer.global_branches),
+                                    len(_branch_meta) * 2)
                         try:
                             from .concolic import solve_for_uncovered_branches
                             observed = [e.input_state for e in fuzzer.corpus[-10:]] if fuzzer.corpus else [{}]
@@ -1654,13 +1653,10 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                                     if _should_add_to_corpus(fuzzer, c_cov, c_edges, c_br):
                                         new_br = c_br - fuzzer.global_branches
                                         new_para = c_cov - fuzzer.global_coverage
-                                        _clog.info(
-                                            "Concolic: branch %d -> NEW coverage "
-                                            "(+%d branches, +%d paras, "
-                                            "trace=%d paras)",
+                                        _clog.debug(
+                                            "Concolic: branch %d +%d br +%d para",
                                             sol.branch_id,
-                                            len(new_br), len(new_para),
-                                            len(c_trace))
+                                            len(new_br), len(new_para))
                                         _concolic_new += 1
                                         c_entry = _CorpusEntry(
                                             input_state={k: v for k, v in base.items()
@@ -1681,8 +1677,7 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                                             )
                                 except (RecursionError, Exception):
                                     pass
-                            _clog.info("Concolic phase done: %d/%d solutions "
-                                       "produced new coverage",
+                            _clog.debug("Concolic stale done: %d/%d new",
                                        _concolic_new, len(solutions))
                         except ImportError:
                             pass  # z3 not installed — skip concolic
@@ -1706,11 +1701,10 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
             _branch_meta = getattr(module, '_BRANCH_META', {})
             if _branch_meta:
                 _clog = logging.getLogger("specter.monte_carlo")
-                _clog.info("Concolic periodic phase at iter %d "
-                           "(branches=%d/%d, paras=%d)",
-                           i, len(fuzzer.global_branches),
-                           len(_branch_meta) * 2,
-                           len(fuzzer.global_coverage))
+                _clog.debug("Concolic periodic at iter %d "
+                            "(branches=%d/%d)",
+                            i, len(fuzzer.global_branches),
+                            len(_branch_meta) * 2)
                 try:
                     from .concolic import solve_for_uncovered_branches
                     observed = [e.input_state for e in fuzzer.corpus[-10:]] if fuzzer.corpus else [{}]
@@ -1771,8 +1765,9 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                                     )
                         except (RecursionError, Exception):
                             pass
-                    _clog.info("Concolic periodic: %d/%d solutions -> new coverage",
-                               _concolic_hits, len(solutions))
+                    if _concolic_hits:
+                        _clog.info("Concolic @%d: %d/%d solutions -> new coverage",
+                                   i, _concolic_hits, len(solutions))
                 except ImportError:
                     pass
 
