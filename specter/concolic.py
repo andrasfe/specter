@@ -9,8 +9,11 @@ The public entry point is :func:`solve_for_uncovered_branches`.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Lazy Z3 import — callers must guard with try/except
@@ -496,7 +499,11 @@ def build_var_env(var_report, observed_state: dict | None = None,
         for status_vars in stub_mapping.values():
             for sv in status_vars:
                 stub_controlled.add(sv.upper())
+        log.info("Concolic: %d stub-controlled vars: %s",
+                 len(stub_controlled), sorted(stub_controlled)[:10])
 
+    n_free = 0
+    n_fixed = 0
     for name, info in var_report.variables.items():
         upper = name.upper()
         is_numeric = _infer_numeric(upper, info)
@@ -507,12 +514,14 @@ def build_var_env(var_report, observed_state: dict | None = None,
 
         if is_free:
             # Free variable — solver can assign
+            n_free += 1
             if is_numeric:
                 env[upper] = z3.Int(upper)
             else:
                 env[upper] = z3.String(upper)
         else:
             # Fixed to observed value
+            n_fixed += 1
             val = observed.get(name, observed.get(upper, ""))
             if is_numeric:
                 try:
@@ -522,6 +531,8 @@ def build_var_env(var_report, observed_state: dict | None = None,
             else:
                 env[upper] = z3.StringVal(str(val))
 
+    log.info("Concolic var env: %d free, %d fixed, %d total",
+             n_free, n_fixed, len(env))
     return env
 
 
@@ -616,8 +627,12 @@ def solve_for_branch(
 
     result = solver.check()
     if result != z3.sat:
+        log.debug("Concolic: branch %d UNSAT/TIMEOUT (condition: %s)",
+                  branch_id, condition[:60])
         return None
 
+    log.debug("Concolic: branch %d SAT (condition: %s, negate=%s)",
+              branch_id, condition[:60], negate)
     model = solver.model()
     assignments: dict[str, object] = {}
     for name, var in local_env.items():
@@ -642,27 +657,64 @@ def solve_for_branch(
     if stub_mapping:
         # Build reverse map: var_name -> [op_keys]
         var_to_ops: dict[str, list[str]] = {}
+        # Also build op_key -> all status vars (for filling success defaults)
+        op_all_vars: dict[str, list[str]] = {}
         for op_key, status_vars in stub_mapping.items():
+            op_all_vars[op_key] = [sv.upper() for sv in status_vars]
             for sv in status_vars:
                 var_to_ops.setdefault(sv.upper(), []).append(op_key)
 
+        # Collect which op_keys need the solved value
+        solved_ops: dict[str, list[tuple[str, object]]] = {}
         for var_name in list(assignments):
             if var_name in var_to_ops:
                 val = assignments.pop(var_name)
                 for op_key in var_to_ops[var_name]:
-                    # Build a stub outcome entry: list of (var, val) pairs
-                    # Repeat the outcome multiple times so it persists across
-                    # multiple invocations of the same stub in the program
-                    entry = [(var_name, val)]
-                    stub_outcomes.setdefault(op_key, []).extend(
-                        [entry] * 20  # enough for most loop iterations
-                    )
+                    solved_ops.setdefault(op_key, []).append((var_name, val))
+
+        # For each op_key, build stub outcomes:
+        # - Ops that need a specific solved value get a few success entries
+        #   first (so earlier invocations pass), then the target value
+        # - All other ops get success defaults
+        for op_key, all_vars in op_all_vars.items():
+            if op_key in solved_ops:
+                target_pairs = solved_ops[op_key]
+                # Build success entry for this op (all vars at success values)
+                success_entry = _stub_success_entry(op_key, all_vars)
+                # First N invocations succeed, then target value repeats
+                entries = [success_entry] * 5
+                target_entry = list(target_pairs)
+                entries.extend([target_entry] * 20)
+                stub_outcomes[op_key] = entries
+            else:
+                # Not targeted — fill with success defaults so program
+                # survives to the branch point
+                success_entry = _stub_success_entry(op_key, all_vars)
+                stub_outcomes[op_key] = [success_entry] * 25
 
     return ConcolicSolution(
         branch_id=branch_id,
         assignments=assignments,
         stub_outcomes=stub_outcomes,
     )
+
+
+def _stub_success_entry(op_key: str, var_names: list[str]) -> list[tuple[str, object]]:
+    """Build a success stub outcome entry for an operation."""
+    entry = []
+    for var in var_names:
+        upper = var.upper()
+        if "SQLCODE" in upper or "SQLSTATE" in upper:
+            entry.append((var, 0))
+        elif "EIBRESP" in upper:
+            entry.append((var, 0))
+        elif "STATUS" in upper or upper.startswith("FS-"):
+            entry.append((var, "00"))
+        elif "RETURN-CODE" in upper or upper.endswith("-RC"):
+            entry.append((var, 0))
+        else:
+            entry.append((var, 0))
+    return entry
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +729,7 @@ def solve_for_uncovered_branches(
     max_attempts: int = _CONCOLIC_MAX_BRANCHES,
     timeout_ms: int = _CONCOLIC_TIMEOUT_MS,
     stub_mapping: dict | None = None,
+    corpus_entries: list | None = None,
 ) -> list[ConcolicSolution]:
     """Find input assignments for uncovered branches using Z3.
 
@@ -686,6 +739,11 @@ def solve_for_uncovered_branches(
     When *stub_mapping* is provided, status variables controlled by stubs
     (SQL, CICS, file I/O) are treated as free variables and solved
     assignments are returned as ``stub_outcomes`` on each solution.
+
+    When *corpus_entries* is provided (list of _CorpusEntry with coverage
+    and input_state), the solver picks the observed state from the entry
+    that best reaches each target branch's paragraph, giving internal
+    variables realistic runtime values.
 
     Works with already-generated code that may lack ``_BRANCH_META`` —
     callers should use ``getattr(module, '_BRANCH_META', {})``.
@@ -698,32 +756,67 @@ def solve_for_uncovered_branches(
     except ImportError:
         return []
 
-    # Build variable environment from most recent observed state
-    observed = observed_states[-1] if observed_states else {}
-    var_env = build_var_env(var_report, observed, stub_mapping=stub_mapping)
+    # Index corpus entries by which paragraphs they reach
+    _para_to_states: dict[str, list[dict]] = {}
+    if corpus_entries:
+        for entry in corpus_entries:
+            for para in entry.coverage:
+                _para_to_states.setdefault(para, []).append(entry.input_state)
+        log.info("Concolic: indexed %d corpus entries covering %d paragraphs",
+                 len(corpus_entries), len(_para_to_states))
+
+    # Default observed state for var env
+    default_observed = observed_states[-1] if observed_states else {}
 
     # Find half-covered branches (one direction covered, other not)
     candidates: list[tuple[int, bool]] = []  # (abs_branch_id, negate)
+    n_half = 0
+    n_uncovered = 0
     for abs_id in sorted(branch_meta.keys()):
         pos_covered = abs_id in covered_branches
         neg_covered = -abs_id in covered_branches
 
         if pos_covered and not neg_covered:
-            # Covered the TRUE branch — negate to cover FALSE
             candidates.append((abs_id, True))
+            n_half += 1
         elif neg_covered and not pos_covered:
-            # Covered the FALSE branch — don't negate to cover TRUE
             candidates.append((abs_id, False))
+            n_half += 1
         elif not pos_covered and not neg_covered:
-            # Neither covered — try both directions
             candidates.append((abs_id, False))
             candidates.append((abs_id, True))
+            n_uncovered += 1
+
+    all_branch_ids = set()
+    for bid in branch_meta:
+        all_branch_ids.add(bid)
+        all_branch_ids.add(-bid)
+    total_covered = len(covered_branches & all_branch_ids)
+    log.info("Concolic: %d/%d branch directions covered, "
+             "%d half-covered, %d fully uncovered, %d candidates to solve",
+             total_covered, len(all_branch_ids),
+             n_half, n_uncovered, len(candidates))
 
     solutions: list[ConcolicSolution] = []
+    n_sat = 0
+    n_unsat = 0
     for abs_id, negate in candidates[:max_attempts]:
         target_id = -abs_id if negate else abs_id
         if target_id in covered_branches:
             continue
+
+        # Pick the best observed state for this branch's paragraph
+        target_para = branch_meta.get(abs_id, {}).get("paragraph", "")
+        if target_para and target_para in _para_to_states:
+            # Use state from a run that actually reached this paragraph
+            observed_for_branch = _para_to_states[target_para][-1]
+        else:
+            observed_for_branch = default_observed
+
+        # Build var env with paragraph-specific observed values
+        var_env = build_var_env(
+            var_report, observed_for_branch, stub_mapping=stub_mapping,
+        )
 
         sol = solve_for_branch(
             target_id, branch_meta, var_env,
@@ -731,6 +824,18 @@ def solve_for_uncovered_branches(
             stub_mapping=stub_mapping,
         )
         if sol is not None:
+            n_sat += 1
+            n_stub_keys = len(sol.stub_outcomes)
+            n_input_keys = len(sol.assignments)
+            log.info("Concolic: branch %d solved (%d input vars, %d stub ops) "
+                     "para=%s cond='%s'",
+                     target_id, n_input_keys, n_stub_keys,
+                     target_para or "?",
+                     branch_meta.get(abs_id, {}).get("condition", "?")[:50])
             solutions.append(sol)
+        else:
+            n_unsat += 1
 
+    log.info("Concolic: %d solutions found, %d unsat/timeout",
+             n_sat, n_unsat)
     return solutions

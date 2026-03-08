@@ -7,6 +7,7 @@ execution paths, branch coverage, and external call patterns.
 from __future__ import annotations
 
 import importlib.util
+import logging
 import random
 import sys
 from collections import Counter
@@ -654,6 +655,33 @@ def _generate_all_success_stubs(
             for _ in range(3):
                 outcomes.setdefault(op_key, []).append(list(success_entry))
     return outcomes
+
+
+def _pick_concolic_base(
+    fuzzer: _FuzzerState,
+    target_para: str,
+) -> tuple[dict, dict | None]:
+    """Pick the best corpus entry as base state for a concolic solution.
+
+    Prefers entries whose trace already reaches *target_para* (or a nearby
+    paragraph).  Falls back to the highest-coverage entry.
+
+    Returns (input_state_copy, stub_outcomes_copy_or_None).
+    """
+    if not fuzzer.corpus:
+        return {}, None
+
+    # First: find entries that already reach the target paragraph
+    if target_para:
+        for entry in fuzzer.corpus:
+            if target_para in entry.coverage:
+                stubs = {k: list(v) for k, v in entry.stub_outcomes.items()} if entry.stub_outcomes else None
+                return dict(entry.input_state), stubs
+
+    # Fallback: entry with most coverage
+    best = max(fuzzer.corpus, key=lambda e: len(e.coverage))
+    stubs = {k: list(v) for k, v in best.stub_outcomes.items()} if best.stub_outcomes else None
+    return dict(best.input_state), stubs
 
 
 def _pick_target(
@@ -1573,6 +1601,12 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                 if concolic and var_report is not None:
                     _branch_meta = getattr(module, '_BRANCH_META', {})
                     if _branch_meta:
+                        _clog = logging.getLogger("specter.monte_carlo")
+                        _clog.info("Concolic phase triggered at iteration %d "
+                                   "(stale=%d, branches=%d/%d)",
+                                   i, _STALE_THRESHOLD,
+                                   len(fuzzer.global_branches),
+                                   len(_branch_meta) * 2)
                         try:
                             from .concolic import solve_for_uncovered_branches
                             observed = [e.input_state for e in fuzzer.corpus[-10:]] if fuzzer.corpus else [{}]
@@ -1580,13 +1614,28 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                                 _branch_meta, fuzzer.global_branches,
                                 var_report, observed,
                                 stub_mapping=stub_mapping,
+                                corpus_entries=fuzzer.corpus,
                             )
+                            _concolic_new = 0
                             for sol in solutions:
-                                base = dict(fuzzer.corpus[0].input_state) if fuzzer.corpus else {}
+                                # Pick best base state: prefer a corpus entry
+                                # that already reaches the target paragraph
+                                target_para = _branch_meta.get(
+                                    abs(sol.branch_id), {},
+                                ).get("paragraph", "")
+                                base, base_stubs = _pick_concolic_base(
+                                    fuzzer, target_para,
+                                )
                                 base.update(sol.assignments)
+
+                                # Merge stub outcomes: concolic-solved stubs
+                                # override, others keep base stubs
+                                merged_stubs = dict(base_stubs) if base_stubs else {}
                                 if sol.stub_outcomes:
+                                    merged_stubs.update(sol.stub_outcomes)
+                                if merged_stubs:
                                     base["_stub_outcomes"] = {
-                                        k: list(v) for k, v in sol.stub_outcomes.items()
+                                        k: list(v) for k, v in merged_stubs.items()
                                     }
                                 _inject_defaults(base, search_rng)
                                 try:
@@ -1603,12 +1652,23 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                                     fuzzer.n_successful += 1
                                     c_br = frozenset(cs.get("_branches", set()))
                                     if _should_add_to_corpus(fuzzer, c_cov, c_edges, c_br):
+                                        new_br = c_br - fuzzer.global_branches
+                                        new_para = c_cov - fuzzer.global_coverage
+                                        _clog.info(
+                                            "Concolic: branch %d -> NEW coverage "
+                                            "(+%d branches, +%d paras, "
+                                            "trace=%d paras)",
+                                            sol.branch_id,
+                                            len(new_br), len(new_para),
+                                            len(c_trace))
+                                        _concolic_new += 1
                                         c_entry = _CorpusEntry(
                                             input_state={k: v for k, v in base.items()
                                                          if not k.startswith("_stub")},
                                             coverage=c_cov,
                                             edges=c_edges,
                                             added_at=i,
+                                            stub_outcomes=merged_stubs if merged_stubs else None,
                                         )
                                         _add_to_corpus(fuzzer, c_entry, c_br)
                                         if var_report is not None and llm_walk_rounds > 0:
@@ -1621,6 +1681,9 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                                             )
                                 except (RecursionError, Exception):
                                     pass
+                            _clog.info("Concolic phase done: %d/%d solutions "
+                                       "produced new coverage",
+                                       _concolic_new, len(solutions))
                         except ImportError:
                             pass  # z3 not installed — skip concolic
 
@@ -1633,6 +1696,85 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
         if (i > 0 and i % _ENERGY_UPDATE_INTERVAL == 0
                 and fuzzer.corpus and all_paragraphs):
             _update_energy(fuzzer, all_paragraphs)
+
+        # Periodic concolic phase — runs every 1000 iterations
+        # independent of stale counter, to continuously target
+        # uncovered branches
+        _CONCOLIC_INTERVAL = 1000
+        if (concolic and var_report is not None
+                and i > 0 and i % _CONCOLIC_INTERVAL == 0):
+            _branch_meta = getattr(module, '_BRANCH_META', {})
+            if _branch_meta:
+                _clog = logging.getLogger("specter.monte_carlo")
+                _clog.info("Concolic periodic phase at iter %d "
+                           "(branches=%d/%d, paras=%d)",
+                           i, len(fuzzer.global_branches),
+                           len(_branch_meta) * 2,
+                           len(fuzzer.global_coverage))
+                try:
+                    from .concolic import solve_for_uncovered_branches
+                    observed = [e.input_state for e in fuzzer.corpus[-10:]] if fuzzer.corpus else [{}]
+                    solutions = solve_for_uncovered_branches(
+                        _branch_meta, fuzzer.global_branches,
+                        var_report, observed,
+                        stub_mapping=stub_mapping,
+                        corpus_entries=fuzzer.corpus,
+                    )
+                    _concolic_hits = 0
+                    for sol in solutions:
+                        target_para = _branch_meta.get(
+                            abs(sol.branch_id), {},
+                        ).get("paragraph", "")
+                        base, base_stubs = _pick_concolic_base(
+                            fuzzer, target_para,
+                        )
+                        base.update(sol.assignments)
+                        merged_stubs = dict(base_stubs) if base_stubs else {}
+                        if sol.stub_outcomes:
+                            merged_stubs.update(sol.stub_outcomes)
+                        if merged_stubs:
+                            base["_stub_outcomes"] = {
+                                k: list(v) for k, v in merged_stubs.items()
+                            }
+                        _inject_defaults(base, search_rng)
+                        try:
+                            cs = module.run(base)
+                            c_trace = cs.get("_trace", [])
+                            c_cov = frozenset(c_trace)
+                            c_edges = frozenset(
+                                (c_trace[j], c_trace[j + 1])
+                                for j in range(len(c_trace) - 1)
+                                if c_trace[j] != c_trace[j + 1]
+                            )
+                            for p in c_trace:
+                                fuzzer.para_hits[p] += 1
+                            fuzzer.n_successful += 1
+                            c_br = frozenset(cs.get("_branches", set()))
+                            if _should_add_to_corpus(fuzzer, c_cov, c_edges, c_br):
+                                _concolic_hits += 1
+                                c_entry = _CorpusEntry(
+                                    input_state={k: v for k, v in base.items()
+                                                 if not k.startswith("_stub")},
+                                    coverage=c_cov,
+                                    edges=c_edges,
+                                    added_at=i,
+                                    stub_outcomes=merged_stubs if merged_stubs else None,
+                                )
+                                _add_to_corpus(fuzzer, c_entry, c_br)
+                                if var_report is not None and llm_walk_rounds > 0:
+                                    _random_walk_suggestion(
+                                        module, base, var_report,
+                                        rng, fuzzer, stub_mapping,
+                                        search_rng, _inject_defaults,
+                                        max_rounds=llm_walk_rounds,
+                                        call_graph=call_graph,
+                                    )
+                        except (RecursionError, Exception):
+                            pass
+                    _clog.info("Concolic periodic: %d/%d solutions -> new coverage",
+                               _concolic_hits, len(solutions))
+                except ImportError:
+                    pass
 
     # Count total branch points from the generated module source
     total_branches = 0

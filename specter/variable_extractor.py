@@ -487,6 +487,11 @@ def extract_stub_status_mapping(
                         # (e.g. RETURN-CODE, PL10-O-RETURN-CODE)
                         if not found and is_call:
                             found = _find_return_vars_in_condition(cond)
+                        # Structural fallback: if no status/return var found
+                        # by name, the first non-keyword variable in the IF
+                        # condition after an external op IS the status var
+                        if not found:
+                            found = _find_first_var_in_condition(cond)
                         if found:
                             mapping.setdefault(op_key, []).extend(
                                 v for v in found if v not in mapping.get(op_key, [])
@@ -549,6 +554,32 @@ def extract_stub_status_mapping(
                             mapping[key] = [candidate]
 
     return mapping
+
+
+def _find_first_var_in_condition(condition: str) -> list[str]:
+    """Structural fallback: extract the first non-keyword variable in a condition.
+
+    Used when name-based status detection fails (e.g. obfuscated programs).
+    The first variable in an IF after EXEC_SQL/CALL is almost always the
+    status variable being checked.
+    """
+    tokens = re.findall(r"[A-Z][A-Z0-9-]*", condition, re.IGNORECASE)
+    for tok in tokens:
+        upper = tok.upper()
+        if upper in _KEYWORDS or upper in ("AND", "OR", "NOT", "IS"):
+            continue
+        if len(upper) < 2:
+            continue
+        # Skip comparison keywords and figurative constants
+        if upper in ("EQUAL", "GREATER", "LESS", "THAN", "NUMERIC",
+                     "SPACES", "SPACE", "ZEROS", "ZERO", "ZEROES",
+                     "LOW-VALUES", "HIGH-VALUES", "TRUE", "FALSE"):
+            continue
+        # Skip DFHRESP tokens
+        if upper.startswith("DFHRESP"):
+            continue
+        return [upper]
+    return []
 
 
 def _find_return_vars_in_condition(condition: str) -> list[str]:

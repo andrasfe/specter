@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -109,6 +110,13 @@ def main(argv: list[str] | None = None) -> int:
     # --concolic implies --guided
     if args.concolic:
         args.guided = True
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)-7s %(message)s",
+            datefmt="%H:%M:%S",
+            stream=sys.stderr,
+            force=True,
+        )
         try:
             import z3  # noqa: F401
         except ImportError:
