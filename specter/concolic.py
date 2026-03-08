@@ -575,6 +575,7 @@ def solve_for_branch(
     negate: bool = True,
     timeout_ms: int = _CONCOLIC_TIMEOUT_MS,
     stub_mapping: dict | None = None,
+    var_report=None,
 ) -> ConcolicSolution | None:
     """Attempt to find inputs that cover *branch_id*.
 
@@ -649,10 +650,8 @@ def solve_for_branch(
             except (AttributeError, Exception):
                 pass
 
-    if not assignments:
-        return None
-
     # Split assignments into regular inputs vs stub-controlled variables
+    # (do this before the empty check — stub-only solutions are valid)
     stub_outcomes: dict[str, list] = {}
     if stub_mapping:
         # Build reverse map: var_name -> [op_keys]
@@ -680,7 +679,7 @@ def solve_for_branch(
             if op_key in solved_ops:
                 target_pairs = solved_ops[op_key]
                 # Build success entry for this op (all vars at success values)
-                success_entry = _stub_success_entry(op_key, all_vars)
+                success_entry = _stub_success_entry(op_key, all_vars, var_report=var_report)
                 # First N invocations succeed, then target value repeats
                 entries = [success_entry] * 5
                 target_entry = list(target_pairs)
@@ -689,8 +688,11 @@ def solve_for_branch(
             else:
                 # Not targeted — fill with success defaults so program
                 # survives to the branch point
-                success_entry = _stub_success_entry(op_key, all_vars)
+                success_entry = _stub_success_entry(op_key, all_vars, var_report=var_report)
                 stub_outcomes[op_key] = [success_entry] * 25
+
+    if not assignments and not stub_outcomes:
+        return None
 
     return ConcolicSolution(
         branch_id=branch_id,
@@ -699,11 +701,29 @@ def solve_for_branch(
     )
 
 
-def _stub_success_entry(op_key: str, var_names: list[str]) -> list[tuple[str, object]]:
-    """Build a success stub outcome entry for an operation."""
+def _stub_success_entry(
+    op_key: str, var_names: list[str], var_report=None,
+) -> list[tuple[str, object]]:
+    """Build a success stub outcome entry for an operation.
+
+    Uses condition_literals from the variable report when available
+    (first literal is typically the success value), falling back to
+    naming conventions.
+    """
     entry = []
     for var in var_names:
         upper = var.upper()
+
+        # Try condition_literals first — first literal is usually success
+        if var_report:
+            info = None
+            if hasattr(var_report, 'variables'):
+                info = var_report.variables.get(var) or var_report.variables.get(upper)
+            if info and hasattr(info, 'condition_literals') and info.condition_literals:
+                entry.append((var, info.condition_literals[0]))
+                continue
+
+        # Name-based fallback
         if "SQLCODE" in upper or "SQLSTATE" in upper:
             entry.append((var, 0))
         elif "EIBRESP" in upper:
@@ -821,6 +841,7 @@ def solve_for_uncovered_branches(
             target_id, branch_meta, var_env,
             negate=negate, timeout_ms=timeout_ms,
             stub_mapping=stub_mapping,
+            var_report=var_report,
         )
         if sol is not None:
             n_sat += 1
