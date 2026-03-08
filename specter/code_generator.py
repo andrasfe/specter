@@ -135,7 +135,9 @@ def _var_name(token: str) -> str:
 
 def _sanitize_name(name: str) -> str:
     """Convert a COBOL paragraph name to a valid Python function name."""
-    return "para_" + name.upper().replace("-", "_").replace(".", "_")
+    cleaned = re.sub(r"[^A-Z0-9_]", "_", name.upper().replace("-", "_").replace(".", "_"))
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return "para_" + cleaned
 
 
 def _sq(name: str) -> str:

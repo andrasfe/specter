@@ -1579,10 +1579,15 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                             solutions = solve_for_uncovered_branches(
                                 _branch_meta, fuzzer.global_branches,
                                 var_report, observed,
+                                stub_mapping=stub_mapping,
                             )
                             for sol in solutions:
                                 base = dict(fuzzer.corpus[0].input_state) if fuzzer.corpus else {}
                                 base.update(sol.assignments)
+                                if sol.stub_outcomes:
+                                    base["_stub_outcomes"] = {
+                                        k: list(v) for k, v in sol.stub_outcomes.items()
+                                    }
                                 _inject_defaults(base, search_rng)
                                 try:
                                     cs = module.run(base)

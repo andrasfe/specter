@@ -94,6 +94,7 @@ class ConcolicSolution:
     """A Z3-derived input assignment that should flip a particular branch."""
     branch_id: int
     assignments: dict[str, object] = field(default_factory=dict)
+    stub_outcomes: dict[str, list] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -470,11 +471,14 @@ def cobol_condition_to_z3(condition_text: str, var_env: dict):
 # Variable environment builder
 # ---------------------------------------------------------------------------
 
-def build_var_env(var_report, observed_state: dict | None = None):
+def build_var_env(var_report, observed_state: dict | None = None,
+                  stub_mapping: dict | None = None):
     """Create Z3 variables for each known COBOL variable.
 
     - ``input``/``status``/``flag`` → free Z3 variable (solvable)
     - ``internal`` → Z3 constant from *observed_state* (fixed)
+    - Variables that appear in *stub_mapping* values are always free
+      (they are set by stub outcomes and thus controllable)
 
     Type inference:
     - If all condition_literals are numeric → ``z3.Int``
@@ -486,11 +490,28 @@ def build_var_env(var_report, observed_state: dict | None = None):
     env: dict[str, object] = {}
     observed = observed_state or {}
 
+    # Collect all variables controlled by stubs — these are always solvable
+    stub_controlled: set[str] = set()
+    if stub_mapping:
+        for status_vars in stub_mapping.values():
+            for sv in status_vars:
+                stub_controlled.add(sv.upper())
+
     for name, info in var_report.variables.items():
         upper = name.upper()
         is_numeric = _infer_numeric(upper, info)
 
-        if info.classification == "internal":
+        # Stub-controlled vars are free even if classified as internal
+        is_free = (info.classification != "internal"
+                   or upper in stub_controlled)
+
+        if is_free:
+            # Free variable — solver can assign
+            if is_numeric:
+                env[upper] = z3.Int(upper)
+            else:
+                env[upper] = z3.String(upper)
+        else:
             # Fixed to observed value
             val = observed.get(name, observed.get(upper, ""))
             if is_numeric:
@@ -500,12 +521,6 @@ def build_var_env(var_report, observed_state: dict | None = None):
                     env[upper] = z3.IntVal(0)
             else:
                 env[upper] = z3.StringVal(str(val))
-        else:
-            # Free variable — solver can assign
-            if is_numeric:
-                env[upper] = z3.Int(upper)
-            else:
-                env[upper] = z3.String(upper)
 
     return env
 
@@ -548,10 +563,13 @@ def solve_for_branch(
     var_env: dict,
     negate: bool = True,
     timeout_ms: int = _CONCOLIC_TIMEOUT_MS,
+    stub_mapping: dict | None = None,
 ) -> ConcolicSolution | None:
     """Attempt to find inputs that cover *branch_id*.
 
     If *negate* is True, the condition is negated (to cover the else-branch).
+    When *stub_mapping* is provided, solved status variables are also
+    returned as ``stub_outcomes`` on the solution.
     Returns a :class:`ConcolicSolution` or ``None`` on unsat/timeout.
     """
     z3 = _import_z3()
@@ -619,7 +637,32 @@ def solve_for_branch(
     if not assignments:
         return None
 
-    return ConcolicSolution(branch_id=branch_id, assignments=assignments)
+    # Split assignments into regular inputs vs stub-controlled variables
+    stub_outcomes: dict[str, list] = {}
+    if stub_mapping:
+        # Build reverse map: var_name -> [op_keys]
+        var_to_ops: dict[str, list[str]] = {}
+        for op_key, status_vars in stub_mapping.items():
+            for sv in status_vars:
+                var_to_ops.setdefault(sv.upper(), []).append(op_key)
+
+        for var_name in list(assignments):
+            if var_name in var_to_ops:
+                val = assignments.pop(var_name)
+                for op_key in var_to_ops[var_name]:
+                    # Build a stub outcome entry: list of (var, val) pairs
+                    # Repeat the outcome multiple times so it persists across
+                    # multiple invocations of the same stub in the program
+                    entry = [(var_name, val)]
+                    stub_outcomes.setdefault(op_key, []).extend(
+                        [entry] * 20  # enough for most loop iterations
+                    )
+
+    return ConcolicSolution(
+        branch_id=branch_id,
+        assignments=assignments,
+        stub_outcomes=stub_outcomes,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -633,11 +676,16 @@ def solve_for_uncovered_branches(
     observed_states: list[dict],
     max_attempts: int = _CONCOLIC_MAX_BRANCHES,
     timeout_ms: int = _CONCOLIC_TIMEOUT_MS,
+    stub_mapping: dict | None = None,
 ) -> list[ConcolicSolution]:
     """Find input assignments for uncovered branches using Z3.
 
     Prioritizes branches where only one direction is covered (the other
     direction is solvable by negation).
+
+    When *stub_mapping* is provided, status variables controlled by stubs
+    (SQL, CICS, file I/O) are treated as free variables and solved
+    assignments are returned as ``stub_outcomes`` on each solution.
 
     Works with already-generated code that may lack ``_BRANCH_META`` —
     callers should use ``getattr(module, '_BRANCH_META', {})``.
@@ -652,7 +700,7 @@ def solve_for_uncovered_branches(
 
     # Build variable environment from most recent observed state
     observed = observed_states[-1] if observed_states else {}
-    var_env = build_var_env(var_report, observed)
+    var_env = build_var_env(var_report, observed, stub_mapping=stub_mapping)
 
     # Find half-covered branches (one direction covered, other not)
     candidates: list[tuple[int, bool]] = []  # (abs_branch_id, negate)
@@ -680,6 +728,7 @@ def solve_for_uncovered_branches(
         sol = solve_for_branch(
             target_id, branch_meta, var_env,
             negate=negate, timeout_ms=timeout_ms,
+            stub_mapping=stub_mapping,
         )
         if sol is not None:
             solutions.append(sol)

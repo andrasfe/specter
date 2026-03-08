@@ -124,6 +124,16 @@ class TestCodeGenerator(unittest.TestCase):
         result = ns["run"]()
         self.assertEqual(result["STATUS"], "DONE")
 
+    def test_missing_perform_target_with_parentheses_generates_valid_stub(self):
+        program = self._make_program([
+            {"type": "PERFORM", "text": "PERFORM BUCKET-AGED-DEROGATORY(1",
+             "line_start": 1, "line_end": 1,
+             "attributes": {"target": "BUCKET-AGED-DEROGATORY(1"},
+             "children": []},
+        ])
+        code = generate_code(program)
+        compile(code, "<test>", "exec")
+
     def test_goback_stops_execution(self):
         data = {
             "program_id": "TEST",
