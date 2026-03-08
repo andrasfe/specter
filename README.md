@@ -105,6 +105,8 @@ specter program.ast --diagram                # generate execution diagrams (impl
 specter program.ast --guided --diagram       # guided fuzzing + diagrams
 specter program.ast --llm-guided             # LLM-guided adaptive fuzzing
 specter program.ast --llm-guided -m 20000 --llm-interval 300  # custom LLM settings
+specter program.ast --concolic -m 10000      # Z3 concolic engine for precise branch solving
+specter program.ast --concolic --llm-guided  # combine concolic + LLM-guided
 specter program.ast --analyze --analysis-output ./reports  # write output to custom dir
 ```
 
@@ -168,6 +170,44 @@ specter program.ast --llm-guided --analysis-output ./reports
 
 See [LLM_GUIDED_FUZZER.md](LLM_GUIDED_FUZZER.md) for the full design document.
 
+## Concolic Branch Solving
+
+The `--concolic` flag enables a Z3-based constraint solver that targets branches random fuzzing can't reach. When a branch is gated by a precise condition (e.g., `IF SQLCODE = 100` or `IF WS-MAGIC = 12345678`), the concolic engine translates the COBOL condition into a Z3 formula and solves for the exact input values needed to flip it.
+
+### How it works
+
+1. **Branch metadata** — during code generation, Specter emits a `_BRANCH_META` dict mapping each branch ID to its COBOL condition text and containing paragraph. This has zero runtime overhead.
+
+2. **Structural stub detection** — Specter identifies which variables are set by external operations (SQL, CICS, file I/O) by analyzing the AST structure: any variable checked in an IF immediately after an EXEC_SQL or CALL is treated as a stub-controlled status variable, regardless of whether its name follows conventions.
+
+3. **Z3 constraint solving** — every 1000 iterations, the engine scans for uncovered branches, translates their conditions into Z3 formulas, and solves. Stub-controlled variables (like SQLCODE) are treated as free variables the solver can assign, producing both input values and stub outcome sequences.
+
+4. **Corpus-aware execution** — solutions are merged with the best existing corpus entry that already reaches the target branch's paragraph, preserving realistic variable values for internal state. New coverage is random-walked to maximize further exploration.
+
+### Requirements
+
+```bash
+pip install z3-solver   # or: pip install specter[concolic]
+```
+
+### Running
+
+```bash
+# Basic concolic run (implies --guided)
+specter program.ast --concolic -m 10000
+
+# Combine with LLM-guided for maximum coverage
+specter program.ast --concolic --llm-guided -m 20000
+```
+
+The concolic engine supplements — not replaces — the existing mutation strategies. It fires periodically alongside directed fuzzing and LLM-guided strategies. Programs without Z3 installed are unaffected; the flag simply errors with an install hint.
+
+### CLI options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--concolic` | off | Enable Z3 concolic engine (implies `--guided`, requires `z3-solver`) |
+
 ## GnuCOBOL Validation
 
 The `tests/cobol_validation/` directory contains 58 COBOL test programs that validate Specter's code generation against GnuCOBOL. Each test compiles and runs with GnuCOBOL, then parses the same source through ProLeap and Specter, comparing DISPLAY output. Run with:
@@ -180,4 +220,6 @@ Requires GnuCOBOL (`cobc`) and the ProLeap wrapper JAR.
 
 ## Requirements
 
-Python 3.10+. No external dependencies.
+Python 3.10+. No external dependencies for core functionality.
+
+Optional: `z3-solver` for `--concolic` mode (`pip install z3-solver`).
