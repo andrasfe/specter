@@ -2053,6 +2053,7 @@ def run_monte_carlo(
 
     rng = random.Random(seed)
     report = MonteCarloReport(n_iterations=n_iterations)
+    _all_branches: set[int] = set()
 
     for i in range(n_iterations):
         if var_report is not None:
@@ -2089,6 +2090,7 @@ def run_monte_carlo(
                 iteration.var_reads = result_state.get("_var_reads", [])
                 iteration.state_diffs = result_state.get("_state_diffs", {})
                 iteration.call_events = result_state.get("_call_events", [])
+                _all_branches.update(result_state.get("_branches", set()))
 
             report.iterations.append(iteration)
             report.n_successful += 1
@@ -2138,8 +2140,24 @@ def run_monte_carlo(
                     "var_reads": it.var_reads or [],
                     "state_diffs": it.state_diffs or {},
                 })
-        report.analysis_report = build_analysis_report(
+
+        analysis = build_analysis_report(
             inst_data, all_paragraphs or [],
         )
+
+        # Compute branch coverage from collected branches
+        try:
+            import re as _re2
+            import inspect as _inspect
+            src = _inspect.getsource(module)
+            total_branches = len(set(
+                int(m) for m in _re2.findall(r"_branches.*?\.add\((-?\d+)\)", src)
+            ))
+            analysis.total_branches = total_branches
+            analysis.branch_hits = len(_all_branches)
+        except Exception:
+            pass
+
+        report.analysis_report = analysis
 
     return report
