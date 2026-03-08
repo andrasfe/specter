@@ -100,8 +100,39 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Use Z3 concolic engine to solve for uncovered branches (requires z3-solver, implies --guided)",
     )
+    parser.add_argument(
+        "--synthesize",
+        action="store_true",
+        help="Synthesize a minimal test set for maximum coverage",
+    )
+    parser.add_argument(
+        "--test-store",
+        metavar="PATH",
+        help="Path to test store JSONL file (default: <analysis-output>/<program>_testset.jsonl)",
+    )
+    parser.add_argument(
+        "--synthesis-layers",
+        type=int, default=5, metavar="N",
+        help="Run only first N synthesis layers (default: 5)",
+    )
+    parser.add_argument(
+        "--synthesis-timeout",
+        type=int, default=None, metavar="N",
+        help="Max seconds for synthesis (default: unlimited)",
+    )
 
     args = parser.parse_args(argv)
+
+    # --synthesize implies --analyze
+    if args.synthesize:
+        args.analyze = True
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)-7s %(message)s",
+            datefmt="%H:%M:%S",
+            stream=sys.stderr,
+            force=True,
+        )
 
     # --diagram implies --analyze
     if args.diagram:
@@ -205,6 +236,39 @@ def main(argv: list[str] | None = None) -> int:
         eq_constraints = extract_equality_constraints(program)
         if eq_constraints:
             print(f"  Equality constraints: {len(eq_constraints)}")
+
+    # Synthesis mode
+    if args.synthesize:
+        from .monte_carlo import _load_module
+        from .test_synthesis import synthesize_test_set
+
+        module = _load_module(output_path)
+
+        analysis_dir = Path(args.analysis_output) if args.analysis_output else Path("/tmp")
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+
+        if args.test_store:
+            test_store_path = Path(args.test_store)
+        else:
+            test_store_path = analysis_dir / f"{ast_path.stem}_testset.jsonl"
+
+        print(f"Synthesizing test set → {test_store_path} ...")
+        synth_report = synthesize_test_set(
+            module=module,
+            program=program,
+            var_report=var_report,
+            call_graph=call_graph,
+            gating_conditions=gating_conds,
+            stub_mapping=stub_mapping,
+            equality_constraints=eq_constraints,
+            store_path=test_store_path,
+            max_time_seconds=args.synthesis_timeout,
+            max_layers=args.synthesis_layers,
+        )
+        print()
+        print(synth_report.summary())
+        print(f"\nTest store: {test_store_path}")
+        return 0
 
     # Monte Carlo
     llm_provider_instance = None

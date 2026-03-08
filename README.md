@@ -108,6 +108,10 @@ specter program.ast --llm-guided -m 20000 --llm-interval 300  # custom LLM setti
 specter program.ast --concolic -m 10000      # Z3 concolic engine for precise branch solving
 specter program.ast --concolic --llm-guided  # combine concolic + LLM-guided
 specter program.ast --analyze --analysis-output ./reports  # write output to custom dir
+specter program.ast --synthesize             # deterministic test set synthesis
+specter program.ast --synthesize --test-store ./tests.jsonl  # custom store path
+specter program.ast --synthesize --synthesis-layers 2        # run only layers 1-2
+specter program.ast --synthesize --synthesis-timeout 300     # 5-minute time limit
 ```
 
 ## LLM-Guided Fuzzing
@@ -207,6 +211,73 @@ The concolic engine supplements — not replaces — the existing mutation strat
 | Flag | Default | Description |
 |---|---|---|
 | `--concolic` | off | Enable Z3 concolic engine (implies `--guided`, requires `z3-solver`) |
+
+## Test Set Synthesis
+
+The `--synthesize` flag runs a deterministic, layered engine that builds a minimal set of test cases for maximum coverage. Unlike the stochastic fuzzer (`--guided`), synthesis systematically solves for the exact inputs needed to reach each paragraph and branch. Results are saved to a JSONL file so progress is never lost — re-running picks up where the last run left off.
+
+Each test case is a complete execution spec: program input variables plus full mock orchestration for all external interactions (SQL query results, CICS EIBRESP codes, file status codes, CALL return codes), all delivered through the `_stub_outcomes` mechanism.
+
+### How it works
+
+The engine runs five layers in sequence, each targeting a different coverage dimension:
+
+1. **All-success baseline** — generates a deterministic state where all status variables are set to success values, ensuring passage through initialization gauntlets. Produces a few variants by cycling through `condition_literals`.
+
+2. **Path-constraint satisfaction** — for each uncovered paragraph, computes the shortest path from program entry via the static call graph, then applies gating conditions deterministically to build an input that should reach it. Unreachable paragraphs are exercised via direct paragraph invocation.
+
+3. **Branch-level solving** — for each uncovered branch in reached paragraphs, uses Z3 (if installed) to solve the condition, or falls back to a heuristic that sets variables from `condition_literals`. Works without Z3, just less precise.
+
+4. **Stub outcome combinatorics** — for remaining uncovered branches, enumerates interesting combinations of SQL/CICS/file/CALL return values near the branch point. Caps at 100 combinations per target.
+
+5. **Targeted refinement walks** — seeded mutation walks from existing test cases, keeping only mutations that discover new coverage. This is the only layer with controlled randomness (seeded from the test case ID for determinism).
+
+### Running
+
+```bash
+# Basic synthesis (implies --analyze for instrumentation)
+specter program.ast --synthesize
+
+# Custom test store path (default: <analysis-output>/<program>_testset.jsonl)
+specter program.ast --synthesize --test-store ./my_tests.jsonl
+
+# Run only first 2 layers (fast, covers paragraph-level)
+specter program.ast --synthesize --synthesis-layers 2
+
+# Time-limited run (seconds)
+specter program.ast --synthesize --synthesis-timeout 300
+
+# Second run — loads existing store, skips solved targets, works on gaps
+specter program.ast --synthesize
+```
+
+### CLI options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--synthesize` | off | Enable test set synthesis (implies `--analyze`) |
+| `--test-store PATH` | `<analysis-output>/<program>_testset.jsonl` | Path to JSONL test store file |
+| `--synthesis-layers N` | 5 | Run only first N layers |
+| `--synthesis-timeout N` | unlimited | Max seconds for synthesis |
+
+### Test store format
+
+The store is a JSONL file (one JSON object per line, append-only). Each line contains:
+
+```json
+{
+  "id": "a1b2c3d4e5f6g7h8",
+  "input_state": {"WS-STATUS": "00", "WS-AMT": 100},
+  "stub_outcomes": {"SQL": [[["SQLCODE", 0]], [["SQLCODE", 100]]]},
+  "stub_defaults": {"SQL": [["SQLCODE", 100]]},
+  "paragraphs_covered": ["MAIN", "INIT", "PROCESS"],
+  "branches_covered": [1, -2, 3],
+  "layer": 2,
+  "target": "PROCESS"
+}
+```
+
+Interrupting a synthesis run loses at most the in-progress test case. On re-run, all previously saved cases are replayed to establish baseline coverage before continuing.
 
 ## GnuCOBOL Validation
 
