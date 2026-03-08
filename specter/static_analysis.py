@@ -195,7 +195,13 @@ def _parse_condition_variables(condition: str) -> list[tuple[str, list, bool]]:
         if not var_name or len(var_name) < 2:
             continue
 
-        # Extract literals from RHS
+        # Extract literals from RHS (including COBOL figurative constants)
+        _FIGURATIVE = {
+            "ZEROES": 0, "ZEROS": 0, "ZERO": 0,
+            "SPACES": " ", "SPACE": " ",
+            "LOW-VALUES": "", "LOW-VALUE": "",
+            "HIGH-VALUES": "\xff", "HIGH-VALUE": "\xff",
+        }
         rhs_tokens = re.findall(
             r"'[^']*'|-?\d+\.?\d*|[A-Z][A-Z0-9-]*(?:\([^)]*\))?",
             rhs_raw, re.IGNORECASE,
@@ -211,6 +217,8 @@ def _parse_condition_variables(condition: str) -> list[tuple[str, list, bool]]:
                 literals.append(int(tok))
             elif re.match(r"^-?\d+\.\d+$", tok):
                 literals.append(float(tok))
+            elif tok_upper in _FIGURATIVE:
+                literals.append(_FIGURATIVE[tok_upper])
 
         if literals:
             results.append((var_name, literals, negated))

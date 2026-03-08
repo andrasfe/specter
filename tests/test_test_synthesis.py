@@ -223,7 +223,7 @@ class TestLayer1(unittest.TestCase):
 
         synth = SynthesisState()
         new = _run_layer_1(
-            module, var_report, None, None,
+            module, prog, var_report, None, None,
             synth, store_path,
             start_time=0, max_time=None,
         )
@@ -312,7 +312,7 @@ class TestLayer2(unittest.TestCase):
         synth = SynthesisState()
 
         # Layer 1 first
-        _run_layer_1(module, var_report, None, None, synth, store_path, 0, None)
+        _run_layer_1(module, prog, var_report, None, None, synth, store_path, 0, None)
 
         # Layer 2
         import time
@@ -383,7 +383,7 @@ class TestLayer3(unittest.TestCase):
         synth = SynthesisState()
 
         # Layer 1 first (covers one branch direction)
-        _run_layer_1(module, var_report, None, None, synth, store_path, 0, None)
+        _run_layer_1(module, prog, var_report, None, None, synth, store_path, 0, None)
 
         # Layer 3 should solve for the other branch direction
         import time

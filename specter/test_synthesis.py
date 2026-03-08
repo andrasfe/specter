@@ -41,6 +41,160 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# PERFORM UNTIL analysis
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _LoopGate:
+    """A PERFORM UNTIL condition that gates entry to loop-body paragraphs."""
+    condition_text: str       # raw COBOL condition
+    target_paras: list[str]   # paragraphs inside the loop body
+    containing_para: str      # paragraph containing the PERFORM UNTIL
+    variables: list[tuple[str, list, bool]]  # parsed (var, vals, negated)
+
+
+def _extract_loop_gates(program, module=None) -> list[_LoopGate]:
+    """Find all PERFORM UNTIL conditions from AST and generated code.
+
+    These generate ``while not (cond):`` loops in the generated code.
+    To enter the loop body, the condition must be FALSE at the start.
+    """
+    import inspect
+    import re
+    gates: list[_LoopGate] = []
+
+    # 1. From AST: PERFORM/PERFORM_THRU with UNTIL conditions
+    for para in program.paragraphs:
+        for stmt in para.statements:
+            _find_loop_gates_in(stmt, para.name, gates)
+
+    # 2. From generated code: scan for 'while not (state[...]):' patterns
+    #    to catch loops the AST analysis misses (e.g., top-level PROCEDURE loops)
+    if module is not None:
+        try:
+            source = inspect.getsource(module)
+        except (TypeError, OSError):
+            source = ""
+
+        # Pattern: while not (state['VAR']):  followed by para_XXX(state) calls
+        _while_re = re.compile(
+            r"while not \(state\['([A-Z][A-Z0-9_-]+)'\]\):\s*\n"
+            r"((?:\s+para_([A-Z][A-Z0-9_]+)\(state\)\s*\n)+)",
+        )
+        # Also pattern for function context
+        _func_re = re.compile(r"def (para_[A-Z][A-Z0-9_]+|run)\(")
+
+        for m in _while_re.finditer(source):
+            var_name = m.group(1)
+            body = m.group(2)
+            # Extract paragraph names from para_XXX(state) calls
+            call_paras = re.findall(r"para_([A-Z][A-Z0-9_]+)\(state\)", body)
+            # Convert from Python name back to paragraph name (_ -> -)
+            target_paras = [p.replace("_", "-") for p in call_paras]
+
+            # Find containing function
+            containing = "run"
+            for fm in _func_re.finditer(source[:m.start()]):
+                containing = fm.group(1)
+            if containing.startswith("para_"):
+                containing = containing[5:].replace("_", "-")
+
+            # The while not (var) loop means: UNTIL var is TRUE
+            # To enter: var must be falsy
+            gates.append(_LoopGate(
+                condition_text=var_name,
+                target_paras=target_paras,
+                containing_para=containing,
+                variables=[(var_name, [True], False)],
+            ))
+
+    return gates
+
+
+def _find_loop_gates_in(stmt, para_name: str, gates: list[_LoopGate]):
+    """Recursively search statements for PERFORM UNTIL patterns."""
+    import re
+
+    if stmt.type in ("PERFORM_THRU", "PERFORM", "PERFORM_INLINE"):
+        condition = stmt.attributes.get("condition", "")
+        if condition:
+            target = stmt.attributes.get("target", "")
+            thru = stmt.attributes.get("thru", "")
+
+            # From text: THRU parsing
+            if stmt.text:
+                m_thru = re.search(
+                    r"THRU\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE,
+                )
+                if m_thru:
+                    thru = m_thru.group(1).upper()
+
+            target_paras = []
+            if target:
+                target_paras.append(target)
+                # If thru, there are intermediate paragraphs too
+                # (we don't enumerate them here; the target is enough)
+                if thru and thru != target:
+                    target_paras.append(thru)
+
+            parsed = _parse_condition_variables(condition)
+            if target_paras or parsed:
+                gates.append(_LoopGate(
+                    condition_text=condition,
+                    target_paras=target_paras,
+                    containing_para=para_name,
+                    variables=parsed,
+                ))
+
+    for child in stmt.children:
+        _find_loop_gates_in(child, para_name, gates)
+
+
+def _apply_loop_gates(
+    state: dict,
+    loop_gates: list[_LoopGate],
+    target_paras: set[str],
+    var_report,
+) -> dict:
+    """Modify state so that PERFORM UNTIL conditions are FALSE at entry.
+
+    For ``PERFORM X UNTIL cond``, the generated code is ``while not (cond):``.
+    To enter the loop, ``cond`` must be false.  For each variable in
+    the condition, set it to a value that makes the overall condition false.
+    """
+    state = dict(state)
+    for lg in loop_gates:
+        # Check if any of the loop's target paragraphs are what we want
+        if not (set(lg.target_paras) & target_paras):
+            continue
+
+        for var, vals, neg in lg.variables:
+            # The UNTIL condition must be FALSE to enter the loop.
+            # So if the condition is "var = val" (neg=False), we need var != val.
+            # If the condition is "NOT var = val" (neg=True), we need var = val.
+            if not neg and vals:
+                # Condition is "var = val"; need var != val to enter loop
+                info = var_report.variables.get(var)
+                literals = (info.condition_literals
+                           if info and hasattr(info, "condition_literals") else [])
+                candidates = [lit for lit in literals if lit not in vals]
+                if candidates:
+                    state[var] = candidates[0]
+                elif vals == [True]:
+                    state[var] = False
+                elif isinstance(vals[0], (int, float)):
+                    state[var] = 0 if vals[0] != 0 else 1
+                elif isinstance(vals[0], str):
+                    state[var] = "" if vals[0] != "" else "X"
+                else:
+                    state[var] = False
+            elif neg and vals:
+                # Condition is "NOT var = val"; need var = val to enter loop
+                state[var] = vals[0]
+    return state
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
@@ -121,6 +275,40 @@ def _execute_and_collect(
         if trace[j] != trace[j + 1]:
             edges.append((trace[j], trace[j + 1]))
     return list(dict.fromkeys(trace)), branches, edges
+
+
+def _execute_and_collect_full(
+    module, input_state: dict, stub_outcomes: dict, stub_defaults: dict,
+) -> tuple[list[str], list[int], list[tuple], dict]:
+    """Like _execute_and_collect but also returns the full final state.
+
+    The returned state can be inspected to understand what values variables
+    had at the point execution stopped, enabling targeted fixes.
+    """
+    default_state_fn = getattr(module, "_default_state", None)
+    state = default_state_fn() if default_state_fn else {}
+    state.update(input_state)
+
+    if stub_outcomes:
+        state["_stub_outcomes"] = {
+            k: [list(entry) for entry in v]
+            for k, v in stub_outcomes.items()
+        }
+    if stub_defaults:
+        state["_stub_defaults"] = dict(stub_defaults)
+
+    try:
+        rs = module.run(state)
+    except Exception:
+        return [], [], [], {}
+
+    trace = rs.get("_trace", [])
+    branches = list(rs.get("_branches", set()))
+    edges = []
+    for j in range(len(trace) - 1):
+        if trace[j] != trace[j + 1]:
+            edges.append((trace[j], trace[j + 1]))
+    return list(dict.fromkeys(trace)), branches, edges, rs
 
 
 def _record_attempt(synth: SynthesisState, store_path: Path,
@@ -214,12 +402,17 @@ def _time_exceeded(start: float, max_time: float | None) -> bool:
 # ---------------------------------------------------------------------------
 
 def _run_layer_1(
-    module, var_report, equality_constraints, stub_mapping,
+    module, program, var_report, equality_constraints, stub_mapping,
     synth: SynthesisState, store_path: Path,
     start_time: float, max_time: float | None,
 ) -> int:
     """Generate all-success baseline + deterministic variants."""
     new_count = 0
+
+    loop_gates = _extract_loop_gates(program, module)
+    all_loop_paras = set()
+    for lg in loop_gates:
+        all_loop_paras.update(lg.target_paras)
 
     # Base all-success state
     base_state = _generate_all_success_state(var_report, equality_constraints)
@@ -241,6 +434,21 @@ def _run_layer_1(
                        paras, branches, edges, layer=1, target=target):
             new_count += 1
         _record_attempt(synth, store_path, 1, target)
+
+    # Try with loop gates applied (enter PERFORM UNTIL loops)
+    if loop_gates:
+        target = "all-success-loops"
+        if not _was_attempted(synth, 1, target):
+            loop_state = _apply_loop_gates(
+                base_state, loop_gates, all_loop_paras, var_report,
+            )
+            paras, branches, edges = _execute_and_collect(
+                module, loop_state, base_stubs, base_defaults,
+            )
+            if _maybe_save(synth, store_path, loop_state, base_stubs, base_defaults,
+                           paras, branches, edges, layer=1, target=target):
+                new_count += 1
+            _record_attempt(synth, store_path, 1, target)
 
     # Generate 3-5 variants with different non-status input values
     for variant_idx in range(5):
@@ -299,36 +507,60 @@ def _find_best_base(synth: SynthesisState, path: list[str]) -> TestCase | None:
     return best
 
 
+def _find_top_bases(synth: SynthesisState, path: list[str], n: int) -> list[TestCase]:
+    """Find top-n test cases with best overlap with the target path."""
+    path_set = set(path)
+    scored = []
+    for tc in synth.test_cases:
+        overlap = len(set(tc.paragraphs_covered) & path_set)
+        scored.append((overlap, tc))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [tc for _, tc in scored[:n]]
+
+
 def _apply_gating_constraints(
     state: dict,
     constraints: list[GatingCondition],
     var_report,
+    variation: int = 0,
 ) -> dict:
-    """Apply gating constraints deterministically to a state."""
+    """Apply gating constraints deterministically to a state.
+
+    *variation* selects alternative satisfying values when available:
+    0 = first literal, 1 = second, etc.  This enables generating
+    multiple distinct states for the same set of constraints.
+    """
     state = dict(state)
     for gc in constraints:
         if not gc.negated and gc.values:
-            # Set var to first value
-            state[gc.variable] = gc.values[0]
+            # Set var to a satisfying value (cycle through available values)
+            if gc.values == [True]:
+                # Bare boolean flag — try various truthy representations
+                _truthy = [True, "Y", "1", 1]
+                state[gc.variable] = _truthy[variation % len(_truthy)]
+            else:
+                state[gc.variable] = gc.values[variation % len(gc.values)]
         elif gc.negated and gc.values:
-            # Pick first condition_literal NOT in the negated values
-            info = var_report.variables.get(gc.variable)
-            literals = (info.condition_literals if info and hasattr(info, "condition_literals")
-                       else [])
-            found = False
-            for lit in literals:
-                if lit not in gc.values:
-                    state[gc.variable] = lit
-                    found = True
-                    break
-            if not found:
-                # Use a sentinel that's different from the gated values
-                if isinstance(gc.values[0], int):
-                    state[gc.variable] = gc.values[0] + 999
-                elif isinstance(gc.values[0], str):
-                    state[gc.variable] = "XX"
+            if gc.values == [True]:
+                # Bare boolean negated — try various falsy representations
+                _falsy = [False, "N", "0", 0, "", " "]
+                state[gc.variable] = _falsy[variation % len(_falsy)]
+            else:
+                # Pick condition_literal NOT in the negated values
+                info = var_report.variables.get(gc.variable)
+                literals = (info.condition_literals if info and hasattr(info, "condition_literals")
+                           else [])
+                candidates = [lit for lit in literals if lit not in gc.values]
+                if candidates:
+                    state[gc.variable] = candidates[variation % len(candidates)]
                 else:
-                    state[gc.variable] = "XX"
+                    # Use a sentinel that's different from the gated values
+                    if isinstance(gc.values[0], int):
+                        state[gc.variable] = gc.values[0] + 999 + variation
+                    elif isinstance(gc.values[0], str):
+                        state[gc.variable] = f"X{variation}" if variation else "XX"
+                    else:
+                        state[gc.variable] = f"X{variation}" if variation else "XX"
     return state
 
 
@@ -338,113 +570,416 @@ def _run_layer_2(
     synth: SynthesisState, store_path: Path,
     start_time: float, max_time: float | None,
 ) -> int:
-    """For each uncovered paragraph, solve the full path of gating conditions."""
+    """For each uncovered paragraph, solve the full path of gating conditions.
+
+    Runs iteratively: when new paragraphs are covered, re-evaluates paths
+    since newly-covered paragraphs may be stepping stones.  Tries multiple
+    constraint variations and multiple base test cases per target.
+    """
     new_count = 0
-
     all_paras = {p.name for p in program.paragraphs}
-    uncovered = all_paras - synth.covered_paras
-
-    # Compute path constraints for all uncovered, sort by path length
-    targets = []
-    for para in uncovered:
-        pc = compute_path_constraints(para, call_graph, gating_conditions)
-        if pc is not None:
-            targets.append(pc)
-    targets.sort(key=lambda pc: len(pc.path))
+    N_VARIATIONS = 6   # constraint value variations to try
+    N_BASES = 3        # base TCs to try per target
+    MAX_ROUNDS = 10    # max iterative rounds
 
     base_defaults = (
         _generate_stub_defaults(stub_mapping, var_report)
         if stub_mapping else {}
     )
 
-    for pc in targets:
+    # Extract loop gates for PERFORM UNTIL handling
+    loop_gates = _extract_loop_gates(program, module)
+
+    for round_num in range(MAX_ROUNDS):
         if _time_exceeded(start_time, max_time):
             break
-        if pc.target in synth.covered_paras:
-            continue  # covered by side-effect of earlier target
-        if _was_attempted(synth, 2, pc.target):
-            continue
 
-        # Find best base test case
-        base_tc = _find_best_base(synth, pc.path)
-        base_state = dict(base_tc.input_state) if base_tc else (
-            _generate_all_success_state(var_report, equality_constraints)
-        )
-        base_stubs = (
-            dict(base_tc.stub_outcomes) if base_tc and base_tc.stub_outcomes
-            else (_generate_all_success_stubs(stub_mapping, var_report)
-                  if stub_mapping else {})
-        )
+        uncovered = all_paras - synth.covered_paras
+        if not uncovered:
+            break
 
-        # Apply gating constraints
-        state = _apply_gating_constraints(base_state, pc.constraints, var_report)
+        # Compute path constraints for all uncovered, sort by path length
+        targets = []
+        for para in uncovered:
+            pc = compute_path_constraints(para, call_graph, gating_conditions)
+            if pc is not None:
+                targets.append(pc)
+        targets.sort(key=lambda pc: len(pc.path))
 
-        paras, branches, edges = _execute_and_collect(
-            module, state, base_stubs, base_defaults,
-        )
-        if _maybe_save(synth, store_path, state, base_stubs, base_defaults,
-                       paras, branches, edges, layer=2, target=pc.target):
-            new_count += 1
+        round_new = 0
+        for pc in targets:
+            if _time_exceeded(start_time, max_time):
+                break
+            if pc.target in synth.covered_paras:
+                continue
 
-        # Also generate error variant for stub operations in the target paragraph
-        if stub_mapping:
-            for op_key, status_vars in stub_mapping.items():
+            # Try multiple base TCs × multiple constraint variations
+            bases = _find_top_bases(synth, pc.path, N_BASES)
+            if not bases:
+                bases = [None]
+
+            for base_tc in bases:
                 if _time_exceeded(start_time, max_time):
                     break
-                error_stubs = dict(base_stubs)
-                for svar in status_vars:
-                    info = var_report.variables.get(svar)
-                    literals = (info.condition_literals
-                               if info and hasattr(info, "condition_literals") else [])
-                    for lit in literals[1:]:  # skip first (success) value
-                        stub_target = f"{pc.target}:{op_key}={lit}"
-                        if _was_attempted(synth, 2, stub_target):
-                            continue
-                        error_entry = [(svar, lit)]
-                        error_stubs[op_key] = [error_entry] * 25
-                        paras, branches, edges = _execute_and_collect(
-                            module, state, error_stubs, base_defaults,
+                if pc.target in synth.covered_paras:
+                    break
+
+                base_state = dict(base_tc.input_state) if base_tc else (
+                    _generate_all_success_state(var_report, equality_constraints)
+                )
+                base_stubs = (
+                    dict(base_tc.stub_outcomes) if base_tc and base_tc.stub_outcomes
+                    else (_generate_all_success_stubs(stub_mapping, var_report)
+                          if stub_mapping else {})
+                )
+
+                for var_idx in range(N_VARIATIONS):
+                    if _time_exceeded(start_time, max_time):
+                        break
+                    if pc.target in synth.covered_paras:
+                        break
+
+                    base_id = base_tc.id[:8] if base_tc else "fresh"
+                    target_key = f"{pc.target}:b={base_id}:v={var_idx}"
+                    if _was_attempted(synth, 2, target_key):
+                        continue
+
+                    state = _apply_gating_constraints(
+                        base_state, pc.constraints, var_report, variation=var_idx,
+                    )
+                    # Also apply loop gates to enter PERFORM UNTIL loops
+                    if loop_gates:
+                        state = _apply_loop_gates(
+                            state, loop_gates, {pc.target}, var_report,
                         )
-                        if _maybe_save(synth, store_path, state, error_stubs,
-                                       base_defaults, paras, branches, edges,
-                                       layer=2, target=stub_target):
-                            new_count += 1
-                        _record_attempt(synth, store_path, 2, stub_target)
 
-        _record_attempt(synth, store_path, 2, pc.target)
+                    paras, branches, edges = _execute_and_collect(
+                        module, state, base_stubs, base_defaults,
+                    )
+                    if _maybe_save(synth, store_path, state, base_stubs, base_defaults,
+                                   paras, branches, edges, layer=2, target=target_key):
+                        new_count += 1
+                        round_new += 1
+                    _record_attempt(synth, store_path, 2, target_key)
 
-    # For unreachable paragraphs, try running directly
+            # Stub error variants (only for first base, variation 0)
+            if stub_mapping and not _time_exceeded(start_time, max_time):
+                base_tc_err = bases[0]
+                base_state_err = dict(base_tc_err.input_state) if base_tc_err else (
+                    _generate_all_success_state(var_report, equality_constraints)
+                )
+                base_stubs_err = (
+                    dict(base_tc_err.stub_outcomes)
+                    if base_tc_err and base_tc_err.stub_outcomes
+                    else (_generate_all_success_stubs(stub_mapping, var_report)
+                          if stub_mapping else {})
+                )
+                state = _apply_gating_constraints(
+                    base_state_err, pc.constraints, var_report,
+                )
+                for op_key, status_vars in stub_mapping.items():
+                    if _time_exceeded(start_time, max_time):
+                        break
+                    error_stubs = dict(base_stubs_err)
+                    for svar in status_vars:
+                        info = var_report.variables.get(svar)
+                        literals = (info.condition_literals
+                                   if info and hasattr(info, "condition_literals") else [])
+                        for lit in literals[1:]:  # skip first (success) value
+                            stub_target = f"{pc.target}:{op_key}={lit}"
+                            if _was_attempted(synth, 2, stub_target):
+                                continue
+                            error_entry = [(svar, lit)]
+                            error_stubs[op_key] = [error_entry] * 25
+                            p2, b2, e2 = _execute_and_collect(
+                                module, state, error_stubs, base_defaults,
+                            )
+                            if _maybe_save(synth, store_path, state, error_stubs,
+                                           base_defaults, p2, b2, e2,
+                                           layer=2, target=stub_target):
+                                new_count += 1
+                                round_new += 1
+                            _record_attempt(synth, store_path, 2, stub_target)
+
+        if round_new == 0:
+            break  # no new coverage this round
+        log.info("Layer 2 round %d: %d new TCs, total covered %d/%d paras",
+                 round_num + 1, round_new,
+                 len(synth.covered_paras), len(all_paras))
+
+    # For unreachable paragraphs, try running directly with multiple base states
     still_uncovered = all_paras - synth.covered_paras
-    for para in still_uncovered:
+    for para in sorted(still_uncovered):
         if _time_exceeded(start_time, max_time):
             break
         if call_graph.path_to(para) is not None:
-            continue  # reachable but constraint solving failed
+            continue  # reachable, handled below
 
         direct_target = f"direct:{para}"
         if _was_attempted(synth, 2, direct_target):
             continue
 
-        base_state = _generate_all_success_state(var_report, equality_constraints)
-        try:
-            rs = _run_paragraph_directly(module, para, base_state)
-            trace = rs.get("_trace", [para])
-            branches = list(rs.get("_branches", set()))
-            paras_list = list(dict.fromkeys(trace)) if trace else [para]
-            edges_list = [
-                (trace[j], trace[j + 1])
-                for j in range(len(trace) - 1)
-                if trace[j] != trace[j + 1]
-            ] if trace else []
-            if _maybe_save(synth, store_path, base_state, {}, {},
-                           paras_list, branches, edges_list,
-                           layer=2, target=direct_target):
-                new_count += 1
-        except Exception:
-            pass
+        states_to_try = [_generate_all_success_state(var_report, equality_constraints)]
+        for tc in synth.test_cases[:5]:
+            states_to_try.append(dict(tc.input_state))
+
+        for base_state in states_to_try:
+            if _time_exceeded(start_time, max_time):
+                break
+            try:
+                rs = _run_paragraph_directly(module, para, base_state)
+                trace = rs.get("_trace", [para])
+                branches_r = list(rs.get("_branches", set()))
+                paras_list = list(dict.fromkeys(trace)) if trace else [para]
+                edges_list = [
+                    (trace[j], trace[j + 1])
+                    for j in range(len(trace) - 1)
+                    if trace[j] != trace[j + 1]
+                ] if trace else []
+                if _maybe_save(synth, store_path, base_state, {}, {},
+                               paras_list, branches_r, edges_list,
+                               layer=2, target=direct_target):
+                    new_count += 1
+                    break
+            except Exception:
+                pass
+        _record_attempt(synth, store_path, 2, direct_target)
+
+    # Also try reachable but still-uncovered paragraphs directly
+    still_uncovered = all_paras - synth.covered_paras
+    for para in sorted(still_uncovered):
+        if _time_exceeded(start_time, max_time):
+            break
+        if call_graph.path_to(para) is None:
+            continue
+
+        direct_target = f"direct-reachable:{para}"
+        if _was_attempted(synth, 2, direct_target):
+            continue
+
+        for tc in synth.test_cases[:3]:
+            if _time_exceeded(start_time, max_time):
+                break
+            try:
+                state = dict(tc.input_state)
+                if tc.stub_outcomes:
+                    state["_stub_outcomes"] = {
+                        k: [list(e) for e in v]
+                        for k, v in tc.stub_outcomes.items()
+                    }
+                if tc.stub_defaults:
+                    state["_stub_defaults"] = dict(tc.stub_defaults)
+                rs = _run_paragraph_directly(module, para, state)
+                trace = rs.get("_trace", [para])
+                branches_r = list(rs.get("_branches", set()))
+                paras_list = list(dict.fromkeys(trace)) if trace else [para]
+                edges_list = [
+                    (trace[j], trace[j + 1])
+                    for j in range(len(trace) - 1)
+                    if trace[j] != trace[j + 1]
+                ] if trace else []
+                stubs = dict(tc.stub_outcomes) if tc.stub_outcomes else {}
+                defaults = dict(tc.stub_defaults) if tc.stub_defaults else {}
+                if _maybe_save(synth, store_path, tc.input_state, stubs, defaults,
+                               paras_list, branches_r, edges_list,
+                               layer=2, target=direct_target):
+                    new_count += 1
+                    break
+            except Exception:
+                pass
         _record_attempt(synth, store_path, 2, direct_target)
 
     _record_layer_done(synth, store_path, 2)
+    return new_count
+
+
+# ---------------------------------------------------------------------------
+# Layer 2.5: Frontier Expansion (trace-based constraint discovery)
+# ---------------------------------------------------------------------------
+
+def _find_frontier_branches(
+    synth: SynthesisState,
+    call_graph,
+    branch_meta: dict,
+) -> list[tuple[int, str, str]]:
+    """Find branches in covered paragraphs that gate uncovered paragraphs.
+
+    Returns list of (branch_id, branch_paragraph, target_paragraph) where
+    flipping the branch might unlock the target paragraph.
+    """
+    frontier = []
+    for covered_para in synth.covered_paras:
+        # What does this paragraph call?
+        callees = call_graph.edges.get(covered_para, set())
+        for callee in callees:
+            if callee not in synth.covered_paras:
+                # callee is uncovered — find branches in covered_para
+                # that gate the PERFORM to callee
+                for abs_id, meta in branch_meta.items():
+                    if meta.get("paragraph", "") == covered_para:
+                        for bid in (abs_id, -abs_id):
+                            if bid not in synth.covered_branches:
+                                frontier.append((bid, covered_para, callee))
+    return frontier
+
+
+def _run_layer_2_5(
+    module, program, var_report, call_graph, gating_conditions,
+    stub_mapping, equality_constraints,
+    synth: SynthesisState, store_path: Path,
+    start_time: float, max_time: float | None,
+) -> int:
+    """Frontier expansion: flip branches in covered paragraphs that gate
+    uncovered callees.
+
+    For each existing test case that reaches a frontier paragraph, run it
+    and inspect the final state.  Use branch metadata to identify which
+    condition blocked entry to uncovered callees, then construct a state
+    that flips that condition.
+    """
+    new_count = 0
+    branch_meta = getattr(module, "_BRANCH_META", {})
+    if not branch_meta:
+        return 0
+
+    base_defaults = (
+        _generate_stub_defaults(stub_mapping, var_report)
+        if stub_mapping else {}
+    )
+
+    MAX_ROUNDS = 5
+    for round_num in range(MAX_ROUNDS):
+        if _time_exceeded(start_time, max_time):
+            break
+
+        frontier = _find_frontier_branches(synth, call_graph, branch_meta)
+        if not frontier:
+            break
+
+        round_new = 0
+        # Group by branch to avoid duplicate work
+        seen_branches = set()
+        for bid, bpara, target_para in frontier:
+            if _time_exceeded(start_time, max_time):
+                break
+            if bid in seen_branches:
+                continue
+            seen_branches.add(bid)
+
+            target_key = f"frontier:{bid}→{target_para}"
+            if _was_attempted(synth, 25, target_key):  # layer 2.5
+                continue
+
+            abs_id = abs(bid)
+            meta = branch_meta.get(abs_id, {})
+            condition = meta.get("condition", "")
+
+            # Find TCs that reach this paragraph
+            relevant_tcs = [
+                tc for tc in synth.test_cases
+                if bpara in tc.paragraphs_covered
+            ]
+            if not relevant_tcs:
+                _record_attempt(synth, store_path, 25, target_key)
+                continue
+
+            negate = bid < 0
+
+            for tc in relevant_tcs[:3]:  # try top 3
+                if _time_exceeded(start_time, max_time):
+                    break
+                if target_para in synth.covered_paras:
+                    break
+
+                # Run TC and inspect final state
+                paras_now, branches_now, edges_now, final_state = (
+                    _execute_and_collect_full(
+                        module, tc.input_state,
+                        tc.stub_outcomes or {},
+                        tc.stub_defaults or base_defaults,
+                    )
+                )
+
+                # The branch wasn't taken in the direction we want.
+                # Parse condition to find what variables to change.
+                if not condition:
+                    continue
+
+                parsed = _parse_condition_variables(condition)
+                if not parsed:
+                    continue
+
+                # Build a modified state that flips the condition
+                state = dict(tc.input_state)
+                stubs = dict(tc.stub_outcomes) if tc.stub_outcomes else {}
+
+                for var, vals, neg in parsed:
+                    effective_neg = neg != negate
+                    current_val = final_state.get(var)
+
+                    if not effective_neg and vals:
+                        # Need var to satisfy condition
+                        if vals == [True]:
+                            # Bare boolean — need truthy
+                            state[var] = True
+                        else:
+                            state[var] = vals[0]
+                    elif effective_neg and vals:
+                        # Need var to NOT satisfy condition
+                        if vals == [True]:
+                            # Bare boolean — need falsy
+                            state[var] = False
+                        elif current_val in vals or current_val is None:
+                            info = var_report.variables.get(var)
+                            literals = (info.condition_literals
+                                       if info and hasattr(info, "condition_literals")
+                                       else [])
+                            found_alt = False
+                            for lit in literals:
+                                if lit not in vals:
+                                    state[var] = lit
+                                    found_alt = True
+                                    break
+                            if not found_alt:
+                                if isinstance(vals[0], (int, float)):
+                                    state[var] = vals[0] + 999
+                                else:
+                                    state[var] = "XX"
+
+                    # Also check if var is a stub-controlled variable
+                    if stub_mapping:
+                        for op_key, svars in stub_mapping.items():
+                            if var in svars:
+                                target_val = vals[0] if (not effective_neg and vals) else None
+                                if target_val is None and vals:
+                                    # Need != vals, pick something else
+                                    info = var_report.variables.get(var)
+                                    literals = (info.condition_literals
+                                               if info and hasattr(info, "condition_literals")
+                                               else [])
+                                    for lit in literals:
+                                        if lit not in vals:
+                                            target_val = lit
+                                            break
+                                if target_val is not None:
+                                    stubs[op_key] = [[(var, target_val)]] * 50
+
+                p2, b2, e2 = _execute_and_collect(
+                    module, state, stubs, base_defaults,
+                )
+                if _maybe_save(synth, store_path, state, stubs, base_defaults,
+                               p2, b2, e2, layer=2, target=target_key):
+                    new_count += 1
+                    round_new += 1
+
+            _record_attempt(synth, store_path, 25, target_key)
+
+        if round_new == 0:
+            break
+        log.info("Layer 2.5 round %d: %d new TCs, covered %d/%d paras",
+                 round_num + 1, round_new,
+                 len(synth.covered_paras), len({p.name for p in program.paragraphs}))
+
     return new_count
 
 
@@ -768,42 +1303,44 @@ def _run_layer_5(
         best_state = dict(tc.input_state)
         best_stubs = dict(tc.stub_outcomes) if tc.stub_outcomes else {}
 
-        for _round in range(20):
+        for _round in range(100):
             if _time_exceeded(start_time, max_time):
                 break
 
-            # Mutate one variable or one stub
+            # Mutate 1-3 variables or stubs per round for faster exploration
             state = dict(best_state)
             stubs = {k: [list(e) for e in v] for k, v in best_stubs.items()}
+            n_mutations = rng.randint(1, 3)
 
             var_names = list(var_report.variables.keys())
-            if var_names and rng.random() < 0.6:
-                # Mutate a variable
-                name = rng.choice(var_names)
-                info = var_report.variables[name]
-                literals = info.condition_literals if hasattr(info, "condition_literals") else []
-                if literals:
-                    state[name] = rng.choice(literals)
-                elif info.classification == "flag":
-                    state[name] = rng.choice([True, False])
-                elif isinstance(state.get(name), int):
-                    state[name] = rng.randint(-999, 999)
-                else:
-                    state[name] = rng.choice(["", " ", "TEST", "00", "XX"])
-            elif stub_mapping:
-                # Mutate a stub outcome
-                op_key = rng.choice(list(stub_mapping.keys()))
-                status_vars = stub_mapping[op_key]
-                svar = status_vars[0] if status_vars else None
-                if svar:
-                    info = var_report.variables.get(svar)
-                    literals = (info.condition_literals
-                               if info and hasattr(info, "condition_literals") else [])
+            for _ in range(n_mutations):
+                if var_names and rng.random() < 0.6:
+                    # Mutate a variable
+                    name = rng.choice(var_names)
+                    info = var_report.variables[name]
+                    literals = info.condition_literals if hasattr(info, "condition_literals") else []
                     if literals:
-                        val = rng.choice(literals)
+                        state[name] = rng.choice(literals)
+                    elif info.classification == "flag":
+                        state[name] = rng.choice([True, False, "Y", "N"])
+                    elif isinstance(state.get(name), int):
+                        state[name] = rng.randint(-999, 999)
                     else:
-                        val = rng.choice([0, "00", "10", 100])
-                    stubs[op_key] = [[(svar, val)]] * 25
+                        state[name] = rng.choice(["", " ", "TEST", "00", "XX"])
+                elif stub_mapping:
+                    # Mutate a stub outcome
+                    op_key = rng.choice(list(stub_mapping.keys()))
+                    status_vars = stub_mapping[op_key]
+                    svar = status_vars[0] if status_vars else None
+                    if svar:
+                        info = var_report.variables.get(svar)
+                        literals = (info.condition_literals
+                                   if info and hasattr(info, "condition_literals") else [])
+                        if literals:
+                            val = rng.choice(literals)
+                        else:
+                            val = rng.choice([0, "00", "10", 100])
+                        stubs[op_key] = [[(svar, val)]] * 25
 
             paras, branches, edges = _execute_and_collect(
                 module, state, stubs, base_defaults,
@@ -892,13 +1429,18 @@ def synthesize_test_set(
         all_branch_ids.add(-bid)
     report.total_branches = len(all_branch_ids)
 
-    # Run layers
+    # Run layers (layer 25 = "2.5" = frontier expansion, runs after layer 2)
     layer_funcs = [
         (1, lambda: _run_layer_1(
-            module, var_report, equality_constraints, stub_mapping,
+            module, program, var_report, equality_constraints, stub_mapping,
             synth, store_path, start_time, max_time_seconds,
         )),
         (2, lambda: _run_layer_2(
+            module, program, var_report, call_graph, gating_conditions,
+            stub_mapping, equality_constraints,
+            synth, store_path, start_time, max_time_seconds,
+        )),
+        (25, lambda: _run_layer_2_5(
             module, program, var_report, call_graph, gating_conditions,
             stub_mapping, equality_constraints,
             synth, store_path, start_time, max_time_seconds,
@@ -920,7 +1462,9 @@ def synthesize_test_set(
     initial_count = len(synth.test_cases)
 
     for layer_num, layer_fn in layer_funcs:
-        if layer_num > max_layers:
+        # Layer 25 (2.5) runs when max_layers >= 3; other layers use their number
+        effective_layer = 3 if layer_num == 25 else layer_num
+        if effective_layer > max_layers:
             break
         if _time_exceeded(start_time, max_time_seconds):
             break
