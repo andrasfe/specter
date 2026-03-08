@@ -3,6 +3,11 @@
 Each test case is a complete execution spec: input variables + all stub
 outcomes (SQL results, file statuses, CALL return codes, etc.).
 Append-only JSONL — survives interruption, enables incremental progress.
+
+The JSONL file contains two record types:
+- **Test case** records (have ``"id"`` key): actual test specs
+- **Progress** records (have ``"_type"`` key): layer completions and
+  attempted targets, so resumed runs skip already-tried work.
 """
 
 from __future__ import annotations
@@ -25,6 +30,17 @@ class TestCase:
     branches_covered: list[int]
     layer: int  # which synthesis layer produced it (1-5)
     target: str  # what paragraph/branch it was targeting
+
+
+@dataclass
+class StoreProgress:
+    """Resumable progress state rebuilt from progress records in the JSONL."""
+
+    completed_layers: set[int] = field(default_factory=set)
+    attempted_targets: dict[int, set[str]] = field(default_factory=dict)
+    # layer -> set of target strings already attempted (hit or miss)
+    walked_tc_ids: set[str] = field(default_factory=set)
+    # TC IDs that layer 5 has already walked
 
 
 def _compute_id(input_state: dict, stub_outcomes: dict) -> str:
@@ -100,11 +116,15 @@ class TestStore:
     """Persistent test case storage backed by a JSONL file."""
 
     @staticmethod
-    def load(path: str | Path) -> list[TestCase]:
-        """Read and deduplicate test cases from a JSONL file."""
+    def load(path: str | Path) -> tuple[list[TestCase], StoreProgress]:
+        """Read test cases and progress records from a JSONL file.
+
+        Returns (test_cases, progress).  Test cases are deduplicated by ID.
+        """
         path = Path(path)
+        progress = StoreProgress()
         if not path.exists():
-            return []
+            return [], progress
 
         seen_ids: set[str] = set()
         cases: list[TestCase] = []
@@ -116,11 +136,22 @@ class TestStore:
                 d = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            tc = _dict_to_tc(d)
-            if tc.id not in seen_ids:
-                seen_ids.add(tc.id)
-                cases.append(tc)
-        return cases
+
+            # Progress records have a "_type" key
+            rec_type = d.get("_type")
+            if rec_type == "layer_done":
+                progress.completed_layers.add(d["layer"])
+            elif rec_type == "attempt":
+                layer = d["layer"]
+                progress.attempted_targets.setdefault(layer, set()).add(d["target"])
+            elif rec_type == "walked":
+                progress.walked_tc_ids.add(d["tc_id"])
+            elif "id" in d:
+                tc = _dict_to_tc(d)
+                if tc.id not in seen_ids:
+                    seen_ids.add(tc.id)
+                    cases.append(tc)
+        return cases, progress
 
     @staticmethod
     def append(path: str | Path, tc: TestCase) -> None:
@@ -128,6 +159,15 @@ class TestStore:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(_tc_to_dict(tc), default=str)
+        with open(path, "a") as f:
+            f.write(line + "\n")
+
+    @staticmethod
+    def append_progress(path: str | Path, record: dict) -> None:
+        """Append a progress record (layer_done, attempt, walked)."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, default=str)
         with open(path, "a") as f:
             f.write(line + "\n")
 
@@ -143,8 +183,6 @@ class TestStore:
         covered_paras: set[str] = set()
         covered_branches: set[int] = set()
         covered_edges: set[tuple] = set()
-
-        goback_cls = getattr(module, "_GobackSignal", None)
 
         for tc in test_cases:
             try:

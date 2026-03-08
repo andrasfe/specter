@@ -16,7 +16,7 @@ from specter.static_analysis import (
     extract_sequential_gates,
     augment_gating_with_sequential_gates,
 )
-from specter.test_store import TestCase, TestStore, _compute_id
+from specter.test_store import TestCase, TestStore, StoreProgress, _compute_id
 from specter.test_synthesis import (
     SynthesisReport,
     SynthesisState,
@@ -77,7 +77,7 @@ class TestTestStore(unittest.TestCase):
             path = f.name
 
         TestStore.append(path, tc)
-        loaded = TestStore.load(path)
+        loaded, progress = TestStore.load(path)
 
         self.assertEqual(len(loaded), 1)
         self.assertEqual(loaded[0].id, "abc123")
@@ -115,7 +115,7 @@ class TestTestStore(unittest.TestCase):
 
         TestStore.append(path, tc1)
         TestStore.append(path, tc2)
-        loaded = TestStore.load(path)
+        loaded, _ = TestStore.load(path)
 
         self.assertEqual(len(loaded), 1)
         self.assertEqual(loaded[0].input_state, {"X": 1})
@@ -144,9 +144,10 @@ class TestTestStore(unittest.TestCase):
             json.loads(line)  # should not raise
 
     def test_load_nonexistent(self):
-        """Loading a nonexistent file returns empty list."""
-        loaded = TestStore.load("/tmp/nonexistent_test_store_xyz.jsonl")
+        """Loading a nonexistent file returns empty list and empty progress."""
+        loaded, progress = TestStore.load("/tmp/nonexistent_test_store_xyz.jsonl")
         self.assertEqual(loaded, [])
+        self.assertEqual(progress.completed_layers, set())
 
     def test_compute_id_deterministic(self):
         """Same inputs produce same ID."""
@@ -446,6 +447,73 @@ class TestLayer4(unittest.TestCase):
 
 
 class TestPersistence(unittest.TestCase):
+
+    def test_progress_records_persisted(self):
+        """Progress records (attempts, layer completions) survive reload."""
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+            path = f.name
+
+        # Save a TC + progress records
+        tc = TestCase(
+            id="tc-1", input_state={"X": 1}, stub_outcomes={},
+            stub_defaults={}, paragraphs_covered=["A"],
+            branches_covered=[1], layer=1, target="test",
+        )
+        TestStore.append(path, tc)
+        TestStore.append_progress(path, {"_type": "attempt", "layer": 2, "target": "B"})
+        TestStore.append_progress(path, {"_type": "attempt", "layer": 2, "target": "C"})
+        TestStore.append_progress(path, {"_type": "layer_done", "layer": 1})
+        TestStore.append_progress(path, {"_type": "walked", "tc_id": "tc-1"})
+
+        loaded, progress = TestStore.load(path)
+
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].id, "tc-1")
+        self.assertIn(1, progress.completed_layers)
+        self.assertNotIn(2, progress.completed_layers)
+        self.assertEqual(progress.attempted_targets[2], {"B", "C"})
+        self.assertIn("tc-1", progress.walked_tc_ids)
+
+    def test_resumed_run_skips_completed_layers(self):
+        """A resumed run skips layers marked as completed."""
+        prog = _make_program([
+            {
+                "name": "MAIN", "line_start": 1, "line_end": 10,
+                "statements": [
+                    {"type": "GOBACK", "text": "GOBACK",
+                     "line_start": 2, "line_end": 2,
+                     "attributes": {}, "children": []},
+                ],
+            },
+        ])
+        var_report = extract_variables(prog)
+        module = _generate_and_load(prog, var_report)
+        call_graph = build_static_call_graph(prog)
+        gating_conds = extract_gating_conditions(prog, call_graph)
+
+        with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as f:
+            store_path = Path(f.name)
+
+        # First run
+        report1 = synthesize_test_set(
+            module=module, program=prog, var_report=var_report,
+            call_graph=call_graph, gating_conditions=gating_conds,
+            stub_mapping=None, equality_constraints=None,
+            store_path=store_path, max_layers=2,
+        )
+
+        # Second run — layers 1-2 should be skipped
+        report2 = synthesize_test_set(
+            module=module, program=prog, var_report=var_report,
+            call_graph=call_graph, gating_conditions=gating_conds,
+            stub_mapping=None, equality_constraints=None,
+            store_path=store_path, max_layers=2,
+        )
+
+        self.assertIn(1, report2.skipped_layers)
+        self.assertIn(2, report2.skipped_layers)
+        # No new test cases on second run
+        self.assertEqual(report2.new_test_cases, 0)
 
     def test_resume_from_store(self):
         """Interrupting and resuming picks up where left off."""

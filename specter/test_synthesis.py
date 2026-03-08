@@ -4,6 +4,10 @@ Systematically analyzes every paragraph to determine the exact inputs,
 SQL results, CICS responses, file I/O outcomes, and CALL return codes
 needed to reach it.  Saves every coverage-expanding discovery to
 persistent storage so progress is never lost.
+
+**Resumability**: progress records (attempted targets, completed layers,
+walked TC IDs) are persisted to the same JSONL store alongside test cases.
+A resumed run loads them and skips all previously-attempted work.
 """
 
 from __future__ import annotations
@@ -28,7 +32,10 @@ from .static_analysis import (
     compute_path_constraints,
     _parse_condition_variables,
 )
-from .test_store import TestCase, TestStore, _build_run_state, _compute_id
+from .test_store import (
+    TestCase, TestStore, StoreProgress,
+    _build_run_state, _compute_id,
+)
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +55,7 @@ class SynthesisReport:
     covered_branches: int = 0
     total_branches: int = 0
     layer_stats: dict[int, int] = field(default_factory=dict)  # layer -> new TCs
+    skipped_layers: list[int] = field(default_factory=list)
     elapsed_seconds: float = 0.0
 
     def summary(self) -> str:
@@ -62,6 +70,8 @@ class SynthesisReport:
         ]
         for layer in sorted(self.layer_stats):
             lines.append(f"    Layer {layer}: {self.layer_stats[layer]} new test cases")
+        if self.skipped_layers:
+            lines.append(f"  Skipped (complete from prior run): {self.skipped_layers}")
         return "\n".join(lines)
 
 
@@ -76,6 +86,7 @@ class SynthesisState:
     covered_branches: set[int] = field(default_factory=set)
     covered_edges: set[tuple] = field(default_factory=set)
     failed_targets: dict[str, int] = field(default_factory=dict)
+    progress: StoreProgress = field(default_factory=StoreProgress)
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +109,6 @@ def _execute_and_collect(
     if stub_defaults:
         state["_stub_defaults"] = dict(stub_defaults)
 
-    goback_cls = getattr(module, "_GobackSignal", None)
-
     try:
         rs = module.run(state)
     except Exception:
@@ -112,6 +121,38 @@ def _execute_and_collect(
         if trace[j] != trace[j + 1]:
             edges.append((trace[j], trace[j + 1]))
     return list(dict.fromkeys(trace)), branches, edges
+
+
+def _record_attempt(synth: SynthesisState, store_path: Path,
+                    layer: int, target: str) -> None:
+    """Persist that a target was attempted (hit or miss) so we skip it on resume."""
+    synth.progress.attempted_targets.setdefault(layer, set()).add(target)
+    TestStore.append_progress(store_path, {
+        "_type": "attempt", "layer": layer, "target": target,
+    })
+
+
+def _was_attempted(synth: SynthesisState, layer: int, target: str) -> bool:
+    """Check if a target was already attempted in a previous or current run."""
+    return target in synth.progress.attempted_targets.get(layer, set())
+
+
+def _record_layer_done(synth: SynthesisState, store_path: Path,
+                       layer: int) -> None:
+    """Mark a layer as fully completed."""
+    synth.progress.completed_layers.add(layer)
+    TestStore.append_progress(store_path, {
+        "_type": "layer_done", "layer": layer,
+    })
+
+
+def _record_walked(synth: SynthesisState, store_path: Path,
+                   tc_id: str) -> None:
+    """Mark a TC as walked by layer 5."""
+    synth.progress.walked_tc_ids.add(tc_id)
+    TestStore.append_progress(store_path, {
+        "_type": "walked", "tc_id": tc_id,
+    })
 
 
 def _maybe_save(
@@ -191,17 +232,24 @@ def _run_layer_1(
         if stub_mapping else {}
     )
 
-    paras, branches, edges = _execute_and_collect(
-        module, base_state, base_stubs, base_defaults,
-    )
-    if _maybe_save(synth, store_path, base_state, base_stubs, base_defaults,
-                   paras, branches, edges, layer=1, target="all-success"):
-        new_count += 1
+    target = "all-success"
+    if not _was_attempted(synth, 1, target):
+        paras, branches, edges = _execute_and_collect(
+            module, base_state, base_stubs, base_defaults,
+        )
+        if _maybe_save(synth, store_path, base_state, base_stubs, base_defaults,
+                       paras, branches, edges, layer=1, target=target):
+            new_count += 1
+        _record_attempt(synth, store_path, 1, target)
 
     # Generate 3-5 variants with different non-status input values
     for variant_idx in range(5):
         if _time_exceeded(start_time, max_time):
             break
+
+        target = f"variant-{variant_idx}"
+        if _was_attempted(synth, 1, target):
+            continue
 
         variant_state = dict(base_state)
         changed = False
@@ -217,16 +265,18 @@ def _run_layer_1(
                 changed = True
 
         if not changed:
+            _record_attempt(synth, store_path, 1, target)
             continue
 
         paras, branches, edges = _execute_and_collect(
             module, variant_state, base_stubs, base_defaults,
         )
         if _maybe_save(synth, store_path, variant_state, base_stubs, base_defaults,
-                       paras, branches, edges, layer=1,
-                       target=f"variant-{variant_idx}"):
+                       paras, branches, edges, layer=1, target=target):
             new_count += 1
+        _record_attempt(synth, store_path, 1, target)
 
+    _record_layer_done(synth, store_path, 1)
     return new_count
 
 
@@ -312,6 +362,8 @@ def _run_layer_2(
             break
         if pc.target in synth.covered_paras:
             continue  # covered by side-effect of earlier target
+        if _was_attempted(synth, 2, pc.target):
+            continue
 
         # Find best base test case
         base_tc = _find_best_base(synth, pc.path)
@@ -345,6 +397,9 @@ def _run_layer_2(
                     literals = (info.condition_literals
                                if info and hasattr(info, "condition_literals") else [])
                     for lit in literals[1:]:  # skip first (success) value
+                        stub_target = f"{pc.target}:{op_key}={lit}"
+                        if _was_attempted(synth, 2, stub_target):
+                            continue
                         error_entry = [(svar, lit)]
                         error_stubs[op_key] = [error_entry] * 25
                         paras, branches, edges = _execute_and_collect(
@@ -352,8 +407,11 @@ def _run_layer_2(
                         )
                         if _maybe_save(synth, store_path, state, error_stubs,
                                        base_defaults, paras, branches, edges,
-                                       layer=2, target=f"{pc.target}:{op_key}={lit}"):
+                                       layer=2, target=stub_target):
                             new_count += 1
+                        _record_attempt(synth, store_path, 2, stub_target)
+
+        _record_attempt(synth, store_path, 2, pc.target)
 
     # For unreachable paragraphs, try running directly
     still_uncovered = all_paras - synth.covered_paras
@@ -362,6 +420,10 @@ def _run_layer_2(
             break
         if call_graph.path_to(para) is not None:
             continue  # reachable but constraint solving failed
+
+        direct_target = f"direct:{para}"
+        if _was_attempted(synth, 2, direct_target):
+            continue
 
         base_state = _generate_all_success_state(var_report, equality_constraints)
         try:
@@ -374,13 +436,15 @@ def _run_layer_2(
                 for j in range(len(trace) - 1)
                 if trace[j] != trace[j + 1]
             ] if trace else []
-            _maybe_save(synth, store_path, base_state, {}, {},
-                        paras_list, branches, edges_list,
-                        layer=2, target=f"direct:{para}")
-            new_count += 1
+            if _maybe_save(synth, store_path, base_state, {}, {},
+                           paras_list, branches, edges_list,
+                           layer=2, target=direct_target):
+                new_count += 1
         except Exception:
             pass
+        _record_attempt(synth, store_path, 2, direct_target)
 
+    _record_layer_done(synth, store_path, 2)
     return new_count
 
 
@@ -431,6 +495,10 @@ def _run_layer_3(
             if target_id in synth.covered_branches:
                 continue
 
+            target_key = f"branch:{target_id}"
+            if _was_attempted(synth, 3, target_key):
+                continue
+
             # Find base test case that reaches this paragraph
             base_tc = None
             for tc in synth.test_cases:
@@ -466,7 +534,7 @@ def _run_layer_3(
                     )
                     if _maybe_save(synth, store_path, state, stubs, base_defaults,
                                    paras, branches, edges, layer=3,
-                                   target=f"branch:{target_id}"):
+                                   target=target_key):
                         new_count += 1
                         solved = True
 
@@ -474,9 +542,11 @@ def _run_layer_3(
                 # Heuristic fallback
                 condition = meta.get("condition", "")
                 if not condition:
+                    _record_attempt(synth, store_path, 3, target_key)
                     continue
                 parsed = _parse_condition_variables(condition)
                 if not parsed:
+                    _record_attempt(synth, store_path, 3, target_key)
                     continue
 
                 state = dict(base_state)
@@ -503,9 +573,12 @@ def _run_layer_3(
                 )
                 if _maybe_save(synth, store_path, state, base_stubs, base_defaults,
                                paras, branches, edges, layer=3,
-                               target=f"branch:{target_id}"):
+                               target=target_key):
                     new_count += 1
 
+            _record_attempt(synth, store_path, 3, target_key)
+
+    _record_layer_done(synth, store_path, 3)
     return new_count
 
 
@@ -596,9 +669,14 @@ def _run_layer_4(
             if target_id in synth.covered_branches:
                 continue
 
+            target_key = f"stub-combo:{target_id}"
+            if _was_attempted(synth, 4, target_key):
+                continue
+
             meta = branch_meta[abs_id]
             para = meta.get("paragraph", "")
             if para and para not in synth.covered_paras:
+                _record_attempt(synth, store_path, 4, target_key)
                 continue
 
             combos = _compute_stub_combinations(
@@ -630,10 +708,13 @@ def _run_layer_4(
                 )
                 if _maybe_save(synth, store_path, base_state, stubs, base_defaults,
                                paras, branches, edges, layer=4,
-                               target=f"stub-combo:{target_id}"):
+                               target=target_key):
                     new_count += 1
                     break  # found new coverage, move to next branch
 
+            _record_attempt(synth, store_path, 4, target_key)
+
+    _record_layer_done(synth, store_path, 4)
     return new_count
 
 
@@ -662,6 +743,10 @@ def _run_layer_5(
         if _time_exceeded(start_time, max_time):
             break
 
+        # Skip TCs already walked in a previous run
+        if tc.id in synth.progress.walked_tc_ids:
+            continue
+
         # Find uncovered branches in this TC's covered paragraphs
         tc_paras = set(tc.paragraphs_covered)
         uncovered_in_reach = []
@@ -673,6 +758,7 @@ def _run_layer_5(
                         uncovered_in_reach.append(bid)
 
         if not uncovered_in_reach:
+            _record_walked(synth, store_path, tc.id)
             continue
 
         # Seeded RNG from TC id for determinism
@@ -729,6 +815,9 @@ def _run_layer_5(
                 best_state = state
                 best_stubs = stubs
 
+        _record_walked(synth, store_path, tc.id)
+
+    _record_layer_done(synth, store_path, 5)
     return new_count
 
 
@@ -771,10 +860,20 @@ def synthesize_test_set(
     report = SynthesisReport()
     synth = SynthesisState()
 
-    # Load existing test cases
-    existing = TestStore.load(store_path)
+    # Load existing test cases and progress
+    existing, progress = TestStore.load(store_path)
+    synth.progress = progress
     if existing:
         log.info("Loaded %d existing test cases from %s", len(existing), store_path)
+        if progress.completed_layers:
+            log.info("Previously completed layers: %s",
+                     sorted(progress.completed_layers))
+        n_attempted = sum(len(v) for v in progress.attempted_targets.values())
+        if n_attempted:
+            log.info("Previously attempted targets: %d", n_attempted)
+        if progress.walked_tc_ids:
+            log.info("Previously walked TCs: %d", len(progress.walked_tc_ids))
+
         paras, branches, edges = TestStore.replay(module, existing)
         synth.test_cases = existing
         synth.covered_paras = paras
@@ -825,6 +924,13 @@ def synthesize_test_set(
             break
         if _time_exceeded(start_time, max_time_seconds):
             break
+
+        # Skip fully completed layers from prior runs
+        if layer_num in synth.progress.completed_layers:
+            log.info("Layer %d: skipped (completed in prior run)", layer_num)
+            report.skipped_layers.append(layer_num)
+            report.layer_stats[layer_num] = 0
+            continue
 
         log.info("Running Layer %d ...", layer_num)
         new = layer_fn()
