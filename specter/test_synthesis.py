@@ -1126,6 +1126,323 @@ def _run_layer_3(
 
 
 # ---------------------------------------------------------------------------
+# Layer 3.5: Paragraph-Level Condition Sweep with Nesting Analysis
+# ---------------------------------------------------------------------------
+
+def _extract_branch_nesting(module, paragraph: str) -> dict[int, list[int]]:
+    """Extract branch nesting tree from generated Python code.
+
+    Parses the generated function for a paragraph and analyzes indentation
+    to determine which branches are nested inside other branches' IF blocks.
+
+    Returns a dict mapping branch_id -> list of parent branch_ids (nesting chain).
+    """
+    import inspect
+    import re
+
+    func_name = "para_" + paragraph.replace("-", "_")
+    para_func = getattr(module, func_name, None)
+    if para_func is None:
+        return {}
+
+    try:
+        src = inspect.getsource(para_func)
+    except (OSError, TypeError):
+        return {}
+
+    # Extract (line_number, indent_level, branch_id) for each .add(N)
+    branch_pattern = re.compile(r"^(\s+).*?\.add\((-?\d+)\)", re.MULTILINE)
+    entries = []
+    for m in branch_pattern.finditer(src):
+        indent = len(m.group(1))
+        bid = int(m.group(2))
+        line_num = src[:m.start()].count('\n')
+        entries.append((line_num, indent, bid))
+
+    if not entries:
+        return {}
+
+    # Find the base indentation (function body)
+    base_indent = min(indent for _, indent, _ in entries)
+
+    # Stack-based nesting: a branch at deeper indent is inside the preceding
+    # branch at shallower indent.
+    stack: list[tuple[int, int]] = []  # (indent, branch_id)
+    parent_map: dict[int, int] = {}
+
+    for _line, indent, bid in entries:
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        if stack:
+            parent_map[bid] = stack[-1][1]
+        stack.append((indent, bid))
+
+    # Build full nesting chains
+    nesting: dict[int, list[int]] = {}
+    for bid in [e[2] for e in entries]:
+        chain = []
+        current = bid
+        while current in parent_map:
+            current = parent_map[current]
+            chain.append(current)
+        chain.reverse()
+        nesting[bid] = chain
+
+    return nesting
+
+
+def _run_layer_35(
+    module, program, var_report, stub_mapping,
+    synth: SynthesisState, store_path: Path,
+    start_time: float, max_time: float | None,
+) -> int:
+    """Paragraph-level condition sweep with nesting analysis.
+
+    For each paragraph with uncovered branches:
+    1. Extract the branch nesting tree from the generated Python code
+    2. For each uncovered branch, compute its nesting chain (parent conditions)
+    3. Sweep condition variables through their condition_literals,
+       satisfying the entire nesting chain simultaneously
+    4. Use direct invocation for fast execution (~1ms per attempt)
+
+    This is more effective than Layer 3 (per-branch solving) because it
+    handles nested IF blocks — setting a parent branch's variable to the
+    right value makes child branches reachable.
+    """
+    import re
+
+    new_count = 0
+    branch_meta = getattr(module, "_BRANCH_META", {})
+    if not branch_meta:
+        _record_layer_done(synth, store_path, 35)
+        return 0
+
+    base_defaults = (
+        _generate_stub_defaults(stub_mapping, var_report)
+        if stub_mapping else {}
+    )
+
+    # Find paragraphs with uncovered branches
+    para_uncovered: dict[str, list[int]] = {}
+    for abs_id, meta in branch_meta.items():
+        para = meta.get("paragraph", "")
+        if not para or para not in synth.covered_paras:
+            continue
+        for bid in (abs_id, -abs_id):
+            if bid not in synth.covered_branches:
+                para_uncovered.setdefault(para, []).append(bid)
+
+    # Sort by number of uncovered branches (most first = highest value)
+    sorted_paras = sorted(
+        para_uncovered.items(), key=lambda x: len(x[1]), reverse=True,
+    )
+
+    # Build paragraph -> best base TC map
+    para_to_tc: dict[str, TestCase] = {}
+    for tc in synth.test_cases:
+        for p in tc.paragraphs_covered:
+            if p not in para_to_tc or len(tc.branches_covered) > len(para_to_tc[p].branches_covered):
+                para_to_tc[p] = tc
+
+    keywords = {
+        "NOT", "AND", "OR", "EQUAL", "GREATER", "LESS", "THAN",
+        "ZERO", "ZEROS", "ZEROES", "SPACES", "SPACE", "OTHER",
+        "NUMERIC", "ALPHABETIC", "TRUE", "FALSE", "HIGH", "LOW",
+        "VALUES", "DFHRESP", "NORMAL", "ERROR", "NOTFND",
+        "NEXT", "SENTENCE", "THEN", "PERFORM", "NEGATIVE",
+        "POSITIVE",
+    }
+
+    for para, uncov_bids in sorted_paras:
+        if _time_exceeded(start_time, max_time):
+            break
+
+        target_key = f"sweep:{para}"
+        if _was_attempted(synth, 35, target_key):
+            continue
+
+        # Get branch nesting for this paragraph
+        nesting = _extract_branch_nesting(module, para)
+
+        # Collect all condition variables from uncovered branches
+        # AND their parent branches (the full nesting chain)
+        cond_vars_values: dict[str, set] = {}  # var -> set of interesting values
+
+        all_relevant_bids = set(uncov_bids)
+        for bid in uncov_bids:
+            abs_bid = abs(bid)
+            if abs_bid in nesting:
+                all_relevant_bids.update(abs(p) for p in nesting[abs_bid])
+
+        for bid in all_relevant_bids:
+            meta = branch_meta.get(bid, {})
+            cond = meta.get("condition", "")
+            if not cond:
+                continue
+
+            # Extract variables from condition
+            found_vars = set(re.findall(r'\b([A-Z][A-Z0-9_-]+)\b', cond))
+            found_vars -= keywords
+
+            for var in found_vars:
+                if var not in cond_vars_values:
+                    cond_vars_values[var] = set()
+
+                # Add condition_literals from var_report
+                info = var_report.variables.get(var)
+                if info and hasattr(info, "condition_literals"):
+                    for lit in info.condition_literals:
+                        cond_vars_values[var].add(lit)
+
+                # Parse literal values directly from condition text
+                parsed = _parse_condition_variables(cond)
+                for pvar, pvals, _neg in parsed:
+                    if pvar == var:
+                        for v in pvals:
+                            cond_vars_values[var].add(v)
+
+                # Add generic values for common patterns
+                if not cond_vars_values[var]:
+                    cond_vars_values[var].update(["", "00", "Y", "N", 0, 1])
+
+        if not cond_vars_values:
+            _record_attempt(synth, store_path, 35, target_key)
+            continue
+
+        # Get base TC
+        base_tc = para_to_tc.get(para)
+        if not base_tc:
+            _record_attempt(synth, store_path, 35, target_key)
+            continue
+
+        base_state = dict(base_tc.input_state)
+        base_stubs = dict(base_tc.stub_outcomes) if base_tc.stub_outcomes else {}
+
+        # Phase 1: Single-variable sweep — try each variable × each value
+        for var, values in sorted(cond_vars_values.items(),
+                                  key=lambda x: len(x[1])):
+            if _time_exceeded(start_time, max_time):
+                break
+
+            for val in values:
+                if _time_exceeded(start_time, max_time):
+                    break
+
+                state = dict(base_state)
+                state[var] = val
+
+                # Also set via stubs if this is a stub-controlled variable
+                stubs = dict(base_stubs)
+                if stub_mapping:
+                    for op_key, status_vars in stub_mapping.items():
+                        if var in status_vars:
+                            stubs[op_key] = [[(var, val)]] * 50
+
+                paras, branches, edges = _execute_direct_and_collect(
+                    module, para, state, stubs, base_defaults,
+                )
+                save_target = f"direct:{para}|sweep:{var}={val}"
+                if _maybe_save(synth, store_path, state, stubs, base_defaults,
+                               paras, branches, edges, layer=35,
+                               target=save_target):
+                    new_count += 1
+                    # Update base state to build on success
+                    base_state = state
+                    base_stubs = stubs
+
+        # Phase 2: Nesting-chain-guided combinations
+        # For each uncovered branch, set ALL variables in its nesting chain
+        for bid in uncov_bids:
+            if _time_exceeded(start_time, max_time):
+                break
+            if bid in synth.covered_branches:
+                continue
+
+            abs_bid = abs(bid)
+            chain = nesting.get(abs_bid, [])
+            if not chain:
+                continue
+
+            # For each parent in the chain, figure out what direction is needed
+            # to reach the child. The child is inside the parent's block,
+            # so we need the parent's direction (positive = true arm).
+            state = dict(base_state)
+            stubs = dict(base_stubs)
+
+            for parent_bid in chain:
+                parent_meta = branch_meta.get(abs(parent_bid), {})
+                parent_cond = parent_meta.get("condition", "")
+                if not parent_cond:
+                    continue
+
+                parsed = _parse_condition_variables(parent_cond)
+                # The parent_bid sign tells us which arm: positive = true
+                need_true = parent_bid > 0
+                for pvar, pvals, neg in parsed:
+                    effective_neg = neg != (not need_true)
+                    if not effective_neg and pvals:
+                        state[pvar] = pvals[0]
+                    elif effective_neg and pvals:
+                        info = var_report.variables.get(pvar)
+                        literals = (info.condition_literals
+                                   if info and hasattr(info, "condition_literals")
+                                   else [])
+                        for lit in literals:
+                            if lit not in pvals:
+                                state[pvar] = lit
+                                break
+                        else:
+                            state[pvar] = "XX" if isinstance(pvals[0], str) else 999
+
+                    # Also set via stubs
+                    if stub_mapping:
+                        for op_key, svars in stub_mapping.items():
+                            if pvar in svars:
+                                stubs[op_key] = [[(pvar, state[pvar])]] * 50
+
+            # Also set the target branch's own condition
+            target_meta = branch_meta.get(abs_bid, {})
+            target_cond = target_meta.get("condition", "")
+            if target_cond:
+                parsed = _parse_condition_variables(target_cond)
+                need_true = bid > 0
+                for pvar, pvals, neg in parsed:
+                    effective_neg = neg != (not need_true)
+                    if not effective_neg and pvals:
+                        state[pvar] = pvals[0]
+                    elif effective_neg and pvals:
+                        info = var_report.variables.get(pvar)
+                        literals = (info.condition_literals
+                                   if info and hasattr(info, "condition_literals")
+                                   else [])
+                        for lit in literals:
+                            if lit not in pvals:
+                                state[pvar] = lit
+                                break
+                        else:
+                            state[pvar] = "XX" if isinstance(pvals[0], str) else 999
+
+                    if stub_mapping:
+                        for op_key, svars in stub_mapping.items():
+                            if pvar in svars:
+                                stubs[op_key] = [[(pvar, state[pvar])]] * 50
+
+            paras, branches, edges = _execute_direct_and_collect(
+                module, para, state, stubs, base_defaults,
+            )
+            save_target = f"direct:{para}|nest:{bid}"
+            if _maybe_save(synth, store_path, state, stubs, base_defaults,
+                           paras, branches, edges, layer=35,
+                           target=save_target):
+                new_count += 1
+
+        _record_attempt(synth, store_path, 35, target_key)
+
+    _record_layer_done(synth, store_path, 35)
+    return new_count
+
+
+# ---------------------------------------------------------------------------
 # Layer 4: Stub Outcome Combinatorics
 # ---------------------------------------------------------------------------
 
@@ -1511,6 +1828,10 @@ def synthesize_test_set(
             module, var_report, stub_mapping,
             synth, store_path, start_time, max_time_seconds,
         )),
+        (35, lambda: _run_layer_35(
+            module, program, var_report, stub_mapping,
+            synth, store_path, start_time, max_time_seconds,
+        )),
         (4, lambda: _run_layer_4(
             module, program, var_report, stub_mapping,
             synth, store_path, start_time, max_time_seconds,
@@ -1524,8 +1845,8 @@ def synthesize_test_set(
     initial_count = len(synth.test_cases)
 
     for layer_num, layer_fn in layer_funcs:
-        # Layer 25 (2.5) runs when max_layers >= 3; other layers use their number
-        effective_layer = 3 if layer_num == 25 else layer_num
+        # Layer 25 (2.5) and 35 (3.5) run within their surrounding layers
+        effective_layer = {25: 3, 35: 4}.get(layer_num, layer_num)
         if effective_layer > max_layers:
             break
         if _time_exceeded(start_time, max_time_seconds):
