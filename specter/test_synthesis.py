@@ -1443,6 +1443,441 @@ def _run_layer_35(
 
 
 # ---------------------------------------------------------------------------
+# Layer 3.7: Stub Fault Injection via Python Dataflow Analysis
+# ---------------------------------------------------------------------------
+
+def _extract_stub_branch_map(
+    module, stub_mapping: dict[str, list[str]],
+) -> dict[int, list[dict]]:
+    """Map each branch to stub operations that control its condition variable.
+
+    Uses two complementary strategies:
+    1. **Stub mapping**: For each branch, checks if its condition variable is a
+       status variable set by any stub operation (from the stub_mapping).
+    2. **Source analysis**: Parses generated Python to extract the exact comparison
+       operator and values from each branch's ``if`` statement.
+
+    Returns a dict: branch_id -> [
+        {
+            "stub_key": "READ:SYM00144",
+            "status_var": "SYM03160",
+            "op": "not_in",       # Python comparison operator
+            "values": ["00", "04"],  # values from the condition
+            "paragraph": "PARA-NAME",
+        },
+        ...
+    ]
+    """
+    import inspect
+    import re
+
+    meta = getattr(module, "_BRANCH_META", {})
+    if not meta or not stub_mapping:
+        return {}
+
+    # Build reverse map: status_variable -> list of stub_keys
+    var_to_stubs: dict[str, list[str]] = {}
+    for op_key, status_vars in stub_mapping.items():
+        for svar in status_vars:
+            var_to_stubs.setdefault(svar, []).append(op_key)
+
+    # Cache function sources
+    _source_cache: dict[str, str] = {}
+
+    def _get_source(para: str) -> str:
+        if para not in _source_cache:
+            func_name = "para_" + para.replace("-", "_")
+            func = getattr(module, func_name, None)
+            if func is None:
+                _source_cache[para] = ""
+                return ""
+            try:
+                _source_cache[para] = inspect.getsource(func)
+            except (OSError, TypeError):
+                _source_cache[para] = ""
+        return _source_cache[para]
+
+    # Patterns for parsing Python conditions
+    var_access_pat = re.compile(
+        r"state(?:\['([A-Z][A-Z0-9_]+)'\]|\.get\('([A-Z][A-Z0-9_]+)')"
+    )
+    val_pat = re.compile(r"'([^']*)'|(?<![A-Za-z_])(\d+)(?![A-Za-z_])")
+
+    result: dict[int, list[dict]] = {}
+
+    for abs_id, info in meta.items():
+        para = info.get("paragraph", "")
+        if not para:
+            continue
+
+        src = _get_source(para)
+        if not src:
+            continue
+
+        lines = src.split("\n")
+
+        # Find the line(s) where this branch ID appears (exact match)
+        add_pattern = re.compile(
+            rf"\.add\({abs_id}\b\)|\.add\(-{abs_id}\b\)"
+        )
+
+        for i, line in enumerate(lines):
+            if not add_pattern.search(line):
+                continue
+
+            # Extract actual branch ID from this line
+            bid_match = re.search(r"\.add\((-?\d+)\)", line)
+            if not bid_match:
+                continue
+            actual_bid = int(bid_match.group(1))
+
+            # Look backward for the if condition
+            cond_line = ""
+            cond_var = None
+            for k in range(i - 1, max(i - 5, -1), -1):
+                if k >= 0 and ("if " in lines[k] or "elif " in lines[k]):
+                    cond_line = lines[k]
+                    vm = var_access_pat.search(lines[k])
+                    if vm:
+                        cond_var = vm.group(1) or vm.group(2)
+                    break
+
+            if not cond_var:
+                continue
+
+            # Check if this variable is controlled by a stub
+            controlling_stubs = var_to_stubs.get(cond_var, [])
+            if not controlling_stubs:
+                continue
+
+            # Parse the Python comparison
+            stripped = cond_line.strip()
+            if "not in" in stripped:
+                op = "not_in"
+            elif " in " in stripped:
+                op = "in"
+            elif "!=" in stripped:
+                op = "!="
+            elif "==" in stripped:
+                op = "=="
+            elif ">=" in stripped:
+                op = ">="
+            elif "<=" in stripped:
+                op = "<="
+            elif ">" in stripped:
+                op = ">"
+            elif "<" in stripped:
+                op = "<"
+            else:
+                op = "truthy"
+
+            # Extract literal values from the condition.
+            # For "not in ('00', '04')" extract the tuple contents.
+            # For "!= '0000'" extract the comparison value.
+            cond_values: list = []
+            if op in ("not_in", "in"):
+                # Extract values from the tuple: ('val1', 'val2', ...)
+                tuple_match = re.search(r'\(([^)]+)\)', stripped)
+                if tuple_match:
+                    tuple_str = tuple_match.group(1)
+                    for vm in val_pat.finditer(tuple_str):
+                        s, n = vm.groups()
+                        if s is not None:
+                            cond_values.append(s)
+                        elif n is not None:
+                            cond_values.append(int(n))
+            else:
+                # Extract values after the operator
+                op_str = {"!=": "!=", "==": "==", ">=": ">=",
+                          "<=": "<=", ">": ">", "<": "<"}.get(op, "")
+                if op_str:
+                    op_pos = stripped.find(op_str)
+                    if op_pos >= 0:
+                        after_op = stripped[op_pos + len(op_str):]
+                        for vm in val_pat.finditer(after_op):
+                            s, n = vm.groups()
+                            if s is not None:
+                                cond_values.append(s)
+                            elif n is not None:
+                                cond_values.append(int(n))
+
+            for stub_key in controlling_stubs:
+                result.setdefault(actual_bid, []).append({
+                    "stub_key": stub_key,
+                    "status_var": cond_var,
+                    "op": op,
+                    "values": cond_values,
+                    "paragraph": para,
+                })
+
+    return result
+
+
+def _compute_fault_values(
+    op: str, cond_values: list, var_report, status_var: str
+) -> list:
+    """Compute values to inject via stubs to trigger or avoid a branch.
+
+    Given the comparison operator and values from the condition, returns
+    a list of values to try that would satisfy or negate the condition.
+    """
+    results = []
+
+    # Get condition_literals for this variable
+    info = var_report.variables.get(status_var) if var_report else None
+    all_literals = []
+    if info and hasattr(info, "condition_literals"):
+        all_literals = list(info.condition_literals)
+
+    if op in ("!=", "not_in") and cond_values:
+        # Condition: var not in (val1, val2, ...) or var != val
+        # To make it TRUE (enter the branch): use something NOT in cond_values
+        # To make it FALSE (skip the branch): use one of cond_values
+        # Try BOTH directions
+        for v in cond_values:
+            results.append(v)  # FALSE direction (skip branch)
+        # TRUE direction: values NOT in cond_values
+        for lit in all_literals:
+            if lit not in cond_values:
+                results.append(lit)
+        # Try generic error values
+        first = cond_values[0] if cond_values else ""
+        if isinstance(first, str):
+            for v in ["10", "23", "35", "39", "46", "99", "XX"]:
+                if v not in cond_values and v not in results:
+                    results.append(v)
+        elif isinstance(first, int):
+            for v in [100, -803, 4, 8, 12, 13, 27, 99]:
+                if v not in cond_values and v not in results:
+                    results.append(v)
+
+    elif op in ("==", "in") and cond_values:
+        # Condition: var in (val1, val2) or var == val
+        # TRUE: use one of cond_values
+        # FALSE: use something else
+        for v in cond_values:
+            results.append(v)
+        for lit in all_literals:
+            if lit not in cond_values:
+                results.append(lit)
+        first = cond_values[0] if cond_values else ""
+        if isinstance(first, str):
+            for v in ["00", "10", "99", ""]:
+                if v not in cond_values and v not in results:
+                    results.append(v)
+        elif isinstance(first, int):
+            for v in [0, 100, -1, 999]:
+                if v not in cond_values and v not in results:
+                    results.append(v)
+
+    elif op in (">", ">=", "<", "<=") and cond_values:
+        # Try boundary values
+        for v in cond_values:
+            if isinstance(v, int):
+                results.extend([v - 1, v, v + 1])
+            elif isinstance(v, str) and v.isdigit():
+                iv = int(v)
+                results.extend([str(iv - 1), v, str(iv + 1)])
+
+    # Always include common status values as fallback
+    if not results:
+        results = ["00", "10", "23", "35", 0, 100, -803, 4, 8]
+
+    return results
+
+
+def _run_layer_37(
+    module, program, var_report, stub_mapping,
+    synth: SynthesisState, store_path: Path,
+    start_time: float, max_time: float | None,
+) -> int:
+    """Stub Fault Injection via Python Dataflow Analysis.
+
+    Analyzes generated Python source code to find branches whose condition
+    variables are SET by _apply_stub_outcome calls. For each such branch,
+    crafts specific stub outcomes (error codes, EOF, etc.) that would
+    trigger or avoid the branch condition.
+
+    This is fundamentally different from Layer 3.5 (which sets input state
+    variables) because it targets variables that are OVERWRITTEN by stub
+    execution during the function — making input state manipulation useless
+    for those branches.
+
+    It also performs multi-stub coordination: when a paragraph has multiple
+    stub operations before a branch, it tries combinations of success/failure
+    across those stubs.
+    """
+    new_count = 0
+
+    branch_meta = getattr(module, "_BRANCH_META", {})
+    if not branch_meta or not stub_mapping:
+        _record_layer_done(synth, store_path, 37)
+        return 0
+
+    base_defaults = (
+        _generate_stub_defaults(stub_mapping, var_report)
+        if stub_mapping else {}
+    )
+
+    # Build the stub-to-branch map
+    stub_branch_map = _extract_stub_branch_map(module, stub_mapping)
+    if not stub_branch_map:
+        log.info("Layer 37: no stub-dependent branches found")
+        _record_layer_done(synth, store_path, 37)
+        return 0
+
+    log.info("Layer 37: found %d branches with stub dependencies", len(stub_branch_map))
+
+    # Build paragraph -> best base TC map
+    para_to_tc: dict[str, TestCase] = {}
+    for tc in synth.test_cases:
+        for p in tc.paragraphs_covered:
+            if p not in para_to_tc or len(tc.branches_covered) > len(para_to_tc[p].branches_covered):
+                para_to_tc[p] = tc
+
+    # Get nesting info for multi-level constraint satisfaction
+    nesting_cache: dict[str, dict[int, list[int]]] = {}
+
+    # Process each stub-dependent branch
+    for bid, stub_entries in sorted(stub_branch_map.items()):
+        if _time_exceeded(start_time, max_time):
+            break
+
+        # Check both positive and negative directions
+        for direction in (bid, -abs(bid)):
+            if direction in synth.covered_branches:
+                continue
+
+            target_key = f"fault:{direction}"
+            if _was_attempted(synth, 37, target_key):
+                continue
+
+            para = stub_entries[0]["paragraph"]
+            if para not in synth.covered_paras:
+                _record_attempt(synth, store_path, 37, target_key)
+                continue
+
+            base_tc = para_to_tc.get(para)
+            if not base_tc:
+                _record_attempt(synth, store_path, 37, target_key)
+                continue
+
+            # Get nesting chain for this branch
+            if para not in nesting_cache:
+                nesting_cache[para] = _extract_branch_nesting(module, para)
+            nesting = nesting_cache[para]
+
+            base_state = dict(base_tc.input_state)
+            base_stubs = dict(base_tc.stub_outcomes) if base_tc.stub_outcomes else {}
+
+            found = False
+
+            # For each controlling stub, try injecting fault values
+            for entry in stub_entries:
+                if found or _time_exceeded(start_time, max_time):
+                    break
+
+                stub_key = entry["stub_key"]
+                status_var = entry["status_var"]
+                op = entry["op"]
+                cond_values = entry["values"]
+
+                fault_values = _compute_fault_values(
+                    op, cond_values, var_report, status_var,
+                )
+
+                for fval in fault_values:
+                    if found or _time_exceeded(start_time, max_time):
+                        break
+
+                    state = dict(base_state)
+                    stubs = dict(base_stubs)
+
+                    # Inject the fault value via stub outcomes
+                    stubs[stub_key] = [[(status_var, fval)]] * 50
+
+                    # Also satisfy nesting chain parents
+                    abs_bid = abs(direction)
+                    chain = nesting.get(abs_bid, [])
+                    for parent_bid in chain:
+                        parent_meta = branch_meta.get(abs(parent_bid), {})
+                        parent_cond = parent_meta.get("condition", "")
+                        if parent_cond:
+                            parsed = _parse_condition_variables(parent_cond)
+                            for pvar, pvals, neg in parsed:
+                                if not neg and pvals:
+                                    state[pvar] = pvals[0]
+                                    # Also set via stubs if applicable
+                                    if stub_mapping:
+                                        for sk, svars in stub_mapping.items():
+                                            if pvar in svars:
+                                                stubs[sk] = [[(pvar, pvals[0])]] * 50
+
+                    paras, branches, edges = _execute_direct_and_collect(
+                        module, para, state, stubs, base_defaults,
+                    )
+                    save_target = f"direct:{para}|fault:{stub_key}={fval}"
+                    if _maybe_save(synth, store_path, state, stubs, base_defaults,
+                                   paras, branches, edges, layer=37,
+                                   target=save_target):
+                        new_count += 1
+                        found = True
+
+            # Phase 2: Multi-stub combinations for the same paragraph
+            # When multiple stubs precede a branch, try error on one + success on others
+            if not found and len(stub_entries) > 1:
+                unique_stubs = list({e["stub_key"] for e in stub_entries})
+                for primary_idx, primary_stub in enumerate(unique_stubs):
+                    if found or _time_exceeded(start_time, max_time):
+                        break
+
+                    primary_entry = next(
+                        e for e in stub_entries if e["stub_key"] == primary_stub
+                    )
+                    primary_var = primary_entry["status_var"]
+                    fault_values = _compute_fault_values(
+                        primary_entry["op"], primary_entry["values"],
+                        var_report, primary_var,
+                    )
+
+                    for fval in fault_values[:5]:  # Limit combos
+                        if found or _time_exceeded(start_time, max_time):
+                            break
+
+                        state = dict(base_state)
+                        stubs = dict(base_stubs)
+
+                        # Error on primary stub, success on others
+                        stubs[primary_stub] = [[(primary_var, fval)]] * 50
+                        for other_stub in unique_stubs:
+                            if other_stub == primary_stub:
+                                continue
+                            other_entry = next(
+                                e for e in stub_entries if e["stub_key"] == other_stub
+                            )
+                            other_var = other_entry["status_var"]
+                            # Success value: first value in condition (usually "00")
+                            success_vals = other_entry["values"]
+                            if success_vals:
+                                stubs[other_stub] = [[(other_var, success_vals[0])]] * 50
+
+                        paras, branches, edges = _execute_direct_and_collect(
+                            module, para, state, stubs, base_defaults,
+                        )
+                        save_target = f"direct:{para}|multi-fault:{primary_stub}={fval}"
+                        if _maybe_save(synth, store_path, state, stubs, base_defaults,
+                                       paras, branches, edges, layer=37,
+                                       target=save_target):
+                            new_count += 1
+                            found = True
+
+            _record_attempt(synth, store_path, 37, target_key)
+
+    _record_layer_done(synth, store_path, 37)
+    return new_count
+
+
+# ---------------------------------------------------------------------------
 # Layer 4: Stub Outcome Combinatorics
 # ---------------------------------------------------------------------------
 
@@ -1832,6 +2267,10 @@ def synthesize_test_set(
             module, program, var_report, stub_mapping,
             synth, store_path, start_time, max_time_seconds,
         )),
+        (37, lambda: _run_layer_37(
+            module, program, var_report, stub_mapping,
+            synth, store_path, start_time, max_time_seconds,
+        )),
         (4, lambda: _run_layer_4(
             module, program, var_report, stub_mapping,
             synth, store_path, start_time, max_time_seconds,
@@ -1846,7 +2285,7 @@ def synthesize_test_set(
 
     for layer_num, layer_fn in layer_funcs:
         # Layer 25 (2.5) and 35 (3.5) run within their surrounding layers
-        effective_layer = {25: 3, 35: 4}.get(layer_num, layer_num)
+        effective_layer = {25: 3, 35: 4, 37: 4}.get(layer_num, layer_num)
         if effective_layer > max_layers:
             break
         if _time_exceeded(start_time, max_time_seconds):
