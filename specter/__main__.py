@@ -25,6 +25,81 @@ from .static_analysis import (
 from .variable_extractor import extract_stub_status_mapping, extract_variables
 
 
+def _extract_tests(store_path: str, fmt: str) -> int:
+    """Extract test cases from a JSONL test store."""
+    import csv
+    import io
+    import json
+
+    from .test_store import TestStore
+
+    test_cases, _progress = TestStore.load(store_path)
+    if not test_cases:
+        print(f"No test cases found in {store_path}", file=sys.stderr)
+        return 1
+
+    print(f"Loaded {len(test_cases)} test cases from {store_path}", file=sys.stderr)
+
+    if fmt == "json":
+        # Full JSON array — each TC has input_state, stub_outcomes, metadata
+        records = []
+        for tc in test_cases:
+            records.append({
+                "id": tc.id,
+                "input_state": tc.input_state,
+                "stub_outcomes": {
+                    k: [
+                        [(pair[0], pair[1]) for pair in entry]
+                        if isinstance(entry, list) and entry and isinstance(entry[0], (list, tuple))
+                        else entry
+                        for entry in v
+                    ]
+                    for k, v in tc.stub_outcomes.items()
+                },
+                "stub_defaults": {
+                    k: [(pair[0], pair[1]) for pair in v]
+                    if isinstance(v, list) and v and isinstance(v[0], (list, tuple))
+                    else v
+                    for k, v in tc.stub_defaults.items()
+                },
+                "paragraphs_covered": tc.paragraphs_covered,
+                "branches_covered": tc.branches_covered,
+                "layer": tc.layer,
+                "target": tc.target,
+            })
+        json.dump(records, sys.stdout, indent=2, default=str)
+        print()  # trailing newline
+
+    elif fmt == "jsonl":
+        # One JSON object per line — input_state only (compact)
+        for tc in test_cases:
+            line = json.dumps({
+                "id": tc.id,
+                "layer": tc.layer,
+                "target": tc.target,
+                "input_state": tc.input_state,
+            }, default=str)
+            print(line)
+
+    elif fmt == "csv":
+        # Flatten input_state to columns — one row per test case
+        # Collect all variable names across all TCs
+        all_vars: set[str] = set()
+        for tc in test_cases:
+            all_vars.update(tc.input_state.keys())
+        sorted_vars = sorted(all_vars)
+
+        writer = csv.writer(sys.stdout)
+        writer.writerow(["id", "layer", "target"] + sorted_vars)
+        for tc in test_cases:
+            row = [tc.id, tc.layer, tc.target]
+            for var in sorted_vars:
+                row.append(tc.input_state.get(var, ""))
+            writer.writerow(row)
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="specter",
@@ -120,8 +195,44 @@ def main(argv: list[str] | None = None) -> int:
         type=int, default=None, metavar="N",
         help="Max seconds for synthesis (default: unlimited)",
     )
+    parser.add_argument(
+        "--extract-tests",
+        metavar="PATH",
+        help="Extract test cases from a test store JSONL file to JSON/CSV",
+    )
+    parser.add_argument(
+        "--extract-format",
+        choices=["json", "csv", "jsonl"],
+        default="json",
+        help="Output format for --extract-tests (default: json)",
+    )
+    parser.add_argument(
+        "--extract-docs",
+        metavar="JSONL",
+        help="Generate Markdown documentation from a test store JSONL file (requires generated .py)",
+    )
 
     args = parser.parse_args(argv)
+
+    # --extract-tests: standalone operation, no AST needed
+    if args.extract_tests:
+        return _extract_tests(args.extract_tests, args.extract_format)
+
+    # --extract-docs: needs generated .py (ast_file used as .py path) + JSONL
+    if args.extract_docs:
+        from .doc_generator import generate_docs
+        # The ast_file arg doubles as the generated .py path for --extract-docs
+        py_path = Path(args.ast_file)
+        if not py_path.exists():
+            # Try .py extension
+            py_path = py_path.with_suffix(".py")
+        if not py_path.exists():
+            print(f"Error: generated module not found: {py_path}", file=sys.stderr)
+            return 1
+        print(f"Generating documentation from {args.extract_docs} ...", file=sys.stderr)
+        md = generate_docs(py_path, args.extract_docs)
+        print(md)
+        return 0
 
     # --synthesize implies --analyze
     if args.synthesize:
