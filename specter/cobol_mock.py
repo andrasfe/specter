@@ -486,25 +486,46 @@ def _replace_io_verbs(lines: list[str]) -> tuple[list[str], int]:
                 continue
             op_key = f"{verb}:{target}"
 
-            # Collect continuation lines (until period or next statement)
+            # Collect continuation lines (until end-of-statement or new verb)
             block = [line]
             j = i + 1
-            # Simple heuristic: collect until we hit a period
-            block_text = content.strip()
-            while j < len(lines) and "." not in block_text:
+            # Track if we're inside a scope-terminated block
+            # (INVALID KEY / AT END / NOT ... => must find END-READ etc.)
+            end_verb = f"END-{verb}"
+            needs_end_verb = False
+            # Check if the first line itself ends with a period
+            first_ended = content.strip().rstrip().endswith(".")
+            while j < len(lines) and not first_ended:
                 next_content = _get_cobol_content(lines[j]).strip()
                 if not next_content or next_content.startswith("*"):
                     block.append(lines[j])
                     j += 1
                     continue
-                # Check if this is a new statement
+                upper_next = next_content.upper()
+                # Track if we entered a scoped clause
+                if re.match(r"^(INVALID|AT\s+END|NOT\s+INVALID|NOT\s+AT)",
+                            upper_next, re.IGNORECASE):
+                    needs_end_verb = True
+                # If inside a scoped clause, collect everything until END-verb
+                if needs_end_verb:
+                    block.append(lines[j])
+                    if upper_next.startswith(end_verb):
+                        j += 1
+                        break
+                    j += 1
+                    continue
+                # Check if this is a new statement (not a known continuation)
                 if re.match(r"^[A-Z]", next_content) and not re.match(
-                    r"^(AT|END-READ|END-WRITE|INTO|FROM|INVALID|NOT|GIVING|STATUS)",
+                    r"^(AT|END-READ|END-WRITE|END-START|END-DELETE"
+                    r"|INTO|FROM|INVALID|NOT|GIVING|STATUS|KEY|RECORD)",
                     next_content, re.IGNORECASE
                 ):
                     break
                 block.append(lines[j])
-                block_text += " " + next_content
+                # Check for end-of-statement period at end of line
+                if next_content.rstrip().endswith("."):
+                    j += 1
+                    break
                 j += 1
 
             # Comment out original
@@ -554,14 +575,37 @@ def _replace_call_stmts(lines: list[str]) -> tuple[list[str], int]:
             ind = m.group(1)
             prog = m.group(2).upper()
 
-            # Collect until period
+            # Collect CALL continuation lines (USING arguments)
             block = [line]
             j = i + 1
-            block_text = content.strip()
-            while j < len(lines) and "." not in block_text:
+            while j < len(lines):
+                next_content = _get_cobol_content(lines[j]).strip()
+                # Stop at blank lines, comments, or new statements
+                if not next_content or next_content.startswith("*"):
+                    break
+                # A new COBOL verb/statement means end of CALL
+                if re.match(
+                    r"^(IF|ELSE|END-IF|MOVE|PERFORM|EVALUATE|DISPLAY"
+                    r"|ADD|SUBTRACT|COMPUTE|GO|READ|WRITE|OPEN|CLOSE"
+                    r"|CALL|EXEC|SET|INITIALIZE|STRING|UNSTRING|INSPECT"
+                    r"|ACCEPT|STOP|GOBACK|EXIT|CONTINUE|SEARCH)\b",
+                    next_content, re.IGNORECASE
+                ):
+                    break
+                # Check for end-of-statement period at end of line
+                if next_content.rstrip().endswith("."):
+                    block.append(lines[j])
+                    j += 1
+                    break
                 block.append(lines[j])
-                block_text += " " + _get_cobol_content(lines[j]).strip()
                 j += 1
+
+            # Check if block ends with a period (sentence terminator)
+            block_text = "".join(
+                _get_cobol_content(bl) for bl in block
+            ).strip()
+            has_period = block_text.endswith(".")
+            dot = "." if has_period else ""
 
             for bl in block:
                 result.append(_comment_line(bl))
@@ -571,7 +615,7 @@ def _replace_call_stmts(lines: list[str]) -> tuple[list[str], int]:
             result.append(f"{_CONT}AT END\n")
             result.append(f"{_CONT}  MOVE 0 TO MOCK-NUM-STATUS\n")
             result.append(f"{_B}END-READ\n")
-            result.append(f"{_B}MOVE MOCK-NUM-STATUS TO RETURN-CODE\n")
+            result.append(f"{_B}MOVE MOCK-NUM-STATUS TO RETURN-CODE{dot}\n")
 
             count += 1
             i = j
@@ -786,14 +830,51 @@ def _fix_procedure_division(lines: list[str]) -> list[str]:
         r"MOVE\s+DFHCOMMAREA\s*\(",
         re.IGNORECASE,
     )
-    for line in lines:
+    in_comm_block = False
+    for i, line in enumerate(lines):
         m = pd_re.match(line)
+        content = _get_cobol_content(line)
         if m:
             result.append(m.group(1) + ".\n")
-        elif comm_re.search(_get_cobol_content(line)):
+            in_comm_block = False
+        elif comm_re.search(content):
             result.append(_comment_line(line))
+            in_comm_block = True
+        elif in_comm_block:
+            # Check if this is a continuation of the DFHCOMMAREA MOVE
+            stripped = content.strip()
+            if not stripped:
+                # Blank line ends the block
+                result.append(line)
+                in_comm_block = False
+            elif stripped.startswith("*"):
+                # Already commented (e.g., by CICS translator)
+                result.append(line)
+            elif not re.match(
+                r"^(IF|ELSE|END-IF|MOVE|PERFORM|EVALUATE|DISPLAY"
+                r"|ADD|SUBTRACT|COMPUTE|GO|READ|WRITE|OPEN|CLOSE"
+                r"|CALL|EXEC|SET|INITIALIZE|STRING|UNSTRING|INSPECT"
+                r"|ACCEPT|STOP|GOBACK|EXIT|CONTINUE|SEARCH)\b",
+                stripped, re.IGNORECASE
+            ):
+                # Continuation line — comment it out
+                result.append(_comment_line(line))
+            else:
+                # New statement — end of block
+                # If next statement is END-IF/ELSE, insert CONTINUE to
+                # avoid empty clause body (COBOL requires it)
+                if re.match(r"^(END-IF|ELSE|END-EVALUATE)\b",
+                            stripped, re.IGNORECASE):
+                    result.append(f"{_B}CONTINUE\n")
+                result.append(line)
+                in_comm_block = False
         else:
-            result.append(line)
+            # Also detect already-commented DFHCOMMAREA lines (from CICS translator)
+            if line[6:7] == "*" and comm_re.search(line[7:72] if len(line) > 7 else ""):
+                result.append(line)
+                in_comm_block = True
+            else:
+                result.append(line)
     return result
 
 
@@ -933,6 +1014,18 @@ def _add_common_stubs(lines: list[str]) -> list[str]:
             f"{_B}05 DFHPF10         PIC X VALUE X'7A'.\n",
             f"{_B}05 DFHPF11         PIC X VALUE X'7B'.\n",
             f"{_B}05 DFHPF12         PIC X VALUE X'7C'.\n",
+            f"{_B}05 DFHPF13         PIC X VALUE X'C1'.\n",
+            f"{_B}05 DFHPF14         PIC X VALUE X'C2'.\n",
+            f"{_B}05 DFHPF15         PIC X VALUE X'C3'.\n",
+            f"{_B}05 DFHPF16         PIC X VALUE X'C4'.\n",
+            f"{_B}05 DFHPF17         PIC X VALUE X'C5'.\n",
+            f"{_B}05 DFHPF18         PIC X VALUE X'C6'.\n",
+            f"{_B}05 DFHPF19         PIC X VALUE X'C7'.\n",
+            f"{_B}05 DFHPF20         PIC X VALUE X'C8'.\n",
+            f"{_B}05 DFHPF21         PIC X VALUE X'C9'.\n",
+            f"{_B}05 DFHPF22         PIC X VALUE X'4A'.\n",
+            f"{_B}05 DFHPF23         PIC X VALUE X'4B'.\n",
+            f"{_B}05 DFHPF24         PIC X VALUE X'4C'.\n",
         ])
 
     # DFHBMSCA — BMS attribute constants
