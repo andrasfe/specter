@@ -275,6 +275,14 @@ def main(argv: list[str] | None = None) -> int:
         print(md)
         return 0
 
+    cbl_path = Path(args.ast_file)
+    cobol_suffixes = {".cbl", ".cob", ".cobol"}
+    if not args.mock_cobol and cbl_path.suffix.lower() in cobol_suffixes:
+        output_looks_cobol = bool(args.output and Path(args.output).suffix.lower() in cobol_suffixes)
+        if args.copybook_dir or args.mock_init or output_looks_cobol:
+            args.mock_cobol = True
+            print("Info: COBOL source detected; enabling --mock-cobol automatically.", file=sys.stderr)
+
     # --mock-cobol: instrument COBOL source for mock execution
     if args.mock_cobol:
         from .cobol_mock import instrument_cobol, MockConfig
