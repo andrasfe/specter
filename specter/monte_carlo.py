@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import logging
 import random
+import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
@@ -919,7 +920,7 @@ def _run_paragraph_directly(module, para_name: str, input_state: dict) -> dict:
     Sets up the same instrumented state that run() would, then calls the
     paragraph function and collects trace/branch/coverage data.
     """
-    func_name = "para_" + para_name.replace("-", "_")
+    func_name = "para_" + re.sub(r"_+", "_", para_name.replace("-", "_")).strip("_")
     para_func = getattr(module, func_name, None)
     if para_func is None:
         return {}
@@ -1875,6 +1876,227 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                                    i, _concolic_hits, len(solutions))
                 except ImportError:
                     pass
+
+    # --- Post-fuzzing error-path sweep ---
+    # For each uncovered paragraph, try running with all-error stub outcomes
+    # to reach error-handling branches that random fuzzing rarely triggers.
+    if (var_report is not None and call_graph is not None
+            and stub_mapping and path_constraints_map):
+        _sweep_rng = random.Random(seed + 7_777_777)
+        uncovered = set(call_graph.reachable) - fuzzer.global_coverage
+        _sweep_log = logging.getLogger("specter.monte_carlo")
+        _sweep_new = 0
+        for target_para in sorted(uncovered):
+            if target_para not in path_constraints_map:
+                continue
+            pc = path_constraints_map[target_para]
+            # Build directed input from path constraints
+            base_state, _ = _generate_directed_input(
+                target_para, pc, var_report, stub_mapping, _sweep_rng, fuzzer,
+            )
+            # Generate ALL-ERROR stub outcomes: every operation fails
+            error_stubs: dict[str, list] = {}
+            for op_key, status_vars in stub_mapping.items():
+                entry: list[tuple[str, object]] = []
+                for svar in status_vars:
+                    upper = svar.upper()
+                    if "SQLCODE" in upper or "SQLSTATE" in upper:
+                        val = _sweep_rng.choice([-803, -811, 100, +100])
+                    elif "EIBRESP" in upper:
+                        val = _sweep_rng.choice([12, 13, 16, 70])
+                    elif "STATUS" in upper or upper.startswith("FS-"):
+                        val = _sweep_rng.choice(["10", "23", "35", "39"])
+                    elif "RETURN-CODE" in upper or upper.endswith("-RC"):
+                        val = _sweep_rng.choice([4, 8, 12, 16])
+                    else:
+                        val = _sweep_rng.choice(["10", "99", 8])
+                    entry.append((svar, val))
+                is_read = op_key.startswith("READ:")
+                n_reps = 10 if is_read else 5
+                error_stubs[op_key] = [list(entry) for _ in range(n_reps)]
+            base_state["_stub_outcomes"] = error_stubs
+            _inject_defaults(base_state, search_rng)
+            # Also try with direct paragraph invocation if unreachable
+            is_unreachable = target_para not in call_graph.reachable
+            try:
+                if is_unreachable:
+                    rs = _run_paragraph_directly(module, target_para, base_state)
+                else:
+                    rs = module.run(base_state)
+                t = rs.get("_trace", [])
+                cov = frozenset(t)
+                edg = frozenset(
+                    (t[j], t[j + 1]) for j in range(len(t) - 1)
+                    if t[j] != t[j + 1]
+                )
+                for p in t:
+                    fuzzer.para_hits[p] += 1
+                fuzzer.n_successful += 1
+                br = frozenset(rs.get("_branches", set()))
+                if _should_add_to_corpus(fuzzer, cov, edg, br):
+                    _sweep_new += 1
+                    e = _CorpusEntry(
+                        input_state={k: v for k, v in base_state.items()
+                                     if not k.startswith("_stub")},
+                        coverage=cov, edges=edg, added_at=n_iterations,
+                        stub_outcomes=error_stubs,
+                    )
+                    _add_to_corpus(fuzzer, e, br)
+            except (RecursionError, Exception):
+                pass
+            # Also try mixed: success stubs for path, error at target
+            if pc.path:
+                mixed_stubs = dict(error_stubs)
+                # Success for operations in path paragraphs
+                for path_para in pc.path[:-1]:
+                    for op_key, status_vars in stub_mapping.items():
+                        entry = []
+                        for svar in status_vars:
+                            upper = svar.upper()
+                            if "SQLCODE" in upper:
+                                entry.append((svar, 0))
+                            elif "STATUS" in upper or upper.startswith("FS-"):
+                                entry.append((svar, "00"))
+                            else:
+                                entry.append((svar, 0))
+                        mixed_stubs[op_key] = [list(entry) for _ in range(10)]
+                base2 = dict(base_state)
+                base2["_stub_outcomes"] = mixed_stubs
+                _inject_defaults(base2, search_rng)
+                try:
+                    rs2 = module.run(base2)
+                    t2 = rs2.get("_trace", [])
+                    cov2 = frozenset(t2)
+                    edg2 = frozenset(
+                        (t2[j], t2[j + 1]) for j in range(len(t2) - 1)
+                        if t2[j] != t2[j + 1]
+                    )
+                    for p in t2:
+                        fuzzer.para_hits[p] += 1
+                    fuzzer.n_successful += 1
+                    br2 = frozenset(rs2.get("_branches", set()))
+                    if _should_add_to_corpus(fuzzer, cov2, edg2, br2):
+                        _sweep_new += 1
+                        e2 = _CorpusEntry(
+                            input_state={k: v for k, v in base2.items()
+                                         if not k.startswith("_stub")},
+                            coverage=cov2, edges=edg2, added_at=n_iterations,
+                            stub_outcomes=mixed_stubs,
+                        )
+                        _add_to_corpus(fuzzer, e2, br2)
+                except (RecursionError, Exception):
+                    pass
+        if _sweep_new:
+            _sweep_log.info("Error-path sweep: %d new corpus entries from %d targets",
+                           _sweep_new, len(uncovered))
+
+    # --- BFS branch-flipping pass ---
+    # For each covered branch, try to flip it by inverting condition variables.
+    # Uses corpus entries that cover the branch's paragraph as base states.
+    if var_report is not None:
+        _branch_meta = getattr(module, '_BRANCH_META', {})
+        if _branch_meta:
+            _bfs_rng = random.Random(seed + 9_999_999)
+            _bfs_log = logging.getLogger("specter.monte_carlo")
+            _bfs_new = 0
+            _bfs_attempts = 0
+            _MAX_BFS_ATTEMPTS = 2000
+
+            # Collect all branch IDs — both positive (true) and negative (false)
+            all_branch_ids = set()
+            for bid in _branch_meta:
+                all_branch_ids.add(bid)
+                all_branch_ids.add(-bid)
+            uncovered_branches = all_branch_ids - fuzzer.global_branches
+
+            for ubid in sorted(uncovered_branches, key=abs):
+                if _bfs_attempts >= _MAX_BFS_ATTEMPTS:
+                    break
+                abs_bid = abs(ubid)
+                meta = _branch_meta.get(abs_bid)
+                if not meta:
+                    continue
+                para = meta.get("paragraph", "")
+                cond_text = meta.get("condition", "")
+                if not cond_text or not para:
+                    continue
+
+                # Parse condition variables
+                from .static_analysis import _parse_condition_variables
+                cond_vars = _parse_condition_variables(cond_text)
+                if not cond_vars:
+                    continue
+
+                # Find corpus entries that cover this paragraph
+                bases = [e for e in fuzzer.corpus if para in e.coverage]
+                if not bases:
+                    continue
+
+                # Try flipping: for uncovered negative branch (else), make
+                # condition FALSE; for uncovered positive, make condition TRUE
+                want_true = ubid > 0
+                for base_entry in bases[:3]:  # try up to 3 base states
+                    _bfs_attempts += 1
+                    state = dict(base_entry.input_state)
+                    for var, vals, negated in cond_vars:
+                        if vals:
+                            if want_true != negated:
+                                # Need condition to match: set var to one of the values
+                                state[var] = _bfs_rng.choice(vals)
+                            else:
+                                # Need condition to NOT match: set var to something else
+                                info = var_report.variables.get(var)
+                                if info and info.condition_literals:
+                                    others = [v for v in info.condition_literals
+                                              if v not in vals]
+                                    if others:
+                                        state[var] = _bfs_rng.choice(others)
+                                    else:
+                                        state[var] = _generate_random_value(
+                                            var, info, _bfs_rng)
+                                elif isinstance(vals[0], str):
+                                    state[var] = "ZZZZ"
+                                elif isinstance(vals[0], (int, float)):
+                                    state[var] = -999999
+                                else:
+                                    state[var] = not vals[0] if isinstance(vals[0], bool) else ""
+
+                    stubs = (
+                        {k: [v2 if not isinstance(v2, list) else list(v2)
+                             for v2 in v]
+                         for k, v in base_entry.stub_outcomes.items()}
+                        if base_entry.stub_outcomes else None
+                    )
+                    if stubs:
+                        state["_stub_outcomes"] = stubs
+                    _inject_defaults(state, search_rng)
+                    try:
+                        rs = module.run(state)
+                        t = rs.get("_trace", [])
+                        cov = frozenset(t)
+                        edg = frozenset(
+                            (t[j], t[j + 1]) for j in range(len(t) - 1)
+                            if t[j] != t[j + 1]
+                        )
+                        for p in t:
+                            fuzzer.para_hits[p] += 1
+                        fuzzer.n_successful += 1
+                        br = frozenset(rs.get("_branches", set()))
+                        if _should_add_to_corpus(fuzzer, cov, edg, br):
+                            _bfs_new += 1
+                            e = _CorpusEntry(
+                                input_state={k: v for k, v in state.items()
+                                             if not k.startswith("_stub")},
+                                coverage=cov, edges=edg, added_at=n_iterations + 1,
+                                stub_outcomes=stubs,
+                            )
+                            _add_to_corpus(fuzzer, e, br)
+                            break  # found coverage for this branch, move on
+                    except (RecursionError, Exception):
+                        pass
+            if _bfs_new:
+                _bfs_log.info("BFS branch-flip: %d new corpus entries from %d attempts",
+                             _bfs_new, _bfs_attempts)
 
     # Count total branch points from the generated module source
     total_branches = 0

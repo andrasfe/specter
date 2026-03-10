@@ -177,3 +177,68 @@ The generated Python code includes several safety mechanisms:
 - **Call depth guard**: every paragraph checks and increments a depth counter on entry, decrements in a `finally` block
 - **ZeroDivisionError catch**: COMPUTE/DIVIDE expressions with zero divisors set `_abended = True` instead of crashing
 - **PERFORM THRU**: executes all paragraphs in program order from target through thru-target, not just the first
+
+## Deterministic Test Set Synthesis (`--synthesize`)
+
+In addition to the random fuzzer, Specter includes a deterministic, layered synthesis engine that generates a minimal test set targeting maximum branch coverage. Unlike the Monte Carlo fuzzer, synthesis is repeatable — given the same AST, it produces the same test set.
+
+### Architecture
+
+The engine runs layers sequentially, each building on prior coverage. Test cases are persisted to a JSONL test store, allowing incremental re-runs (completed layers are skipped).
+
+### Layers
+
+| Layer | Name | Strategy | Typical Yield |
+|-------|------|----------|---------------|
+| 1 | All-Success Seeds | 5 seed TCs with status=success, equality constraints applied | ~200 branch dirs |
+| 2 | Per-Paragraph Direct Invocation | Invoke each paragraph function directly with default state | ~1100 branch dirs |
+| 2.5 | Frontier Expansion | Try adjacent paragraphs from Layer 2's traces | ~40 branch dirs |
+| 3 | Condition-Targeted | Parse each uncovered branch's condition, set variables to satisfy/negate it | ~700 branch dirs |
+| 3.5 | Paragraph Sweep | Full condition sweep per paragraph with cartesian products, Phase 3 targeted flip | ~400 branch dirs |
+| 3.7 | Stub Fault Injection | Dataflow analysis to find stub-dependent branches | 0-5 branch dirs |
+| 4 | Stub Combination | Systematically vary external operation return codes | 0-5 branch dirs |
+| 5 | Mutation Walks | Hill-climbing: mutate best TCs for 100 rounds, keep improvements | ~15 branch dirs |
+| 6 | Branch Direction Flip | For each flippable branch (one direction covered), try to flip via condition manipulation | ~20 branch dirs |
+| 7 | Random Exploration | Targeted random state generation per high-gap paragraph with hill-climbing | ~100+ branch dirs |
+
+### Branch Instrumentation
+
+Every IF statement emits both `+bid` (TRUE taken) and `-bid` (FALSE taken) branch IDs, including an explicit `else` clause for IF-without-ELSE patterns. EVALUATE WHEN clauses emit `+bid` only (FALSE is implicit when a different WHEN matches). PERFORM UNTIL and SEARCH emit both directions.
+
+Branch metadata is stored in `_BRANCH_META`, a module-level dict mapping each absolute branch ID to `{condition, paragraph, type, subject}`.
+
+### Condition Parser
+
+`_parse_condition_variables()` extracts `(variable, values, negated)` triples from COBOL condition strings. It handles:
+
+- Simple comparisons: `WS-STATUS = '00'`
+- Multi-value lists: `FS-FILE NOT EQUAL '00' AND '04' AND '05'`
+- Variable-to-variable: `TRANS-TYPE EQUAL REGLR-DEF-TXN-CODE` (both vars emitted with `[0]` marker)
+- Compound AND/OR: split on top-level logical operators, recurse
+- Figurative constants: ZEROS, SPACES, LOW-VALUES
+- Flag conditions: bare `SCHEDULE-FILE-ERROR` or `NOT C-VSAM-FILE-OK`
+- COBOL decimal commas: `1000000,00` parsed as `1000000.0`
+- Subscripted variables: `VAR(I)` stripped to `VAR`
+
+### Variable-to-Variable Comparisons
+
+When the condition compares two variables (e.g., `A EQUAL B`), the synthesis looks up the current runtime value of the RHS variable in the base state or defaults, then sets the LHS to match (for TRUE) or differ (for FALSE). This avoids the problem of setting both to an arbitrary constant like `42` which fails when the RHS already has a different default value.
+
+### Layer 7: Random Exploration
+
+The most aggressive layer. For each paragraph with 3+ uncovered branch directions:
+
+1. Collect all condition literals referenced by uncovered branches in that paragraph
+2. For 500 trials, generate a state by randomly setting condition variables to known literals (40%), random domain values (20%), or leaving defaults (40%)
+3. Also perturb 1-8 random variables and occasionally vary stub outcomes
+4. Hill-climbing: when a trial discovers new branches, use that state as the base for subsequent trials (70% of the time; 30% restart from the original base TC)
+
+### Paragraph Name Sanitization
+
+COBOL paragraph names like `R--1CF2` (double dash) are sanitized to Python function names via `re.sub(r"_+", "_", name.replace("-", "_"))`, collapsing consecutive underscores. The synthesis engine and direct invocation use the same sanitization to correctly resolve function names.
+
+### Coverage Ceiling
+
+Some branch directions are structurally unreachable:
+- EVALUATE WHEN FALSE: only TRUE (`+bid`) is instrumented per WHEN clause, since FALSE is implicit
+- Sub-paragraph state overwrite: branches depending on variables set by called sub-paragraphs cannot be controlled via input state alone

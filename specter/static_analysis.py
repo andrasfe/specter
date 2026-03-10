@@ -140,10 +140,53 @@ def _parse_condition_variables(condition: str) -> list[tuple[str, list, bool]]:
     Returns a list of tuples: (variable_name, [literal_values], negated).
     For bare flag conditions like "SCHEDULE-FILE-ERROR", returns
     (variable_name, [True], False) since the flag must be truthy.
+
+    For variable-to-variable comparisons like "VAR-A = VAR-B", returns
+    both variables: (VAR-A, [0], False) and (VAR-B, [0], False) so that
+    the synthesis engine can set them to matching/differing values.
     """
     if not condition:
         return []
     text = condition.strip()
+
+    # Strip outer parentheses: "((A > B) AND (C = D))" -> "A > B AND C = D"
+    # Repeatedly strip matching outer parens
+    while text.startswith("(") and text.endswith(")"):
+        depth = 0
+        matched = True
+        for i, ch in enumerate(text):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            if depth == 0 and i < len(text) - 1:
+                matched = False
+                break
+        if matched:
+            text = text[1:-1].strip()
+        else:
+            break
+
+    # Handle EVALUATE literals: "+0", "-803", "OTHER"
+    if text == "OTHER":
+        return []  # EVALUATE OTHER has no variable to set
+    if re.match(r"^[+-]?\d+$", text):
+        return []  # EVALUATE WHEN literal — no variable to set
+
+    # Split compound conditions on top-level AND/OR for recursive processing
+    # Only split when AND/OR separates full comparisons (has operator on both sides)
+    top_level_parts = _split_top_level_logical(text)
+    if len(top_level_parts) > 1:
+        results = []
+        seen = set()
+        for part in top_level_parts:
+            for triple in _parse_condition_variables(part.strip()):
+                key = (triple[0], tuple(triple[1]), triple[2])
+                if key not in seen:
+                    seen.add(key)
+                    results.append(triple)
+        return results
+
     results = []
 
     parts = _CMP_RE.split(text)
@@ -166,6 +209,13 @@ def _parse_condition_variables(condition: str) -> list[tuple[str, list, bool]]:
             results.append((var_name, [True], negated))
         return results
 
+    _FIGURATIVE = {
+        "ZEROES": 0, "ZEROS": 0, "ZERO": 0,
+        "SPACES": " ", "SPACE": " ",
+        "LOW-VALUES": "", "LOW-VALUE": "",
+        "HIGH-VALUES": "\xff", "HIGH-VALUE": "\xff",
+    }
+
     for idx, op in enumerate(ops):
         lhs_raw = parts[idx].strip() if idx < len(parts) else ""
         rhs_raw = parts[idx + 1].strip() if idx + 1 < len(parts) else ""
@@ -178,52 +228,105 @@ def _parse_condition_variables(condition: str) -> list[tuple[str, list, bool]]:
         lhs_upper = lhs_raw.upper()
         negated = "NOT" in op_upper or lhs_upper.rstrip().endswith("NOT")
 
-        # Extract variable from LHS
+        # Extract variable from LHS (strip subscripts for matching)
         lhs_tokens = re.findall(
-            r"[A-Z][A-Z0-9-]*(?:\([^)]*\))?|'[^']*'|-?\d+\.?\d*",
+            r"[A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?|'[^']*'|[+-]?\d+\.?\d*",
             lhs_raw, re.IGNORECASE,
         )
         var_name = None
         for tok in reversed(lhs_tokens):
-            tok_upper = tok.upper()
+            tok_clean = re.sub(r"\s*\([^)]*\)$", "", tok)  # strip subscript
+            tok_upper = tok_clean.upper()
             if (tok_upper not in _KEYWORDS
                     and tok_upper not in ("AND", "OR", "NOT")
-                    and not tok.startswith("'")
-                    and not re.match(r"^-?\d+\.?\d*$", tok)):
+                    and not tok_clean.startswith("'")
+                    and not re.match(r"^[+-]?\d+\.?\d*$", tok_clean)):
                 var_name = _clean_var_name(tok_upper)
                 break
-        if not var_name or len(var_name) < 2:
+        # Allow single-char variables (I, J, K) — common loop counters
+        if not var_name:
             continue
 
         # Extract literals from RHS (including COBOL figurative constants)
-        _FIGURATIVE = {
-            "ZEROES": 0, "ZEROS": 0, "ZERO": 0,
-            "SPACES": " ", "SPACE": " ",
-            "LOW-VALUES": "", "LOW-VALUE": "",
-            "HIGH-VALUES": "\xff", "HIGH-VALUE": "\xff",
-        }
+        # The regex captures COBOL decimal commas (e.g. 1000000,00)
         rhs_tokens = re.findall(
-            r"'[^']*'|-?\d+\.?\d*|[A-Z][A-Z0-9-]*(?:\([^)]*\))?",
+            r"'[^']*'|[+-]?\d+[.,]\d+|[+-]?\d+|[A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?",
             rhs_raw, re.IGNORECASE,
         )
         literals: list = []
+        rhs_variables: list[str] = []
         for tok in rhs_tokens:
-            tok_upper = tok.upper()
-            if tok_upper in ("AND", "OR", "NOT", "IS", "NUMERIC"):
+            tok_clean = re.sub(r"\s*\([^)]*\)$", "", tok)  # strip subscript
+            tok_upper = tok_clean.upper()
+            if tok_upper in ("AND", "OR", "NOT", "IS", "NUMERIC", "THAN"):
                 continue
-            if tok.startswith("'") and tok.endswith("'"):
-                literals.append(tok[1:-1])
-            elif re.match(r"^-?\d+$", tok):
-                literals.append(int(tok))
-            elif re.match(r"^-?\d+\.\d+$", tok):
-                literals.append(float(tok))
+            if tok_clean.startswith("'") and tok_clean.endswith("'"):
+                literals.append(tok_clean[1:-1])
+            elif re.match(r"^[+-]?\d+$", tok_clean):
+                literals.append(int(tok_clean))
+            elif re.match(r"^[+-]?\d+[.,]\d+$", tok_clean):
+                # COBOL uses comma as decimal separator
+                literals.append(float(tok_clean.replace(",", ".")))
             elif tok_upper in _FIGURATIVE:
                 literals.append(_FIGURATIVE[tok_upper])
+            elif tok_upper not in _KEYWORDS:
+                # RHS is a variable reference — record it
+                rhs_variables.append(_clean_var_name(tok_upper))
 
         if literals:
             results.append((var_name, literals, negated))
+        elif rhs_variables:
+            # Variable-to-variable comparison: emit both sides with
+            # generic values so the synthesis engine can set them.
+            # Use 0 as a default matchable value for both.
+            results.append((var_name, [0], negated))
+            for rv in rhs_variables:
+                if rv and len(rv) >= 1:
+                    results.append((rv, [0], negated))
 
     return results
+
+
+def _split_top_level_logical(text: str) -> list[str]:
+    """Split a condition on top-level AND/OR, respecting parentheses.
+
+    Only splits when AND/OR appears at depth 0 (not inside parentheses).
+    Returns the original text in a single-element list if no split is found.
+    """
+    depth = 0
+    parts = []
+    current_start = 0
+    i = 0
+    upper = text.upper()
+    while i < len(upper):
+        ch = upper[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif depth == 0:
+            # Check for AND or OR at word boundary
+            for kw in (" AND ", " OR "):
+                if upper[i:i + len(kw)] == kw:
+                    # Verify it's separating comparisons, not a multi-value list
+                    # A multi-value OR/AND looks like "X = 'A' OR 'B'" or
+                    # "X NOT = SPACES AND '00'" (no operator after AND/OR)
+                    after = text[i + len(kw):].strip()
+                    # If after starts with a quoted literal, number, or figurative
+                    # constant without a comparison operator, it's a multi-value list
+                    if re.match(
+                        r"^(?:NOT\s+)?(?:'[^']*'|[+-]?\d+|ZERO|ZEROS|ZEROES|SPACES?|LOW-VALUES?)(?:\s|$)",
+                        after, re.IGNORECASE,
+                    ):
+                        i += 1
+                        continue
+                    parts.append(text[current_start:i].strip())
+                    i += len(kw)
+                    current_start = i
+                    continue
+        i += 1
+    parts.append(text[current_start:].strip())
+    return [p for p in parts if p]
 
 
 def extract_gating_conditions(

@@ -136,6 +136,37 @@ class TestResolveWhenValue(unittest.TestCase):
         )
         self.assertIn("state[", result)
 
+    def test_implied_subject_and_not_equal(self):
+        """AND NOT = val should use the subject from the first comparison."""
+        result = cobol_condition_to_python(
+            "FILE-STATUS NOT = '00' AND NOT = '04' AND NOT = '05'"
+        )
+        # Should produce three != checks against the same subject
+        self.assertEqual(result.count("state['FILE-STATUS']"), 3)
+        self.assertIn("!= '00'", result)
+        self.assertIn("!= '04'", result)
+        self.assertIn("!= '05'", result)
+        self.assertNotIn("True", result)
+
+    def test_implied_subject_and_equal(self):
+        """AND = val should use the subject from the first comparison."""
+        result = cobol_condition_to_python(
+            "SQLCODE NOT = 0 AND NOT = 100"
+        )
+        self.assertEqual(result.count("state['SQLCODE']"), 2)
+        self.assertIn("!= 0", result)
+        self.assertIn("!= 100", result)
+
+    def test_and_with_different_subject(self):
+        """AND with a full comparison should NOT use implied subject."""
+        result = cobol_condition_to_python(
+            "WS-FLAG NOT EQUAL 'Y' AND WS-OTHER = 'X'"
+        )
+        self.assertIn("state['WS-FLAG']", result)
+        self.assertIn("state['WS-OTHER']", result)
+        self.assertIn("!= 'Y'", result)
+        self.assertIn("== 'X'", result)
+
 
 if __name__ == "__main__":
     unittest.main()

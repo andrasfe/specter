@@ -229,5 +229,58 @@ class TestCodeGenerator(unittest.TestCase):
         self.assertEqual(result["MY-VAR"], "")
 
 
+    def test_compute_with_star_comment(self):
+        """COMPUTE with *> comments should strip comments and generate code."""
+        program = self._make_program([
+            {"type": "COMPUTE",
+             "text": "COMPUTE WS-RESULT = WS-A * *> OLD-VAR. WS-B",
+             "line_start": 1, "line_end": 1,
+             "attributes": {"target": "WS-RESULT",
+                            "expression": "WS-A * *> OLD-VAR. WS-B"},
+             "children": []},
+        ])
+        code = generate_code(program)
+        ns = {}
+        exec(code, ns)
+        result = ns["run"]({"WS-A": 5, "WS-B": 3})
+        self.assertEqual(result["WS-RESULT"], 15)
+
+    def test_add_no_keyword_leak(self):
+        """ADD with *> comments should not treat COBOL keywords as variables."""
+        program = self._make_program([
+            {"type": "ADD",
+             "text": "ADD WS-X *> TO OLD-TARGET. TO WS-Y",
+             "line_start": 1, "line_end": 1,
+             "attributes": {}, "children": []},
+        ])
+        code = generate_code(program)
+        # Should not contain state['TO']
+        self.assertNotIn("state['TO']", code)
+        ns = {}
+        exec(code, ns)
+        result = ns["run"]({"WS-X": 10, "WS-Y": 5})
+        self.assertEqual(result["WS-Y"], 15)
+
+    def test_if_with_star_comment_in_condition(self):
+        """IF with *> comments in condition should strip and parse correctly."""
+        program = self._make_program([
+            {"type": "IF",
+             "text": "IF WS-FLAG AND *> old-check. WS-OTHER",
+             "line_start": 1, "line_end": 1,
+             "attributes": {"condition": "WS-FLAG AND *> old-check. WS-OTHER"},
+             "children": [
+                 {"type": "DISPLAY", "text": "DISPLAY 'YES'",
+                  "line_start": 2, "line_end": 2,
+                  "attributes": {}, "children": []},
+             ]},
+        ])
+        code = generate_code(program)
+        ns = {}
+        exec(code, ns)
+        # Both WS-FLAG and WS-OTHER truthy → should display YES
+        result = ns["run"]({"WS-FLAG": True, "WS-OTHER": True})
+        self.assertIn("YES", str(result.get("_display", [])))
+
+
 if __name__ == "__main__":
     unittest.main()

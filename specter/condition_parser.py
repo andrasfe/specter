@@ -172,6 +172,7 @@ class _Parser:
     def __init__(self, tokens: list[str]):
         self.tokens = tokens
         self.pos = 0
+        self._last_subject: str | None = None  # Track subject for implied-subject continuations
 
     def peek(self, offset: int = 0) -> str | None:
         idx = self.pos + offset
@@ -205,6 +206,39 @@ class _Parser:
     def _or_expr(self) -> str:
         left = self._and_expr()
         while self.match("OR"):
+            # Check for implied-subject continuation: OR NOT = val / OR = val
+            next1 = self.peek(1)
+            next2 = self.peek(2)
+            if next1 and next1.upper() == "NOT" and next2 and next2.upper() in ("=", "EQUAL", "GREATER", "LESS", ">", "<", ">=", "<="):
+                if self._last_subject:
+                    self.advance()  # skip OR
+                    self.advance()  # skip NOT
+                    op = self._parse_operator()
+                    if op:
+                        rhs_token = self._primary_token()
+                        if rhs_token:
+                            rhs = _resolve_value(rhs_token)
+                            py_op = _negate_op(op)
+                            subj = self._last_subject
+                            if py_op in ("<", ">", "<=", ">="):
+                                subj = f"_to_num({subj})"
+                                rhs = f"_to_num({rhs})"
+                            left = f"({left}) or ({subj} {py_op} {rhs})"
+                            continue
+            elif next1 and next1.upper() in ("=", "EQUAL", "GREATER", "LESS", ">", "<", ">=", "<="):
+                if self._last_subject:
+                    self.advance()  # skip OR
+                    op = self._parse_operator()
+                    if op:
+                        rhs_token = self._primary_token()
+                        if rhs_token:
+                            rhs = _resolve_value(rhs_token)
+                            subj = self._last_subject
+                            if op in ("<", ">", "<=", ">="):
+                                subj = f"_to_num({subj})"
+                                rhs = f"_to_num({rhs})"
+                            left = f"({left}) or ({subj} {op} {rhs})"
+                            continue
             self.advance()
             right = self._and_expr()
             left = f"({left}) or ({right})"
@@ -213,8 +247,40 @@ class _Parser:
     def _and_expr(self) -> str:
         left = self._not_expr()
         while self.match("AND"):
-            # Peek ahead: is this AND part of "NOT EQUAL TO X AND Y"?
-            # If so, it was already handled in comparison
+            # Check for implied-subject continuation: AND NOT = val / AND = val
+            # In COBOL, "X NOT = A AND NOT = B" means X != A AND X != B
+            next1 = self.peek(1)
+            next2 = self.peek(2)
+            if next1 and next1.upper() == "NOT" and next2 and next2.upper() in ("=", "EQUAL", "GREATER", "LESS", ">", "<", ">=", "<="):
+                if self._last_subject:
+                    self.advance()  # skip AND
+                    self.advance()  # skip NOT
+                    op = self._parse_operator()
+                    if op:
+                        rhs_token = self._primary_token()
+                        if rhs_token:
+                            rhs = _resolve_value(rhs_token)
+                            py_op = _negate_op(op)
+                            subj = self._last_subject
+                            if py_op in ("<", ">", "<=", ">="):
+                                subj = f"_to_num({subj})"
+                                rhs = f"_to_num({rhs})"
+                            left = f"({left}) and ({subj} {py_op} {rhs})"
+                            continue
+            elif next1 and next1.upper() in ("=", "EQUAL", "GREATER", "LESS", ">", "<", ">=", "<="):
+                if self._last_subject:
+                    self.advance()  # skip AND
+                    op = self._parse_operator()
+                    if op:
+                        rhs_token = self._primary_token()
+                        if rhs_token:
+                            rhs = _resolve_value(rhs_token)
+                            subj = self._last_subject
+                            if op in ("<", ">", "<=", ">="):
+                                subj = f"_to_num({subj})"
+                                rhs = f"_to_num({rhs})"
+                            left = f"({left}) and ({subj} {op} {rhs})"
+                            continue
             self.advance()
             right = self._not_expr()
             left = f"({left}) and ({right})"
@@ -238,6 +304,8 @@ class _Parser:
             return "True"
 
         lhs = _resolve_value(lhs_token)
+        # Save subject for implied-subject continuations (AND NOT = val)
+        self._last_subject = lhs
 
         # Check for IS NUMERIC / IS NOT NUMERIC / IS GREATER/LESS/EQUAL
         if self.match("IS"):

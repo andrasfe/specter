@@ -108,6 +108,19 @@ def _strip_comments_arithmetic(text: str) -> str:
         if seg and seg[0] == ')':
             result += " " + seg
             continue
+        # If result ends with an operator, look for a variable/number after period or space
+        if result and result.rstrip()[-1:] in '+-*/':
+            # Pattern: *> OLD-CODE. NEW-CODE or *> OLD-CODE NEW-CODE
+            # Look for a COBOL variable after a period-space separator
+            m2 = re.search(r'\.\s+([A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?)', seg, re.IGNORECASE)
+            if m2:
+                result += " " + m2.group(1)
+                continue
+            # Look for last COBOL variable/number in the segment (likely the replacement)
+            tokens = re.findall(r'[A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?', seg, re.IGNORECASE)
+            if tokens:
+                result += " " + tokens[-1]
+                continue
     return " ".join(result.split()).strip()
 
 
@@ -302,20 +315,65 @@ def _gen_compute(cb: _CodeBuilder, stmt: Statement):
             cb.line(f"pass  # COMPUTE: {_oneline(stmt.text)}")
             return
     # Strip COBOL inline comments (*> ... to end)
-    # First try simple truncation, then arithmetic-aware recovery if empty
-    simple_expr = re.sub(r"\*>.*", "", expression)
-    simple_expr = " ".join(simple_expr.split()).strip().rstrip(".")
-    while simple_expr and simple_expr[-1] in "+-*/":
-        simple_expr = simple_expr[:-1].strip()
+    # Try multiple strategies and pick the first that compiles
+    if "*>" in expression:
+        candidates = []
 
-    if simple_expr:
-        expression = simple_expr
-    else:
-        # Simple strip gave empty — try arithmetic-aware recovery
-        expression = _strip_comments_arithmetic(expression)
-        expression = " ".join(expression.split()).strip().rstrip(".")
-        while expression and expression[-1] in "+-*/":
-            expression = expression[:-1].strip()
+        # Strategy 1: _strip_cobol_comments (understands old-code. new-code)
+        s1 = _strip_cobol_comments(expression)
+        s1 = " ".join(s1.split()).strip().rstrip(".")
+        while s1 and s1[-1] in "+-*/":
+            s1 = s1[:-1].strip()
+        if s1:
+            candidates.append(s1)
+
+        # Strategy 2: simple truncation (strip everything after *>)
+        s2 = re.sub(r"\*>.*", "", expression)
+        s2 = " ".join(s2.split()).strip().rstrip(".")
+        while s2 and s2[-1] in "+-*/":
+            s2 = s2[:-1].strip()
+        if s2 and s2 not in candidates:
+            candidates.append(s2)
+
+        # Strategy 3: arithmetic-aware recovery
+        s3 = _strip_comments_arithmetic(expression)
+        s3 = " ".join(s3.split()).strip().rstrip(".")
+        while s3 and s3[-1] in "+-*/":
+            s3 = s3[:-1].strip()
+        if s3 and s3 not in candidates:
+            candidates.append(s3)
+
+        # Strategy 4: for *> OLD-CODE NEW-CODE, strip *> markers then try
+        # taking the last N tokens that form a valid expression (new code
+        # typically mirrors old code structure)
+        bare = re.sub(r"\*>[^*]*?(?=[A-Z0-9(])", "", expression, flags=re.IGNORECASE)
+        bare = " ".join(bare.split()).strip().rstrip(".")
+        if bare:
+            # Try the full bare expression
+            if bare not in candidates:
+                candidates.append(bare)
+            # Try taking the second half (old code replaced by new code)
+            tokens = re.findall(r"[A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?|[+\-*/()]|\d+\.?\d*", bare, re.IGNORECASE)
+            for split_idx in range(1, len(tokens)):
+                half = " ".join(tokens[split_idx:])
+                if half and half not in candidates:
+                    candidates.append(half)
+
+        # Pick the first candidate that produces a valid Python expression
+        expression = ""
+        for cand in candidates:
+            # Balance parens before testing
+            open_c = cand.count("(") - cand.count(")")
+            test_expr = cand + ")" * open_c if open_c > 0 else cand
+            # Quick variable substitution for compile test
+            test_py = re.sub(r"[A-Z_][A-Z0-9_-]*(?:\s*\([^)]*\))?", "0", test_expr, flags=re.IGNORECASE)
+            test_py = test_py.replace(")(", ")*(")  # fix adjacent parens
+            try:
+                compile(test_py, "<test>", "eval")
+                expression = cand
+                break
+            except SyntaxError:
+                continue
 
     if not expression:
         cb.line(f"pass  # COMPUTE: empty expression after comment strip")
@@ -479,7 +537,7 @@ def _gen_add(cb: _CodeBuilder, stmt: Statement):
 
         for tok in _tokenize_cobol_vars(targets_str):
             tname = _var_name(tok)
-            if tname and tname not in ("GIVING", "ROUNDED"):
+            if tname and tname not in ("TO", "GIVING", "ROUNDED"):
                 cb.line(f"state['{tname}'] = _to_num(state.get('{tname}', 0)) + {val}")
     else:
         cb.line(f"pass  # ADD: {_oneline(stmt.text)}")
@@ -514,14 +572,93 @@ def _gen_subtract(cb: _CodeBuilder, stmt: Statement):
 
         for tok in _tokenize_cobol_vars(targets_str):
             tname = _var_name(tok)
-            if tname and tname not in ("GIVING", "ROUNDED"):
+            if tname and tname not in ("FROM", "GIVING", "ROUNDED"):
                 cb.line(f"state['{tname}'] = _to_num(state.get('{tname}', 0)) - {val}")
     else:
         cb.line(f"pass  # SUBTRACT: {_oneline(stmt.text)}")
 
 
+def _strip_comments_condition(text: str) -> str:
+    """Strip *> comments from a COBOL condition expression.
+
+    In merged AST text, *> introduces inline comments that may contain old
+    condition code. We strip the comment text and keep what follows if it
+    looks like a valid condition continuation (starts with paren or variable
+    followed by a COBOL comparison keyword).
+    """
+    if "*>" not in text:
+        return text.strip()
+
+    parts = text.split("*>")
+    result = parts[0].strip()
+
+    # Pattern for condition continuation: AND/OR followed by condition,
+    # or a parenthesized condition group
+    _COND_CONT = re.compile(
+        r"\b(AND|OR)\s+(?:NOT\s+)?(?:\()?[A-Z][A-Z0-9-]",
+        re.IGNORECASE,
+    )
+    # Pattern for start of condition: VAR comparison or (VAR comparison
+    _COND_START = re.compile(
+        r"(?:\()?\s*[A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?\s+(?:EQUAL|NOT|LESS|GREATER|IN)\b",
+        re.IGNORECASE,
+    )
+
+    def _append(result: str, new_text: str) -> str:
+        """Append new_text to result, avoiding AND AND or OR OR duplication."""
+        new_text = new_text.strip()
+        result_stripped = result.rstrip()
+        # If result ends with AND/OR and new_text starts with same, skip the dupe
+        for kw in ("AND", "OR"):
+            if result_stripped.upper().endswith(kw) and re.match(rf"^{kw}\b", new_text, re.IGNORECASE):
+                new_text = new_text[len(kw):].strip()
+                break
+        # If result ends with AND but new_text starts with OR (or vice versa),
+        # the AND was from the old code — replace it with the new connector
+        if result_stripped.upper().endswith("AND") and re.match(r"^OR\b", new_text, re.IGNORECASE):
+            result = result_stripped[:-3].rstrip()
+        elif result_stripped.upper().endswith("OR") and re.match(r"^AND\b", new_text, re.IGNORECASE):
+            result = result_stripped[:-2].rstrip()
+        return result + " " + new_text
+
+    for seg in parts[1:]:
+        seg = seg.strip()
+        if not seg:
+            continue
+
+        # Look for AND/OR continuation — most reliable indicator of new code
+        m = _COND_CONT.search(seg)
+        if m:
+            result = _append(result, seg[m.start():])
+            continue
+
+        # Look for period-separated new code: *> old-code. new-code
+        if ". " in seg:
+            after = seg.split(". ", 1)[1].strip()
+            if after and _COND_START.match(after):
+                result = _append(result, after)
+                continue
+
+        # Look for a parenthesized condition start
+        m = re.search(r"(\([A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?\s+(?:EQUAL|NOT|LESS|GREATER))", seg, re.IGNORECASE)
+        if m:
+            result = _append(result, seg[m.start():])
+            continue
+
+        # Look for condition start: VAR EQUAL/NOT/LESS...
+        m = _COND_START.search(seg)
+        if m:
+            result = _append(result, seg[m.start():])
+            continue
+
+    return " ".join(result.split()).strip()
+
+
 def _gen_if(cb: _CodeBuilder, stmt: Statement):
     condition = stmt.attributes.get("condition", "")
+    # Strip *> comments from conditions (AST may contain inline comments)
+    if "*>" in condition:
+        condition = _strip_comments_condition(condition)
     bid = cb.next_branch_id()
     cb.branch_meta[bid] = {
         "condition": condition,
@@ -561,6 +698,12 @@ def _gen_if(cb: _CodeBuilder, stmt: Statement):
         else:
             for child in else_node.children:
                 _gen_statement(cb, child)
+        cb.dedent()
+    else:
+        # No ELSE in AST — still instrument the fall-through path
+        cb.line("else:")
+        cb.indent()
+        cb.line(f"state.get('_branches', set()).add(-{bid})")
         cb.dedent()
 
 
@@ -657,11 +800,18 @@ def _gen_perform(cb: _CodeBuilder, stmt: Statement):
         by_val = _resolve_source(m_vary.group(3).strip())
         until_cond = m_vary.group(4).strip().rstrip(".")
         py_until = cobol_condition_to_python(until_cond)
+        bid = cb.next_branch_id()
+        cb.branch_meta[bid] = {
+            "condition": until_cond,
+            "paragraph": cb.current_para,
+            "type": "PERFORM_VARYING",
+        }
         lv = cb.next_loop_var()
         cb.line(f"state['{loop_var}'] = _to_num({from_val})")
         cb.line(f"{lv} = 0")
         cb.line(f"while not ({py_until}):")
         cb.indent()
+        cb.line(f"state.get('_branches', set()).add({bid})")
         cb.line(f"{func_name}(state)")
         cb.line(f"state['{loop_var}'] = _to_num(state.get('{loop_var}', 0)) + _to_num({by_val})")
         cb.line(f"{lv} += 1")
@@ -669,6 +819,10 @@ def _gen_perform(cb: _CodeBuilder, stmt: Statement):
         cb.indent()
         cb.line("break")
         cb.dedent()
+        cb.dedent()
+        cb.line(f"if {lv} == 0:")
+        cb.indent()
+        cb.line(f"state.get('_branches', set()).add(-{bid})")
         cb.dedent()
         return
 
@@ -716,10 +870,17 @@ def _gen_perform_thru(cb: _CodeBuilder, stmt: Statement):
 
     if condition:
         py_cond = cobol_condition_to_python(condition)
+        bid = cb.next_branch_id()
+        cb.branch_meta[bid] = {
+            "condition": condition,
+            "paragraph": cb.current_para,
+            "type": "PERFORM_UNTIL",
+        }
         lv = cb.next_loop_var()
         cb.line(f"{lv} = 0")
         cb.line(f"while not ({py_cond}):")
         cb.indent()
+        cb.line(f"state.get('_branches', set()).add({bid})")
         for para_name in range_paras:
             cb.line(f"{_sanitize_name(para_name)}(state)")
         cb.line(f"{lv} += 1")
@@ -727,6 +888,11 @@ def _gen_perform_thru(cb: _CodeBuilder, stmt: Statement):
         cb.indent()
         cb.line("break")
         cb.dedent()
+        cb.dedent()
+        # Branch for "condition was true from start" (loop not entered)
+        cb.line(f"if {lv} == 0:")
+        cb.indent()
+        cb.line(f"state.get('_branches', set()).add(-{bid})")
         cb.dedent()
     else:
         for para_name in range_paras:
@@ -738,9 +904,16 @@ def _gen_perform_inline(cb: _CodeBuilder, stmt: Statement):
     varying = stmt.attributes.get("varying", "")
     lv = cb.next_loop_var()
     vary_increment = None  # (loop_var, by_val) if VARYING parsed
+    loop_bid = None  # branch ID for loop condition
 
     if condition:
         py_cond = cobol_condition_to_python(condition)
+        loop_bid = cb.next_branch_id()
+        cb.branch_meta[loop_bid] = {
+            "condition": condition,
+            "paragraph": cb.current_para,
+            "type": "PERFORM_UNTIL",
+        }
         cb.line(f"{lv} = 0")
         cb.line(f"while not ({py_cond}):")
     elif varying:
@@ -755,6 +928,12 @@ def _gen_perform_inline(cb: _CodeBuilder, stmt: Statement):
             by_val = _resolve_source(m_vary.group(3).strip())
             until_cond = m_vary.group(4).strip()
             py_until = cobol_condition_to_python(until_cond)
+            loop_bid = cb.next_branch_id()
+            cb.branch_meta[loop_bid] = {
+                "condition": until_cond,
+                "paragraph": cb.current_para,
+                "type": "PERFORM_VARYING",
+            }
             cb.line(f"state['{loop_var}'] = _to_num({from_val})")
             cb.line(f"{lv} = 0")
             cb.line(f"while not ({py_until}):")
@@ -767,6 +946,8 @@ def _gen_perform_inline(cb: _CodeBuilder, stmt: Statement):
         cb.line(f"while True:  # PERFORM_INLINE")
 
     cb.indent()
+    if loop_bid is not None:
+        cb.line(f"state.get('_branches', set()).add({loop_bid})")
     if not stmt.children:
         cb.line("pass")
     else:
@@ -781,6 +962,11 @@ def _gen_perform_inline(cb: _CodeBuilder, stmt: Statement):
     cb.line("break")
     cb.dedent()
     cb.dedent()
+    if loop_bid is not None:
+        cb.line(f"if {lv} == 0:")
+        cb.indent()
+        cb.line(f"state.get('_branches', set()).add(-{loop_bid})")
+        cb.dedent()
 
 
 def _gen_set(cb: _CodeBuilder, stmt: Statement):
@@ -1010,22 +1196,32 @@ def _gen_search(cb: _CodeBuilder, stmt: Statement):
     elif at_end_pos:
         at_end_body = text[at_end_pos.end():].strip()
 
-    # Generate branching code
+    # Generate branching code with branch instrumentation
+    bid = cb.next_branch_id()
+    cb.branch_meta[bid] = {
+        "condition": f"SEARCH {table_name} FOUND",
+        "paragraph": cb.current_para,
+        "type": "SEARCH",
+    }
     stub_key = f"SEARCH:{table_name}"
     cb.line(f"_sl = state.get('_stub_outcomes', {{}}).get('{stub_key}', [])")
     cb.line(f"_search_found = _sl.pop(0) if _sl else True")
     cb.line("if _search_found:")
     cb.indent()
+    cb.line(f"state.get('_branches', set()).add({bid})")
     # WHEN branch: set index and execute extracted statements
     if index_var:
         cb.line(f"state['{index_var}'] = 1")
     _gen_search_body(cb, when_body)
     cb.dedent()
+    cb.line("else:")
+    cb.indent()
+    cb.line(f"state.get('_branches', set()).add(-{bid})")
     if at_end_body:
-        cb.line("else:")
-        cb.indent()
         _gen_search_body(cb, at_end_body)
-        cb.dedent()
+    else:
+        cb.line("pass")
+    cb.dedent()
 
 
 def _gen_search_body(cb: _CodeBuilder, body: str):
@@ -1063,8 +1259,14 @@ def _gen_search_body(cb: _CodeBuilder, body: str):
         r"PERFORM\s+([A-Z][A-Z0-9-]*)(?:\s+THRU\s+([A-Z][A-Z0-9-]*))?",
         body, re.IGNORECASE,
     ):
-        func_name = _sanitize_name(m.group(1))
-        cb.line(f"{func_name}(state)")
+        target = m.group(1).upper()
+        thru = m.group(2).upper() if m.group(2) else None
+        if thru and thru != target:
+            range_paras = _get_thru_range(target, thru)
+        else:
+            range_paras = [target]
+        for para_name in range_paras:
+            cb.line(f"{_sanitize_name(para_name)}(state)")
         generated = True
 
     # Extract DISPLAY

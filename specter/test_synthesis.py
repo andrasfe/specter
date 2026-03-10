@@ -257,7 +257,8 @@ def _execute_and_collect(
 
     if stub_outcomes:
         state["_stub_outcomes"] = {
-            k: [list(entry) for entry in v]
+            k: [entry if not isinstance(entry, list) else list(entry)
+                for entry in v]
             for k, v in stub_outcomes.items()
         }
     if stub_defaults:
@@ -285,7 +286,8 @@ def _execute_direct_and_collect(
     run_state = dict(input_state)
     if stub_outcomes:
         run_state["_stub_outcomes"] = {
-            k: [list(entry) for entry in v]
+            k: [entry if not isinstance(entry, list) else list(entry)
+                for entry in v]
             for k, v in stub_outcomes.items()
         }
     if stub_defaults:
@@ -322,7 +324,8 @@ def _execute_and_collect_full(
 
     if stub_outcomes:
         state["_stub_outcomes"] = {
-            k: [list(entry) for entry in v]
+            k: [entry if not isinstance(entry, list) else list(entry)
+                for entry in v]
             for k, v in stub_outcomes.items()
         }
     if stub_defaults:
@@ -747,7 +750,8 @@ def _run_layer_2(
                 run_s = dict(try_state)
                 if try_stubs:
                     run_s["_stub_outcomes"] = {
-                        k: [list(e) for e in v]
+                        k: [e if not isinstance(e, list) else list(e)
+                            for e in v]
                         for k, v in try_stubs.items()
                     }
                 if base_defaults:
@@ -1084,6 +1088,50 @@ def _run_layer_3(
                         solved = True
 
             if not solved:
+                # EVALUATE branch handling
+                if meta.get("type") == "EVALUATE" and meta.get("subject"):
+                    subject = meta["subject"]
+                    when_val = meta.get("condition", "")
+                    state = dict(base_state)
+
+                    if negate:
+                        # Need FALSE → subject should NOT match WHEN value
+                        # Use a value that differs from WHEN
+                        if when_val == "OTHER":
+                            pass  # OTHER always matches; can't be made false
+                        else:
+                            state[subject] = -99999  # unlikely to match
+                    else:
+                        # Need TRUE → subject should match WHEN value
+                        if when_val == "OTHER":
+                            # OTHER matches when no other WHEN matches
+                            # Use a value unlikely to match any WHEN
+                            state[subject] = -99999
+                        elif when_val.startswith("'") and when_val.endswith("'"):
+                            state[subject] = when_val[1:-1]
+                        elif when_val.startswith("+"):
+                            state[subject] = int(when_val)
+                        elif when_val.lstrip("-").isdigit():
+                            state[subject] = int(when_val)
+                        else:
+                            state[subject] = when_val
+
+                    # Also set via stubs
+                    if stub_mapping:
+                        for op_key, svars in stub_mapping.items():
+                            if subject in svars:
+                                base_stubs[op_key] = [
+                                    [(subject, state[subject])]
+                                ] * 50
+
+                    paras, branches, edges = _try_execute(state, base_stubs)
+                    if _maybe_save(synth, store_path, state, base_stubs,
+                                   base_defaults, paras, branches, edges,
+                                   layer=3, target=save_target):
+                        new_count += 1
+                        solved = True
+
+            if not solved:
                 # Heuristic fallback
                 condition = meta.get("condition", "")
                 if not condition:
@@ -1095,9 +1143,82 @@ def _run_layer_3(
                     continue
 
                 state = dict(base_state)
-                for var, vals, neg in parsed:
+                # Detect var-to-var comparison direction from condition text
+                cond_upper = condition.upper()
+                is_gt = ("GREATER" in cond_upper or ">" in condition)
+                is_lt = ("LESS" in cond_upper or "<" in condition)
+                is_eq = ("EQUAL" in cond_upper or "=" in condition)
+                is_var_to_var = (len(parsed) >= 2
+                                 and all(v == [0] for _, v, _ in parsed))
+
+                for i, (var, vals, neg) in enumerate(parsed):
                     effective_neg = neg != negate
-                    if not effective_neg and vals:
+                    if is_var_to_var and vals == [0]:
+                        # Variable-to-variable comparison — look up existing
+                        # values in base_state / defaults so we match (or
+                        # mismatch) the *actual* runtime values, not an
+                        # arbitrary constant like 42.
+                        other_var = (parsed[1][0] if i == 0
+                                     else parsed[0][0])
+                        # Current value of the other variable
+                        other_val = state.get(other_var,
+                                              base_defaults.get(other_var, ''))
+                        if not effective_neg:
+                            # Need condition TRUE
+                            if is_gt and i == 0:
+                                ov = state.get(other_var,
+                                               base_defaults.get(other_var, 0))
+                                try:
+                                    state[var] = int(ov) + 100
+                                except (ValueError, TypeError):
+                                    state[var] = 100
+                            elif is_gt and i > 0:
+                                pass  # leave other var as-is
+                            elif is_lt and i == 0:
+                                ov = state.get(other_var,
+                                               base_defaults.get(other_var, 0))
+                                try:
+                                    state[var] = int(ov) - 100
+                                except (ValueError, TypeError):
+                                    state[var] = ''
+                            elif is_lt and i > 0:
+                                pass
+                            elif is_eq:
+                                # Set this var to match the other var's value
+                                state[var] = other_val
+                            else:
+                                state[var] = other_val
+                        else:
+                            # Need condition FALSE
+                            if is_gt and i == 0:
+                                ov = state.get(other_var,
+                                               base_defaults.get(other_var, 0))
+                                try:
+                                    state[var] = int(ov) - 100
+                                except (ValueError, TypeError):
+                                    state[var] = ''
+                            elif is_gt and i > 0:
+                                pass
+                            elif is_lt and i == 0:
+                                ov = state.get(other_var,
+                                               base_defaults.get(other_var, 0))
+                                try:
+                                    state[var] = int(ov) + 100
+                                except (ValueError, TypeError):
+                                    state[var] = 'ZZZZZZ'
+                            elif is_lt and i > 0:
+                                pass
+                            elif is_eq:
+                                # Set to something different from other var
+                                if isinstance(other_val, int):
+                                    state[var] = other_val + 99999
+                                elif isinstance(other_val, str) and other_val:
+                                    state[var] = other_val + '_DIFF'
+                                else:
+                                    state[var] = '__NOMATCH__'
+                            else:
+                                state[var] = '__NOMATCH__'
+                    elif not effective_neg and vals:
                         state[var] = vals[0]
                     elif effective_neg and vals:
                         info = var_report.variables.get(var)
@@ -1140,7 +1261,7 @@ def _extract_branch_nesting(module, paragraph: str) -> dict[int, list[int]]:
     import inspect
     import re
 
-    func_name = "para_" + paragraph.replace("-", "_")
+    func_name = "para_" + re.sub(r"_+", "_", paragraph.replace("-", "_")).strip("_")
     para_func = getattr(module, func_name, None)
     if para_func is None:
         return {}
@@ -1277,6 +1398,34 @@ def _run_layer_35(
         for bid in all_relevant_bids:
             meta = branch_meta.get(bid, {})
             cond = meta.get("condition", "")
+
+            # Handle EVALUATE branches: subject + WHEN values
+            if meta.get("type") == "EVALUATE" and meta.get("subject"):
+                subject = meta["subject"]
+                if subject not in cond_vars_values:
+                    cond_vars_values[subject] = set()
+                # Add the WHEN value
+                when_val = cond
+                if when_val.startswith("'") and when_val.endswith("'"):
+                    cond_vars_values[subject].add(when_val[1:-1])
+                elif when_val.startswith("+"):
+                    try:
+                        cond_vars_values[subject].add(int(when_val))
+                    except ValueError:
+                        pass
+                elif when_val.lstrip("-").isdigit():
+                    cond_vars_values[subject].add(int(when_val))
+                elif when_val not in ("OTHER", ""):
+                    cond_vars_values[subject].add(when_val)
+                # Add condition_literals for subject
+                info = var_report.variables.get(subject)
+                if info and hasattr(info, "condition_literals"):
+                    for lit in info.condition_literals:
+                        cond_vars_values[subject].add(lit)
+                # Add -99999 for "OTHER" match (no WHEN matches)
+                cond_vars_values[subject].add(-99999)
+                continue
+
             if not cond:
                 continue
 
@@ -1304,6 +1453,10 @@ def _run_layer_35(
                 # Add generic values for common patterns
                 if not cond_vars_values[var]:
                     cond_vars_values[var].update(["", "00", "Y", "N", 0, 1])
+                # For numeric comparisons (GREATER, LESS), add boundary values
+                if any(kw in cond.upper() for kw in
+                       ("GREATER", "LESS", ">", "<")):
+                    cond_vars_values[var].update([0, -1, 1, 100, 999])
 
         if not cond_vars_values:
             _record_attempt(synth, store_path, 35, target_key)
@@ -1349,6 +1502,88 @@ def _run_layer_35(
                     # Update base state to build on success
                     base_state = state
                     base_stubs = stubs
+
+        # Phase 1b: Per-branch targeted variable combination
+        # For each uncovered branch, parse its specific condition and set ALL
+        # variables from that condition simultaneously (handles AND conditions)
+        for bid in uncov_bids:
+            if _time_exceeded(start_time, max_time):
+                break
+            if bid in synth.covered_branches:
+                continue
+
+            abs_bid = abs(bid)
+            meta = branch_meta.get(abs_bid, {})
+            cond = meta.get("condition", "")
+            if not cond:
+                continue
+
+            parsed = _parse_condition_variables(cond)
+            if len(parsed) < 2:
+                continue  # Single-var already handled by Phase 1
+
+            need_true = bid > 0
+
+            # Build value sets for each variable in this condition
+            per_var_vals: dict[str, list] = {}
+            for pvar, pvals, neg in parsed:
+                effective_neg = neg != (not need_true)
+                if pvar not in per_var_vals:
+                    per_var_vals[pvar] = []
+                if not effective_neg and pvals:
+                    # Need to satisfy: add the condition values
+                    for v in pvals:
+                        if v not in per_var_vals[pvar]:
+                            per_var_vals[pvar].append(v)
+                elif effective_neg and pvals:
+                    # Need to NOT satisfy: add alternatives
+                    info = var_report.variables.get(pvar)
+                    literals = (info.condition_literals
+                               if info and hasattr(info, "condition_literals")
+                               else [])
+                    for lit in literals:
+                        if lit not in pvals and lit not in per_var_vals[pvar]:
+                            per_var_vals[pvar].append(lit)
+                    if not per_var_vals[pvar]:
+                        per_var_vals[pvar].append(999 if isinstance(
+                            pvals[0], (int, float)) else "XX")
+
+            if not per_var_vals:
+                continue
+
+            # Try cartesian product (limited to avoid explosion)
+            var_names_list = sorted(per_var_vals.keys())
+            val_lists = [per_var_vals[v][:4] for v in var_names_list]  # max 4 per var
+            combo_count = 1
+            for vl in val_lists:
+                combo_count *= len(vl)
+            if combo_count > 64:
+                # Too many — just try first value for each
+                val_lists = [[vl[0]] for vl in val_lists]
+
+            for combo in product(*val_lists):
+                if _time_exceeded(start_time, max_time):
+                    break
+                state = dict(base_state)
+                stubs = dict(base_stubs)
+                for vname, val in zip(var_names_list, combo):
+                    state[vname] = val
+                    if stub_mapping:
+                        for op_key, svars in stub_mapping.items():
+                            if vname in svars:
+                                stubs[op_key] = [[(vname, val)]] * 50
+
+                paras, branches, edges = _execute_direct_and_collect(
+                    module, para, state, stubs, base_defaults,
+                )
+                save_target = f"direct:{para}|combo:{bid}"
+                if _maybe_save(synth, store_path, state, stubs, base_defaults,
+                               paras, branches, edges, layer=35,
+                               target=save_target):
+                    new_count += 1
+                    base_state = state
+                    base_stubs = stubs
+                    break
 
         # Phase 2: Nesting-chain-guided combinations
         # For each uncovered branch, set ALL variables in its nesting chain
@@ -1436,6 +1671,171 @@ def _run_layer_35(
                            target=save_target):
                 new_count += 1
 
+        # Phase 3: Targeted branch flip with multiple base TCs
+        # For each still-uncovered branch, try different base TCs and set
+        # all condition variables for each direction (true/false)
+        all_bases = [tc for tc in synth.test_cases
+                     if para in tc.paragraphs_covered][:5]
+        for bid in uncov_bids:
+            if _time_exceeded(start_time, max_time):
+                break
+            if bid in synth.covered_branches:
+                continue
+
+            abs_bid = abs(bid)
+
+            # Handle SEARCH branches: inject stub outcomes
+            target_meta_3 = branch_meta.get(abs_bid, {})
+            if target_meta_3.get("type") == "SEARCH":
+                cond_text = target_meta_3.get("condition", "")
+                # Extract table name from "SEARCH TABLE_NAME FOUND"
+                m_search = re.match(r"SEARCH\s+(\S+)", cond_text)
+                if m_search:
+                    table_name = m_search.group(1)
+                    search_key = f"SEARCH:{table_name}"
+                    want_found = bid > 0
+                    for alt_base in (all_bases or [base_tc]):
+                        if _time_exceeded(start_time, max_time):
+                            break
+                        state = dict(alt_base.input_state)
+                        stubs = dict(
+                            alt_base.stub_outcomes
+                            if alt_base.stub_outcomes else {}
+                        )
+                        stubs[search_key] = [want_found] * 50
+                        paras_s, branches_s, edges_s = (
+                            _execute_direct_and_collect(
+                                module, para, state, stubs, base_defaults,
+                            )
+                        )
+                        save_target = (
+                            f"direct:{para}|search:{search_key}={want_found}"
+                        )
+                        if _maybe_save(
+                            synth, store_path, state, stubs,
+                            base_defaults, paras_s, branches_s, edges_s,
+                            layer=35, target=save_target,
+                        ):
+                            new_count += 1
+                            break
+                    continue
+            target_meta = branch_meta.get(abs_bid, {})
+            target_cond = target_meta.get("condition", "")
+            if not target_cond:
+                continue
+            parsed = _parse_condition_variables(target_cond)
+            if not parsed:
+                continue
+
+            need_true = bid > 0
+            # Detect comparison direction for var-to-var
+            cond_upper = target_cond.upper()
+            is_gt = ("GREATER" in cond_upper or ">" in target_cond)
+            is_lt = ("LESS" in cond_upper or "<" in target_cond)
+            is_var_to_var = (len(parsed) >= 2
+                             and all(v == [0] for _, v, _ in parsed))
+
+            for base_tc_idx, alt_base in enumerate(all_bases):
+                if _time_exceeded(start_time, max_time):
+                    break
+                state = dict(alt_base.input_state)
+                stubs = dict(alt_base.stub_outcomes) if alt_base.stub_outcomes else {}
+
+                # Also satisfy nesting chain
+                chain = nesting.get(abs_bid, [])
+                for parent_bid in chain:
+                    parent_meta = branch_meta.get(abs(parent_bid), {})
+                    parent_cond = parent_meta.get("condition", "")
+                    if parent_cond:
+                        pp = _parse_condition_variables(parent_cond)
+                        p_need_true = parent_bid > 0
+                        for pvar, pvals, pneg in pp:
+                            eff_neg = pneg != (not p_need_true)
+                            if not eff_neg and pvals:
+                                state[pvar] = pvals[0]
+                            elif eff_neg and pvals:
+                                info = var_report.variables.get(pvar)
+                                lits = (info.condition_literals
+                                       if info and hasattr(info, "condition_literals")
+                                       else [])
+                                for lit in lits:
+                                    if lit not in pvals:
+                                        state[pvar] = lit
+                                        break
+                                else:
+                                    state[pvar] = ("XX" if isinstance(
+                                        pvals[0], str) else 999)
+
+                # Set target condition variables
+                for i, (pvar, pvals, pneg) in enumerate(parsed):
+                    eff_neg = pneg != (not need_true)
+                    if is_var_to_var and pvals == [0]:
+                        other_var = (parsed[1][0] if i == 0
+                                     else parsed[0][0])
+                        other_val = state.get(other_var,
+                                              base_defaults.get(other_var, ''))
+                        if not eff_neg:
+                            if is_gt:
+                                try:
+                                    state[pvar] = int(other_val) + 100 if i == 0 else state.get(pvar, '')
+                                except (ValueError, TypeError):
+                                    state[pvar] = 100 if i == 0 else 1
+                            elif is_lt:
+                                try:
+                                    state[pvar] = int(other_val) - 100 if i == 0 else state.get(pvar, '')
+                                except (ValueError, TypeError):
+                                    state[pvar] = 1 if i == 0 else 100
+                            else:
+                                state[pvar] = other_val
+                        else:
+                            if is_gt:
+                                try:
+                                    state[pvar] = int(other_val) - 100 if i == 0 else state.get(pvar, '')
+                                except (ValueError, TypeError):
+                                    state[pvar] = 1 if i == 0 else 100
+                            elif is_lt:
+                                try:
+                                    state[pvar] = int(other_val) + 100 if i == 0 else state.get(pvar, '')
+                                except (ValueError, TypeError):
+                                    state[pvar] = 100 if i == 0 else 1
+                            else:
+                                if isinstance(other_val, int):
+                                    state[pvar] = other_val + 99999
+                                elif isinstance(other_val, str) and other_val:
+                                    state[pvar] = other_val + '_DIFF'
+                                else:
+                                    state[pvar] = '__NOMATCH__'
+                    elif not eff_neg and pvals:
+                        state[pvar] = pvals[0]
+                    elif eff_neg and pvals:
+                        info = var_report.variables.get(pvar)
+                        lits = (info.condition_literals
+                               if info and hasattr(info, "condition_literals")
+                               else [])
+                        for lit in lits:
+                            if lit not in pvals:
+                                state[pvar] = lit
+                                break
+                        else:
+                            state[pvar] = ("XX" if isinstance(
+                                pvals[0], str) else 999)
+
+                    # Set via stubs if applicable
+                    if stub_mapping:
+                        for op_key, svars in stub_mapping.items():
+                            if pvar in svars:
+                                stubs[op_key] = [[(pvar, state.get(pvar, 0))]] * 50
+
+                paras, branches, edges = _execute_direct_and_collect(
+                    module, para, state, stubs, base_defaults,
+                )
+                save_target = f"direct:{para}|flip:{bid}:b{base_tc_idx}"
+                if _maybe_save(synth, store_path, state, stubs, base_defaults,
+                               paras, branches, edges, layer=35,
+                               target=save_target):
+                    new_count += 1
+                    break
+
         _record_attempt(synth, store_path, 35, target_key)
 
     _record_layer_done(synth, store_path, 35)
@@ -1486,7 +1886,7 @@ def _extract_stub_branch_map(
 
     def _get_source(para: str) -> str:
         if para not in _source_cache:
-            func_name = "para_" + para.replace("-", "_")
+            func_name = "para_" + re.sub(r"_+", "_", para.replace("-", "_")).strip("_")
             func = getattr(module, func_name, None)
             if func is None:
                 _source_cache[para] = ""
@@ -2112,7 +2512,8 @@ def _run_layer_5(
 
             # Mutate 1-3 variables or stubs per round
             state = dict(best_state)
-            stubs = {k: [list(e) for e in v] for k, v in best_stubs.items()}
+            stubs = {k: [e if not isinstance(e, list) else list(e) for e in v]
+                    for k, v in best_stubs.items()}
             n_mutations = rng.randint(1, 3)
 
             var_names = list(var_report.variables.keys())
@@ -2169,6 +2570,455 @@ def _run_layer_5(
         _record_walked(synth, store_path, tc.id)
 
     _record_layer_done(synth, store_path, 5)
+    return new_count
+
+
+# ---------------------------------------------------------------------------
+# Layer 6: Branch Direction Flip
+# ---------------------------------------------------------------------------
+
+def _run_layer_6(
+    module, program, var_report, stub_mapping,
+    synth: SynthesisState, store_path: Path,
+    start_time: float, max_time: float | None,
+) -> int:
+    """Flip branches where exactly one direction is covered.
+
+    For each branch where only TRUE or only FALSE is covered, find TCs
+    that reach the paragraph, then systematically try to flip the condition.
+    Uses condition parsing + multiple value strategies.
+    """
+    import re
+
+    new_count = 0
+    branch_meta = getattr(module, "_BRANCH_META", {})
+    if not branch_meta:
+        _record_layer_done(synth, store_path, 6)
+        return 0
+
+    base_defaults = (
+        _generate_stub_defaults(stub_mapping, var_report)
+        if stub_mapping else {}
+    )
+
+    # Find flippable branches (one direction covered, other not)
+    flippable: list[tuple[int, int, str]] = []  # (target_bid, covered_bid, para)
+    for abs_id, meta in branch_meta.items():
+        para = meta.get("paragraph", "")
+        if not para or para not in synth.covered_paras:
+            continue
+        t_covered = abs_id in synth.covered_branches
+        f_covered = -abs_id in synth.covered_branches
+        if t_covered and not f_covered:
+            flippable.append((-abs_id, abs_id, para))
+        elif f_covered and not t_covered:
+            flippable.append((abs_id, -abs_id, para))
+
+    log.info("Layer 6: %d flippable branches", len(flippable))
+
+    # Sort by paragraph (process all branches in same para together)
+    flippable.sort(key=lambda x: x[2])
+
+    # Build paragraph -> TCs map (top 3 TCs per paragraph)
+    para_tcs: dict[str, list[TestCase]] = {}
+    for tc in synth.test_cases:
+        for p in tc.paragraphs_covered:
+            if p not in para_tcs:
+                para_tcs[p] = []
+            if len(para_tcs[p]) < 5:
+                para_tcs[p].append(tc)
+
+    nesting_cache: dict[str, dict[int, list[int]]] = {}
+
+    for target_bid, covered_bid, para in flippable:
+        if _time_exceeded(start_time, max_time):
+            break
+        if target_bid in synth.covered_branches:
+            continue
+
+        target_key = f"flip6:{target_bid}"
+        if _was_attempted(synth, 6, target_key):
+            continue
+
+        abs_id = abs(target_bid)
+        meta = branch_meta.get(abs_id, {})
+        condition = meta.get("condition", "")
+        need_true = target_bid > 0
+
+        # Get nesting chain
+        if para not in nesting_cache:
+            nesting_cache[para] = _extract_branch_nesting(module, para)
+        nesting = nesting_cache[para]
+
+        # Strategy 1: EVALUATE handling
+        if meta.get("type") == "EVALUATE" and meta.get("subject"):
+            subject = meta["subject"]
+            when_val = condition
+            tcs = para_tcs.get(para, synth.test_cases[:1])
+            for tc in tcs:
+                if _time_exceeded(start_time, max_time):
+                    break
+                state = dict(tc.input_state)
+                stubs = dict(tc.stub_outcomes) if tc.stub_outcomes else {}
+                if need_true:
+                    if when_val == "OTHER":
+                        state[subject] = -99999
+                    elif when_val.startswith("'") and when_val.endswith("'"):
+                        state[subject] = when_val[1:-1]
+                    elif when_val.lstrip("+-").isdigit():
+                        state[subject] = int(when_val)
+                    else:
+                        state[subject] = when_val
+                else:
+                    state[subject] = -99999  # unlikely to match
+                if stub_mapping:
+                    for op_key, svars in stub_mapping.items():
+                        if subject in svars:
+                            stubs[op_key] = [[(subject, state[subject])]] * 50
+                use_direct = tc.target.startswith("direct:")
+                if use_direct:
+                    dp = tc.target.split("|")[0][len("direct:"):]
+                    paras, branches, edges = _execute_direct_and_collect(
+                        module, dp or para, state, stubs, base_defaults)
+                else:
+                    paras, branches, edges = _execute_and_collect(
+                        module, state, stubs, base_defaults)
+                if _maybe_save(synth, store_path, state, stubs, base_defaults,
+                               paras, branches, edges, layer=6,
+                               target=f"direct:{para}|{target_key}"):
+                    new_count += 1
+                    break
+            _record_attempt(synth, store_path, 6, target_key)
+            continue
+
+        # Strategy 2: SEARCH handling
+        if meta.get("type") == "SEARCH":
+            m_search = re.match(r"SEARCH\s+(\S+)", condition)
+            if m_search:
+                table_name = m_search.group(1)
+                search_key = f"SEARCH:{table_name}"
+                want_found = need_true
+                tcs = para_tcs.get(para, synth.test_cases[:1])
+                for tc in tcs:
+                    if _time_exceeded(start_time, max_time):
+                        break
+                    state = dict(tc.input_state)
+                    stubs = dict(tc.stub_outcomes) if tc.stub_outcomes else {}
+                    stubs[search_key] = [want_found] * 50
+                    use_direct = tc.target.startswith("direct:")
+                    if use_direct:
+                        dp = tc.target.split("|")[0][len("direct:"):]
+                        paras, branches, edges = _execute_direct_and_collect(
+                            module, dp or para, state, stubs, base_defaults)
+                    else:
+                        paras, branches, edges = _execute_and_collect(
+                            module, state, stubs, base_defaults)
+                    if _maybe_save(synth, store_path, state, stubs, base_defaults,
+                                   paras, branches, edges, layer=6,
+                                   target=f"direct:{para}|{target_key}"):
+                        new_count += 1
+                        break
+                _record_attempt(synth, store_path, 6, target_key)
+                continue
+
+        # Strategy 3: Condition variable manipulation
+        parsed = _parse_condition_variables(condition)
+        if not parsed:
+            _record_attempt(synth, store_path, 6, target_key)
+            continue
+
+        # Detect var-to-var comparison
+        cond_upper = condition.upper()
+        is_gt = ("GREATER" in cond_upper or ">" in condition)
+        is_lt = ("LESS" in cond_upper or "<" in condition)
+        is_var_to_var = (len(parsed) >= 2
+                         and all(v == [0] for _, v, _ in parsed))
+
+        tcs = para_tcs.get(para, synth.test_cases[:1])
+        found = False
+        for tc in tcs:
+            if found or _time_exceeded(start_time, max_time):
+                break
+            state = dict(tc.input_state)
+            stubs = dict(tc.stub_outcomes) if tc.stub_outcomes else {}
+
+            # Satisfy nesting chain
+            chain = nesting.get(abs_id, [])
+            for parent_bid in chain:
+                parent_meta = branch_meta.get(abs(parent_bid), {})
+                parent_cond = parent_meta.get("condition", "")
+                if parent_cond:
+                    pp = _parse_condition_variables(parent_cond)
+                    p_need_true = parent_bid > 0
+                    for pvar, pvals, pneg in pp:
+                        eff_neg = pneg != (not p_need_true)
+                        if not eff_neg and pvals:
+                            state[pvar] = pvals[0]
+                        elif eff_neg and pvals:
+                            info = var_report.variables.get(pvar)
+                            lits = (info.condition_literals
+                                   if info and hasattr(info, "condition_literals")
+                                   else [])
+                            for lit in lits:
+                                if lit not in pvals:
+                                    state[pvar] = lit
+                                    break
+                            else:
+                                state[pvar] = ("XX" if isinstance(
+                                    pvals[0], str) else 999)
+
+            # Set target condition variables
+            for i, (pvar, pvals, pneg) in enumerate(parsed):
+                eff_neg = pneg != (not need_true)
+                if is_var_to_var and pvals == [0]:
+                    other_var = (parsed[1][0] if i == 0
+                                 else parsed[0][0])
+                    other_val = state.get(other_var,
+                                          base_defaults.get(other_var, ''))
+                    if not eff_neg:
+                        if is_gt:
+                            try:
+                                state[pvar] = int(other_val) + 100 if i == 0 else state.get(pvar, '')
+                            except (ValueError, TypeError):
+                                state[pvar] = 100 if i == 0 else 1
+                        elif is_lt:
+                            try:
+                                state[pvar] = int(other_val) - 100 if i == 0 else state.get(pvar, '')
+                            except (ValueError, TypeError):
+                                state[pvar] = 1 if i == 0 else 100
+                        else:
+                            state[pvar] = other_val
+                    else:
+                        if is_gt:
+                            try:
+                                state[pvar] = int(other_val) - 100 if i == 0 else state.get(pvar, '')
+                            except (ValueError, TypeError):
+                                state[pvar] = 1 if i == 0 else 100
+                        elif is_lt:
+                            try:
+                                state[pvar] = int(other_val) + 100 if i == 0 else state.get(pvar, '')
+                            except (ValueError, TypeError):
+                                state[pvar] = 100 if i == 0 else 1
+                        else:
+                            if isinstance(other_val, int):
+                                state[pvar] = other_val + 99999
+                            elif isinstance(other_val, str) and other_val:
+                                state[pvar] = other_val + '_DIFF'
+                            else:
+                                state[pvar] = '__NOMATCH__'
+                elif not eff_neg and pvals:
+                    state[pvar] = pvals[0]
+                elif eff_neg and pvals:
+                    info = var_report.variables.get(pvar)
+                    lits = (info.condition_literals
+                           if info and hasattr(info, "condition_literals")
+                           else [])
+                    for lit in lits:
+                        if lit not in pvals:
+                            state[pvar] = lit
+                            break
+                    else:
+                        state[pvar] = ("XX" if isinstance(
+                            pvals[0], str) else 999)
+
+                # Set via stubs
+                if stub_mapping:
+                    for op_key, svars in stub_mapping.items():
+                        if pvar in svars:
+                            stubs[op_key] = [
+                                [(pvar, state.get(pvar, 0))]
+                            ] * 50
+
+            use_direct = tc.target.startswith("direct:")
+            if use_direct:
+                dp = tc.target.split("|")[0][len("direct:"):]
+                paras, branches, edges = _execute_direct_and_collect(
+                    module, dp or para, state, stubs, base_defaults)
+            else:
+                paras, branches, edges = _execute_and_collect(
+                    module, state, stubs, base_defaults)
+            if _maybe_save(synth, store_path, state, stubs, base_defaults,
+                           paras, branches, edges, layer=6,
+                           target=f"direct:{para}|{target_key}"):
+                new_count += 1
+                found = True
+
+        _record_attempt(synth, store_path, 6, target_key)
+
+    _record_layer_done(synth, store_path, 6)
+    return new_count
+
+
+# ---------------------------------------------------------------------------
+# Layer 7: Targeted Random Exploration per Paragraph
+# ---------------------------------------------------------------------------
+
+def _run_layer_7(
+    module, var_report, stub_mapping,
+    synth: SynthesisState, store_path: Path,
+    start_time: float, max_time: float | None,
+) -> int:
+    """Aggressively explore high-gap paragraphs with random states.
+
+    For each paragraph with many uncovered branches, run it many times
+    with condition-aware random inputs. Uses condition literals and
+    classification-based random values.
+    """
+    import random as _random
+    import re
+
+    new_count = 0
+    branch_meta = getattr(module, "_BRANCH_META", {})
+    if not branch_meta:
+        _record_layer_done(synth, store_path, 7)
+        return 0
+
+    base_defaults = (
+        _generate_stub_defaults(stub_mapping, var_report)
+        if stub_mapping else {}
+    )
+    all_success_stubs = (
+        _generate_all_success_stubs(stub_mapping, var_report)
+        if stub_mapping else {}
+    )
+
+    # Find paragraphs with uncovered branches
+    from collections import Counter
+    para_uncov = Counter()
+    para_uncov_bids: dict[str, list[int]] = {}
+    for abs_id, meta in branch_meta.items():
+        para = meta.get("paragraph", "")
+        for d in (abs_id, -abs_id):
+            if d not in synth.covered_branches:
+                para_uncov[para] += 1
+                if para not in para_uncov_bids:
+                    para_uncov_bids[para] = []
+                para_uncov_bids[para].append(abs_id)
+
+    if not para_uncov:
+        _record_layer_done(synth, store_path, 7)
+        return 0
+
+    # Collect condition variables and their literals per paragraph
+    para_cond_vars: dict[str, dict[str, set]] = {}
+    for para, bids in para_uncov_bids.items():
+        cond_vars: dict[str, set] = {}
+        for bid in bids:
+            m = branch_meta.get(bid, {})
+            cond = m.get("condition", "")
+            if not cond:
+                continue
+            parsed = _parse_condition_variables(cond)
+            for var, vals, neg in parsed:
+                if var not in cond_vars:
+                    cond_vars[var] = set()
+                for v in vals:
+                    cond_vars[var].add(v)
+        para_cond_vars[para] = cond_vars
+
+    default_state_fn = getattr(module, "_default_state", None)
+    ds = default_state_fn() if default_state_fn else {}
+
+    rng = _random.Random(7777)
+    # Values for random generation
+    str_vals = ['', ' ', 'Y', 'N', '00', '04', '05', '10',
+                '001', '002', '013', '019', 'XX', 'I', 'T', 'R']
+    int_vals = [0, 1, -1, 99, 100, 999, -999, 1000000]
+    flag_vals = [True, False, 'Y', 'N', ' ', 'X']
+
+    max_trials_per_para = 500
+
+    # Sort by most uncovered first
+    for para, uncov_count in para_uncov.most_common(50):
+        if _time_exceeded(start_time, max_time):
+            break
+        if uncov_count < 3:
+            break
+
+        target_key = f"rand7:{para}"
+        if _was_attempted(synth, 7, target_key):
+            continue
+
+        cond_vars = para_cond_vars.get(para, {})
+        var_list = list(ds.keys())
+
+        # Find best base TC for this paragraph
+        best_tc = None
+        for tc in synth.test_cases:
+            if para in set(tc.paragraphs_covered):
+                best_tc = tc
+                break
+
+        # Hill-climbing: track best state for this paragraph
+        best_state = dict(best_tc.input_state) if best_tc else {}
+        best_stubs = dict(best_tc.stub_outcomes) if best_tc and best_tc.stub_outcomes else dict(all_success_stubs)
+
+        for trial in range(max_trials_per_para):
+            if _time_exceeded(start_time, max_time):
+                break
+
+            # 70% of the time start from best state, 30% from scratch
+            if rng.random() < 0.7:
+                state = dict(best_state)
+                stubs = {k: [e if not isinstance(e, list) else list(e) for e in v]
+                         for k, v in best_stubs.items()}
+            else:
+                state = dict(best_tc.input_state) if best_tc else {}
+                stubs = dict(best_tc.stub_outcomes) if best_tc and best_tc.stub_outcomes else dict(all_success_stubs)
+
+            # Set condition variables to their known literals (or random)
+            for var, literals in cond_vars.items():
+                lit_list = list(literals)
+                r = rng.random()
+                if r < 0.4 and lit_list:
+                    state[var] = rng.choice(lit_list)
+                elif r < 0.6:
+                    info = var_report.variables.get(var)
+                    if info and info.classification == "flag":
+                        state[var] = rng.choice(flag_vals)
+                    elif isinstance(ds.get(var), int):
+                        state[var] = rng.choice(int_vals)
+                    else:
+                        state[var] = rng.choice(str_vals)
+                # else: leave at default/base value
+
+            # Also perturb a few random vars
+            n_extra = rng.randint(1, 8)
+            for _ in range(n_extra):
+                var = rng.choice(var_list) if var_list else None
+                if var and var not in cond_vars:
+                    val = ds.get(var)
+                    if isinstance(val, int):
+                        state[var] = rng.choice(int_vals)
+                    elif isinstance(val, str):
+                        state[var] = rng.choice(str_vals)
+
+            # Occasionally perturb stubs too
+            if stub_mapping and rng.random() < 0.3:
+                op_key = rng.choice(list(stub_mapping.keys()))
+                svars = stub_mapping[op_key]
+                if svars:
+                    svar = svars[0]
+                    info = var_report.variables.get(svar)
+                    lits = (info.condition_literals
+                           if info and hasattr(info, "condition_literals") else [])
+                    sval = rng.choice(lits) if lits else rng.choice([0, "00", "10"])
+                    stubs[op_key] = [[(svar, sval)]] * 25
+
+            paras, branches, edges = _execute_direct_and_collect(
+                module, para, state, stubs, base_defaults,
+            )
+            if _maybe_save(synth, store_path, state, stubs, base_defaults,
+                           paras, branches, edges, layer=7,
+                           target=f"direct:{para}|rand7:{trial}"):
+                new_count += 1
+                best_state = dict(state)
+                best_stubs = {k: [e if not isinstance(e, list) else list(e) for e in v]
+                              for k, v in stubs.items()}
+
+        _record_attempt(synth, store_path, 7, target_key)
+
+    _record_layer_done(synth, store_path, 7)
     return new_count
 
 
@@ -2279,13 +3129,21 @@ def synthesize_test_set(
             module, var_report, stub_mapping,
             synth, store_path, start_time, max_time_seconds,
         )),
+        (6, lambda: _run_layer_6(
+            module, program, var_report, stub_mapping,
+            synth, store_path, start_time, max_time_seconds,
+        )),
+        (7, lambda: _run_layer_7(
+            module, var_report, stub_mapping,
+            synth, store_path, start_time, max_time_seconds,
+        )),
     ]
 
     initial_count = len(synth.test_cases)
 
     for layer_num, layer_fn in layer_funcs:
         # Layer 25 (2.5) and 35 (3.5) run within their surrounding layers
-        effective_layer = {25: 3, 35: 4, 37: 4}.get(layer_num, layer_num)
+        effective_layer = {25: 3, 35: 4, 37: 4, 6: 5, 7: 5}.get(layer_num, layer_num)
         if effective_layer > max_layers:
             break
         if _time_exceeded(start_time, max_time_seconds):
