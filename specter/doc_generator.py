@@ -22,6 +22,17 @@ from .monte_carlo import _load_module, _run_paragraph_directly
 from .test_store import TestStore, TestCase, _build_run_state
 
 
+def _safe_str(val) -> str:
+    """Render a value as a string, showing non-ASCII as hex escapes."""
+    s = str(val)
+    if not s.isascii():
+        s = "".join(
+            ch if ch.isascii() else f"\\x{ord(ch):02x}"
+            for ch in s
+        )
+    return s
+
+
 def generate_docs(
     module_path: str | Path,
     store_path: str | Path,
@@ -196,7 +207,7 @@ def _section_execution_flows(
                 if shown >= 15:
                     lines.append(f"- ... and {len(interesting_inputs) - shown} more")
                     break
-                lines.append(f"- `{var}` = `{val}`")
+                lines.append(f"- `{var}` = `{_safe_str(val)}`")
                 shown += 1
 
         lines.append("")
@@ -278,7 +289,7 @@ def _section_external_interfaces(test_cases: list[TestCase]) -> str:
             result.append("|----------|-------|-------------|")
             for var in sorted(var_vals):
                 for val, count in var_vals[var]:
-                    result.append(f"| `{var}` | `{val}` | {count} |")
+                    result.append(f"| `{var}` | `{_safe_str(val)}` | {count} |")
             result.append("")
 
         return result
@@ -390,7 +401,7 @@ def _section_decision_tables(
                 true_val = true_tc.input_state.get(var, "—")
                 false_val = false_tc.input_state.get(var, "—")
                 if true_val != false_val:
-                    lines.append(f"| `{var}` | `{true_val}` | `{false_val}` |")
+                    lines.append(f"| `{var}` | `{_safe_str(true_val)}` | `{_safe_str(false_val)}` |")
 
             lines.append("")
 
@@ -533,7 +544,7 @@ def _section_error_paths(module, test_cases: list[TestCase]) -> str:
                 unique_pairs = list(dict.fromkeys(
                     (v, val) for v, val in pairs
                 ))[:3]
-                vals = ", ".join(f"`{v}`=`{val}`" for v, val in unique_pairs)
+                vals = ", ".join(f"`{v}`=`{_safe_str(val)}`" for v, val in unique_pairs)
                 lines.append(f"- `{op_key}`: {vals}")
             lines.append("")
 
@@ -578,7 +589,7 @@ def _section_display_output(module, test_cases: list[TestCase]) -> str:
 
     for msg, count in all_displays.most_common(50):
         # Escape pipe characters for markdown
-        escaped = msg.replace("|", "\\|")
+        escaped = _safe_str(msg).replace("|", "\\|")
         lines.append(f"| `{escaped}` | {count} |")
 
     return "\n".join(lines)

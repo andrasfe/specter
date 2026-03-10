@@ -381,6 +381,11 @@ def _format_stub_entry(entry) -> str:
 
 
 def _escape_md(val) -> str:
-    """Escape value for Markdown table cell."""
+    """Escape value for Markdown table cell, rendering non-ASCII as hex."""
     s = str(val)
+    if not s.isascii():
+        s = "".join(
+            ch if ch.isascii() else f"\\x{ord(ch):02x}"
+            for ch in s
+        )
     return s.replace("|", "\\|").replace("\n", " ")
