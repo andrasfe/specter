@@ -211,6 +211,11 @@ def main(argv: list[str] | None = None) -> int:
         metavar="JSONL",
         help="Generate Markdown documentation from a test store JSONL file (requires generated .py)",
     )
+    parser.add_argument(
+        "--paragraph-catalog",
+        metavar="JSONL",
+        help="Generate paragraph catalog from a test store JSONL file (requires generated .py)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -231,6 +236,20 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"Generating documentation from {args.extract_docs} ...", file=sys.stderr)
         md = generate_docs(py_path, args.extract_docs)
+        print(md)
+        return 0
+
+    # --paragraph-catalog: needs generated .py + JSONL
+    if args.paragraph_catalog:
+        from .paragraph_catalog import generate_paragraph_catalog
+        py_path = Path(args.ast_file)
+        if not py_path.exists():
+            py_path = py_path.with_suffix(".py")
+        if not py_path.exists():
+            print(f"Error: generated module not found: {py_path}", file=sys.stderr)
+            return 1
+        print(f"Generating paragraph catalog from {args.paragraph_catalog} ...", file=sys.stderr)
+        md = generate_paragraph_catalog(py_path, args.paragraph_catalog)
         print(md)
         return 0
 
@@ -379,6 +398,17 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print(synth_report.summary())
         print(f"\nTest store: {test_store_path}")
+
+        # Auto-generate paragraph catalog
+        from .paragraph_catalog import generate_paragraph_catalog
+        try:
+            catalog_md = generate_paragraph_catalog(output_path, test_store_path, program)
+            catalog_path = test_store_path.with_suffix(".catalog.md")
+            catalog_path.write_text(catalog_md)
+            print(f"Paragraph catalog: {catalog_path}")
+        except Exception as e:
+            print(f"Warning: catalog generation failed: {e}", file=sys.stderr)
+
         return 0
 
     # Monte Carlo
