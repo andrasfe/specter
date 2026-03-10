@@ -241,11 +241,63 @@ class SynthesisState:
     covered_edges: set[tuple] = field(default_factory=set)
     failed_targets: dict[str, int] = field(default_factory=dict)
     progress: StoreProgress = field(default_factory=StoreProgress)
+    excluded_values: set = field(default_factory=set)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _filter_excluded(state: dict, excluded: set) -> None:
+    """Remove excluded values from a state dict, replacing with safe alternatives."""
+    if not excluded:
+        return
+    for key in list(state):
+        if key.startswith("_"):
+            continue
+        val = state[key]
+        # Normalize for comparison: check both raw value and string form
+        if val in excluded or str(val) in excluded:
+            # Replace with a type-appropriate non-excluded alternative
+            if isinstance(val, bool):
+                alt = not val
+                state[key] = alt if alt not in excluded and str(alt) not in excluded else val
+            elif isinstance(val, (int, float)):
+                # Try 0, 1, -1 until one is not excluded
+                for candidate in [0, 1, -1, 42, 99]:
+                    if candidate not in excluded and str(candidate) not in excluded:
+                        state[key] = candidate
+                        break
+            else:
+                for candidate in ["", " ", "00", "A"]:
+                    if candidate not in excluded and str(candidate) not in excluded:
+                        state[key] = candidate
+                        break
+
+
+def _filter_excluded_stubs(stub_outcomes: dict, excluded: set) -> None:
+    """Remove excluded values from stub outcome queues."""
+    if not excluded:
+        return
+    for op_key, queue in stub_outcomes.items():
+        for entry in queue:
+            if isinstance(entry, list):
+                for i, pair in enumerate(entry):
+                    if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                        var, val = pair
+                        if val in excluded or str(val) in excluded:
+                            # Replace with type-appropriate alternative
+                            if isinstance(val, (int, float)):
+                                for cand in [0, 1, -1]:
+                                    if cand not in excluded and str(cand) not in excluded:
+                                        entry[i] = (var, cand) if isinstance(pair, tuple) else [var, cand]
+                                        break
+                            else:
+                                for cand in ["", " ", "00"]:
+                                    if cand not in excluded and str(cand) not in excluded:
+                                        entry[i] = (var, cand) if isinstance(pair, tuple) else [var, cand]
+                                        break
+
 
 def _execute_and_collect(
     module, input_state: dict, stub_outcomes: dict, stub_defaults: dict,
@@ -390,6 +442,11 @@ def _maybe_save(
     target: str,
 ) -> bool:
     """Save test case if it expands coverage. Returns True if saved."""
+    # Apply exclusion filter before saving
+    if synth.excluded_values:
+        _filter_excluded(input_state, synth.excluded_values)
+        _filter_excluded_stubs(stub_outcomes, synth.excluded_values)
+
     new_paras = set(paras) - synth.covered_paras
     new_branches = set(branches) - synth.covered_branches
     new_edges = set(edges) - synth.covered_edges
@@ -3607,6 +3664,11 @@ def _run_layer_7(
                 '001', '002', '013', '019', 'XX', 'I', 'T', 'R']
     int_vals = [0, 1, -1, 99, 100, 999, -999, 1000000]
     flag_vals = [True, False, 'Y', 'N', ' ', 'X']
+    if synth.excluded_values:
+        _excl = synth.excluded_values
+        str_vals = [v for v in str_vals if v not in _excl and str(v) not in _excl] or ['']
+        int_vals = [v for v in int_vals if v not in _excl and str(v) not in _excl] or [0]
+        flag_vals = [v for v in flag_vals if v not in _excl and str(v) not in _excl] or [False]
 
     max_trials_per_para = 500
 
@@ -3719,6 +3781,7 @@ def synthesize_test_set(
     store_path: str | Path,
     max_time_seconds: float | None = None,
     max_layers: int = 5,
+    excluded_values: set | None = None,
 ) -> SynthesisReport:
     """Run the layered synthesis engine.
 
@@ -3733,6 +3796,7 @@ def synthesize_test_set(
         store_path: Path to JSONL test store file.
         max_time_seconds: Optional time limit.
         max_layers: Run only first N layers (default 5).
+        excluded_values: Optional set of values to exclude from generated tests.
 
     Returns:
         SynthesisReport with coverage statistics.
@@ -3742,6 +3806,8 @@ def synthesize_test_set(
 
     report = SynthesisReport()
     synth = SynthesisState()
+    if excluded_values:
+        synth.excluded_values = excluded_values
 
     # Load existing test cases and progress
     existing, progress = TestStore.load(store_path)

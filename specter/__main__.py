@@ -196,6 +196,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Max seconds for synthesis (default: unlimited)",
     )
     parser.add_argument(
+        "--exclude-values",
+        metavar="FILE",
+        help="File with values to exclude from synthesis (one per line)",
+    )
+    parser.add_argument(
         "--extract-tests",
         metavar="PATH",
         help="Extract test cases from a test store JSONL file to JSON/CSV",
@@ -382,6 +387,20 @@ def main(argv: list[str] | None = None) -> int:
         else:
             test_store_path = analysis_dir / f"{ast_path.stem}_testset.jsonl"
 
+        # Load excluded values if provided
+        excluded_values = None
+        if args.exclude_values:
+            ev_path = Path(args.exclude_values)
+            if not ev_path.exists():
+                print(f"Error: exclude-values file not found: {ev_path}", file=sys.stderr)
+                return 1
+            excluded_values = set()
+            for line in ev_path.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    excluded_values.add(line)
+            print(f"  Excluding {len(excluded_values)} values from synthesis")
+
         print(f"Synthesizing test set → {test_store_path} ...")
         synth_report = synthesize_test_set(
             module=module,
@@ -394,6 +413,7 @@ def main(argv: list[str] | None = None) -> int:
             store_path=test_store_path,
             max_time_seconds=args.synthesis_timeout,
             max_layers=args.synthesis_layers,
+            excluded_values=excluded_values,
         )
         print()
         print(synth_report.summary())
