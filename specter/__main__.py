@@ -232,6 +232,12 @@ def main(argv: list[str] | None = None) -> int:
         metavar="DIR",
         help="Copybook directory for --mock-cobol (can repeat)",
     )
+    parser.add_argument(
+        "--mock-init",
+        action="append",
+        metavar="VAR=VALUE",
+        help="Set initial variable value for --mock-cobol (can repeat)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -279,6 +285,11 @@ def main(argv: list[str] | None = None) -> int:
         cfg = MockConfig()
         if args.copybook_dir:
             cfg.copybook_dirs = [Path(d) for d in args.copybook_dir]
+        if args.mock_init:
+            for item in args.mock_init:
+                if "=" in item:
+                    var, val = item.split("=", 1)
+                    cfg.initial_values[var.strip()] = val.strip()
         print(f"Instrumenting {cbl_path} ...", file=sys.stderr)
         result = instrument_cobol(cbl_path, cfg)
         out_path = Path(args.output) if args.output else cbl_path.with_suffix(".mock.cbl")

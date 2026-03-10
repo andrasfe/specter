@@ -48,6 +48,7 @@ class MockConfig:
     mock_dd_name: str = "MOCKDATA"
     stop_on_exec_return: bool = True  # EXEC CICS RETURN → STOP RUN
     stop_on_exec_xctl: bool = True   # EXEC CICS XCTL → STOP RUN
+    initial_values: dict[str, str] = field(default_factory=dict)  # var→value MOVEs after OPEN
 
 
 @dataclass
@@ -166,7 +167,7 @@ def _resolve_copies(
 ) -> tuple[list[str], int, int, list[str]]:
     """Resolve COPY statements by inlining copybook content."""
     copy_re = re.compile(
-        r"^(\s{6}\s+)COPY\s+([A-Za-z0-9_-]+)\s*\.?\s*$",
+        r"^(\s{6}\s+)COPY\s+'?([A-Za-z0-9_-]+)'?\s*\.?\s*$",
         re.IGNORECASE,
     )
     resolved = 0
@@ -249,7 +250,7 @@ def _find_divisions(lines: list[str]) -> dict[str, int]:
             divisions["linkage"] = i
         elif "PROCEDURE DIVISION" in upper:
             divisions["procedure"] = i
-        elif re.match(r"\s+FILE-CONTROL\.", upper):
+        elif re.match(r"\s*FILE-CONTROL\.", upper):
             divisions["file-control"] = i
         elif "CONFIGURATION SECTION" in upper:
             divisions["configuration"] = i
@@ -323,9 +324,9 @@ def _generate_exec_mock(
     if "EXEC CICS" in block_text:
         return _mock_cics(block_text, ind, config, has_period=has_period)
     elif "EXEC SQL" in block_text:
-        return _mock_sql(block_text, ind)
+        return _mock_sql(block_text, ind, has_period=has_period)
     elif "EXEC DLI" in block_text:
-        return _mock_dli(block_text, ind)
+        return _mock_dli(block_text, ind, has_period=has_period)
     else:
         mock_lines.append(f"{ind}CONTINUE\n")
     return mock_lines
@@ -356,7 +357,7 @@ def _mock_cics(
         prog_match = re.search(r"PROGRAM\s*\(\s*([^)]+)\s*\)", block_text)
         prog = prog_match.group(1).strip() if prog_match else "?"
         if config.stop_on_exec_xctl:
-            lines.append(f"{_B}DISPLAY 'SPECTER-CICS:XCTL:' {prog}\n")
+            lines.append(f"{_B}DISPLAY 'SPECTER-CICS:XCTL:{prog}'\n")
             lines.append(f"{_B}GO TO SPECTER-EXIT-PARA{dot}\n")
             return lines
     elif re.search(r"\bSYNCPOINT\b", block_text):
@@ -384,14 +385,21 @@ def _mock_cics(
     if resp_var:
         lines.append(f"{_B}MOVE MOCK-NUM-STATUS TO {resp_var}\n")
     if resp2_var:
-        lines.append(f"{_B}MOVE 0 TO {resp2_var}\n")
+        lines.append(f"{_B}MOVE 0 TO {resp2_var}{dot}\n")
+    elif resp_var:
+        # Add period to last MOVE if needed
+        lines[-1] = lines[-1].rstrip("\n") + dot + "\n" if dot else lines[-1]
+    elif dot:
+        # No RESP vars — add period to END-READ
+        lines[-1] = lines[-1].rstrip("\n").rstrip() + dot + "\n"
 
     return lines
 
 
-def _mock_sql(block_text: str, ind: str) -> list[str]:
+def _mock_sql(block_text: str, ind: str, has_period: bool = False) -> list[str]:
     """Generate mock for EXEC SQL block."""
     lines = []
+    dot = "." if has_period else ""
 
     op = "SQL"
     for verb in ["SELECT", "INSERT", "UPDATE", "DELETE", "OPEN",
@@ -403,7 +411,7 @@ def _mock_sql(block_text: str, ind: str) -> list[str]:
 
     # DECLARE and INCLUDE are compile-time — no mock needed
     if op in ("SQL-DECLARE", "SQL-INCLUDE"):
-        lines.append(f"{_B}CONTINUE\n")
+        lines.append(f"{_B}CONTINUE{dot}\n")
         return lines
 
     lines.append(f"{_B}DISPLAY 'SPECTER-MOCK:{op}'\n")
@@ -412,14 +420,15 @@ def _mock_sql(block_text: str, ind: str) -> list[str]:
     lines.append(f"{_CONT}  MOVE '00' TO MOCK-ALPHA-STATUS\n")
     lines.append(f"{_CONT}  MOVE 0 TO MOCK-NUM-STATUS\n")
     lines.append(f"{_B}END-READ\n")
-    lines.append(f"{_B}MOVE MOCK-NUM-STATUS TO SQLCODE\n")
+    lines.append(f"{_B}MOVE MOCK-NUM-STATUS TO SQLCODE{dot}\n")
 
     return lines
 
 
-def _mock_dli(block_text: str, ind: str) -> list[str]:
+def _mock_dli(block_text: str, ind: str, has_period: bool = False) -> list[str]:
     """Generate mock for EXEC DLI block."""
     lines = []
+    dot = "." if has_period else ""
 
     op = "DLI"
     for verb in ["GU", "GN", "GNP", "GHU", "GHN", "GHNP",
@@ -430,7 +439,7 @@ def _mock_dli(block_text: str, ind: str) -> list[str]:
 
     if op == "DLI-TERM":
         lines.append(f"{_B}DISPLAY 'SPECTER-MOCK:DLI-TERM'\n")
-        lines.append(f"{_B}CONTINUE\n")
+        lines.append(f"{_B}CONTINUE{dot}\n")
         return lines
 
     lines.append(f"{_B}DISPLAY 'SPECTER-MOCK:{op}'\n")
@@ -439,7 +448,7 @@ def _mock_dli(block_text: str, ind: str) -> list[str]:
     lines.append(f"{_CONT}  MOVE '  ' TO MOCK-ALPHA-STATUS\n")
     lines.append(f"{_CONT}  MOVE 0 TO MOCK-NUM-STATUS\n")
     lines.append(f"{_B}END-READ\n")
-    lines.append(f"{_B}MOVE MOCK-ALPHA-STATUS TO DIBSTAT\n")
+    lines.append(f"{_B}MOVE MOCK-ALPHA-STATUS TO DIBSTAT{dot}\n")
 
     return lines
 
@@ -623,6 +632,9 @@ def _add_mock_infrastructure(
     """Add WORKING-STORAGE entries and FILE-CONTROL for mock file."""
     result = list(lines)
 
+    # Re-scan for current division positions (earlier phases may have shifted lines)
+    divisions = _find_divisions(result)
+
     # --- Add to WORKING-STORAGE ---
     ws_entries = [
         "\n",
@@ -630,8 +642,8 @@ def _add_mock_infrastructure(
         f"{_A}01 MOCK-RECORD.\n",
         f"{_B}05 MOCK-OP-KEY        PIC X(30).\n",
         f"{_B}05 MOCK-ALPHA-STATUS  PIC X(20).\n",
-        f"{_B}05 MOCK-NUM-STATUS    PIC S9(09) COMP.\n",
-        f"{_B}05 MOCK-FILLER        PIC X(26).\n",
+        f"{_B}05 MOCK-NUM-STATUS    PIC S9(09).\n",
+        f"{_B}05 MOCK-FILLER        PIC X(21).\n",
         f"{_A}01 MOCK-FILE-STATUS      PIC XX VALUE '00'.\n",
         "\n",
         f"{_CMT} SPECTER COMMON STUBS\n",
@@ -660,21 +672,27 @@ def _add_mock_infrastructure(
     if fc_idx is not None:
         result.insert(fc_idx + 1, fc_entry)
     else:
-        # Need to add INPUT-OUTPUT SECTION + FILE-CONTROL
-        env_idx = divisions.get("environment")
-        if env_idx is not None:
-            insert_at = env_idx + 1
-            for k in range(insert_at, min(insert_at + 10, len(result))):
-                if "CONFIGURATION SECTION" in result[k].upper():
-                    insert_at = k + 1
-                    break
-            io_block = [
-                f"{_A}INPUT-OUTPUT SECTION.\n",
-                f"{_A}FILE-CONTROL.\n",
-                fc_entry,
-            ]
-            for entry in reversed(io_block):
-                result.insert(insert_at, entry)
+        io_idx = divisions.get("input-output")
+        if io_idx is not None:
+            # INPUT-OUTPUT SECTION exists but no FILE-CONTROL — add it
+            result.insert(io_idx + 1, f"{_A}FILE-CONTROL.\n")
+            result.insert(io_idx + 2, fc_entry)
+        else:
+            # Need to add INPUT-OUTPUT SECTION + FILE-CONTROL
+            env_idx = divisions.get("environment")
+            if env_idx is not None:
+                insert_at = env_idx + 1
+                for k in range(insert_at, min(insert_at + 10, len(result))):
+                    if "CONFIGURATION SECTION" in result[k].upper():
+                        insert_at = k + 1
+                        break
+                io_block = [
+                    f"{_A}INPUT-OUTPUT SECTION.\n",
+                    f"{_A}FILE-CONTROL.\n",
+                    fc_entry,
+                ]
+                for entry in reversed(io_block):
+                    result.insert(insert_at, entry)
 
     # --- Add FILE SECTION with FD ---
     fd_block = [
@@ -757,16 +775,23 @@ def _convert_linkage(lines: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _fix_procedure_division(lines: list[str]) -> list[str]:
-    """Remove USING clause from PROCEDURE DIVISION."""
+    """Remove USING clause and comment out DFHCOMMAREA copies."""
     result: list[str] = []
     pd_re = re.compile(
         r"^(\s+PROCEDURE\s+DIVISION)\s+USING\s+.*$",
+        re.IGNORECASE,
+    )
+    # DFHCOMMAREA copy is meaningless in mock mode — comment it out
+    comm_re = re.compile(
+        r"MOVE\s+DFHCOMMAREA\s*\(",
         re.IGNORECASE,
     )
     for line in lines:
         m = pd_re.match(line)
         if m:
             result.append(m.group(1) + ".\n")
+        elif comm_re.search(_get_cobol_content(line)):
+            result.append(_comment_line(line))
         else:
             result.append(line)
     return result
@@ -805,6 +830,13 @@ def _add_mock_file_handling(
                 result.append(
                     f"{_B}OPEN INPUT MOCK-FILE\n"
                 )
+                # Read initial variable values from mock file
+                # Records with op-key starting with INIT: are consumed
+                # and used to set variables before main logic runs.
+                if config.initial_values:
+                    result.append(
+                        f"{_B}PERFORM SPECTER-READ-INIT-VARS\n"
+                    )
                 continue
 
         result.append(line)
@@ -835,6 +867,35 @@ def _add_mock_file_handling(
     final.append(f"{_A}SPECTER-EXIT-PARA.\n")
     final.append(f"{_B}CLOSE MOCK-FILE\n")
     final.append(f"{_B}STOP RUN.\n")
+
+    # Append init-vars reader paragraph if initial values are configured
+    if config.initial_values:
+        final.append(f"\n")
+        final.append(f"{_CMT} SPECTER: read init records from mock file\n")
+        final.append(f"{_A}SPECTER-READ-INIT-VARS.\n")
+        final.append(f"{_B}READ MOCK-FILE INTO MOCK-RECORD\n")
+        final.append(f"{_CONT}AT END\n")
+        final.append(f"{_CONT}  GO TO SPECTER-INIT-DONE\n")
+        final.append(f"{_B}END-READ\n")
+        final.append(f"{_B}IF MOCK-OP-KEY(1:5) = 'INIT:'\n")
+        # Evaluate variable name (cols 6-30 of op-key) and set value
+        final.append(f"{_B}  EVALUATE MOCK-OP-KEY(6:25)\n")
+        for var, val in config.initial_values.items():
+            padded = f"{var:<25}"
+            if val.isdigit() or (val.startswith("-") and val[1:].isdigit()):
+                final.append(f"{_B}    WHEN '{padded}'\n")
+                final.append(f"{_B}      MOVE {val} TO {var}\n")
+            elif re.match(r"^X'[0-9A-Fa-f]+'$", val):
+                final.append(f"{_B}    WHEN '{padded}'\n")
+                final.append(f"{_B}      MOVE {val} TO {var}\n")
+            else:
+                final.append(f"{_B}    WHEN '{padded}'\n")
+                final.append(f"{_B}      MOVE MOCK-ALPHA-STATUS TO {var}\n")
+        final.append(f"{_B}  END-EVALUATE\n")
+        final.append(f"{_B}  GO TO SPECTER-READ-INIT-VARS\n")
+        final.append(f"{_B}END-IF.\n")
+        final.append(f"{_A}SPECTER-INIT-DONE.\n")
+        final.append(f"{_B}CONTINUE.\n")
 
     return final
 
@@ -887,6 +948,17 @@ def _add_common_stubs(lines: list[str]) -> list[str]:
             f"{_B}05 DFHBMASF        PIC X VALUE X'C1'.\n",
             f"{_B}05 DFHBMASK        PIC X VALUE X'F0'.\n",
             f"{_B}05 DFHBMFSE        PIC X VALUE X'C8'.\n",
+            f"{_B}05 DFHRED          PIC X VALUE X'F2'.\n",
+            f"{_B}05 DFHBLUE         PIC X VALUE X'F4'.\n",
+            f"{_B}05 DFHGREEN        PIC X VALUE X'F5'.\n",
+            f"{_B}05 DFHWHITE        PIC X VALUE X'F7'.\n",
+            f"{_B}05 DFHYELLO        PIC X VALUE X'F6'.\n",
+            f"{_B}05 DFHTURQ         PIC X VALUE X'F1'.\n",
+            f"{_B}05 DFHPINK         PIC X VALUE X'F3'.\n",
+            f"{_B}05 DFHDFCOL        PIC X VALUE X'00'.\n",
+            f"{_B}05 DFHNEUTR        PIC X VALUE X'00'.\n",
+            f"{_B}05 DFHBMDAR        PIC X VALUE X'0C'.\n",
+            f"{_B}05 DFHBMBRY        PIC X VALUE X'F0'.\n",
         ])
 
     # EIB fields
@@ -986,6 +1058,27 @@ def _comment_line(line: str) -> str:
 # ---------------------------------------------------------------------------
 # Mock data generation from test cases
 # ---------------------------------------------------------------------------
+
+def generate_init_records(initial_values: dict[str, str]) -> str:
+    """Generate INIT: records for the mock data file.
+
+    These must be the first records in the file so the SPECTER-READ-INIT-VARS
+    paragraph consumes them before main logic runs.
+    """
+    records: list[str] = []
+    for var, val in initial_values.items():
+        op_key = f"INIT:{var:<25}"[:30]
+        alpha = str(val)
+        try:
+            num = int(val)
+        except (ValueError, TypeError):
+            num = 0
+        record = f"{op_key:<30}{alpha:<20}{num:>10}"
+        records.append(f"{record:<80}"[:80])
+    # Sentinel: non-INIT record to stop the init loop
+    records.append(f"{'END-INIT':<30}{'':<20}{0:>10}"[:80])
+    return "\n".join(records)
+
 
 def generate_mock_data(
     test_case,
