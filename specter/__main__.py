@@ -221,6 +221,17 @@ def main(argv: list[str] | None = None) -> int:
         metavar="JSONL",
         help="Generate paragraph catalog from a test store JSONL file (requires generated .py)",
     )
+    parser.add_argument(
+        "--mock-cobol",
+        action="store_true",
+        help="Instrument COBOL source for standalone mock execution (input is .cbl file)",
+    )
+    parser.add_argument(
+        "--copybook-dir",
+        action="append",
+        metavar="DIR",
+        help="Copybook directory for --mock-cobol (can repeat)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -256,6 +267,32 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Generating paragraph catalog from {args.paragraph_catalog} ...", file=sys.stderr)
         md = generate_paragraph_catalog(py_path, args.paragraph_catalog)
         print(md)
+        return 0
+
+    # --mock-cobol: instrument COBOL source for mock execution
+    if args.mock_cobol:
+        from .cobol_mock import instrument_cobol, MockConfig
+        cbl_path = Path(args.ast_file)
+        if not cbl_path.exists():
+            print(f"Error: COBOL file not found: {cbl_path}", file=sys.stderr)
+            return 1
+        cfg = MockConfig()
+        if args.copybook_dir:
+            cfg.copybook_dirs = [Path(d) for d in args.copybook_dir]
+        print(f"Instrumenting {cbl_path} ...", file=sys.stderr)
+        result = instrument_cobol(cbl_path, cfg)
+        out_path = Path(args.output) if args.output else cbl_path.with_suffix(".mock.cbl")
+        out_path.write_text(result.source)
+        print(f"  EXEC blocks replaced: {result.exec_blocks_replaced}", file=sys.stderr)
+        print(f"  I/O verbs replaced: {result.io_verbs_replaced}", file=sys.stderr)
+        print(f"  CALL stmts replaced: {result.call_stmts_replaced}", file=sys.stderr)
+        print(f"  Paragraphs traced: {result.paragraphs_traced}", file=sys.stderr)
+        print(f"  COPYs resolved: {result.copy_resolved}", file=sys.stderr)
+        print(f"  COPYs stubbed: {result.copy_stubbed}", file=sys.stderr)
+        if result.warnings:
+            for w in result.warnings:
+                print(f"  Warning: {w}", file=sys.stderr)
+        print(f"Output: {out_path}", file=sys.stderr)
         return 0
 
     # --synthesize implies --analyze

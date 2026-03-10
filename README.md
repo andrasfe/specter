@@ -112,6 +112,8 @@ specter program.ast --synthesize             # deterministic test set synthesis
 specter program.ast --synthesize --test-store ./tests.jsonl  # custom store path
 specter program.ast --synthesize --synthesis-layers 2        # run only layers 1-2
 specter program.ast --synthesize --synthesis-timeout 300     # 5-minute time limit
+specter program.cbl --mock-cobol -o program.mock.cbl        # instrument COBOL for mock execution
+specter program.cbl --mock-cobol --copybook-dir ./cpy       # with copybook directory
 ```
 
 ## LLM-Guided Fuzzing
@@ -279,6 +281,70 @@ The store is a JSONL file (one JSON object per line, append-only). Each line con
 
 Interrupting a synthesis run loses at most the in-progress test case. On re-run, all previously saved cases are replayed to establish baseline coverage before continuing.
 
+## COBOL Mock Execution
+
+The `--mock-cobol` flag takes a COBOL source file and produces a modified version that compiles and runs standalone with GnuCOBOL. All external operations (EXEC CICS, EXEC SQL, EXEC DLI, CALL, file I/O) are replaced with reads from a sequential mock data file, and every paragraph entry is traced via DISPLAY statements.
+
+### What it does
+
+The instrumentation pipeline has 11 phases:
+
+1. **COPY resolution** — inlines copybooks from provided directories
+2. **EXEC block replacement** — EXEC CICS/SQL/DLI blocks become mock file reads that set status variables (SQLCODE, DIBSTAT, RESP)
+3. **File I/O replacement** — READ/WRITE/OPEN/CLOSE on application files become mock reads
+4. **CALL replacement** — CALL statements become mock reads setting RETURN-CODE
+5. **Paragraph tracing** — DISPLAY statements inserted at every paragraph entry
+6. **Mock infrastructure** — WORKING-STORAGE entries for mock record layout, FILE-CONTROL and FD for the mock file
+7. **LINKAGE conversion** — LINKAGE SECTION items moved to WORKING-STORAGE
+8. **PROCEDURE DIVISION fix** — removes USING clause for standalone execution
+9. **Mock file handling** — OPEN/CLOSE around program logic
+10. **Common stubs** — DFHAID, DFHBMSCA, EIB field definitions; DFHRESP(xxx) replaced with numeric literals
+
+CICS RETURN and XCTL are replaced with `GO TO SPECTER-EXIT-PARA` (period-aware to preserve EVALUATE/IF sentence scope).
+
+### Mock data format
+
+Each record is 80 characters, line-sequential:
+
+| Cols | Content |
+|------|---------|
+| 1-30 | Operation key (e.g., `CICS-READ`, `SQL-SELECT`, `DLI-GU`, `CALL:CBLTDLI`) |
+| 31-50 | Alphanumeric status value |
+| 51-80 | Numeric status value |
+
+Records are consumed sequentially in execution order, matching Specter's `_apply_stub_outcome` FIFO semantics.
+
+### Running
+
+```bash
+# Instrument a COBOL source file
+specter program.cbl --mock-cobol -o program.mock.cbl
+
+# With copybook directories
+specter program.cbl --mock-cobol --copybook-dir ./cpy --copybook-dir ./cpy-bms -o program.mock.cbl
+
+# Compile with GnuCOBOL
+cobc -x -o program.mock program.mock.cbl
+
+# Run with mock data
+DD_MOCKDATA=mockdata.txt ./program.mock
+```
+
+### Output
+
+The program produces DISPLAY output with these prefixes:
+
+- `SPECTER-TRACE:<PARAGRAPH>` — paragraph entry trace
+- `SPECTER-MOCK:<OPERATION>` — mock operation consumed
+- `SPECTER-CICS:RETURN` / `SPECTER-CICS:XCTL:<PROGRAM>` — CICS transfer control
+
+### CLI options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--mock-cobol` | off | Instrument COBOL source for mock execution (input is .cbl file) |
+| `--copybook-dir DIR` | auto-detected | Copybook search directory (repeatable) |
+
 ## GnuCOBOL Validation
 
 The `tests/cobol_validation/` directory contains 58 COBOL test programs that validate Specter's code generation against GnuCOBOL. Each test compiles and runs with GnuCOBOL, then parses the same source through ProLeap and Specter, comparing DISPLAY output. Run with:
@@ -294,3 +360,5 @@ Requires GnuCOBOL (`cobc`) and the ProLeap wrapper JAR.
 Python 3.10+. No external dependencies for core functionality.
 
 Optional: `z3-solver` for `--concolic` mode (`pip install z3-solver`).
+
+Optional: GnuCOBOL (`cobc`) for `--mock-cobol` mode.
