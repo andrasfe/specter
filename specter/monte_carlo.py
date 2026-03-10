@@ -496,13 +496,15 @@ def _generate_stub_defaults(
                 entry.append((svar, "23"))  # not found
             elif "EIBRESP" in upper:
                 entry.append((svar, 0))  # NORMAL
+            elif harvested:
+                # Prefer harvested condition_literals — they reflect actual
+                # success values used in the program (e.g., IMS PCB status
+                # uses spaces ' ' rather than file-status '00')
+                entry.append((svar, harvested[0]))
             elif "STATUS" in upper or upper.startswith("FS-"):
                 entry.append((svar, "00"))  # success
             elif "RETURN-CODE" in upper or upper.endswith("-RC"):
                 entry.append((svar, 0))
-            elif harvested:
-                # Use first condition_literal (typically the success value)
-                entry.append((svar, harvested[0]))
             else:
                 # Default: use string "00" for safety (matches file status checks
                 # which are the most common pattern in COBOL programs)

@@ -147,6 +147,8 @@ Repetition counts per operation type:
 
 Random stub generation uses a 60% success bias. All-success stubs use 100% success with explicit EOF terminators.
 
+When stub outcomes are exhausted at runtime, a **default fallback** is applied. Defaults prefer harvested condition literals (the first value the variable is compared against in IF conditions), which captures domain-specific success conventions — e.g., IMS PCB status codes use spaces `' '` for success rather than file-status `'00'`. This prevents stub exhaustion from triggering spurious error paths.
+
 ## Branch-Level Coverage
 
 In addition to paragraph and edge coverage, the fuzzer tracks **branch-level coverage**. Each IF statement in the generated code is assigned a unique branch ID. When the true branch is taken, the positive ID is recorded; when the else branch is taken, the negative ID is recorded. Similarly, each WHEN clause in an EVALUATE statement gets its own branch ID.
@@ -196,6 +198,7 @@ The engine runs layers sequentially, each building on prior coverage. Test cases
 | 3 | Condition-Targeted | Parse each uncovered branch's condition, set variables to satisfy/negate it | ~700 branch dirs |
 | 3.5 | Paragraph Sweep | Full condition sweep per paragraph with cartesian products, Phase 3 targeted flip | ~400 branch dirs |
 | 3.7 | Stub Fault Injection | Dataflow analysis to find stub-dependent branches | 0-5 branch dirs |
+| 3.8 | Dataflow Constraint Propagation | Backward tracing through arithmetic/MOVE chains + inter-procedural analysis | ~30 branch dirs |
 | 4 | Stub Combination | Systematically vary external operation return codes | 0-5 branch dirs |
 | 5 | Mutation Walks | Hill-climbing: mutate best TCs for 100 rounds, keep improvements | ~15 branch dirs |
 | 6 | Branch Direction Flip | For each flippable branch (one direction covered), try to flip via condition manipulation | ~20 branch dirs |
@@ -223,6 +226,20 @@ Branch metadata is stored in `_BRANCH_META`, a module-level dict mapping each ab
 ### Variable-to-Variable Comparisons
 
 When the condition compares two variables (e.g., `A EQUAL B`), the synthesis looks up the current runtime value of the RHS variable in the base state or defaults, then sets the LHS to match (for TRUE) or differ (for FALSE). This avoids the problem of setting both to an arbitrary constant like `42` which fails when the RHS already has a different default value.
+
+### Layer 3.8: Dataflow Constraint Propagation
+
+Layers 3 and 3.5 assume that condition variables are directly settable as inputs. Layer 3.8 handles the case where the condition variable is **computed** by intermediate operations (COMPUTE, MOVE, ADD, etc.) within the paragraph.
+
+For each uncovered branch:
+
+1. **Parse the paragraph's generated Python** to extract a per-paragraph dataflow graph: every `state['VAR'] = expr` assignment and its dependency variables
+2. **Trace backward** from the condition variable through assignments to find the chain of computations. For example, if `BASE-1-WS = AUX-COMPUTE * ORIGINAL-BASE * DAYS` and the branch checks `BASE-1-WS > LIMIT`, the chain traces back to the three operands
+3. **Inter-procedural tracing**: when no local assignment exists, checks sub-paragraph calls before the branch to find which one assigns the condition variable, and traces backward through that sub-paragraph
+4. **Solve backward constraints**: given the chain, compute input values that produce the needed condition. Handles multiplication (set operands to non-zero), division (account for truncation), modulo (find multiples), addition/subtraction, and MOVE chains
+5. **Generate multiple variations** (5 attempts per branch): direct + amplified + computation-only + large-value + override-only
+
+This layer primarily unlocks branches gated by arithmetic (COMPUTE chains), variable-to-variable comparisons where the RHS is computed, and MOVE chains through intermediate variables.
 
 ### Layer 7: Random Exploration
 

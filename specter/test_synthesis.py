@@ -2338,6 +2338,688 @@ def _compute_stub_combinations(
     return combos
 
 
+# ---------------------------------------------------------------------------
+# Layer 3.8: Dataflow Constraint Propagation
+# ---------------------------------------------------------------------------
+
+def _extract_paragraph_dataflow(module, paragraph: str) -> tuple[
+    list[tuple[int, str, str, list[str]]],   # assignments: (line, var, expr, deps)
+    list[tuple[int, int, str, int]],          # branches: (line, bid, cond_line, indent)
+]:
+    """Parse a paragraph function to extract assignments and branch checks.
+
+    Returns two lists ordered by line number:
+    - assignments: (line_idx, target_var, raw_expr, [dep_vars])
+    - branches: (line_idx, branch_id, condition_line_text, indent_level)
+    """
+    import inspect
+    import re
+
+    func_name = "para_" + re.sub(r"_+", "_", paragraph.replace("-", "_")).strip("_")
+    para_func = getattr(module, func_name, None)
+    if para_func is None:
+        return [], []
+
+    try:
+        src = inspect.getsource(para_func)
+    except (OSError, TypeError):
+        return [], []
+
+    lines = src.split("\n")
+
+    # Pattern for state['VAR'] = expr
+    assign_pat = re.compile(
+        r"^(\s*)state\['([A-Z][A-Z0-9_-]*)'\]\s*=\s*(.*)"
+    )
+    # Pattern for dependency variables in an expression
+    dep_pat = re.compile(
+        r"state\.get\('([A-Z][A-Z0-9_-]*)'|state\['([A-Z][A-Z0-9_-]*)'\]"
+    )
+    # Pattern for branch .add(N)
+    branch_pat = re.compile(r"\.add\((-?\d+)\)")
+    # Pattern for stub outcome pop
+    stub_pop_pat = re.compile(
+        r"_stub_outcomes.*?\.get\('([^']+)'|_apply_stub_outcome"
+    )
+
+    assignments: list[tuple[int, str, str, list[str]]] = []
+    branches: list[tuple[int, int, str, int]] = []
+
+    for i, line in enumerate(lines):
+        # Check for assignments
+        am = assign_pat.match(line)
+        if am:
+            indent = len(am.group(1))
+            target_var = am.group(2)
+            expr = am.group(3)
+            deps = [g1 or g2 for g1, g2 in dep_pat.findall(expr)]
+            # Check if it's a stub-derived value (pop from _stub_outcomes)
+            is_stub = bool(stub_pop_pat.search(expr))
+            if is_stub:
+                deps.append("__STUB__")
+            assignments.append((i, target_var, expr, deps))
+
+        # Check for branch checks
+        bm = branch_pat.search(line)
+        if bm:
+            bid = int(bm.group(1))
+            # Find the condition (look backward for if/elif/while)
+            cond_line = ""
+            cond_indent = 0
+            for k in range(i - 1, max(i - 5, -1), -1):
+                if k >= 0 and ("if " in lines[k] or "elif " in lines[k]
+                               or "while " in lines[k]):
+                    cond_line = lines[k]
+                    cond_indent = len(lines[k]) - len(lines[k].lstrip())
+                    break
+            branches.append((i, bid, cond_line, cond_indent))
+
+    return assignments, branches
+
+
+def _trace_backward(
+    target_var: str,
+    branch_line: int,
+    assignments: list[tuple[int, str, str, list[str]]],
+    max_depth: int = 3,
+) -> list[tuple[str, str]]:
+    """Trace backward from a branch to find input dependencies.
+
+    Starting from a condition variable at a specific line, walks backward
+    through assignments to find the chain of computations.
+
+    Returns list of (variable, expression) pairs representing the
+    backward chain, from condition var to inputs.
+    """
+    chain: list[tuple[str, str]] = []
+    frontier = {target_var}
+    seen_vars: set[str] = set()
+
+    for depth in range(max_depth):
+        if not frontier:
+            break
+        next_frontier: set[str] = set()
+        for var in frontier:
+            if var in seen_vars or var == "__STUB__":
+                continue
+            seen_vars.add(var)
+
+            # Find the LAST assignment to this var BEFORE the branch line
+            last_assign = None
+            for line_idx, avar, expr, deps in assignments:
+                if avar == var and line_idx < branch_line:
+                    last_assign = (avar, expr, deps)
+
+            if last_assign:
+                avar, expr, deps = last_assign
+                chain.append((avar, expr))
+                for dep in deps:
+                    if dep not in seen_vars:
+                        next_frontier.add(dep)
+        frontier = next_frontier
+
+    return chain
+
+
+def _trace_interprocedural(
+    module,
+    target_var: str,
+    branch_line: int,
+    parent_assignments: list[tuple[int, str, str, list[str]]],
+    parent_branches: list[tuple[int, int, str, int]],
+    df_cache: dict[str, tuple],
+) -> list[tuple[str, str]]:
+    """Trace backward through sub-paragraph calls.
+
+    When a variable is not assigned in the current paragraph, checks if
+    any sub-paragraph called before the branch assigns it. If so, traces
+    backward through that sub-paragraph's dataflow.
+    """
+    import inspect
+    import re
+
+    # Find the paragraph function source to locate sub-paragraph calls
+    # We need to look at the raw source lines to find para_XXX(state) calls
+    # before the branch_line
+    # Since we have parent_assignments ordered by line, we can look at the
+    # function source directly
+
+    # Get the paragraph name from any branch check
+    para_name = None
+    for _, bid, _, _ in parent_branches:
+        meta = getattr(module, "_BRANCH_META", {}).get(abs(bid))
+        if meta:
+            para_name = meta.get("paragraph")
+            break
+
+    if not para_name:
+        return []
+
+    func_name = "para_" + re.sub(r"_+", "_", para_name.replace("-", "_")).strip("_")
+    para_func = getattr(module, func_name, None)
+    if not para_func:
+        return []
+
+    try:
+        src = inspect.getsource(para_func)
+    except (OSError, TypeError):
+        return []
+
+    lines = src.split("\n")
+    call_pat = re.compile(r"(para_[A-Z0-9_]+)\(state\)")
+
+    # Find sub-paragraph calls before the branch line
+    sub_calls = []
+    for i in range(min(branch_line, len(lines))):
+        cm = call_pat.search(lines[i])
+        if cm:
+            sub_calls.append((i, cm.group(1)))
+
+    # Check each sub-paragraph (in reverse order — last one wins)
+    for _call_line, sub_func_name in reversed(sub_calls):
+        sub_func = getattr(module, sub_func_name, None)
+        if not sub_func:
+            continue
+
+        # Get the sub-paragraph's COBOL name for cache lookup
+        # Convert para_XXX_YYY back to XXX-YYY
+        cobol_name = sub_func_name[5:].replace("_", "-")  # approximate
+
+        # Extract dataflow from the sub-function
+        try:
+            sub_src = inspect.getsource(sub_func)
+        except (OSError, TypeError):
+            continue
+
+        sub_lines = sub_src.split("\n")
+        assign_pat = re.compile(
+            r"^(\s*)state\['([A-Z][A-Z0-9_-]*)'\]\s*=\s*(.*)"
+        )
+        dep_pat = re.compile(
+            r"state\.get\('([A-Z][A-Z0-9_-]*)'|state\['([A-Z][A-Z0-9_-]*)'\]"
+        )
+
+        # Check if this sub-paragraph assigns target_var
+        sub_assigns = []
+        for j, line in enumerate(sub_lines):
+            am = assign_pat.match(line)
+            if am:
+                avar = am.group(2)
+                expr = am.group(3)
+                deps = [g1 or g2 for g1, g2 in dep_pat.findall(expr)]
+                sub_assigns.append((j, avar, expr, deps))
+
+        # Find the last assignment to target_var in the sub-paragraph
+        last_assign = None
+        for j, avar, expr, deps in sub_assigns:
+            if avar == target_var:
+                last_assign = (avar, expr, deps)
+
+        if last_assign:
+            avar, expr, deps = last_assign
+            chain = [(avar, expr)]
+            # Also trace one more level back through the sub-paragraph
+            for dep in deps:
+                for j, davar, dexpr, ddeps in sub_assigns:
+                    if davar == dep:
+                        chain.append((davar, dexpr))
+            return chain
+
+    return []
+
+
+def _solve_backward_constraint(
+    condition_var: str,
+    condition_text: str,
+    chain: list[tuple[str, str]],
+    negate: bool,
+    branch_meta_entry: dict,
+    var_report,
+    base_state: dict,
+) -> dict[str, object]:
+    """Given a backward dataflow chain, compute input values that satisfy the condition.
+
+    Returns dict of variable -> value to set in input state.
+    """
+    import re
+
+    result: dict[str, object] = {}
+
+    # If chain is empty, condition var is directly settable (no intermediate computation)
+    if not chain:
+        return result
+
+    # Classify what the chain tells us about the condition var
+    first_var, first_expr = chain[0]
+
+    # Case 1: Simple MOVE/copy — state['X'] = state.get('Y', '')
+    copy_match = re.match(
+        r"state\.get\('([A-Z][A-Z0-9_-]*)'\s*,\s*''\s*\)", first_expr
+    )
+    if copy_match:
+        source_var = copy_match.group(1)
+        # The condition on X is really a condition on Y
+        # Parse what value we need
+        from .static_analysis import _parse_condition_variables
+        try:
+            parsed = _parse_condition_variables(
+                branch_meta_entry.get("condition", "")
+            )
+        except Exception:
+            parsed = []
+        for pvar, vals, neg in parsed:
+            effective_neg = neg ^ negate
+            if vals:
+                if not effective_neg:
+                    result[source_var] = vals[0]
+                else:
+                    # Need the opposite — try a different value
+                    if isinstance(vals[0], str):
+                        result[source_var] = "__DIFF__"
+                    else:
+                        result[source_var] = vals[0] + 99999
+        return result
+
+    # Case 2: Constant assignment — state['X'] = 'literal' or state['X'] = 0
+    const_match = re.match(r"^'([^']*)'$|^(-?\d+(?:\.\d+)?)$|^(\d+)$", first_expr.strip())
+    if const_match:
+        # Variable is always set to a constant — can't change it via inputs
+        # But maybe we can skip the paragraph call that does this
+        return {}
+
+    # Case 3: Arithmetic — state['X'] = _to_num(A) OP _to_num(B)
+    # Extract the operation and operands
+    arith_pat = re.compile(
+        r"_to_num\(state\.get\('([A-Z][A-Z0-9_-]*)'"
+    )
+    operand_vars = arith_pat.findall(first_expr)
+
+    if operand_vars:
+        from .static_analysis import _parse_condition_variables
+        try:
+            parsed = _parse_condition_variables(
+                branch_meta_entry.get("condition", "")
+            )
+        except Exception:
+            parsed = []
+
+        # Determine what value condition_var needs
+        target_val = None
+        need_nonzero = False
+        need_zero = False
+        need_greater = None
+        need_equal = None
+
+        cond_text = branch_meta_entry.get("condition", "")
+        is_greater = "GREATER" in cond_text.upper() or ">" in cond_text
+
+        for pvar, vals, neg in parsed:
+            effective_neg = neg ^ negate
+            if vals:
+                if not effective_neg:
+                    target_val = vals[0]
+                    if isinstance(target_val, (int, float)) and target_val == 0:
+                        need_zero = True
+                    elif isinstance(target_val, (int, float)):
+                        if is_greater:
+                            need_greater = target_val
+                        else:
+                            need_equal = target_val
+                else:
+                    if isinstance(vals[0], (int, float)) and vals[0] == 0:
+                        need_nonzero = True
+                    else:
+                        target_val = vals[0]
+                        if is_greater:
+                            # Negated GREATER means need <= val
+                            need_equal = 0  # try zero
+                        else:
+                            need_nonzero = True
+
+        # For modulo: A % B = target (REMAINDER)
+        if " % " in first_expr and operand_vars:
+            mod_match = re.search(r'%\s*\(?(\d+)', first_expr)
+            modulus = int(mod_match.group(1)) if mod_match else 4
+            if need_zero:
+                # Need X % modulus == 0, so X must be a multiple
+                result[operand_vars[0]] = modulus * 500  # e.g., 2000 for %4
+            elif need_nonzero or need_equal:
+                target_n = need_equal if need_equal else 1
+                # Need X % modulus == target_n
+                result[operand_vars[0]] = modulus * 500 + int(target_n)
+            return result
+
+        # For floor division: A // B = target
+        if " // " in first_expr and operand_vars:
+            div_match = re.search(r'//\s*\(?(\d+)', first_expr)
+            divisor = int(div_match.group(1)) if div_match else 1
+            if need_nonzero or need_greater or (need_equal and need_equal != 0):
+                target_n = need_greater or need_equal or 1
+                # Need A // divisor > target_n, so A > target_n * divisor
+                for ov in operand_vars:
+                    result[ov] = (int(target_n) + 1) * divisor
+            elif need_zero:
+                for ov in operand_vars:
+                    result[ov] = 0
+            return result
+
+        # For multiplication: A * B = target
+        if " * " in first_expr and operand_vars:
+            if need_nonzero or need_greater or (need_equal and need_equal != 0):
+                # Set all operands to non-zero values
+                target_n = need_greater or need_equal or 100
+                val = max(100, int(abs(target_n)) + 1)
+                for ov in operand_vars:
+                    cur = base_state.get(ov, 0)
+                    try:
+                        cur_num = float(cur) if cur else 0
+                    except (ValueError, TypeError):
+                        cur_num = 0
+                    if cur_num == 0:
+                        result[ov] = val
+                    # Also check deeper chain for this operand
+                    for cvar, cexpr in chain[1:]:
+                        if cvar == ov:
+                            inner_ops = arith_pat.findall(cexpr)
+                            for iov in inner_ops:
+                                cur2 = base_state.get(iov, 0)
+                                try:
+                                    cur2_num = float(cur2) if cur2 else 0
+                                except (ValueError, TypeError):
+                                    cur2_num = 0
+                                if cur2_num == 0:
+                                    result[iov] = val
+            elif need_zero:
+                # Set one operand to zero
+                if operand_vars:
+                    result[operand_vars[0]] = 0
+
+        # For division: A / B = target
+        elif " / " in first_expr:
+            if need_nonzero or need_greater or (need_equal and need_equal != 0):
+                # Need numerator large enough that division produces nonzero
+                div_match = re.search(r'/\s*\(?(\d+)', first_expr)
+                divisor = int(div_match.group(1)) if div_match else 1
+                target_n = need_greater or need_equal or 1
+                for ov in operand_vars:
+                    result[ov] = divisor * (int(abs(target_n)) + 1)
+            elif need_zero:
+                for ov in operand_vars:
+                    result[ov] = 0
+
+        # For addition: A + B = target
+        elif " + " in first_expr:
+            if need_nonzero or need_greater or (need_equal and need_equal != 0):
+                target_n = need_greater or need_equal or 100
+                for ov in operand_vars:
+                    result[ov] = int(abs(target_n)) + 1
+            elif need_zero:
+                for ov in operand_vars:
+                    result[ov] = 0
+
+        # For subtraction: A - B = target
+        elif " - " in first_expr:
+            if need_nonzero or need_greater:
+                target_n = need_greater or 100
+                if len(operand_vars) >= 2:
+                    result[operand_vars[0]] = int(abs(target_n)) + 200
+                    result[operand_vars[1]] = 0
+                elif operand_vars:
+                    result[operand_vars[0]] = int(abs(target_n)) + 200
+            elif need_zero:
+                if len(operand_vars) >= 2:
+                    result[operand_vars[0]] = 100
+                    result[operand_vars[1]] = 100
+
+    # Case 4: Round/int truncation wrapping arithmetic
+    round_match = re.match(r"round\((.*)\)$|int\((.*)\)$", first_expr.strip())
+    if round_match and not result:
+        inner = round_match.group(1) or round_match.group(2)
+        operand_vars2 = arith_pat.findall(inner)
+        if operand_vars2:
+            for ov in operand_vars2:
+                cur = base_state.get(ov, 0)
+                try:
+                    cur_num = float(cur) if cur else 0
+                except (ValueError, TypeError):
+                    cur_num = 0
+                if cur_num == 0:
+                    result[ov] = 10000  # large enough to survive truncation
+
+    return result
+
+
+def _run_layer_38(
+    module, program, var_report, stub_mapping,
+    synth: SynthesisState, store_path: Path,
+    start_time: float, max_time: float | None,
+) -> int:
+    """Dataflow Constraint Propagation.
+
+    For each uncovered branch, parses the paragraph's generated Python to
+    build a dataflow graph, then traces backward from the condition variable
+    through intermediate computations to find the actual input variables
+    that need specific values. Handles MOVE chains, arithmetic, and
+    stub-derived values.
+    """
+    import re
+
+    new_count = 0
+
+    branch_meta = getattr(module, "_BRANCH_META", {})
+    if not branch_meta:
+        _record_layer_done(synth, store_path, 38)
+        return 0
+
+    base_defaults = (
+        _generate_stub_defaults(stub_mapping, var_report)
+        if stub_mapping else {}
+    )
+
+    # Build paragraph -> best base TC map (prefer TCs with most branches)
+    para_to_tc: dict[str, TestCase] = {}
+    for tc in synth.test_cases:
+        for p in tc.paragraphs_covered:
+            if p not in para_to_tc or len(tc.branches_covered) > len(para_to_tc[p].branches_covered):
+                para_to_tc[p] = tc
+
+    # Identify paragraphs that need direct invocation
+    direct_paras: set[str] = set()
+    run_paras: set[str] = set()
+    for tc in synth.test_cases:
+        if tc.target.startswith("direct:"):
+            direct_paras.update(tc.paragraphs_covered)
+        else:
+            run_paras.update(tc.paragraphs_covered)
+    direct_only = direct_paras - run_paras
+
+    # Cache dataflow extractions per paragraph
+    df_cache: dict[str, tuple] = {}
+
+    # Group uncovered branches by paragraph
+    from collections import defaultdict
+    para_branches: dict[str, list[tuple[int, bool]]] = defaultdict(list)
+    for abs_id, meta in branch_meta.items():
+        para = meta.get("paragraph", "")
+        if not para or para not in synth.covered_paras:
+            continue
+        for negate in (False, True):
+            target_id = -abs_id if negate else abs_id
+            if target_id not in synth.covered_branches:
+                para_branches[para].append((abs_id, negate))
+
+    log.info(
+        "Layer 38: %d paragraphs with %d uncovered branch directions to analyze",
+        len(para_branches),
+        sum(len(v) for v in para_branches.values()),
+    )
+
+    for para, branch_list in sorted(para_branches.items(),
+                                     key=lambda x: -len(x[1])):
+        if _time_exceeded(start_time, max_time):
+            break
+
+        # Extract dataflow for this paragraph (cached)
+        if para not in df_cache:
+            df_cache[para] = _extract_paragraph_dataflow(module, para)
+        assignments, branch_checks = df_cache[para]
+
+        if not assignments and not branch_checks:
+            continue
+
+        use_direct = para in direct_only
+        base_tc = para_to_tc.get(para)
+        if base_tc is None and synth.test_cases:
+            base_tc = synth.test_cases[0]
+
+        base_state = dict(base_tc.input_state) if base_tc else {}
+        base_stubs = (
+            dict(base_tc.stub_outcomes) if base_tc and base_tc.stub_outcomes
+            else {}
+        )
+
+        for abs_id, negate in branch_list:
+            if _time_exceeded(start_time, max_time):
+                break
+
+            target_id = -abs_id if negate else abs_id
+            if target_id in synth.covered_branches:
+                continue
+
+            target_key = f"branch:{target_id}"
+            if _was_attempted(synth, 38, target_key):
+                continue
+
+            meta = branch_meta[abs_id]
+            condition = meta.get("condition", "")
+
+            # Find the branch check line
+            branch_line = None
+            for line_idx, bid, cond_line, indent in branch_checks:
+                if bid == abs_id or bid == -abs_id:
+                    branch_line = line_idx
+                    break
+
+            if branch_line is None:
+                _record_attempt(synth, store_path, 38, target_key)
+                continue
+
+            # Parse condition to get the variable
+            from .static_analysis import _parse_condition_variables
+            try:
+                parsed = _parse_condition_variables(condition)
+            except Exception:
+                _record_attempt(synth, store_path, 38, target_key)
+                continue
+
+            found = False
+            for pvar, vals, neg in parsed:
+                # Trace backward from this variable
+                chain = _trace_backward(pvar, branch_line, assignments)
+
+                # If no chain in this paragraph, try inter-procedural:
+                # look at sub-paragraph calls before the branch and check
+                # if any of them assign the condition variable
+                if not chain:
+                    chain = _trace_interprocedural(
+                        module, pvar, branch_line, assignments,
+                        branch_checks, df_cache,
+                    )
+
+                if not chain:
+                    continue  # No intermediate computation found
+
+                # Check if the chain involves a stub
+                has_stub = any(
+                    "__STUB__" in adeps
+                    for aline, avar, _aexpr, adeps in assignments
+                    if aline < branch_line and avar == pvar
+                )
+
+                # Solve backward constraints
+                overrides = _solve_backward_constraint(
+                    pvar, condition, chain, negate, meta,
+                    var_report, base_state,
+                )
+
+                if not overrides and not has_stub:
+                    continue
+
+                # Build candidate state
+                state = dict(base_state)
+                state.update(overrides)
+
+                # Also try to set the condition variable directly
+                # (some chains have conditional assignments that might not execute)
+                effective_neg = neg ^ negate
+                if vals:
+                    if not effective_neg:
+                        state[pvar] = vals[0]
+                    else:
+                        if isinstance(vals[0], str):
+                            state[pvar] = "__NOMATCH__"
+                        elif isinstance(vals[0], (int, float)):
+                            state[pvar] = vals[0] + 99999
+                        else:
+                            state[pvar] = "__NOMATCH__"
+
+                # Try multiple variations
+                for attempt in range(5):
+                    trial_state = dict(state)
+                    trial_stubs = dict(base_stubs)
+
+                    if attempt == 1:
+                        # Variation: amplify numeric overrides
+                        for k, v in overrides.items():
+                            if isinstance(v, (int, float)) and v != 0:
+                                trial_state[k] = v * 10
+                    elif attempt == 2:
+                        # Variation: don't set condition var directly
+                        # (let computation produce it)
+                        if pvar in trial_state and pvar in [c[0] for c in chain]:
+                            del trial_state[pvar]
+                    elif attempt == 3:
+                        # Variation: set condition var to large value
+                        # (for GREATER conditions)
+                        trial_state[pvar] = 999999
+                        for k, v in overrides.items():
+                            if isinstance(v, (int, float)):
+                                trial_state[k] = v * 100
+                    elif attempt == 4:
+                        # Variation: only set overrides, no direct condition var
+                        trial_state = dict(base_state)
+                        trial_state.update(overrides)
+
+                    save_target = (
+                        f"direct:{para}|{target_key}" if use_direct and para
+                        else target_key
+                    )
+
+                    if use_direct and para:
+                        paras, branches, edges = _execute_direct_and_collect(
+                            module, para, trial_state, trial_stubs, base_defaults,
+                        )
+                    else:
+                        paras, branches, edges = _execute_and_collect(
+                            module, trial_state, trial_stubs, base_defaults,
+                        )
+
+                    if _maybe_save(synth, store_path, trial_state, trial_stubs,
+                                   base_defaults, paras, branches, edges,
+                                   layer=38, target=save_target):
+                        new_count += 1
+                        found = True
+                        break
+
+                if found:
+                    break
+
+            _record_attempt(synth, store_path, 38, target_key)
+
+    _record_layer_done(synth, store_path, 38)
+    return new_count
+
+
 def _run_layer_4(
     module, program, var_report, stub_mapping,
     synth: SynthesisState, store_path: Path,
@@ -3121,6 +3803,10 @@ def synthesize_test_set(
             module, program, var_report, stub_mapping,
             synth, store_path, start_time, max_time_seconds,
         )),
+        (38, lambda: _run_layer_38(
+            module, program, var_report, stub_mapping,
+            synth, store_path, start_time, max_time_seconds,
+        )),
         (4, lambda: _run_layer_4(
             module, program, var_report, stub_mapping,
             synth, store_path, start_time, max_time_seconds,
@@ -3143,7 +3829,7 @@ def synthesize_test_set(
 
     for layer_num, layer_fn in layer_funcs:
         # Layer 25 (2.5) and 35 (3.5) run within their surrounding layers
-        effective_layer = {25: 3, 35: 4, 37: 4, 6: 5, 7: 5}.get(layer_num, layer_num)
+        effective_layer = {25: 3, 35: 4, 37: 4, 38: 4, 6: 5, 7: 5}.get(layer_num, layer_num)
         if effective_layer > max_layers:
             break
         if _time_exceeded(start_time, max_time_seconds):
