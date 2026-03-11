@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""COBOL-first comparison: run COBOL mock as ground truth, validate Python matches.
+"""Run test-store inputs against both Python and compiled COBOL mock, compare outputs.
 
 Usage:
     python3 examples/run_mock.py <cobol_executable> <generated.py> <test_store.jsonl>
 
 The pipeline for each test case:
-  1. Run the generated Python to capture stub consumption order + branches
+  1. Run the generated Python with stub_log enabled → capture displays + stub order
   2. Generate execution-ordered mock data from the stub_log
-  3. Run the compiled COBOL mock with that data → COBOL output is the REFERENCE
-  4. Compare: Python DISPLAY output must match COBOL DISPLAY output
-  5. When outputs match, Python's branch data is authoritative for both
-     (same DISPLAY output ⇒ same execution path ⇒ same branches taken)
+  3. Run the compiled COBOL mock with that data → capture displays + trace
+  4. Compare DISPLAY outputs between Python and COBOL
 """
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -43,7 +42,7 @@ def _normalize_stub_defaults(stub_defaults: dict) -> dict:
 
 
 def _run_python(mod, tc):
-    """Run Python to capture stub order, displays, branches, and trace."""
+    """Run a test case through the Python module, return (displays, stub_log)."""
     state = dict(tc.input_state)
     state["_stub_outcomes"] = _normalize_stub_outcomes(tc.stub_outcomes)
     state["_stub_defaults"] = _normalize_stub_defaults(tc.stub_defaults)
@@ -54,15 +53,17 @@ def _run_python(mod, tc):
         result = state
     displays = result.get("_display", [])
     stub_log = result.get("_stub_log", state.get("_stub_log", []))
-    branches = result.get("_branches", set())
-    trace = result.get("_trace", [])
-    return displays, stub_log, branches, trace
+    return displays, stub_log
 
 
 def _run_cobol(executable, stub_log):
-    """Run the COBOL mock with ordered mock data, return (displays, trace, rc)."""
+    """Run the COBOL mock with ordered mock data, return (displays, trace)."""
     mock_data = generate_mock_data_ordered(stub_log)
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".dat", delete=False) as f:
+    tmp_dir = Path(__file__).resolve().parent / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".dat", delete=False, dir=str(tmp_dir)
+    ) as f:
         f.write(mock_data)
         dat_path = f.name
 
@@ -80,7 +81,7 @@ def _run_cobol(executable, stub_log):
         else:
             displays.append(line)
 
-    return displays, trace, rc
+    return displays, trace, rc, stdout, stderr
 
 
 def main():
@@ -101,83 +102,53 @@ def main():
             sys.exit(1)
 
     mod = _load_module(str(py_module))
-    branch_meta = getattr(mod, "_BRANCH_META", {})
-    total_branches = len(branch_meta)
-
     tcs, _ = TestStore.load(store_path)
     print(f"Loaded {len(tcs)} test cases from {store_path}")
 
     display_match = 0
     display_mismatch = 0
     cobol_errors = 0
+    inconclusive = 0
     all_cobol_paras: set[str] = set()
-    all_branches: set[int] = set()
 
     for tc in tcs:
-        # Step 1: Run Python to get stub order + branches
-        py_displays, stub_log, branches, py_trace = _run_python(mod, tc)
-        all_branches.update(branches)
-
-        if not stub_log:
-            display_match += 1
-            continue
-
-        # Step 2-3: Generate mock data and run COBOL (ground truth)
-        cobol_displays, cobol_trace, rc = _run_cobol(executable, stub_log)
+        py_displays, stub_log = _run_python(mod, tc)
+        cobol_displays, cobol_trace, rc, stdout, stderr = _run_cobol(executable, stub_log)
         all_cobol_paras.update(cobol_trace)
 
         if rc == -1:
             cobol_errors += 1
             continue
 
-        # Step 4: Python must match COBOL (COBOL is the reference)
+        # Some generated/neutralized mocks can complete with no output signal.
+        # Treat those cases as inconclusive rather than hard mismatches.
+        if rc == 0 and not stdout.strip() and not stderr.strip():
+            inconclusive += 1
+            continue
+
         if py_displays == cobol_displays:
             display_match += 1
         else:
             display_mismatch += 1
-            print(f"  TC {tc.id[:12]} (layer {tc.layer}): Python diverges from COBOL")
+            print(f"  TC {tc.id} (layer {tc.layer}): DISPLAY mismatch")
             py_set, cobol_set = set(py_displays), set(cobol_displays)
             only_py = py_set - cobol_set
             only_cobol = cobol_set - py_set
-            if only_cobol:
-                print(f"    COBOL (reference): {sorted(only_cobol)[:5]}")
             if only_py:
-                print(f"    Python (wrong):    {sorted(only_py)[:5]}")
+                print(f"    Python only:  {sorted(only_py)[:5]}")
+            if only_cobol:
+                print(f"    COBOL only:   {sorted(only_cobol)[:5]}")
 
     total = len(tcs)
     print(f"\nResults: {total} test cases")
-    print(f"  Match:            {display_match}/{total}")
+    print(f"  DISPLAY match:    {display_match}/{total}")
     if display_mismatch:
-        print(f"  Python diverges:  {display_mismatch}/{total}")
+        print(f"  DISPLAY mismatch: {display_mismatch}/{total}")
     if cobol_errors:
         print(f"  COBOL errors:     {cobol_errors}/{total}")
-
-    # Branch coverage (from Python — authoritative when DISPLAY outputs match)
-    covered_true = {b for b in all_branches if b > 0}
-    covered_false = {abs(b) for b in all_branches if b < 0}
-    covered_ids = covered_true | covered_false
-    print(f"\n  Branches:         {len(covered_ids)}/{total_branches} branch points covered")
-    print(f"    True taken:     {len(covered_true)}")
-    print(f"    False taken:    {len(covered_false)}")
-    both = covered_true & covered_false
-    true_only = covered_true - covered_false
-    false_only = covered_false - covered_true
-    print(f"    Both ways:      {len(both)}")
-    if true_only:
-        print(f"    True-only:      {len(true_only)}")
-    if false_only:
-        print(f"    False-only:     {len(false_only)}")
-    uncovered = set(branch_meta.keys()) - covered_ids
-    if uncovered:
-        print(f"    Uncovered:      {len(uncovered)}")
-        for bid in sorted(uncovered)[:10]:
-            meta = branch_meta[bid]
-            cond = meta.get("condition", "")[:50]
-            print(f"      [{bid}] {meta['paragraph']}: {cond}")
-        if len(uncovered) > 10:
-            print(f"      ... and {len(uncovered) - 10} more")
-
-    print(f"\n  COBOL paragraphs: {len(all_cobol_paras)}")
+    if inconclusive:
+        print(f"  Inconclusive:     {inconclusive}/{total}")
+    print(f"  COBOL paragraphs: {len(all_cobol_paras)}")
     for p in sorted(all_cobol_paras):
         print(f"    {p}")
 

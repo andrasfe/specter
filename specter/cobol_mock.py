@@ -25,6 +25,7 @@ import re
 import subprocess
 import tempfile
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -155,6 +156,10 @@ def instrument_cobol(
 
     # Phase 12: Auto-stub unresolved symbols reported by cobc (if available)
     lines = _auto_stub_undefined_with_cobc(lines)
+
+    # Phase 13: Normalize source characters to ASCII-safe content so cobc does
+    # not choke on legacy encoded literals in transformed sources.
+    lines = _sanitize_source_ascii(lines)
 
     result_source = "".join(lines)
 
@@ -1531,7 +1536,8 @@ def _auto_stub_undefined_with_cobc(lines: list[str], max_passes: int = 48) -> li
     """
     current = list(lines)
     start_ts = time.time()
-    max_seconds = 35.0
+    max_seconds = 180.0
+    syntax_timeout = 20
     for _ in range(max_passes):
         if (time.time() - start_ts) > max_seconds:
             break
@@ -1544,12 +1550,14 @@ def _auto_stub_undefined_with_cobc(lines: list[str], max_passes: int = 48) -> li
                     capture_output=True,
                     text=True,
                     check=False,
-                    timeout=8,
+                    timeout=syntax_timeout,
                 )
             except Exception:
                 return current
 
             stderr = (proc.stderr or "") + "\n" + (proc.stdout or "")
+            if _is_cobc_internal_abort(stderr):
+                return _mitigate_cobc_internal_abort(current, stderr)
             err_rows = re.findall(r":(\d+):\s+error:\s+(.*)", stderr)
             if not err_rows:
                 return current
@@ -1685,10 +1693,12 @@ def _auto_stub_undefined_with_cobc(lines: list[str], max_passes: int = 48) -> li
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=8,
+                timeout=syntax_timeout,
             )
             if proc.returncode != 0:
                 stderr = (proc.stderr or "") + "\n" + (proc.stdout or "")
+                if _is_cobc_internal_abort(stderr):
+                    return _mitigate_cobc_internal_abort(current, stderr)
 
                 # First, neutralize only paragraphs explicitly named by cobc.
                 final_bad_paras = set(re.findall(r"in paragraph '([^']+)'", stderr, re.IGNORECASE))
@@ -1714,13 +1724,45 @@ def _auto_stub_undefined_with_cobc(lines: list[str], max_passes: int = 48) -> li
                         capture_output=True,
                         text=True,
                         check=False,
-                        timeout=8,
+                        timeout=syntax_timeout,
                     )
                 if proc2.returncode == 0:
                     return tentative
+                if _is_cobc_internal_abort((proc2.stderr or "") + "\n" + (proc2.stdout or "")):
+                    return _mitigate_cobc_internal_abort(
+                        tentative,
+                        (proc2.stderr or "") + "\n" + (proc2.stdout or ""),
+                    )
+
+                # Keep as much runnable logic as possible by progressively
+                # neutralizing exact cobc-reported error lines before giving up.
+                salvage = _progressive_syntax_salvage(tentative)
+                with tempfile.TemporaryDirectory(prefix="specter-mock-") as td3:
+                    tmp_src3 = Path(td3) / "autocheck-salvage.cbl"
+                    tmp_src3.write_text("".join(salvage))
+                    proc3 = subprocess.run(
+                        ["cobc", "-fsyntax-only", str(tmp_src3)],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=syntax_timeout,
+                    )
+                if proc3.returncode == 0:
+                    return salvage
+                if _is_cobc_internal_abort((proc3.stderr or "") + "\n" + (proc3.stdout or "")):
+                    return _mitigate_cobc_internal_abort(
+                        salvage,
+                        (proc3.stderr or "") + "\n" + (proc3.stdout or ""),
+                    )
+
+                _write_hardening_diagnostics(
+                    stage="post-salvage",
+                    diagnostics=(proc3.stderr or "") + "\n" + (proc3.stdout or ""),
+                )
 
                 return _hard_comment_procedure(current)
     except Exception:
+        _write_hardening_diagnostics(stage="exception", diagnostics="exception during auto-stub recovery")
         return _hard_comment_procedure(current)
 
     return current
@@ -1833,6 +1875,57 @@ def _comment_specific_lines(lines: list[str], line_numbers: set[int]) -> list[st
         else:
             out.append(line)
     return out
+
+
+def _comment_exact_lines(lines: list[str], line_numbers: set[int]) -> list[str]:
+    """Comment exact physical lines regardless of division/section."""
+    if not line_numbers:
+        return lines
+    out: list[str] = []
+    for idx, line in enumerate(lines, start=1):
+        if idx in line_numbers and len(line) > 6 and line[6] not in ("*", "/"):
+            out.append(_comment_line(line))
+        else:
+            out.append(line)
+    return out
+
+
+def _progressive_syntax_salvage(lines: list[str], max_rounds: int = 20) -> list[str]:
+    """Iteratively comment cobc-reported error lines to preserve runnable flow."""
+    current = list(lines)
+    for _ in range(max_rounds):
+        with tempfile.TemporaryDirectory(prefix="specter-mock-") as td:
+            tmp_src = Path(td) / "salvage.cbl"
+            tmp_src.write_text("".join(current))
+            proc = subprocess.run(
+                ["cobc", "-fsyntax-only", str(tmp_src)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+        if proc.returncode == 0:
+            return current
+
+        stderr = (proc.stderr or "") + "\n" + (proc.stdout or "")
+        if _is_cobc_internal_abort(stderr):
+            return current
+        err_lines = {
+            int(m.group(1))
+            for m in re.finditer(r":(\d+):\s+error:", stderr)
+            if m.group(1).isdigit()
+        }
+        if not err_lines:
+            return current
+
+        bad_paras = {p.upper() for p in re.findall(r"in paragraph '([^']+)'", stderr, re.IGNORECASE)}
+        if bad_paras:
+            current = _force_neutralize_paragraphs(current, bad_paras)
+
+        current = _comment_exact_lines(current, err_lines)
+        current = _cleanup_unbalanced_procedure(current)
+
+    return current
 
 
 def _comment_data_blocks(lines: list[str], line_numbers: set[int]) -> list[str]:
@@ -2094,12 +2187,70 @@ def _hard_comment_procedure(lines: list[str]) -> list[str]:
     stub = [
         f"{_A}PROCEDURE DIVISION.\n",
         f"{_A}SPECTER-HARDENED-ENTRY.\n",
+        f"{_B}DISPLAY 'SPECTER-TRACE:HARDENED'\n",
         f"{_B}CONTINUE.\n",
         f"{_B}GOBACK.\n",
     ]
     for s in reversed(stub):
         out.insert(insert_at, s)
     return out
+
+
+def _write_hardening_diagnostics(stage: str, diagnostics: str) -> None:
+    """Persist generic hardening diagnostics under examples/tmp for analysis."""
+    try:
+        out_dir = Path("examples/tmp")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        out_path = out_dir / f"hardening-diagnostics-{ts}.log"
+        payload = [
+            f"stage={stage}",
+            "",
+            diagnostics or "(no diagnostics)",
+            "",
+        ]
+        out_path.write_text("\n".join(payload), errors="replace")
+    except Exception:
+        # Diagnostics must never break instrumentation flow.
+        pass
+
+
+def _is_cobc_internal_abort(diag: str) -> bool:
+    """Detect cobc internal compiler abort signatures."""
+    d = (diag or "").lower()
+    return ("unknown (signal)" in d) or ("please report this" in d)
+
+
+def _mitigate_cobc_internal_abort(lines: list[str], diag: str, rounds: int = 6) -> list[str]:
+    """Mitigate cobc internal aborts by neutralizing local crash-line windows."""
+    current = list(lines)
+    details = diag or ""
+    for _ in range(rounds):
+        m = re.search(r"at line\s+(\d+)", details, re.IGNORECASE)
+        if not m:
+            return _hard_comment_procedure(current)
+        ln = int(m.group(1))
+        targets = set(range(max(1, ln - 2), ln + 3))
+        current = _comment_exact_lines(current, targets)
+        current = _cleanup_unbalanced_procedure(current)
+
+        with tempfile.TemporaryDirectory(prefix="specter-mock-") as td:
+            tmp_src = Path(td) / "abort-mitigate.cbl"
+            tmp_src.write_text("".join(current))
+            proc = subprocess.run(
+                ["cobc", "-fsyntax-only", str(tmp_src)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+        details = (proc.stderr or "") + "\n" + (proc.stdout or "")
+        if proc.returncode == 0:
+            return current
+        if not _is_cobc_internal_abort(details):
+            return current
+
+    return _hard_comment_procedure(current)
 
 
 # ---------------------------------------------------------------------------
@@ -2114,6 +2265,27 @@ def _get_cobol_content(line: str) -> str:
     if len(line) > 6 and line[6] in ("*", "/"):
         return ""
     return line[6:72] if len(line) > 72 else line[6:]
+
+
+def _sanitize_source_ascii(lines: list[str]) -> list[str]:
+    """Replace non-ASCII/non-printable characters with spaces."""
+    out: list[str] = []
+    for line in lines:
+        if not line:
+            out.append(line)
+            continue
+        has_nl = line.endswith("\n")
+        body = line[:-1] if has_nl else line
+        sanitized_chars: list[str] = []
+        for ch in body:
+            code = ord(ch)
+            if 32 <= code <= 126:
+                sanitized_chars.append(ch)
+            else:
+                sanitized_chars.append(" ")
+        sanitized = "".join(sanitized_chars)
+        out.append(sanitized + ("\n" if has_nl else ""))
+    return out
 
 
 def _comment_line(line: str) -> str:

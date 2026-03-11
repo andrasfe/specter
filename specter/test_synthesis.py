@@ -327,7 +327,12 @@ def _execute_and_collect(
 
     try:
         rs = module.run(state)
-    except Exception:
+    except Exception as exc:
+        log.warning(
+            "Synthesis run failed in _execute_and_collect: %s: %s",
+            type(exc).__name__, exc,
+        )
+        log.debug("Stack trace for _execute_and_collect failure", exc_info=True)
         return [], [], []
 
     trace = rs.get("_trace", [])
@@ -356,7 +361,16 @@ def _execute_direct_and_collect(
 
     try:
         rs = _run_paragraph_directly(module, para_name, run_state)
-    except Exception:
+    except Exception as exc:
+        log.warning(
+            "Synthesis direct run failed for %s: %s: %s",
+            para_name, type(exc).__name__, exc,
+        )
+        log.debug(
+            "Stack trace for _execute_direct_and_collect failure (%s)",
+            para_name,
+            exc_info=True,
+        )
         return [], [], []
 
     if not rs:
@@ -394,7 +408,15 @@ def _execute_and_collect_full(
 
     try:
         rs = module.run(state)
-    except Exception:
+    except Exception as exc:
+        log.warning(
+            "Synthesis run failed in _execute_and_collect_full: %s: %s",
+            type(exc).__name__, exc,
+        )
+        log.debug(
+            "Stack trace for _execute_and_collect_full failure",
+            exc_info=True,
+        )
         return [], [], [], {}
 
     trace = rs.get("_trace", [])
@@ -456,7 +478,11 @@ def _validate_against_cobol(
 
     # 2. Generate execution-ordered mock data and run COBOL
     mock_data = generate_mock_data_ordered(stub_log)
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".dat", delete=False) as f:
+    temp_dir = Path("examples/tmp")
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".dat", delete=False, dir=str(temp_dir)
+    ) as f:
         f.write(mock_data)
         dat_path = f.name
 
@@ -469,11 +495,10 @@ def _validate_against_cobol(
         # Timeout or execution error — don't reject
         return True
 
-    # Some heavily neutralized/generated COBOL mocks can exit cleanly without
-    # any stdout/stderr, which provides no signal for comparison. Treat this
-    # as inconclusive instead of rejecting every candidate test case.
+    # Empty successful output gives no comparison signal; reject it so only
+    # tests with observable COBOL behavior are accepted.
     if rc == 0 and not stdout.strip() and not stderr.strip():
-        return True
+        return False
 
     # 3. Parse COBOL displays (skip SPECTER-* internal lines)
     cobol_displays = []

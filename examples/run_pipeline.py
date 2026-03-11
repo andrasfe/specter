@@ -76,6 +76,18 @@ def main() -> int:
         default=None,
         help="Optional path to exclude-values file, used only if specter supports --exclude-values",
     )
+    parser.add_argument(
+        "--synthesis-layers",
+        type=int,
+        default=None,
+        help="Optional synthesis layer limit to pass to specter",
+    )
+    parser.add_argument(
+        "--synthesis-timeout",
+        type=int,
+        default=None,
+        help="Optional synthesis timeout in seconds to pass to specter",
+    )
     parser.add_argument("--cobc-bin", default="cobc", help="GnuCOBOL compiler binary (default: cobc)")
     parser.add_argument(
         "--specter-bin",
@@ -146,6 +158,10 @@ def main() -> int:
         cmd3 += ["--cobol-validate", str(mock_exe)]
     if args.exclude_values and supports_exclude_values:
         cmd3 += ["--exclude-values", str(Path(args.exclude_values).expanduser().resolve())]
+    if args.synthesis_layers is not None:
+        cmd3 += ["--synthesis-layers", str(args.synthesis_layers)]
+    if args.synthesis_timeout is not None:
+        cmd3 += ["--synthesis-timeout", str(args.synthesis_timeout)]
     _run(cmd3, cwd=repo_root)
 
     # 4) Compare Python vs COBOL outputs using synthesized test store.
