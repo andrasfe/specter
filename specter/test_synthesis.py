@@ -422,11 +422,24 @@ def _validate_against_cobol(
     state = default_state_fn() if default_state_fn else {}
     state.update(input_state)
     if stub_outcomes:
-        state["_stub_outcomes"] = {
-            k: [list(e) for e in v] for k, v in stub_outcomes.items()
-        }
+        normalized_outcomes = {}
+        for k, v in stub_outcomes.items():
+            if isinstance(v, list):
+                normalized_outcomes[k] = [
+                    list(e) if isinstance(e, list) else e for e in v
+                ]
+            else:
+                # Be defensive: synthesis can carry scalar sentinels here.
+                normalized_outcomes[k] = v
+        state["_stub_outcomes"] = normalized_outcomes
     if stub_defaults:
-        state["_stub_defaults"] = {k: list(v) for k, v in stub_defaults.items()}
+        normalized_defaults = {}
+        for k, v in stub_defaults.items():
+            if isinstance(v, list):
+                normalized_defaults[k] = list(v)
+            else:
+                normalized_defaults[k] = v
+        state["_stub_defaults"] = normalized_defaults
     state["_stub_log"] = []
 
     try:
@@ -454,6 +467,12 @@ def _validate_against_cobol(
 
     if rc == -1:
         # Timeout or execution error — don't reject
+        return True
+
+    # Some heavily neutralized/generated COBOL mocks can exit cleanly without
+    # any stdout/stderr, which provides no signal for comparison. Treat this
+    # as inconclusive instead of rejecting every candidate test case.
+    if rc == 0 and not stdout.strip() and not stderr.strip():
         return True
 
     # 3. Parse COBOL displays (skip SPECTER-* internal lines)

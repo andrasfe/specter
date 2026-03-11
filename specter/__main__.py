@@ -7,9 +7,13 @@ import logging
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except Exception:  # pragma: no cover - optional dependency
+    load_dotenv = None
 
-load_dotenv()
+if load_dotenv is not None:
+    load_dotenv()
 
 from .ast_parser import parse_ast
 from .code_generator import generate_code
@@ -196,16 +200,6 @@ def main(argv: list[str] | None = None) -> int:
         help="Max seconds for synthesis (default: unlimited)",
     )
     parser.add_argument(
-        "--exclude-values",
-        metavar="FILE",
-        help="File with values to exclude from synthesis (one per line)",
-    )
-    parser.add_argument(
-        "--cobol-validate",
-        metavar="PATH",
-        help="Path to compiled COBOL mock binary for synthesis validation",
-    )
-    parser.add_argument(
         "--extract-tests",
         metavar="PATH",
         help="Extract test cases from a test store JSONL file to JSON/CSV",
@@ -222,25 +216,22 @@ def main(argv: list[str] | None = None) -> int:
         help="Generate Markdown documentation from a test store JSONL file (requires generated .py)",
     )
     parser.add_argument(
-        "--paragraph-catalog",
-        metavar="JSONL",
-        help="Generate paragraph catalog from a test store JSONL file (requires generated .py)",
-    )
-    parser.add_argument(
         "--mock-cobol",
         action="store_true",
-        help="Instrument COBOL source for standalone mock execution (input is .cbl file)",
+        help="Instrument COBOL source for standalone mock execution (input is .cbl/.cob/.cobol)",
     )
     parser.add_argument(
         "--copybook-dir",
         action="append",
+        default=[],
         metavar="DIR",
         help="Copybook directory for --mock-cobol (can repeat)",
     )
     parser.add_argument(
-        "--mock-init",
+        "--init-var",
         action="append",
-        metavar="VAR=VALUE",
+        default=[],
+        metavar="NAME=VALUE",
         help="Set initial variable value for --mock-cobol (can repeat)",
     )
 
@@ -266,58 +257,77 @@ def main(argv: list[str] | None = None) -> int:
         print(md)
         return 0
 
-    # --paragraph-catalog: needs generated .py + JSONL
-    if args.paragraph_catalog:
-        from .paragraph_catalog import generate_paragraph_catalog
-        py_path = Path(args.ast_file)
-        if not py_path.exists():
-            py_path = py_path.with_suffix(".py")
-        if not py_path.exists():
-            print(f"Error: generated module not found: {py_path}", file=sys.stderr)
-            return 1
-        print(f"Generating paragraph catalog from {args.paragraph_catalog} ...", file=sys.stderr)
-        md = generate_paragraph_catalog(py_path, args.paragraph_catalog)
-        print(md)
-        return 0
-
-    cbl_path = Path(args.ast_file)
+    source_path = Path(args.ast_file)
     cobol_suffixes = {".cbl", ".cob", ".cobol"}
+
+    # Convenience auto-detect: treat .cbl/.cob input as mock mode when related
+    # flags are present (or output is a COBOL file), so older invocation patterns
+    # still work.
+    cbl_path = Path(args.ast_file)
     if not args.mock_cobol and cbl_path.suffix.lower() in cobol_suffixes:
         output_looks_cobol = bool(args.output and Path(args.output).suffix.lower() in cobol_suffixes)
-        if args.copybook_dir or args.mock_init or output_looks_cobol:
+        if args.copybook_dir or args.init_var or output_looks_cobol:
             args.mock_cobol = True
-            print("Info: COBOL source detected; enabling --mock-cobol automatically.", file=sys.stderr)
+            print(
+                "Info: COBOL source detected; enabling --mock-cobol automatically.",
+                file=sys.stderr,
+            )
 
     # --mock-cobol: instrument COBOL source for mock execution
     if args.mock_cobol:
         from .cobol_mock import instrument_cobol, MockConfig
-        cbl_path = Path(args.ast_file)
-        if not cbl_path.exists():
-            print(f"Error: COBOL file not found: {cbl_path}", file=sys.stderr)
+
+        if cbl_path.suffix.lower() not in cobol_suffixes:
+            print(
+                f"Error: --mock-cobol expects a COBOL source (.cbl/.cob/.cobol), got: {source_path}",
+                file=sys.stderr,
+            )
             return 1
-        cfg = MockConfig()
-        if args.copybook_dir:
-            cfg.copybook_dirs = [Path(d) for d in args.copybook_dir]
-        if args.mock_init:
-            for item in args.mock_init:
-                if "=" in item:
-                    var, val = item.split("=", 1)
-                    cfg.initial_values[var.strip()] = val.strip()
-        print(f"Instrumenting {cbl_path} ...", file=sys.stderr)
-        result = instrument_cobol(cbl_path, cfg)
-        out_path = Path(args.output) if args.output else cbl_path.with_suffix(".mock.cbl")
-        out_path.write_text(result.source)
-        print(f"  EXEC blocks replaced: {result.exec_blocks_replaced}", file=sys.stderr)
-        print(f"  I/O verbs replaced: {result.io_verbs_replaced}", file=sys.stderr)
-        print(f"  CALL stmts replaced: {result.call_stmts_replaced}", file=sys.stderr)
-        print(f"  Paragraphs traced: {result.paragraphs_traced}", file=sys.stderr)
-        print(f"  COPYs resolved: {result.copy_resolved}", file=sys.stderr)
-        print(f"  COPYs stubbed: {result.copy_stubbed}", file=sys.stderr)
+        if not source_path.exists():
+            print(f"Error: COBOL source not found: {source_path}", file=sys.stderr)
+            return 1
+
+        init_values: dict[str, str] = {}
+        for item in args.init_var:
+            if "=" not in item:
+                print(f"Error: --init-var requires NAME=VALUE, got: {item}", file=sys.stderr)
+                return 1
+            name, value = item.split("=", 1)
+            name = name.strip().upper()
+            if not name:
+                print(f"Error: --init-var has empty variable name: {item}", file=sys.stderr)
+                return 1
+            init_values[name] = value
+
+        copybook_dirs = [Path(d) for d in args.copybook_dir]
+        cfg = MockConfig(copybook_dirs=copybook_dirs, initial_values=init_values)
+
+        output_path = Path(args.output) if args.output else source_path.with_suffix(".mock.cbl")
+
+        print(f"Instrumenting COBOL {source_path} ...")
+        result = instrument_cobol(source_path, cfg)
+        output_path.write_text(result.source)
+
+        print(f"  Written {output_path}")
+        print(f"  EXEC blocks replaced: {result.exec_blocks_replaced}")
+        print(f"  I/O verbs replaced: {result.io_verbs_replaced}")
+        print(f"  CALL statements replaced: {result.call_stmts_replaced}")
+        print(f"  Paragraphs traced: {result.paragraphs_traced}")
+        print(f"  COPY resolved: {result.copy_resolved} (stubbed: {result.copy_stubbed})")
         if result.warnings:
-            for w in result.warnings:
-                print(f"  Warning: {w}", file=sys.stderr)
-        print(f"Output: {out_path}", file=sys.stderr)
+            print("  Warnings:")
+            for w in result.warnings[:20]:
+                print(f"    - {w}")
+            if len(result.warnings) > 20:
+                print(f"    - ... and {len(result.warnings) - 20} more")
         return 0
+
+    if args.copybook_dir or args.init_var:
+        print(
+            "Error: --copybook-dir/--init-var require --mock-cobol (or a .cbl input with mock mode).",
+            file=sys.stderr,
+        )
+        return 1
 
     # --synthesize implies --analyze
     if args.synthesize:
@@ -364,9 +374,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.analyze and not args.monte_carlo:
         args.monte_carlo = 100
 
-    ast_path = Path(args.ast_file)
+    ast_path = source_path
     if not ast_path.exists():
         print(f"Error: AST file not found: {ast_path}", file=sys.stderr)
+        return 1
+
+    if ".py" in ast_path.suffixes:
+        print(
+            "Error: expected a JSON AST (.ast). You provided a generated Python module. "
+            "Use the .ast file from your parser, or use --extract-docs for .py inputs.",
+            file=sys.stderr,
+        )
         return 1
 
     # Determine output path
@@ -448,22 +466,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             test_store_path = analysis_dir / f"{ast_path.stem}_testset.jsonl"
 
-        # Load excluded values if provided
-        excluded_values = None
-        if args.exclude_values:
-            ev_path = Path(args.exclude_values)
-            if not ev_path.exists():
-                print(f"Error: exclude-values file not found: {ev_path}", file=sys.stderr)
-                return 1
-            excluded_values = set()
-            for line in ev_path.read_text().splitlines():
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    excluded_values.add(line)
-            print(f"  Excluding {len(excluded_values)} values from synthesis")
-
         print(f"Synthesizing test set → {test_store_path} ...")
-        cobol_exe = getattr(args, "cobol_validate", None)
         synth_report = synthesize_test_set(
             module=module,
             program=program,
@@ -475,23 +478,10 @@ def main(argv: list[str] | None = None) -> int:
             store_path=test_store_path,
             max_time_seconds=args.synthesis_timeout,
             max_layers=args.synthesis_layers,
-            excluded_values=excluded_values,
-            cobol_executable=cobol_exe,
         )
         print()
         print(synth_report.summary())
         print(f"\nTest store: {test_store_path}")
-
-        # Auto-generate paragraph catalog
-        from .paragraph_catalog import generate_paragraph_catalog
-        try:
-            catalog_md = generate_paragraph_catalog(output_path, test_store_path, program)
-            catalog_path = test_store_path.with_suffix(".catalog.md")
-            catalog_path.write_text(catalog_md)
-            print(f"Paragraph catalog: {catalog_path}")
-        except Exception as e:
-            print(f"Warning: catalog generation failed: {e}", file=sys.stderr)
-
         return 0
 
     # Monte Carlo

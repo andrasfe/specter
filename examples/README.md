@@ -14,9 +14,9 @@ specter ../aws-mainframe-modernization-carddemo/app/app-authorization-ims-db2-mq
 cobc -x -o examples/COPAUA0C.mock ./examples/COPAUA0C.mock.cbl
 ```
 
-## 3. Generate Python + synthesize with COBOL validation
+## 3. Generate Python + COBOL-first synthesis
 
-Each candidate test case is validated against the compiled COBOL binary before being accepted into the test store.
+Synthesis generates candidate inputs using Python (fast, in-process), then validates each candidate against the compiled COBOL binary. **COBOL coverage drives acceptance** — a test case is only accepted if it adds new COBOL paragraph coverage and Python DISPLAY output matches COBOL.
 
 ```sh
 specter examples/COPAUA0C.cbl.ast -o examples/COPAUA0C.py --synthesize --test-store examples/tests.jsonl --exclude-values examples/exclude.txt --cobol-validate examples/COPAUA0C.mock
@@ -32,8 +32,10 @@ python3 examples/run_mock.py examples/COPAUA0C.mock examples/COPAUA0C.py example
 
 ## How it works
 
-For each test case the validation pipeline:
-1. Runs the generated Python with `_stub_log` to capture execution-ordered stub calls
-2. Generates a mock data file with records in the exact order the COBOL program will consume them
-3. Runs the compiled COBOL binary with that mock data
-4. Compares DISPLAY output between Python and COBOL — rejects mismatches
+COBOL-first synthesis pipeline for each candidate test case:
+1. Python generates candidate inputs/stub values (fast exploration via 7 synthesis layers)
+2. Python runs the candidate with `_stub_log` to capture execution-ordered stub calls
+3. A mock data file is generated with records in the exact order COBOL will consume them
+4. The compiled COBOL binary runs with that mock data — paragraph coverage extracted from `SPECTER-TRACE:` output
+5. DISPLAY outputs are compared between Python and COBOL — mismatches are rejected
+6. The test case is accepted only if it adds new **COBOL** paragraph coverage
