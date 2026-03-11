@@ -201,6 +201,11 @@ def main(argv: list[str] | None = None) -> int:
         help="File with values to exclude from synthesis (one per line)",
     )
     parser.add_argument(
+        "--cobol-validate",
+        metavar="PATH",
+        help="Path to compiled COBOL mock binary for synthesis validation",
+    )
+    parser.add_argument(
         "--extract-tests",
         metavar="PATH",
         help="Extract test cases from a test store JSONL file to JSON/CSV",
@@ -458,6 +463,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  Excluding {len(excluded_values)} values from synthesis")
 
         print(f"Synthesizing test set → {test_store_path} ...")
+        cobol_exe = getattr(args, "cobol_validate", None)
         synth_report = synthesize_test_set(
             module=module,
             program=program,
@@ -470,6 +476,7 @@ def main(argv: list[str] | None = None) -> int:
             max_time_seconds=args.synthesis_timeout,
             max_layers=args.synthesis_layers,
             excluded_values=excluded_values,
+            cobol_executable=cobol_exe,
         )
         print()
         print(synth_report.summary())

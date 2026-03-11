@@ -211,6 +211,8 @@ class SynthesisReport:
     layer_stats: dict[int, int] = field(default_factory=dict)  # layer -> new TCs
     skipped_layers: list[int] = field(default_factory=list)
     elapsed_seconds: float = 0.0
+    cobol_validated: int = 0
+    cobol_rejected: int = 0
 
     def summary(self) -> str:
         lines = [
@@ -226,6 +228,9 @@ class SynthesisReport:
             lines.append(f"    Layer {layer}: {self.layer_stats[layer]} new test cases")
         if self.skipped_layers:
             lines.append(f"  Skipped (complete from prior run): {self.skipped_layers}")
+        if self.cobol_validated or self.cobol_rejected:
+            lines.append("")
+            lines.append(f"  COBOL validation: {self.cobol_validated} accepted, {self.cobol_rejected} rejected")
         return "\n".join(lines)
 
 
@@ -242,6 +247,10 @@ class SynthesisState:
     failed_targets: dict[str, int] = field(default_factory=dict)
     progress: StoreProgress = field(default_factory=StoreProgress)
     excluded_values: set = field(default_factory=set)
+    cobol_executable: str | None = None  # Path to compiled COBOL mock for validation
+    cobol_module: object = None          # Python module ref (for COBOL validation)
+    cobol_validated: int = 0    # Count of TCs validated against COBOL
+    cobol_rejected: int = 0     # Count of TCs rejected by COBOL validation
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +406,74 @@ def _execute_and_collect_full(
     return list(dict.fromkeys(trace)), branches, edges, rs
 
 
+def _validate_against_cobol(
+    module, cobol_executable: str,
+    input_state: dict, stub_outcomes: dict, stub_defaults: dict,
+) -> bool:
+    """Run a test case through Python and COBOL, compare DISPLAY output.
+
+    Returns True if outputs match (or COBOL can't be run), False on mismatch.
+    """
+    import tempfile
+    from .cobol_mock import generate_mock_data_ordered, run_cobol
+
+    # 1. Run Python with stub_log
+    default_state_fn = getattr(module, "_default_state", None)
+    state = default_state_fn() if default_state_fn else {}
+    state.update(input_state)
+    if stub_outcomes:
+        state["_stub_outcomes"] = {
+            k: [list(e) for e in v] for k, v in stub_outcomes.items()
+        }
+    if stub_defaults:
+        state["_stub_defaults"] = {k: list(v) for k, v in stub_defaults.items()}
+    state["_stub_log"] = []
+
+    try:
+        rs = module.run(state)
+    except Exception:
+        rs = state
+
+    py_displays = rs.get("_display", [])
+    stub_log = rs.get("_stub_log", state.get("_stub_log", []))
+
+    if not stub_log:
+        # No stubs consumed — nothing to validate against COBOL
+        return True
+
+    # 2. Generate execution-ordered mock data and run COBOL
+    mock_data = generate_mock_data_ordered(stub_log)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".dat", delete=False) as f:
+        f.write(mock_data)
+        dat_path = f.name
+
+    try:
+        rc, stdout, stderr = run_cobol(cobol_executable, dat_path)
+    finally:
+        Path(dat_path).unlink(missing_ok=True)
+
+    if rc == -1:
+        # Timeout or execution error — don't reject
+        return True
+
+    # 3. Parse COBOL displays (skip SPECTER-* internal lines)
+    cobol_displays = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("SPECTER-"):
+            cobol_displays.append(line)
+
+    # 4. Compare
+    if py_displays != cobol_displays:
+        log.debug(
+            "COBOL validation failed: Python displays=%d, COBOL displays=%d",
+            len(py_displays), len(cobol_displays),
+        )
+        return False
+
+    return True
+
+
 def _record_attempt(synth: SynthesisState, store_path: Path,
                     layer: int, target: str) -> None:
     """Persist that a target was attempted (hit or miss) so we skip it on resume."""
@@ -453,6 +530,16 @@ def _maybe_save(
 
     if not new_paras and not new_branches and not new_edges:
         return False
+
+    # COBOL validation: reject TCs whose Python output doesn't match COBOL
+    if synth.cobol_executable and synth.cobol_module:
+        if not _validate_against_cobol(
+            synth.cobol_module, synth.cobol_executable,
+            input_state, stub_outcomes, stub_defaults,
+        ):
+            synth.cobol_rejected += 1
+            return False
+        synth.cobol_validated += 1
 
     tc_id = _compute_id(input_state, stub_outcomes)
     # If same input/stubs but different target (e.g. direct invocation),
@@ -3782,6 +3869,7 @@ def synthesize_test_set(
     max_time_seconds: float | None = None,
     max_layers: int = 5,
     excluded_values: set | None = None,
+    cobol_executable: str | None = None,
 ) -> SynthesisReport:
     """Run the layered synthesis engine.
 
@@ -3808,6 +3896,10 @@ def synthesize_test_set(
     synth = SynthesisState()
     if excluded_values:
         synth.excluded_values = excluded_values
+    if cobol_executable:
+        synth.cobol_executable = cobol_executable
+        synth.cobol_module = module
+        log.info("COBOL validation enabled: %s", cobol_executable)
 
     # Load existing test cases and progress
     existing, progress = TestStore.load(store_path)
@@ -3923,5 +4015,7 @@ def synthesize_test_set(
     report.covered_paras = len(synth.covered_paras)
     report.covered_branches = len(synth.covered_branches)
     report.elapsed_seconds = time.time() - start_time
+    report.cobol_validated = synth.cobol_validated
+    report.cobol_rejected = synth.cobol_rejected
 
     return report
