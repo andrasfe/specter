@@ -22,9 +22,9 @@ Synthesis generates candidate inputs using Python (fast, in-process), then valid
 specter examples/COPAUA0C.cbl.ast -o examples/COPAUA0C.py --synthesize --test-store examples/tests.jsonl --exclude-values examples/exclude.txt --cobol-validate examples/COPAUA0C.mock
 ```
 
-## 4. Compare Python vs COBOL outputs (standalone)
+## 4. COBOL-first comparison
 
-Runs each test case through both the generated Python and the compiled COBOL mock, then compares DISPLAY output.
+Runs each test case through the compiled COBOL mock (ground truth), then checks that the generated Python produces identical DISPLAY output.
 
 ```sh
 python3 examples/run_mock.py examples/COPAUA0C.mock examples/COPAUA0C.py examples/tests.jsonl
@@ -32,10 +32,10 @@ python3 examples/run_mock.py examples/COPAUA0C.mock examples/COPAUA0C.py example
 
 ## How it works
 
-COBOL-first synthesis pipeline for each candidate test case:
-1. Python generates candidate inputs/stub values (fast exploration via 7 synthesis layers)
-2. Python runs the candidate with `_stub_log` to capture execution-ordered stub calls
-3. A mock data file is generated with records in the exact order COBOL will consume them
-4. The compiled COBOL binary runs with that mock data — paragraph coverage extracted from `SPECTER-TRACE:` output
-5. DISPLAY outputs are compared between Python and COBOL — mismatches are rejected
-6. The test case is accepted only if it adds new **COBOL** paragraph coverage
+COBOL-first pipeline for each test case:
+1. Python runs the candidate (fast, in-process) to capture stub consumption order (`_stub_log`)
+2. A mock data file is generated with records in the exact order COBOL will consume them
+3. The compiled COBOL binary runs with that mock data — this is the **ground truth**
+4. Paragraph coverage is extracted from `SPECTER-TRACE:` output
+5. Python DISPLAY output is compared against COBOL DISPLAY output
+6. If Python diverges from COBOL, the test case is flagged — COBOL is always right
