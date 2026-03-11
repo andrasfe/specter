@@ -30,6 +30,39 @@ Runs each test case through the compiled COBOL mock (ground truth), then checks 
 python3 examples/run_mock.py examples/COPAUA0C.mock examples/COPAUA0C.py examples/tests.jsonl
 ```
 
+## 5. Generate Java project
+
+Generates a Maven project with one Paragraph subclass per COBOL paragraph, runtime support classes, and JUnit 5 integration tests from the test store.
+
+```sh
+specter examples/COPAUA0C.cbl.ast --java --test-store examples/tests.jsonl -o examples/COPAUA0C/COPAUA0C.py
+```
+
+The project is created at `examples/COPAUA0C/COPAUA0C/` with:
+- `src/main/java/` — generated paragraph classes + runtime (ProgramState, CobolRuntime, etc.)
+- `src/test/java/` — parameterized JUnit 5 tests (one per test store entry)
+- `src/test/resources/test_store.jsonl` — test data copied from synthesis output
+- `pom.xml` — Maven build with JUnit 5 + Gson (test) + Lanterna (UI)
+
+## 6. Build and test Java project
+
+```sh
+cd examples/COPAUA0C/COPAUA0C
+mvn test
+```
+
+Or without Maven (manual compile + JUnit console launcher):
+
+```sh
+cd examples/COPAUA0C/COPAUA0C
+find src/main -name "*.java" | xargs javac -cp "lib/*" -d out/main
+find src/test -name "*.java" | xargs javac -cp "lib/*:out/main" -d out/test
+cp src/test/resources/test_store.jsonl out/test/
+java -jar lib/junit-platform-console-standalone-1.10.2.jar \
+  --class-path "out/main:out/test:lib/gson-2.10.1.jar" \
+  --scan-class-path out/test
+```
+
 ## How it works
 
 COBOL-first pipeline for each test case:
@@ -39,3 +72,5 @@ COBOL-first pipeline for each test case:
 4. Paragraph coverage is extracted from `SPECTER-TRACE:` output
 5. Python DISPLAY output is compared against COBOL DISPLAY output
 6. If Python diverges from COBOL, the test case is flagged — COBOL is always right
+
+Java generation uses the same AST and test store. Each test case from synthesis becomes a parameterized JUnit test that wires `input_state`, `stub_outcomes`, and `stub_defaults` into the Java program's `ProgramState`, runs it, and asserts no abend + expected paragraph coverage.

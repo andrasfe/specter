@@ -226,6 +226,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Generate Markdown documentation from a test store JSONL file (requires generated .py)",
     )
     parser.add_argument(
+        "--java",
+        action="store_true",
+        help="Generate a Maven Java project instead of Python",
+    )
+    parser.add_argument(
+        "--java-package",
+        default="com.specter.generated",
+        metavar="PKG",
+        help="Java package name (default: com.specter.generated)",
+    )
+    parser.add_argument(
         "--mock-cobol",
         action="store_true",
         help="Instrument COBOL source for standalone mock execution (input is .cbl/.cob/.cobol)",
@@ -416,6 +427,22 @@ def main(argv: list[str] | None = None) -> int:
     print(f"    Internal: {len(var_report.internal_vars)}")
     print(f"    Status: {len(var_report.status_vars)}")
     print(f"    Flags: {len(var_report.flag_vars)}")
+
+    # Java project generation
+    if args.java:
+        from .java_code_generator import generate_java_project
+        java_dir = output_path.with_suffix("")  # e.g. examples/COPAUA0C
+        test_store = Path(args.test_store) if args.test_store else None
+        print(f"Generating Java project → {java_dir}/ ...")
+        project_path = generate_java_project(
+            program, var_report, str(java_dir),
+            instrument=args.analyze,
+            test_store_path=str(test_store) if test_store else None,
+        )
+        n_paras = len(program.paragraphs)
+        print(f"  {n_paras} paragraph classes generated")
+        print(f"  Project: {project_path}")
+        return 0
 
     # Generate code
     print(f"Generating {output_path} ...")
