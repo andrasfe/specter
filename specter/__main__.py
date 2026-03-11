@@ -200,6 +200,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Max seconds for synthesis (default: unlimited)",
     )
     parser.add_argument(
+        "--exclude-values",
+        metavar="PATH",
+        help="Path to newline-separated values to exclude from synthesized tests",
+    )
+    parser.add_argument(
+        "--cobol-validate",
+        metavar="EXECUTABLE",
+        help="Validate synthesized tests against compiled COBOL mock executable",
+    )
+    parser.add_argument(
         "--extract-tests",
         metavar="PATH",
         help="Extract test cases from a test store JSONL file to JSON/CSV",
@@ -466,6 +476,26 @@ def main(argv: list[str] | None = None) -> int:
         else:
             test_store_path = analysis_dir / f"{ast_path.stem}_testset.jsonl"
 
+        excluded_values: set[str] | None = None
+        if args.exclude_values:
+            exclude_path = Path(args.exclude_values)
+            if not exclude_path.exists():
+                print(f"Error: exclude-values file not found: {exclude_path}", file=sys.stderr)
+                return 1
+            excluded_values = {
+                line.strip()
+                for line in exclude_path.read_text().splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            }
+
+        cobol_executable: str | None = None
+        if args.cobol_validate:
+            cobol_path = Path(args.cobol_validate)
+            if not cobol_path.exists():
+                print(f"Error: COBOL executable not found: {cobol_path}", file=sys.stderr)
+                return 1
+            cobol_executable = str(cobol_path)
+
         print(f"Synthesizing test set → {test_store_path} ...")
         synth_report = synthesize_test_set(
             module=module,
@@ -478,6 +508,8 @@ def main(argv: list[str] | None = None) -> int:
             store_path=test_store_path,
             max_time_seconds=args.synthesis_timeout,
             max_layers=args.synthesis_layers,
+            excluded_values=excluded_values,
+            cobol_executable=cobol_executable,
         )
         print()
         print(synth_report.summary())
