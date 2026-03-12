@@ -38,6 +38,25 @@ _FIGURATIVE_JAVA: dict[str, str] = {
     "ZEROES": "0",
 }
 
+
+def _java_numeric_literal(token: str) -> str:
+    """Render a COBOL numeric token as a Java-safe numeric expression."""
+    t = token.strip()
+    if re.match(r"^[+-]?\d+$", t):
+        digits = t.lstrip("+-").lstrip("0") or "0"
+        if len(digits) <= 18:
+            n = int(t)
+            if -2147483648 <= n <= 2147483647:
+                return str(n)
+            if -9223372036854775808 <= n <= 9223372036854775807:
+                return f"{n}L"
+        return f'CobolRuntime.toNum("{t}")'
+
+    if re.match(r"^[+-]?\d+\.\d*$", t):
+        return f'CobolRuntime.toNum("{t}")'
+
+    return t
+
 # ---------------------------------------------------------------------------
 # Value resolution (Java)
 # ---------------------------------------------------------------------------
@@ -68,7 +87,7 @@ def _resolve_value_java(token: str) -> str:
 
     # Numeric literal
     if re.match(r"^[+-]?\d+\.?\d*$", token):
-        return str(int(token)) if "." not in token else str(float(token))
+        return _java_numeric_literal(token)
 
     # Variable reference
     return f'state.get("{token.upper()}")'
