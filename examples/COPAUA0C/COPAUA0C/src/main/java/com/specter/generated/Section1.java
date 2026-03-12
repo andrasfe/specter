@@ -35,11 +35,7 @@ public class Section1 extends SectionBase {
 
     void do_1100_OPEN_REQUEST_QUEUE(ProgramState state) {
         state.put("MQOD-OBJECTTYPE", state.get("MQOT-Q"));
-        state.put("OF", state.get("MQOT-Q"));
-        state.put("MQM-OD-REQUEST", state.get("MQOT-Q"));
         state.put("MQOD-OBJECTNAME", state.get("WS-REQUEST-QNAME"));
-        state.put("OF", state.get("WS-REQUEST-QNAME"));
-        state.put("MQM-OD-REQUEST", state.get("WS-REQUEST-QNAME"));
         state.put("WS-OPTIONS", CobolRuntime.toNum(state.get("MQOO-INPUT-SHARED")));
         stubs.mqOpen(state, "WS-REQUEST-QNAME");
         if (java.util.Objects.equals(state.get("WS-COMPCODE"), state.get("MQCC-OK"))) {

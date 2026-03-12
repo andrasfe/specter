@@ -83,7 +83,7 @@ public class Section9 extends SectionBase {
 
     void do_9990_END_ROUTINE(ProgramState state) {
         perform(state, "9000-TERMINATE");
-        stubs.cicsReturn(state);
+        stubs.cicsReturn(state, false);
         // UNKNOWN: 
     }
 

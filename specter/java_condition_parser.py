@@ -507,6 +507,13 @@ def cobol_condition_to_java(condition_text: str) -> str:
     if text.upper().startswith("UNTIL "):
         text = text[6:].strip()
 
+    # Strip OF qualifications: "FIELD OF RECORD" → "FIELD"
+    import re
+    text = re.sub(
+        r"([A-Z][A-Z0-9-]*)\s+OF\s+[A-Z][A-Z0-9-]*",
+        r"\1", text, flags=re.IGNORECASE,
+    )
+
     tokens = _tokenize(text)
     if not tokens:
         return "true"

@@ -49,6 +49,13 @@ from .java_templates.runtime import (
     SECTION_BASE_JAVA,
     STUB_EXECUTOR_JAVA,
 )
+from .java_templates.terminal import (
+    BMS_SCREEN_JAVA,
+    CICS_RETURN_SIGNAL_JAVA,
+    SCREEN_LAYOUT_JAVA,
+    TERMINAL_MAIN_JAVA,
+    TERMINAL_STUB_EXECUTOR_JAVA,
+)
 from .models import Program, Statement
 from .variable_extractor import VariableReport, extract_variables
 
@@ -154,12 +161,42 @@ def _java_numeric_literal(token: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _strip_of_qualification(text: str) -> str:
+    """Strip COBOL OF qualification: ``FIELD OF RECORD`` → ``FIELD``."""
+    return re.sub(
+        r"\s+OF\s+[A-Z][A-Z0-9-]*", "", text, flags=re.IGNORECASE
+    ).strip()
+
+
 def _resolve_source_java(source: str) -> str:
     """Resolve a MOVE source to a Java expression."""
     s = source.strip()
 
     # Strip leading ALL (MOVE ALL 'X' etc.)
     s = re.sub(r"^ALL\s+", "", s, flags=re.IGNORECASE).strip()
+
+    # FUNCTION UPPER-CASE / LOWER-CASE
+    m = re.match(
+        r"FUNCTION\s+UPPER-CASE\s*\((.+)\)", s, re.IGNORECASE
+    )
+    if m:
+        inner = _strip_of_qualification(m.group(1).strip())
+        varname = _vk(inner)
+        return f'String.valueOf(state.get("{varname}")).toUpperCase()'
+    m = re.match(
+        r"FUNCTION\s+LOWER-CASE\s*\((.+)\)", s, re.IGNORECASE
+    )
+    if m:
+        inner = _strip_of_qualification(m.group(1).strip())
+        varname = _vk(inner)
+        return f'String.valueOf(state.get("{varname}")).toLowerCase()'
+
+    # FUNCTION CURRENT-DATE
+    if re.match(r"FUNCTION\s+CURRENT-DATE", s, re.IGNORECASE):
+        return (
+            'new java.text.SimpleDateFormat("yyyyMMddHHmmssSSS")'
+            ".format(new java.util.Date())"
+        )
 
     # Figurative constant
     upper = s.upper()
@@ -181,6 +218,9 @@ def _resolve_source_java(source: str) -> str:
         varname = _vk(m.group(1).strip())
         return f'String.valueOf(state.get("{varname}")).length()'
 
+    # Strip OF qualification for simple variable references
+    s = _strip_of_qualification(s)
+
     # Variable with subscript like FOO(1:2)
     m = re.match(r"([A-Z][A-Z0-9-]*)\((\d+):(\d+)\)", s, re.IGNORECASE)
     if m:
@@ -189,9 +229,10 @@ def _resolve_source_java(source: str) -> str:
         length = int(m.group(3))
         end = start + length
         return (
+            f'(String.valueOf(state.get("{varname}")).length() > {start} ? '
             f'String.valueOf(state.get("{varname}"))'
             f".substring({start}, Math.min({end}, "
-            f'String.valueOf(state.get("{varname}")).length()))'
+            f'String.valueOf(state.get("{varname}")).length())) : "")'
         )
 
     # Variable reference
@@ -288,7 +329,10 @@ def _gen_move_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
         source = re.sub(r"^ALL\s+", "", source, flags=re.IGNORECASE).strip()
 
     resolved = _resolve_source_java(source)
-    for target_tok in _tokenize_cobol_vars(_strip_cobol_comments(targets)):
+    # Strip OF qualifications from targets before tokenizing:
+    # "ERRMSGO OF COSGN0AO" → "ERRMSGO", not three tokens
+    clean_targets = _strip_of_qualification(_strip_cobol_comments(targets))
+    for target_tok in _tokenize_cobol_vars(clean_targets):
         target_tok = target_tok.strip().rstrip(".")
         if not target_tok:
             continue
@@ -444,12 +488,27 @@ def _gen_compute_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
                 elif "DATE-OF-INTEGER" in upper_fname:
                     replacement = _ph(_resolve_function_java(inner))
                 elif "NUMVAL" in upper_fname:
-                    cleaned = re.sub(
-                        r"\s+OF\s+\S+", "", inner, flags=re.IGNORECASE
-                    ).strip()
+                    cleaned = _strip_of_qualification(inner)
                     varname = _vk(cleaned)
                     replacement = _ph(
                         f'CobolRuntime.toNum(state.get("{varname}"))'
+                    )
+                elif "UPPER-CASE" in upper_fname:
+                    cleaned = _strip_of_qualification(inner)
+                    varname = _vk(cleaned)
+                    replacement = _ph(
+                        f'String.valueOf(state.get("{varname}")).toUpperCase()'
+                    )
+                elif "LOWER-CASE" in upper_fname:
+                    cleaned = _strip_of_qualification(inner)
+                    varname = _vk(cleaned)
+                    replacement = _ph(
+                        f'String.valueOf(state.get("{varname}")).toLowerCase()'
+                    )
+                elif "CURRENT-DATE" in upper_fname:
+                    replacement = _ph(
+                        'new java.text.SimpleDateFormat("yyyyMMddHHmmssSSS")'
+                        '.format(new java.util.Date())'
                     )
                 else:
                     replacement = _ph("0")
@@ -1213,7 +1272,8 @@ def _gen_exec_java(
             )
             return
         if "RETURN" in upper:
-            cb.stmt("stubs.cicsReturn(state)")
+            has_transid = "TRANSID" in upper
+            cb.stmt(f"stubs.cicsReturn(state, {str(has_transid).lower()})")
             return
         if "RETRIEVE" in upper:
             into = _extract_exec_param(raw, "INTO") or ""
@@ -2529,6 +2589,213 @@ def _generate_mockito_verify_calls(test_store_path: str) -> str:
     return "\n".join(lines) if lines else "        // No stub operations detected"
 
 
+# ---------------------------------------------------------------------------
+# BMS screen field extraction
+# ---------------------------------------------------------------------------
+
+
+def _walk_all_statements(stmts: list[Statement]):
+    """Yield every statement in a tree (depth-first)."""
+    for s in stmts:
+        yield s
+        yield from _walk_all_statements(s.children)
+
+
+def _extract_bms_info(program: Program) -> dict | None:
+    """Extract BMS map field info from the COBOL AST.
+
+    Scans EXEC CICS SEND MAP / RECEIVE MAP statements and collects field
+    names from ``FIELD OF <RECORD>`` patterns in MOVE statements.
+
+    Returns a dict keyed by map name, each with 'output' and 'input' field
+    lists, or None if no BMS operations are found.
+    """
+    maps: dict[str, dict[str, set[str]]] = {}
+
+    # Pass 1: find map names from SEND MAP / RECEIVE MAP
+    for para in program.paragraphs:
+        for stmt in _walk_all_statements(para.statements):
+            if stmt.type != "EXEC_CICS":
+                continue
+            raw = stmt.attributes.get("raw_text", "") + " " + stmt.text
+            for pat in [r"SEND\s+MAP\s*\('([^']+)'\)",
+                        r"RECEIVE\s+MAP\s*\('([^']+)'\)"]:
+                m = re.search(pat, raw, re.IGNORECASE)
+                if m:
+                    maps.setdefault(m.group(1).upper(),
+                                    {"output": set(), "input": set()})
+
+    if not maps:
+        return None
+
+    # Pass 2: collect field references from OF <RECORD> patterns
+    for map_name, info in maps.items():
+        out_record = map_name + "O"
+        in_record = map_name + "I"
+        for para in program.paragraphs:
+            for stmt in _walk_all_statements(para.statements):
+                text = stmt.text + " " + stmt.attributes.get("source", "")
+                text += " " + stmt.attributes.get("targets", "")
+                for m in re.finditer(
+                    rf"([A-Z][A-Z0-9-]+)\s+OF\s+{re.escape(out_record)}\b",
+                    text, re.IGNORECASE,
+                ):
+                    info["output"].add(m.group(1).upper())
+                for m in re.finditer(
+                    rf"([A-Z][A-Z0-9-]+)\s+OF\s+{re.escape(in_record)}\b",
+                    text, re.IGNORECASE,
+                ):
+                    info["input"].add(m.group(1).upper())
+
+    # Separate length fields from value fields in input
+    result = {}
+    for map_name, info in maps.items():
+        value_inputs = sorted(
+            f for f in info["input"] if not f.endswith("L")
+        )
+        length_fields = sorted(
+            f for f in info["input"] if f.endswith("L")
+        )
+        result[map_name] = {
+            "output": sorted(info["output"]),
+            "input": value_inputs,
+            "length_fields": length_fields,
+        }
+    return result
+
+
+def _compute_screen_layout(
+    bms_info: dict,
+) -> list[dict]:
+    """Compute row/col positions for BMS fields using naming heuristics.
+
+    Returns a list of field dicts with keys: name, row, col, width, type,
+    label, masked.
+    """
+    layout: list[dict] = []
+
+    # Use the first (typically only) map
+    map_name = next(iter(bms_info))
+    info = bms_info[map_name]
+    output = info["output"]
+    input_fields = info["input"]
+
+    row = 0
+
+    # Title fields (centered)
+    titles = sorted(f for f in output if "TITLE" in f)
+    for f in titles:
+        layout.append({
+            "name": f, "row": row, "col": 0, "width": 80,
+            "type": "CENTER", "label": None, "masked": False,
+        })
+        row += 1
+    row = max(row, 2)
+
+    # Navigation info line (transaction, program, date, time)
+    nav_fields = [f for f in output
+                  if any(x in f for x in ("TRNNAME", "PGMNAME"))]
+    date_fields = [f for f in output
+                   if any(x in f for x in ("CURDATE", "CURTIME"))]
+    col = 2
+    for f in sorted(nav_fields):
+        label = f.rstrip("O").replace("-", " ").title()
+        layout.append({
+            "name": f, "row": row, "col": col, "width": 12,
+            "type": "DISPLAY", "label": label, "masked": False,
+        })
+        col += 22
+    col = 50
+    for f in sorted(date_fields):
+        label = f.rstrip("O").replace("-", " ").title()
+        layout.append({
+            "name": f, "row": row, "col": col, "width": 10,
+            "type": "DISPLAY", "label": label, "masked": False,
+        })
+        col += 18
+    if nav_fields or date_fields:
+        row += 1
+
+    # System info (APPLID, SYSID)
+    sys_fields = [f for f in output
+                  if any(x in f for x in ("APPLID", "SYSID"))]
+    col = 2
+    for f in sorted(sys_fields):
+        label = f.rstrip("O").replace("-", " ").title()
+        layout.append({
+            "name": f, "row": row, "col": col, "width": 10,
+            "type": "DISPLAY", "label": label, "masked": False,
+        })
+        col += 22
+    if sys_fields:
+        row += 1
+
+    row += 1  # blank separator
+
+    # Remaining output fields (not titles, nav, date, sys, or messages)
+    covered = {d["name"] for d in layout}
+    msg_fields = [f for f in output if any(x in f for x in ("ERRMSG", "MSG"))]
+    remaining = [f for f in output if f not in covered and f not in msg_fields]
+    for f in sorted(remaining):
+        label = f.rstrip("O").replace("-", " ").title()
+        layout.append({
+            "name": f, "row": row, "col": 2, "width": 40,
+            "type": "DISPLAY", "label": label, "masked": False,
+        })
+        row += 1
+
+    # Input fields (centered vertically)
+    # Sort: non-password fields first (User ID before Password)
+    def _input_sort_key(f: str) -> tuple:
+        is_pw = any(x in f.upper() for x in ("PASSW", "PWD", "PIN"))
+        return (1 if is_pw else 0, f)
+
+    input_start = max(row + 1, 10)
+    for i, f in enumerate(sorted(input_fields, key=_input_sort_key)):
+        base = f[:-1] if f.endswith("I") else f
+        label = base.replace("-", " ").replace("_", " ").title()
+        is_password = any(x in f.upper() for x in ("PASSW", "PWD", "PIN"))
+        r = input_start + i * 2
+        layout.append({
+            "name": f, "row": r, "col": 30, "width": 20,
+            "type": "INPUT", "label": label, "masked": is_password,
+        })
+
+    # Message/error fields near bottom
+    msg_row = 20
+    for f in sorted(msg_fields):
+        layout.append({
+            "name": f, "row": msg_row, "col": 2, "width": 76,
+            "type": "MESSAGE", "label": None, "masked": False,
+        })
+        msg_row += 1
+
+    return layout
+
+
+def _generate_screen_layout_java(
+    layout: list[dict],
+    package_name: str,
+    prog_class_name: str,
+) -> str:
+    """Generate ScreenLayout.java with static field definitions."""
+    entries = []
+    for f in layout:
+        masked = "true" if f["masked"] else "false"
+        label = f'"{f["label"]}"' if f["label"] else "null"
+        entries.append(
+            f'        new BmsScreen.Field("{f["name"]}", '
+            f'{f["row"]}, {f["col"]}, {f["width"]}, '
+            f'BmsScreen.FieldType.{f["type"]}, {label}, {masked})'
+        )
+    field_entries = ",\n".join(entries)
+    return SCREEN_LAYOUT_JAVA.format(
+        package_name=package_name,
+        program_class_name=prog_class_name,
+        field_entries=field_entries,
+    )
+
+
 def generate_java_project(
     program: Program,
     var_report: VariableReport | None = None,
@@ -2749,5 +3016,42 @@ def generate_java_project(
                 "-- Auto-generated placeholder. Add CREATE TABLE statements here.\n",
                 encoding="utf-8",
             )
+
+    # Terminal UI (Lanterna BMS screen emulation)
+    bms_info = _extract_bms_info(program)
+    if bms_info is not None:
+        layout = _compute_screen_layout(bms_info)
+        screen_layout_src = _generate_screen_layout_java(
+            layout, package_name, prog_class_name,
+        )
+        (src_main / "ScreenLayout.java").write_text(
+            screen_layout_src, encoding="utf-8"
+        )
+
+        # Static terminal classes
+        _terminal_files = {
+            "CicsReturnSignal.java": CICS_RETURN_SIGNAL_JAVA,
+            "BmsScreen.java": BMS_SCREEN_JAVA,
+            "TerminalStubExecutor.java": TERMINAL_STUB_EXECUTOR_JAVA,
+        }
+        for filename, template in _terminal_files.items():
+            content = template.format(**fmt_args)
+            (src_main / filename).write_text(content, encoding="utf-8")
+
+        # TerminalMain needs initial state lines for CICS fields
+        initial_lines = []
+        initial_lines.append(
+            '        state.put("WS-TRANID", "' + program_id[:4] + '");'
+        )
+        initial_lines.append(
+            '        state.put("WS-PGMNAME", "' + program_id + '");'
+        )
+        terminal_main_src = TERMINAL_MAIN_JAVA.format(
+            **fmt_args,
+            initial_state_lines="\n".join(initial_lines),
+        )
+        (src_main / "TerminalMain.java").write_text(
+            terminal_main_src, encoding="utf-8"
+        )
 
     return str(out.resolve())

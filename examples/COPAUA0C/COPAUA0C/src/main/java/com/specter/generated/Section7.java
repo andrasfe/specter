@@ -13,35 +13,15 @@ public class Section7 extends SectionBase {
 
     void do_7100_SEND_RESPONSE(ProgramState state) {
         state.put("MQOD-OBJECTTYPE", state.get("MQOT-Q"));
-        state.put("OF", state.get("MQOT-Q"));
-        state.put("MQM-OD-REPLY", state.get("MQOT-Q"));
         state.put("MQOD-OBJECTNAME", state.get("WS-REPLY-QNAME"));
-        state.put("OF", state.get("WS-REPLY-QNAME"));
-        state.put("MQM-OD-REPLY", state.get("WS-REPLY-QNAME"));
         state.put("MQMD-MSGTYPE", state.get("MQMT-REPLY"));
-        state.put("OF", state.get("MQMT-REPLY"));
-        state.put("MQM-MD-REPLY", state.get("MQMT-REPLY"));
         state.put("MQMD-CORRELID", state.get("WS-SAVE-CORRELID"));
-        state.put("OF", state.get("WS-SAVE-CORRELID"));
-        state.put("MQM-MD-REPLY", state.get("WS-SAVE-CORRELID"));
         state.put("MQMD-MSGID", state.get("MQMI-NONE"));
-        state.put("OF", state.get("MQMI-NONE"));
-        state.put("MQM-MD-REPLY", state.get("MQMI-NONE"));
         state.put("MQMD-REPLYTOQ", " ");
-        state.put("OF", " ");
-        state.put("MQM-MD-REPLY", " ");
         state.put("MQMD-REPLYTOQMGR", " ");
-        state.put("OF", " ");
-        state.put("MQM-MD-REPLY", " ");
         state.put("MQMD-PERSISTENCE", state.get("MQPER-NOT-PERSISTENT"));
-        state.put("OF", state.get("MQPER-NOT-PERSISTENT"));
-        state.put("MQM-MD-REPLY", state.get("MQPER-NOT-PERSISTENT"));
         state.put("MQMD-EXPIRY", 50);
-        state.put("OF", 50);
-        state.put("MQM-MD-REPLY", 50);
         state.put("MQMD-FORMAT", state.get("MQFMT-STRING"));
-        state.put("OF", state.get("MQFMT-STRING"));
-        state.put("MQM-MD-REPLY", state.get("MQFMT-STRING"));
         state.put("MQPMO-OPTIONS", CobolRuntime.toNum(state.get("MQPMO-NO-SYNCPOINT")));
         state.put("W02-BUFFLEN", state.get("WS-RESP-LENGTH"));
         stubs.mqPut1(state, "WS-REPLY-QNAME", "W02-PUT-BUFFER", "W02-BUFLEN");

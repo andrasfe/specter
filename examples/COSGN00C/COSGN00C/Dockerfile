@@ -9,7 +9,7 @@ RUN mvn package -DskipTests -B
 # Stage 2: Runtime
 FROM eclipse-temurin:17-jre-alpine
 WORKDIR /app
-COPY --from=build /app/target/copaua0c-1.0-SNAPSHOT.jar app.jar
+COPY --from=build /app/target/cosgn00c-1.0-SNAPSHOT.jar app.jar
 COPY sql/ /app/sql/
 # Default: batch mode (Main). For interactive terminal:
 #   docker compose run -it app java -cp app.jar com.specter.generated.TerminalMain

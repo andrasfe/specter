@@ -535,7 +535,7 @@ public interface StubExecutor {{
 
     void cicsRead(ProgramState state, String dataset, String ridfld, String intoRecord, String respVar, String resp2Var);
 
-    void cicsReturn(ProgramState state);
+    void cicsReturn(ProgramState state, boolean hasTransid);
 
     void cicsRetrieve(ProgramState state, String intoVar);
 
@@ -665,7 +665,7 @@ public class DefaultStubExecutor implements StubExecutor {{
     }}
 
     @Override
-    public void cicsReturn(ProgramState state) {{
+    public void cicsReturn(ProgramState state, boolean hasTransid) {{
         Map<String, Object> entry = new LinkedHashMap<>();
         entry.put("kind", "CICS");
         entry.put("text", "RETURN");
@@ -1051,7 +1051,7 @@ public class JdbcStubExecutor implements StubExecutor, AutoCloseable {{
     }}
 
     @Override
-    public void cicsReturn(ProgramState state) {{
+    public void cicsReturn(ProgramState state, boolean hasTransid) {{
         throw new GobackSignal();
     }}
 

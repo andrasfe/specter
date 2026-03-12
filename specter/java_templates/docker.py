@@ -22,6 +22,8 @@ FROM eclipse-temurin:17-jre-alpine
 WORKDIR /app
 COPY --from=build /app/target/{artifact_id}-1.0-SNAPSHOT.jar app.jar
 COPY sql/ /app/sql/
+# Default: batch mode (Main). For interactive terminal:
+#   docker compose run -it app java -cp app.jar com.specter.generated.TerminalMain
 ENTRYPOINT ["java", "-jar", "app.jar"]
 """
 
@@ -65,6 +67,22 @@ services:
 
   app:
     build: .
+    depends_on:
+      db:
+        condition: service_healthy
+      activemq:
+        condition: service_healthy
+    environment:
+      SPECTER_DB_URL: jdbc:postgresql://db:5432/specter
+      SPECTER_DB_USER: specter
+      SPECTER_DB_PASSWORD: specter
+      SPECTER_JMS_URL: tcp://activemq:61616
+
+  terminal:
+    build: .
+    stdin_open: true
+    tty: true
+    entrypoint: ["java", "-cp", "app.jar", "com.specter.generated.TerminalMain"]
     depends_on:
       db:
         condition: service_healthy

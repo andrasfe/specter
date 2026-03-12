@@ -76,7 +76,7 @@ public class Section8 extends SectionBase {
     void do_8500_INSERT_AUTH(ProgramState state) {
         stubs.cicsAsktime(state, "WS-ABS-TIME");
         stubs.cicsFormattime(state, "WS-ABS-TIME", "WS-CUR-DATE-X6", "WS-CUR-TIME-X6", "WS-CUR-TIME-MS");
-        state.put("WS-YYDDD", String.valueOf(state.get("WS-CUR-DATE-X6")).substring(0, Math.min(5, String.valueOf(state.get("WS-CUR-DATE-X6")).length())));
+        state.put("WS-YYDDD", (String.valueOf(state.get("WS-CUR-DATE-X6")).length() > 0 ? String.valueOf(state.get("WS-CUR-DATE-X6")).substring(0, Math.min(5, String.valueOf(state.get("WS-CUR-DATE-X6")).length())) : ""));
         state.put("WS-CUR-TIME-N6", state.get("WS-CUR-TIME-X6"));
         state.put("WS-TIME-WITH-MS", (CobolRuntime.toNum(state.get("WS-CUR-TIME-N6")) * 1000));
         state.put("PA-AUTH-DATE-9C", 99999 - CobolRuntime.toNum(state.get("WS-YYDDD")));
