@@ -1,5 +1,31 @@
-*/__pycache__/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
 .venv/
-specter.egg-info/
 .env
- */__pycache__/
+
+# Java build output
+**/target/
+**/*.class
+
+# Java dependencies (downloaded jars)
+**/lib/*.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary / generated
+examples/tmp/
+*.mock
+/tmp/

@@ -1,13 +1,3 @@
-"""Maven pom.xml template for generated Specter Java projects.
-
-The template uses Python ``str.format`` placeholders:
-- ``{group_id}``     -- Maven group ID (e.g. ``com.example``)
-- ``{artifact_id}``  -- Maven artifact ID (e.g. ``cobol-program``)
-- ``{program_name}`` -- Human-readable program name for ``<name>``
-- ``{main_class}``   -- Fully qualified Main class for shade plugin
-"""
-
-POM_XML = """\
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -15,45 +5,30 @@ POM_XML = """\
                              http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>{group_id}</groupId>
-    <artifactId>{artifact_id}</artifactId>
+    <groupId>com.specter</groupId>
+    <artifactId>copaua0c-integration-tests</artifactId>
     <version>1.0-SNAPSHOT</version>
     <packaging>jar</packaging>
 
-    <name>{program_name}</name>
-    <description>Generated COBOL-to-Java translation by Specter</description>
+    <name>COPAUA0C Integration Tests</name>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <junit.version>5.10.2</junit.version>
-        <lanterna.version>3.1.1</lanterna.version>
         <mockito.version>5.11.0</mockito.version>
     </properties>
 
     <dependencies>
-        <!-- JUnit Jupiter (test scope) -->
+        <!-- Parent artifact (generated runtime classes) -->
         <dependency>
-            <groupId>org.junit.jupiter</groupId>
-            <artifactId>junit-jupiter-api</artifactId>
-            <version>${{junit.version}}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.junit.jupiter</groupId>
-            <artifactId>junit-jupiter-engine</artifactId>
-            <version>${{junit.version}}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.junit.jupiter</groupId>
-            <artifactId>junit-jupiter-params</artifactId>
-            <version>${{junit.version}}</version>
-            <scope>test</scope>
+            <groupId>com.specter</groupId>
+            <artifactId>copaua0c</artifactId>
+            <version>1.0-SNAPSHOT</version>
         </dependency>
 
-        <!-- Gson (test scope - for loading test-store JSONL) -->
+        <!-- Gson (for loading test store JSONL) -->
         <dependency>
             <groupId>com.google.code.gson</groupId>
             <artifactId>gson</artifactId>
@@ -61,18 +36,46 @@ POM_XML = """\
             <scope>test</scope>
         </dependency>
 
-        <!-- Lanterna terminal UI -->
+        <!-- JUnit Jupiter -->
         <dependency>
-            <groupId>com.googlecode.lanterna</groupId>
-            <artifactId>lanterna</artifactId>
-            <version>${{lanterna.version}}</version>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-api</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-engine</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-params</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
         </dependency>
 
-        <!-- PostgreSQL JDBC driver -->
+        <!-- Mockito -->
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>${mockito.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-junit-jupiter</artifactId>
+            <version>${mockito.version}</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- PostgreSQL JDBC (for DB integration tests) -->
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
             <version>42.7.2</version>
+            <scope>test</scope>
         </dependency>
 
         <!-- HikariCP connection pooling -->
@@ -80,6 +83,7 @@ POM_XML = """\
             <groupId>com.zaxxer</groupId>
             <artifactId>HikariCP</artifactId>
             <version>5.1.0</version>
+            <scope>test</scope>
         </dependency>
 
         <!-- Jakarta JMS API -->
@@ -87,6 +91,7 @@ POM_XML = """\
             <groupId>jakarta.jms</groupId>
             <artifactId>jakarta.jms-api</artifactId>
             <version>3.1.0</version>
+            <scope>test</scope>
         </dependency>
 
         <!-- ActiveMQ Artemis JMS client -->
@@ -94,33 +99,28 @@ POM_XML = """\
             <groupId>org.apache.activemq</groupId>
             <artifactId>artemis-jakarta-client</artifactId>
             <version>2.31.2</version>
-        </dependency>
-
-        <!-- Mockito (test scope) -->
-        <dependency>
-            <groupId>org.mockito</groupId>
-            <artifactId>mockito-core</artifactId>
-            <version>${{mockito.version}}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.mockito</groupId>
-            <artifactId>mockito-junit-jupiter</artifactId>
-            <version>${{mockito.version}}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
 
     <build>
         <plugins>
-            <!-- Surefire for running JUnit 5 tests -->
+            <!-- Failsafe for *IT.java integration tests -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-surefire-plugin</artifactId>
+                <artifactId>maven-failsafe-plugin</artifactId>
                 <version>3.2.5</version>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
 
-            <!-- Compiler plugin (explicit Java 17) -->
+            <!-- Compiler plugin -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
@@ -130,29 +130,6 @@ POM_XML = """\
                     <target>17</target>
                 </configuration>
             </plugin>
-
-            <!-- Shade plugin for runnable fat JAR -->
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-shade-plugin</artifactId>
-                <version>3.5.2</version>
-                <executions>
-                    <execution>
-                        <phase>package</phase>
-                        <goals>
-                            <goal>shade</goal>
-                        </goals>
-                        <configuration>
-                            <transformers>
-                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                                    <mainClass>{main_class}</mainClass>
-                                </transformer>
-                            </transformers>
-                        </configuration>
-                    </execution>
-                </executions>
-            </plugin>
         </plugins>
     </build>
 </project>
-"""

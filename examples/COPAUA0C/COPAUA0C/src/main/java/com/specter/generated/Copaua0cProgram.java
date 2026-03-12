@@ -14,7 +14,11 @@ public class Copaua0cProgram {
     private final StubExecutor stubs;
 
     public Copaua0cProgram() {
-        this.stubs = new DefaultStubExecutor();
+        this(new DefaultStubExecutor());
+    }
+
+    public Copaua0cProgram(StubExecutor stubs) {
+        this.stubs = stubs;
         this.registry = new ParagraphRegistry();
         new SectionMain(registry, stubs);
         new Section1(registry, stubs);

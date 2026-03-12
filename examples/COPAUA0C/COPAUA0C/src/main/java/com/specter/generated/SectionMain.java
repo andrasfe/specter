@@ -26,7 +26,7 @@ public class SectionMain extends SectionBase {
         performThru(state, "1000-INITIALIZE", "1000-EXIT");
         performThru(state, "2000-MAIN-PROCESS", "2000-EXIT");
         performThru(state, "9000-TERMINATE", "9000-EXIT");
-        stubs.dummyExec(state, "CICS", "EXEC CICS RETURN END-EXEC.");
+        stubs.cicsReturn(state);
     }
 
     void do_MQCLOSE(ProgramState state) {

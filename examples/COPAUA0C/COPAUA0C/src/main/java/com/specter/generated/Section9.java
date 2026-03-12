@@ -20,7 +20,7 @@ public class Section9 extends SectionBase {
     void do_9000_TERMINATE(ProgramState state) {
         if (CobolRuntime.isTruthy(state.get("IMS-PSB-SCHD"))) {
             state.addBranch(45);
-            stubs.dummyExec(state, "DLI", "EXEC DLI TERM END-EXEC");
+            stubs.dliTerminate(state);
         } else {
             state.addBranch(-45);
         }
@@ -34,7 +34,7 @@ public class Section9 extends SectionBase {
     void do_9100_CLOSE_REQUEST_QUEUE(ProgramState state) {
         if (CobolRuntime.isTruthy(state.get("WS-REQUEST-MQ-OPEN"))) {
             state.addBranch(46);
-            stubs.dummyCall(state, "MQCLOSE");
+            stubs.mqClose(state);
             if (java.util.Objects.equals(state.get("WS-COMPCODE"), state.get("MQCC-OK"))) {
                 state.addBranch(47);
                 state.put("WS-REQUEST-MQ-CLSE", true);
@@ -62,13 +62,13 @@ public class Section9 extends SectionBase {
     }
 
     void do_9500_LOG_ERROR(ProgramState state) {
-        stubs.dummyExec(state, "CICS", "EXEC CICS ASKTIME NOHANDLE ABSTIME(WS-ABS-TIME) END-EXEC");
-        stubs.dummyExec(state, "CICS", "EXEC CICS FORMATTIME ABSTIME(WS-ABS-TIME) YYMMDD(WS-CUR-DATE-X6) TIME(WS-CUR-TIME-X6) END-EXEC");
+        stubs.cicsAsktime(state, "WS-ABS-TIME");
+        stubs.cicsFormattime(state, "WS-ABS-TIME", "WS-CUR-DATE-X6", "WS-CUR-TIME-X6", null);
         state.put("ERR-APPLICATION", state.get("WS-CICS-TRANID"));
         state.put("ERR-PROGRAM", state.get("WS-PGM-AUTH"));
         state.put("ERR-DATE", state.get("WS-CUR-DATE-X6"));
         state.put("ERR-TIME", state.get("WS-CUR-TIME-X6"));
-        stubs.dummyExec(state, "CICS", "EXEC CICS WRITEQ TD QUEUE('CSSL') FROM (ERROR-LOG-RECORD) LENGTH (LENGTH OF ERROR-LOG-RECORD) NOHANDLE END-EXEC");
+        stubs.cicsWriteqTd(state, "CSSL", "ERROR-LOG-RECORD");
         if (CobolRuntime.isTruthy(state.get("ERR-CRITICAL"))) {
             state.addBranch(48);
             perform(state, "9990-END-ROUTINE");
@@ -83,7 +83,7 @@ public class Section9 extends SectionBase {
 
     void do_9990_END_ROUTINE(ProgramState state) {
         perform(state, "9000-TERMINATE");
-        stubs.dummyExec(state, "CICS", "EXEC CICS RETURN END-EXEC");
+        stubs.cicsReturn(state);
         // UNKNOWN: 
     }
 

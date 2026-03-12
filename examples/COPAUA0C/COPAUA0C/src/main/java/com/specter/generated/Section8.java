@@ -48,10 +48,10 @@ public class Section8 extends SectionBase {
         }
         if (CobolRuntime.isTruthy(state.get("FOUND-PAUT-SMRY-SEG"))) {
             state.addBranch(41);
-            stubs.dummyExec(state, "DLI", "EXEC DLI REPL USING PCB(PAUT-PCB-NUM) SEGMENT (PAUTSUM0) FROM (PENDING-AUTH-SUMMARY) END-EXEC");
+            stubs.dliReplace(state, "PAUTSUM0", "PENDING-AUTH-SUMMARY");
         } else {
             state.addBranch(-41);
-            stubs.dummyExec(state, "DLI", "EXEC DLI ISRT USING PCB(PAUT-PCB-NUM) SEGMENT (PAUTSUM0) FROM (PENDING-AUTH-SUMMARY) END-EXEC");
+            stubs.dliInsert(state, "PAUTSUM0", "PENDING-AUTH-SUMMARY");
         }
         state.put("IMS-RETURN-CODE", state.get("DIBSTAT"));
         if (CobolRuntime.isTruthy(state.get("STATUS-OK"))) {
@@ -74,8 +74,8 @@ public class Section8 extends SectionBase {
     }
 
     void do_8500_INSERT_AUTH(ProgramState state) {
-        stubs.dummyExec(state, "CICS", "EXEC CICS ASKTIME NOHANDLE ABSTIME(WS-ABS-TIME) END-EXEC");
-        stubs.dummyExec(state, "CICS", "EXEC CICS FORMATTIME ABSTIME(WS-ABS-TIME) YYDDD(WS-CUR-DATE-X6) TIME(WS-CUR-TIME-X6) MILLISECONDS(WS-CUR-TIME-MS) END-EXEC");
+        stubs.cicsAsktime(state, "WS-ABS-TIME");
+        stubs.cicsFormattime(state, "WS-ABS-TIME", "WS-CUR-DATE-X6", "WS-CUR-TIME-X6", "WS-CUR-TIME-MS");
         state.put("WS-YYDDD", String.valueOf(state.get("WS-CUR-DATE-X6")).substring(0, Math.min(5, String.valueOf(state.get("WS-CUR-DATE-X6")).length())));
         state.put("WS-CUR-TIME-N6", state.get("WS-CUR-TIME-X6"));
         state.put("WS-TIME-WITH-MS", (CobolRuntime.toNum(state.get("WS-CUR-TIME-N6")) * 1000));
@@ -112,7 +112,7 @@ public class Section8 extends SectionBase {
         }
         state.put("PA-AUTH-FRAUD", " ");
         state.put("PA-ACCT-ID", state.get("XREF-ACCT-ID"));
-        stubs.dummyExec(state, "DLI", "EXEC DLI ISRT USING PCB(PAUT-PCB-NUM) SEGMENT (PAUTSUM0) WHERE (ACCNTID = PA-ACCT-ID) SEGMENT (PAUTDTL1) FROM (PENDING-AUTH-DETAILS) SEGLENGTH (LENGTH OF PENDING-AUTH-DETAILS) END-EXEC");
+        stubs.dliInsertChild(state, "PAUTSUM0", "ACCNTID", "PA-ACCT-ID", "PAUTDTL1", "PENDING-AUTH-DETAILS");
         state.put("IMS-RETURN-CODE", state.get("DIBSTAT"));
         if (CobolRuntime.isTruthy(state.get("STATUS-OK"))) {
             state.addBranch(44);

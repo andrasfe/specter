@@ -44,7 +44,7 @@ public class Section7 extends SectionBase {
         state.put("MQM-MD-REPLY", state.get("MQFMT-STRING"));
         state.put("MQPMO-OPTIONS", CobolRuntime.toNum(state.get("MQPMO-NO-SYNCPOINT")));
         state.put("W02-BUFFLEN", state.get("WS-RESP-LENGTH"));
-        stubs.dummyCall(state, "MQPUT1");
+        stubs.mqPut1(state, "WS-REPLY-QNAME", "W02-PUT-BUFFER", "W02-BUFLEN");
         if (!java.util.Objects.equals(state.get("WS-COMPCODE"), state.get("MQCC-OK"))) {
             state.addBranch(38);
             state.put("ERR-LOCATION", "M004");

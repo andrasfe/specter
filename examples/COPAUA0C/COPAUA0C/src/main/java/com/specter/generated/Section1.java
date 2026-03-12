@@ -16,7 +16,7 @@ public class Section1 extends SectionBase {
     }
 
     void do_1000_INITIALIZE(ProgramState state) {
-        stubs.dummyExec(state, "CICS", "EXEC CICS RETRIEVE INTO(MQTM) NOHANDLE END-EXEC");
+        stubs.cicsRetrieve(state, "MQTM");
         if (java.util.Objects.equals(state.get("EIBRESP"), 0)) {
             state.addBranch(1);
             state.put("WS-REQUEST-QNAME", state.get("MQTM-QNAME"));
@@ -41,7 +41,7 @@ public class Section1 extends SectionBase {
         state.put("OF", state.get("WS-REQUEST-QNAME"));
         state.put("MQM-OD-REQUEST", state.get("WS-REQUEST-QNAME"));
         state.put("WS-OPTIONS", CobolRuntime.toNum(state.get("MQOO-INPUT-SHARED")));
-        stubs.dummyCall(state, "MQOPEN");
+        stubs.mqOpen(state, "WS-REQUEST-QNAME");
         if (java.util.Objects.equals(state.get("WS-COMPCODE"), state.get("MQCC-OK"))) {
             state.addBranch(2);
             state.put("WS-REQUEST-MQ-OPEN", true);
@@ -64,12 +64,12 @@ public class Section1 extends SectionBase {
     }
 
     void do_1200_SCHEDULE_PSB(ProgramState state) {
-        stubs.dummyExec(state, "DLI", "EXEC DLI SCHD PSB((PSB-NAME)) NODHABEND END-EXEC");
+        stubs.dliSchedulePsb(state, "PSB-NAME");
         state.put("IMS-RETURN-CODE", state.get("DIBSTAT"));
         if (CobolRuntime.isTruthy(state.get("PSB-SCHEDULED-MORE-THAN-ONCE"))) {
             state.addBranch(3);
-            stubs.dummyExec(state, "DLI", "EXEC DLI TERM END-EXEC");
-            stubs.dummyExec(state, "DLI", "EXEC DLI SCHD PSB((PSB-NAME)) NODHABEND END-EXEC");
+            stubs.dliTerminate(state);
+            stubs.dliSchedulePsb(state, "PSB-NAME");
             state.put("IMS-RETURN-CODE", state.get("DIBSTAT"));
         } else {
             state.addBranch(-3);

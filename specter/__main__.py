@@ -237,6 +237,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Java package name (default: com.specter.generated)",
     )
     parser.add_argument(
+        "--docker",
+        action="store_true",
+        help="Generate Dockerfile + docker-compose.yml (with --java)",
+    )
+    parser.add_argument(
+        "--integration-tests",
+        action="store_true",
+        help="Generate Mockito integration tests (with --java)",
+    )
+    parser.add_argument(
         "--mock-cobol",
         action="store_true",
         help="Instrument COBOL source for standalone mock execution (input is .cbl/.cob/.cobol)",
@@ -343,9 +353,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"    - ... and {len(result.warnings) - 20} more")
         return 0
 
-    if args.copybook_dir or args.init_var:
+    if args.init_var and not args.mock_cobol:
         print(
-            "Error: --copybook-dir/--init-var require --mock-cobol (or a .cbl input with mock mode).",
+            "Error: --init-var requires --mock-cobol (or a .cbl input with mock mode).",
+            file=sys.stderr,
+        )
+        return 1
+    if args.copybook_dir and not args.mock_cobol and not args.java:
+        print(
+            "Error: --copybook-dir requires --mock-cobol or --java.",
             file=sys.stderr,
         )
         return 1
@@ -433,15 +449,25 @@ def main(argv: list[str] | None = None) -> int:
         from .java_code_generator import generate_java_project
         java_dir = output_path.with_suffix("")  # e.g. examples/COPAUA0C
         test_store = Path(args.test_store) if args.test_store else None
+        copybook_paths = [str(Path(d)) for d in args.copybook_dir] or None
         print(f"Generating Java project → {java_dir}/ ...")
         project_path = generate_java_project(
             program, var_report, str(java_dir),
             instrument=args.analyze,
             test_store_path=str(test_store) if test_store else None,
+            copybook_paths=copybook_paths,
+            docker=args.docker,
+            integration_tests=args.integration_tests,
         )
         n_paras = len(program.paragraphs)
         print(f"  {n_paras} paragraph classes generated")
         print(f"  Project: {project_path}")
+        if args.docker:
+            print("  Docker: Dockerfile + docker-compose.yml generated")
+        if args.integration_tests:
+            print("  Integration tests: integration-tests/ generated")
+        if copybook_paths:
+            print("  SQL: sql/init.sql generated from copybooks")
         return 0
 
     # Generate code

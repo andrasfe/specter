@@ -52,7 +52,7 @@ public class Section5 extends SectionBase {
 
     void do_5100_READ_XREF_RECORD(ProgramState state) {
         state.put("XREF-CARD-NUM", state.get("PA-RQ-CARD-NUM"));
-        stubs.dummyExec(state, "CICS", "EXEC CICS READ DATASET   (WS-CCXREF-FILE) INTO      (CARD-XREF-RECORD) LENGTH    (LENGTH OF CARD-XREF-RECORD) RIDFLD    (XREF-CARD-NUM) KEYLENGTH (LENGTH OF XREF-CARD-NUM) RESP      (WS-RESP-CD) RESP2...");
+        stubs.cicsRead(state, "WS-CCXREF-FILE", "XREF-CARD-NUM", "CARD-XREF-RECORD", "WS-RESP-CD", "WS-REAS-CD");
         Object _evalSubject = state.get("WS-RESP-CD");
         if (java.util.Objects.equals(_evalSubject, 0)) {
             state.addBranch(11);
@@ -92,7 +92,7 @@ public class Section5 extends SectionBase {
 
     void do_5200_READ_ACCT_RECORD(ProgramState state) {
         state.put("WS-CARD-RID-ACCT-ID", state.get("XREF-ACCT-ID"));
-        stubs.dummyExec(state, "CICS", "EXEC CICS READ DATASET   (WS-ACCTFILENAME) RIDFLD    (WS-CARD-RID-ACCT-ID-X) KEYLENGTH (LENGTH OF WS-CARD-RID-ACCT-ID-X) INTO      (ACCOUNT-RECORD) LENGTH    (LENGTH OF ACCOUNT-RECORD) RESP      (WS-R...");
+        stubs.cicsRead(state, "WS-ACCTFILENAME", "WS-CARD-RID-ACCT-ID-X", "ACCOUNT-RECORD", "WS-RESP-CD", "WS-REAS-CD");
         Object _evalSubject = state.get("WS-RESP-CD");
         if (java.util.Objects.equals(_evalSubject, 0)) {
             state.addBranch(14);
@@ -131,7 +131,7 @@ public class Section5 extends SectionBase {
 
     void do_5300_READ_CUST_RECORD(ProgramState state) {
         state.put("WS-CARD-RID-CUST-ID", state.get("XREF-CUST-ID"));
-        stubs.dummyExec(state, "CICS", "EXEC CICS READ DATASET   (WS-CUSTFILENAME) RIDFLD    (WS-CARD-RID-CUST-ID-X) KEYLENGTH (LENGTH OF WS-CARD-RID-CUST-ID-X) INTO      (CUSTOMER-RECORD) LENGTH    (LENGTH OF CUSTOMER-RECORD) RESP      (WS...");
+        stubs.cicsRead(state, "WS-CUSTFILENAME", "WS-CARD-RID-CUST-ID-X", "CUSTOMER-RECORD", "WS-RESP-CD", "WS-REAS-CD");
         Object _evalSubject = state.get("WS-RESP-CD");
         if (java.util.Objects.equals(_evalSubject, 0)) {
             state.addBranch(17);
@@ -170,7 +170,7 @@ public class Section5 extends SectionBase {
 
     void do_5500_READ_AUTH_SUMMRY(ProgramState state) {
         state.put("PA-ACCT-ID", state.get("XREF-ACCT-ID"));
-        stubs.dummyExec(state, "DLI", "EXEC DLI GU USING PCB(PAUT-PCB-NUM) SEGMENT (PAUTSUM0) INTO (PENDING-AUTH-SUMMARY) WHERE (ACCNTID = PA-ACCT-ID) END-EXEC");
+        stubs.dliGetUnique(state, "PAUTSUM0", "PENDING-AUTH-SUMMARY", "ACCNTID", "PA-ACCT-ID");
         state.put("IMS-RETURN-CODE", state.get("DIBSTAT"));
         if (CobolRuntime.isTruthy(state.get("STATUS-OK"))) {
             state.addBranch(20);

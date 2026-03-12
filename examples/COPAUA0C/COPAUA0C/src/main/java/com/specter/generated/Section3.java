@@ -24,7 +24,7 @@ public class Section3 extends SectionBase {
         state.put("OF", state.get("MQFMT-STRING"));
         state.put("MQM-MD-REQUEST", state.get("MQFMT-STRING"));
         state.put("W01-BUFFLEN", String.valueOf(state.get("W01-GET-BUFFER")).length());
-        stubs.dummyCall(state, "MQGET");
+        stubs.mqGet(state, "W01-GET-BUFFER", "W01-DATALEN", "MQGMO-WAITINTERVAL");
         if (java.util.Objects.equals(state.get("WS-COMPCODE"), state.get("MQCC-OK"))) {
             state.addBranch(7);
             state.put("WS-SAVE-CORRELID", state.get("MQMD-CORRELID OF MQM-MD-REQUEST"));
