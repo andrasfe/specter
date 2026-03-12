@@ -108,7 +108,7 @@ public class SectionMain extends SectionBase {
         stubs.cicsRead(state, "WS-USRSEC-FILE", "WS-USER-ID", "SEC-USER-DATA", "WS-RESP-CD", "WS-REAS-CD");
         Object _evalSubject = state.get("WS-RESP-CD");
         _evalSubject = CobolRuntime.toNum(_evalSubject);
-        if (java.util.Objects.equals(_evalSubject, 0)) {
+        if (java.util.Objects.equals(_evalSubject, CobolRuntime.toNum(0))) {
             state.addBranch(9);
             if (java.util.Objects.equals(state.get("SEC-USR-PWD"), state.get("WS-USER-PWD"))) {
                 state.addBranch(10);
@@ -131,7 +131,7 @@ public class SectionMain extends SectionBase {
                 perform(state, "SEND-SIGNON-SCREEN");
             }
         }
-        else if (java.util.Objects.equals(_evalSubject, 13)) {
+        else if (java.util.Objects.equals(_evalSubject, CobolRuntime.toNum(13))) {
             state.addBranch(12);
             state.put("WS-ERR-FLG", "Y");
             state.put("WS-MESSAGE", "User not found. Try again ...");

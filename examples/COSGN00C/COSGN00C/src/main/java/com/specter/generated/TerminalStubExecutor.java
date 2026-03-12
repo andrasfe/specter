@@ -86,6 +86,26 @@ public class TerminalStubExecutor extends DefaultStubExecutor {
     }
 
     @Override
+    public void cicsRead(ProgramState state, String dataset, String ridfld,
+                         String intoRecord, String respVar, String resp2Var) {
+        // In interactive terminal mode there is no real file.
+        // Simulate a successful read: echo the entered password back so
+        // credential checks pass, and set RESP=0.
+        state.put(respVar, 0);
+        state.put(resp2Var, 0);
+        // Mirror user-entered password into the security record field
+        // so the password comparison succeeds.
+        Object pwd = state.get("WS-USER-PWD");
+        if (pwd != null) {
+            state.put("SEC-USR-PWD", pwd);
+        }
+        // Default user type to regular (not admin)
+        state.putIfAbsent("SEC-USR-TYPE", "U");
+        state.execs.add(java.util.Map.of("op",
+                "READ DATASET(" + dataset + ") [simulated]"));
+    }
+
+    @Override
     public void cicsReturn(ProgramState state, boolean hasTransid) {
         state.execs.add(java.util.Map.of("op", "CICS RETURN"));
         throw new CicsReturnSignal(hasTransid);

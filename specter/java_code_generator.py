@@ -895,8 +895,13 @@ def _gen_evaluate_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
                 cb.open_block(f"{keyword} ({resolved})")
             else:
                 keyword = "if" if first_when else "else if"
+                # When subject was coerced to double via toNum, wrap
+                # WHEN values in toNum too so Double==Double comparison works.
+                cmp_val = resolved
+                if _has_numeric_when:
+                    cmp_val = f"CobolRuntime.toNum({resolved})"
                 cb.open_block(
-                    f"{keyword} (java.util.Objects.equals(_evalSubject, {resolved}))"
+                    f"{keyword} (java.util.Objects.equals(_evalSubject, {cmp_val}))"
                 )
             first_when = False
 
