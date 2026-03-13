@@ -253,6 +253,7 @@ class _JavaCodeBuilder:
         self._indent: int = 0
         self._loop_counter: int = 0
         self._branch_counter: int = 0
+        self._temp_counter: int = 0
         self.branch_meta: dict[int, dict] = {}
         self.current_para: str = ""
 
@@ -267,6 +268,11 @@ class _JavaCodeBuilder:
         """Return a unique loop counter variable name."""
         self._loop_counter += 1
         return f"_lc{self._loop_counter}"
+
+    def next_temp_var(self, prefix: str) -> str:
+        """Return a unique temporary variable name with the given prefix."""
+        self._temp_counter += 1
+        return f"{prefix}{self._temp_counter}"
 
     # -- Output primitives ------------------------------------------------
 
@@ -864,19 +870,20 @@ def _gen_if_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
 def _gen_evaluate_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
     subject = stmt.attributes.get("subject", "TRUE")
     is_true = subject.upper() == "TRUE"
+    eval_var = cb.next_temp_var("_evalSubject")
+    has_numeric_when = False
 
     if not is_true:
-        cb.stmt(f'Object _evalSubject = state.get("{_vk(subject)}")')
+        cb.stmt(f'Object {eval_var} = state.get("{_vk(subject)}")')
         # Check if WHEN values are numeric -- coerce subject to number
-        _has_numeric_when = False
         for child in stmt.children:
             if child.type == "WHEN":
                 vt, io = parse_when_value(child.text)
                 if not io and re.match(r"^[+-]?\d+\.?\d*$", vt.strip()):
-                    _has_numeric_when = True
+                    has_numeric_when = True
                     break
-        if _has_numeric_when:
-            cb.stmt("_evalSubject = CobolRuntime.toNum(_evalSubject)")
+        if has_numeric_when:
+            cb.stmt(f"{eval_var} = CobolRuntime.toNum({eval_var})")
 
     first_when = True
     for child in stmt.children:
@@ -898,10 +905,10 @@ def _gen_evaluate_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
                 # When subject was coerced to double via toNum, wrap
                 # WHEN values in toNum too so Double==Double comparison works.
                 cmp_val = resolved
-                if _has_numeric_when:
+                if has_numeric_when:
                     cmp_val = f"CobolRuntime.toNum({resolved})"
                 cb.open_block(
-                    f"{keyword} (java.util.Objects.equals(_evalSubject, {cmp_val}))"
+                    f"{keyword} (java.util.Objects.equals({eval_var}, {cmp_val}))"
                 )
             first_when = False
 
@@ -1598,16 +1605,18 @@ def _gen_search_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
         "type": "SEARCH",
     }
     stub_key = f"SEARCH:{table_name}"
+    sl_var = cb.next_temp_var("_sl")
+    found_var = cb.next_temp_var("_searchFound")
     cb.stmt(
-        f'java.util.List<?> _sl = (java.util.List<?>)'
+        f'java.util.List<?> {sl_var} = (java.util.List<?>)'
         f' state.stubOutcomes.getOrDefault("{stub_key}", '
         f"java.util.Collections.emptyList())"
     )
     cb.stmt(
-        "boolean _searchFound = !_sl.isEmpty() "
-        "? (Boolean) ((java.util.List<?>) _sl).remove(0) : true"
+        f"boolean {found_var} = !{sl_var}.isEmpty() "
+        f"? (Boolean) ((java.util.List<?>) {sl_var}).remove(0) : true"
     )
-    cb.open_block("if (_searchFound)")
+    cb.open_block(f"if ({found_var})")
     cb.stmt(f"state.addBranch({bid})")
     if index_var:
         cb.stmt(f'state.put("{index_var}", 1)')
@@ -1883,6 +1892,11 @@ def _gen_statement_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
         cb.comment(f"{stype}: {_oneline(stmt.text)}")
 
 
+def _is_terminal_statement(stmt: Statement) -> bool:
+    """Return True when the statement always transfers control out."""
+    return stmt.type in {"GO_TO", "GOBACK", "STOP_RUN"}
+
+
 # ---------------------------------------------------------------------------
 # Paragraph class file generation
 # ---------------------------------------------------------------------------
@@ -1927,6 +1941,7 @@ def _generate_paragraph_java(
     body_cb._indent = 2
     body_cb._branch_counter = cb._branch_counter
     body_cb._loop_counter = cb._loop_counter
+    body_cb._temp_counter = cb._temp_counter
     body_cb.branch_meta = cb.branch_meta
     body_cb.current_para = para_name
 
@@ -1935,10 +1950,16 @@ def _generate_paragraph_java(
     else:
         for stmt in statements:
             _gen_statement_java(body_cb, stmt)
+            if _is_terminal_statement(stmt):
+                # Some parsed tails become unreachable after unconditional
+                # control transfer (e.g. GO TO paragraph). Stop emitting
+                # method-level code to keep Java compilable.
+                break
 
     # Propagate counters back
     cb._branch_counter = body_cb._branch_counter
     cb._loop_counter = body_cb._loop_counter
+    cb._temp_counter = body_cb._temp_counter
 
     lines.extend(body_cb.lines)
     lines.append("    }")
@@ -1969,6 +1990,7 @@ def _generate_paragraph_method(
     body_cb._indent = 2  # method body indent
     body_cb._branch_counter = cb._branch_counter
     body_cb._loop_counter = cb._loop_counter
+    body_cb._temp_counter = cb._temp_counter
     body_cb.branch_meta = cb.branch_meta
     body_cb.current_para = para_name
 
@@ -1977,10 +1999,16 @@ def _generate_paragraph_method(
     else:
         for stmt in statements:
             _gen_statement_java(body_cb, stmt)
+            if _is_terminal_statement(stmt):
+                # Some parsed tails become unreachable after unconditional
+                # control transfer (e.g. GO TO paragraph). Stop emitting
+                # method-level code to keep Java compilable.
+                break
 
     # Propagate counters back
     cb._branch_counter = body_cb._branch_counter
     cb._loop_counter = body_cb._loop_counter
+    cb._temp_counter = body_cb._temp_counter
 
     lines: list[str] = []
     lines.append(f"    void {method_name}(ProgramState state) {{")

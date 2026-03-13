@@ -30,6 +30,7 @@ POM_XML = """\
         <junit.version>5.10.2</junit.version>
         <lanterna.version>3.1.1</lanterna.version>
         <mockito.version>5.11.0</mockito.version>
+        <netty.version>4.2.9.Final</netty.version>
     </properties>
 
     <dependencies>
@@ -94,6 +95,13 @@ POM_XML = """\
             <groupId>org.apache.activemq</groupId>
             <artifactId>artemis-jakarta-client</artifactId>
             <version>2.31.2</version>
+        </dependency>
+
+        <!-- Pin Netty handler version explicitly -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-handler</artifactId>
+            <version>${{netty.version}}</version>
         </dependency>
 
         <!-- Mockito (test scope) -->

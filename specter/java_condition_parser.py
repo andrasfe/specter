@@ -305,11 +305,11 @@ class _JavaParser:
                 if op is not None:
                     rhs_token = self._primary_token()
                     if rhs_token is None:
-                        return f"!({lhs})"
+                        return f"!CobolRuntime.isTruthy({lhs})"
                     rhs = _resolve_value_java(rhs_token)
                     neg_op = _negate_op(op)
                     return self._build_cmp(lhs, neg_op, rhs)
-                return f"!({lhs})"
+                return f"!CobolRuntime.isTruthy({lhs})"
             if self.match("NUMERIC"):
                 self.advance()
                 return f"CobolRuntime.isNumeric({lhs})"
@@ -318,7 +318,7 @@ class _JavaParser:
                     "GREATER", "LESS", "EQUAL", ">", "<", ">=", "<=", "=")):
                 pass
             else:
-                return lhs
+                return f"CobolRuntime.isTruthy({lhs})"
 
         # Comparison operators
         negated = False
@@ -335,7 +335,9 @@ class _JavaParser:
 
         rhs_token = self._primary_token()
         if rhs_token is None:
-            return lhs
+            if negated:
+                return f"!CobolRuntime.isTruthy({lhs})"
+            return f"CobolRuntime.isTruthy({lhs})"
 
         rhs = _resolve_value_java(rhs_token)
 

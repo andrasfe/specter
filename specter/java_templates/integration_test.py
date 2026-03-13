@@ -29,6 +29,7 @@ INTEGRATION_POM_XML = """\
         <maven.compiler.target>17</maven.compiler.target>
         <junit.version>5.10.2</junit.version>
         <mockito.version>5.11.0</mockito.version>
+        <netty.version>4.2.9.Final</netty.version>
     </properties>
 
     <dependencies>
@@ -110,6 +111,14 @@ INTEGRATION_POM_XML = """\
             <groupId>org.apache.activemq</groupId>
             <artifactId>artemis-jakarta-client</artifactId>
             <version>2.31.2</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Pin Netty handler version explicitly -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-handler</artifactId>
+            <version>${{netty.version}}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
