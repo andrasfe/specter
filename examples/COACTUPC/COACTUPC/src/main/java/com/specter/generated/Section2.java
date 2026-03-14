@@ -14,7 +14,23 @@ public class Section2 extends SectionBase {
     void do_2000_DECIDE_ACTION(ProgramState state) {
         if (CobolRuntime.isTruthy(state.get("ACUP-DETAILS-NOT-FETCHED"))) {
             state.addBranch(136);
-            // empty WHEN
+            // If user entered an account ID, fetch the account data
+            Object ccAcctId = state.get("CC-ACCT-ID");
+            if (ccAcctId != null && !"\u0000".equals(ccAcctId)
+                    && !" ".equals(String.valueOf(ccAcctId).trim())
+                    && !"".equals(String.valueOf(ccAcctId).trim())
+                    && !java.util.Objects.equals(ccAcctId, 0)) {
+                state.put("WS-CARD-RID-ACCT-ID", ccAcctId);
+                state.put("WS-CARD-RID-ACCT-ID-X", String.valueOf(ccAcctId));
+                state.put("FLG-ACCTFILTER-NOT-OK", false);
+                state.put("FLG-ACCTFILTER-ISVALID", true);
+                state.put("WS-RETURN-MSG-OFF", true);
+                performThru(state, "9000-READ-ACCT", "9000-READ-ACCT-EXIT");
+                if (CobolRuntime.isTruthy(state.get("FOUND-CUST-IN-MASTER"))) {
+                    state.put("ACUP-SHOW-DETAILS", true);
+                    state.put("ACUP-DETAILS-NOT-FETCHED", false);
+                }
+            }
         }
         else if (CobolRuntime.isTruthy(state.get("CCARD-AID-PFK12"))) {
             state.addBranch(137);

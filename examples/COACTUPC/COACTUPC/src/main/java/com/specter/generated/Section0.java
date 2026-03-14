@@ -69,7 +69,12 @@ public class Section0 extends SectionBase {
         }
         else if (CobolRuntime.isTruthy(state.get("ACUP-DETAILS-NOT-FETCHED"))) {
             state.addBranch(7);
-            // First entry: show the account lookup screen
+            if (CobolRuntime.isTruthy(state.get("CDEMO-PGM-REENTER"))) {
+                // Re-entry: user has entered data — process inputs and fetch
+                state.put("CDEMO-PGM-ENTER", false);
+                performThru(state, "1000-PROCESS-INPUTS", "1000-PROCESS-INPUTS-EXIT");
+                performThru(state, "2000-DECIDE-ACTION", "2000-DECIDE-ACTION-EXIT");
+            }
             performThru(state, "3000-SEND-MAP", "3000-SEND-MAP-EXIT");
             state.put("CDEMO-PGM-REENTER", true);
             registry.get("COMMON-RETURN").execute(state);
