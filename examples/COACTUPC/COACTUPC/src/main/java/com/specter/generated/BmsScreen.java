@@ -73,8 +73,10 @@ public class BmsScreen implements AutoCloseable {
                 }
                 case DISPLAY -> {
                     if (field.label != null && !field.label.isEmpty()) {
-                        graphics.setForegroundColor(TextColor.ANSI.CYAN);
+                        graphics.setForegroundColor(TextColor.ANSI.WHITE);
+                        graphics.enableModifiers(SGR.BOLD);
                         graphics.putString(field.col, field.row, field.label + ":");
+                        graphics.disableModifiers(SGR.BOLD);
                         graphics.setForegroundColor(TextColor.ANSI.GREEN);
                         graphics.putString(
                                 field.col + field.label.length() + 2,
@@ -84,13 +86,15 @@ public class BmsScreen implements AutoCloseable {
                     }
                 }
                 case INPUT -> {
-                    graphics.setForegroundColor(TextColor.ANSI.CYAN);
+                    graphics.setForegroundColor(TextColor.ANSI.WHITE);
+                    graphics.enableModifiers(SGR.BOLD);
                     int labelCol = Math.max(0, field.col - (field.label != null
                             ? field.label.length() + 2 : 0));
                     if (field.label != null) {
                         graphics.putString(labelCol, field.row,
                                 field.label + ":");
                     }
+                    graphics.disableModifiers(SGR.BOLD);
                     graphics.setForegroundColor(TextColor.ANSI.GREEN);
                     String cur = inputValues.getOrDefault(field.name, "");
                     String display = field.masked
@@ -121,7 +125,7 @@ public class BmsScreen implements AutoCloseable {
         graphics.setBackgroundColor(TextColor.ANSI.BLACK);
         graphics.setForegroundColor(TextColor.ANSI.GREEN);
 
-        screen.refresh();
+        screen.refresh(Screen.RefreshType.COMPLETE);
     }
 
     /**
@@ -149,7 +153,7 @@ public class BmsScreen implements AutoCloseable {
                 inputValues.getOrDefault(
                         inputFields.get(activeFieldIndex).name, ""));
         positionCursor(inputFields.get(activeFieldIndex), currentInput.length());
-        screen.refresh();
+        screen.refresh(Screen.RefreshType.COMPLETE);
 
         while (true) {
             KeyStroke key = screen.readInput();
@@ -180,7 +184,7 @@ public class BmsScreen implements AutoCloseable {
                                 inputFields.get(activeFieldIndex).name, ""));
                 positionCursor(inputFields.get(activeFieldIndex),
                         currentInput.length());
-                screen.refresh();
+                screen.refresh(Screen.RefreshType.COMPLETE);
                 continue;
             }
 
@@ -191,7 +195,7 @@ public class BmsScreen implements AutoCloseable {
                             currentInput.toString());
                     positionCursor(inputFields.get(activeFieldIndex),
                             currentInput.length());
-                    screen.refresh();
+                    screen.refresh(Screen.RefreshType.COMPLETE);
                 }
                 continue;
             }
@@ -202,7 +206,7 @@ public class BmsScreen implements AutoCloseable {
                     currentInput.append(key.getCharacter());
                     redrawInputField(f, currentInput.toString());
                     positionCursor(f, currentInput.length());
-                    screen.refresh();
+                    screen.refresh(Screen.RefreshType.COMPLETE);
                 }
             }
         }
@@ -233,7 +237,7 @@ public class BmsScreen implements AutoCloseable {
         graphics.putString(0, 23, " ".repeat(80));
         graphics.putString(1, 23, "Press any key to exit...");
         graphics.setBackgroundColor(TextColor.ANSI.BLACK);
-        screen.refresh();
+        screen.refresh(Screen.RefreshType.COMPLETE);
         screen.readInput();
     }
 
@@ -253,7 +257,7 @@ public class BmsScreen implements AutoCloseable {
         graphics.putString(0, 23, " ".repeat(80));
         graphics.putString(1, 23, "Press any key to exit...");
         graphics.setBackgroundColor(TextColor.ANSI.BLACK);
-        screen.refresh();
+        screen.refresh(Screen.RefreshType.COMPLETE);
         screen.readInput();
     }
 

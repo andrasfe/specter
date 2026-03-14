@@ -1995,7 +1995,35 @@ def _generate_paragraph_method(
     body_cb.current_para = para_name
 
     if not statements:
-        body_cb.comment("empty paragraph")
+        # Known copybook implementations for empty paragraphs
+        if para_name == "YYYY-STORE-PFKEY":
+            body_cb.comment(
+                "Implements CSSTRPFY copybook: map EIBAID to CCARD-AID flags"
+            )
+            body_cb.emit('state.put("CCARD-AID-ENTER", false);')
+            body_cb.emit('state.put("CCARD-AID-PFK03", false);')
+            body_cb.emit('state.put("CCARD-AID-PFK05", false);')
+            body_cb.emit('state.put("CCARD-AID-PFK12", false);')
+            body_cb.emit('Object eibaid = state.get("EIBAID");')
+            body_cb.emit('if ("DFHENTER".equals(eibaid)) {')
+            body_cb._indent += 1
+            body_cb.emit('state.put("CCARD-AID-ENTER", true);')
+            body_cb._indent -= 1
+            body_cb.emit('} else if ("DFHPF3".equals(eibaid)) {')
+            body_cb._indent += 1
+            body_cb.emit('state.put("CCARD-AID-PFK03", true);')
+            body_cb._indent -= 1
+            body_cb.emit('} else if ("DFHPF5".equals(eibaid)) {')
+            body_cb._indent += 1
+            body_cb.emit('state.put("CCARD-AID-PFK05", true);')
+            body_cb._indent -= 1
+            body_cb.emit('} else if ("DFHPF12".equals(eibaid)) {')
+            body_cb._indent += 1
+            body_cb.emit('state.put("CCARD-AID-PFK12", true);')
+            body_cb._indent -= 1
+            body_cb.emit("}")
+        else:
+            body_cb.comment("empty paragraph")
     else:
         for stmt in statements:
             _gen_statement_java(body_cb, stmt)
@@ -2728,6 +2756,85 @@ def _extract_bms_info(program: Program) -> dict | None:
     return result
 
 
+# Common BMS field abbreviation → human-readable label mapping.
+# Keyed by uppercase base name (no I/O/A/L suffix).
+_BMS_LABEL_MAP: dict[str, str] = {
+    "ACCTSID": "Account ID",
+    "AADDGRP": "Group",
+    "ACSFNAM": "First Name",
+    "ACSMNAM": "Middle Name",
+    "ACSLNAM": "Last Name",
+    "ACSADL1": "Address Line 1",
+    "ACSADL2": "Address Line 2",
+    "ACSCITY": "City",
+    "ACSCTRY": "Country",
+    "ACSSTE": "State",
+    "ACSSTTE": "State",
+    "ACSZPC": "Zip",
+    "ACSZIPCO": "Zip",
+    "ACRDLIM": "Credit Limit",
+    "ACSHLIM": "Cash Limit",
+    "ACURBAL": "Current Balance",
+    "ACRCYCR": "Cycle Credit",
+    "ACRCYDB": "Cycle Debit",
+    "ACSEFTC": "EFT Account",
+    "ACSGOVT": "Govt ID",
+    "ACSPFLG": "Primary Holder",
+    "ACSTFCO": "FICO Score",
+    "ACSTTUS": "Status",
+    "ACSTNUMO": "Customer#",
+    "ACTSSN1": "SSN-1",
+    "ACTSSN2": "SSN-2",
+    "ACTSSN3": "SSN-3",
+    "ACSPH1A": "Phone1 Area",
+    "ACSPH1B": "Phone1 Prefix",
+    "ACSPH1C": "Phone1 Line",
+    "ACSPH2A": "Phone2 Area",
+    "ACSPH2B": "Phone2 Prefix",
+    "ACSPH2C": "Phone2 Line",
+    "PGMNAME": "Program",
+    "TRNNAME": "Trans",
+    "CURDATE": "Date",
+    "CURTIME": "Time",
+    "APPLID": "Applid",
+    "SYSID": "Sysid",
+    "USERID": "User ID",
+    "PASSWD": "Password",
+    "ERRMSG": "Error",
+    "INFOMSG": "Info",
+    "OPNYEAR": "Open Year",
+    "OPNMON": "Open Month",
+    "OPNDAY": "Open Day",
+    "EXPYEAR": "Exp Year",
+    "EXPMON": "Exp Month",
+    "EXPDAY": "Exp Day",
+    "RISYEAR": "Reissue Year",
+    "RISMON": "Reissue Month",
+    "RISDAY": "Reissue Day",
+    "DOBYEAR": "DOB Year",
+    "DOBMON": "DOB Month",
+    "DOBDAY": "DOB Day",
+}
+
+
+def _bms_label(field_name: str) -> str:
+    """Derive a human-readable label from a BMS field name."""
+    # Strip common suffixes
+    base = field_name
+    for suffix in ("I", "O", "A", "L", "C"):
+        if base.endswith(suffix) and len(base) > 2:
+            candidate = base[:-1]
+            if candidate.upper() in _BMS_LABEL_MAP:
+                return _BMS_LABEL_MAP[candidate.upper()]
+    if base.upper() in _BMS_LABEL_MAP:
+        return _BMS_LABEL_MAP[base.upper()]
+    # Fallback: strip suffix, expand
+    base = field_name
+    if base.endswith(("I", "O")) and len(base) > 2:
+        base = base[:-1]
+    return base.replace("-", " ").replace("_", " ").title()
+
+
 def _compute_screen_layout(
     bms_info: dict,
 ) -> list[dict]:
@@ -2763,7 +2870,7 @@ def _compute_screen_layout(
                    if any(x in f for x in ("CURDATE", "CURTIME"))]
     col = 2
     for f in sorted(nav_fields):
-        label = f.rstrip("O").replace("-", " ").title()
+        label = _bms_label(f)
         layout.append({
             "name": f, "row": row, "col": col, "width": 12,
             "type": "DISPLAY", "label": label, "masked": False,
@@ -2771,7 +2878,7 @@ def _compute_screen_layout(
         col += 22
     col = 50
     for f in sorted(date_fields):
-        label = f.rstrip("O").replace("-", " ").title()
+        label = _bms_label(f)
         layout.append({
             "name": f, "row": row, "col": col, "width": 10,
             "type": "DISPLAY", "label": label, "masked": False,
@@ -2785,7 +2892,7 @@ def _compute_screen_layout(
                   if any(x in f for x in ("APPLID", "SYSID"))]
     col = 2
     for f in sorted(sys_fields):
-        label = f.rstrip("O").replace("-", " ").title()
+        label = _bms_label(f)
         layout.append({
             "name": f, "row": row, "col": col, "width": 10,
             "type": "DISPLAY", "label": label, "masked": False,
@@ -2825,7 +2932,7 @@ def _compute_screen_layout(
     for i, f in enumerate(sorted(remaining)):
         if placed_out >= out_budget:
             break
-        label = f.rstrip("O").replace("-", " ").title()
+        label = _bms_label(f)
         if total > avail_rows:
             # 2-column layout
             c = 2 if i % 2 == 0 else 42
@@ -2858,8 +2965,7 @@ def _compute_screen_layout(
         r = row + i
         if r >= max_data_row:
             break
-        base = f[:-1] if f.endswith("I") else f
-        label = base.replace("-", " ").replace("_", " ").title()
+        label = _bms_label(f)
         is_password = any(x in f.upper() for x in ("PASSW", "PWD", "PIN"))
         layout.append({
             "name": f, "row": r, "col": 30, "width": 20,
@@ -3151,6 +3257,26 @@ def generate_java_project(
         initial_lines.append(
             '        state.put("WS-PGMNAME", "' + program_id + '");'
         )
+
+        # Seed COBOL literal constants (LIT-*, CCDA-*) used for
+        # screen titles, program names, map names, etc.
+        _lit_defaults = {
+            "LIT-THISTRANID": program_id[:4],
+            "LIT-THISPGM": program_id,
+            "LIT-THISMAP": next(iter(bms_info), ""),
+            "LIT-THISMAPSET": next(iter(bms_info), "")[:6]
+                if bms_info else "",
+            "LIT-MENUPGM": "COMEN01C",
+            "LIT-MENUTRANID": "COME",
+            "CCDA-TITLE01": "Credit Card Demo Application",
+            "CCDA-TITLE02": program_id + " - Account Update",
+            "CCDA-MSG-THANK-YOU": "Thank you for using the application",
+            "CCDA-MSG-INVALID-KEY": "Invalid key pressed",
+        }
+        for var, val in _lit_defaults.items():
+            initial_lines.append(
+                f'        state.put("{var}", "{val}");'
+            )
         terminal_main_src = TERMINAL_MAIN_JAVA.format(
             **fmt_args,
             initial_state_lines="\n".join(initial_lines),

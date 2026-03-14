@@ -259,7 +259,21 @@ public class SectionMain extends SectionBase {
     }
 
     void do_YYYY_STORE_PFKEY(ProgramState state) {
-        // empty paragraph
+        // Implements CSSTRPFY copybook: map EIBAID to CCARD-AID flags
+        state.put("CCARD-AID-ENTER", false);
+        state.put("CCARD-AID-PFK03", false);
+        state.put("CCARD-AID-PFK05", false);
+        state.put("CCARD-AID-PFK12", false);
+        Object eibaid = state.get("EIBAID");
+        if ("DFHENTER".equals(eibaid)) {
+            state.put("CCARD-AID-ENTER", true);
+        } else if ("DFHPF3".equals(eibaid)) {
+            state.put("CCARD-AID-PFK03", true);
+        } else if ("DFHPF5".equals(eibaid)) {
+            state.put("CCARD-AID-PFK05", true);
+        } else if ("DFHPF12".equals(eibaid)) {
+            state.put("CCARD-AID-PFK12", true);
+        }
     }
 
 }

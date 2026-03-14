@@ -28,6 +28,16 @@ public class TerminalMain {
         state.put("EIBCALEN", 0);
         state.put("WS-TRANID", "COAC");
         state.put("WS-PGMNAME", "COACTUPC");
+        state.put("LIT-THISTRANID", "COAC");
+        state.put("LIT-THISPGM", "COACTUPC");
+        state.put("LIT-THISMAP", "CACTUPA");
+        state.put("LIT-THISMAPSET", "CACTUP");
+        state.put("LIT-MENUPGM", "COMEN01C");
+        state.put("LIT-MENUTRANID", "COME");
+        state.put("CCDA-TITLE01", "Credit Card Demo Application");
+        state.put("CCDA-TITLE02", "COACTUPC - Account Update");
+        state.put("CCDA-MSG-THANK-YOU", "Thank you for using the application");
+        state.put("CCDA-MSG-INVALID-KEY", "Invalid key pressed");
         try {
             boolean running = true;
             while (running) {
@@ -45,6 +55,20 @@ public class TerminalMain {
                         // Preserve state across turns, update CICS fields
                         state.put("EIBAID", eibaid);
                         state.put("EIBCALEN", 1);
+                        // Reset AID flags (CSSTRPFY copybook)
+                        state.put("CCARD-AID-ENTER", false);
+                        state.put("CCARD-AID-PFK03", false);
+                        state.put("CCARD-AID-PFK05", false);
+                        state.put("CCARD-AID-PFK12", false);
+                        if ("DFHENTER".equals(eibaid)) {
+                            state.put("CCARD-AID-ENTER", true);
+                        } else if ("DFHPF3".equals(eibaid)) {
+                            state.put("CCARD-AID-PFK03", true);
+                        } else if ("DFHPF5".equals(eibaid)) {
+                            state.put("CCARD-AID-PFK05", true);
+                        } else if ("DFHPF12".equals(eibaid)) {
+                            state.put("CCARD-AID-PFK12", true);
+                        }
                         state.abended = false;
                         state.trace.clear();
                         state.execs.clear();

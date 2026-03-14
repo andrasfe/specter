@@ -73,8 +73,10 @@ public class BmsScreen implements AutoCloseable {
                 }
                 case DISPLAY -> {
                     if (field.label != null && !field.label.isEmpty()) {
-                        graphics.setForegroundColor(TextColor.ANSI.CYAN);
+                        graphics.setForegroundColor(TextColor.ANSI.WHITE);
+                        graphics.enableModifiers(SGR.BOLD);
                         graphics.putString(field.col, field.row, field.label + ":");
+                        graphics.disableModifiers(SGR.BOLD);
                         graphics.setForegroundColor(TextColor.ANSI.GREEN);
                         graphics.putString(
                                 field.col + field.label.length() + 2,
@@ -84,13 +86,15 @@ public class BmsScreen implements AutoCloseable {
                     }
                 }
                 case INPUT -> {
-                    graphics.setForegroundColor(TextColor.ANSI.CYAN);
+                    graphics.setForegroundColor(TextColor.ANSI.WHITE);
+                    graphics.enableModifiers(SGR.BOLD);
                     int labelCol = Math.max(0, field.col - (field.label != null
                             ? field.label.length() + 2 : 0));
                     if (field.label != null) {
                         graphics.putString(labelCol, field.row,
                                 field.label + ":");
                     }
+                    graphics.disableModifiers(SGR.BOLD);
                     graphics.setForegroundColor(TextColor.ANSI.GREEN);
                     String cur = inputValues.getOrDefault(field.name, "");
                     String display = field.masked

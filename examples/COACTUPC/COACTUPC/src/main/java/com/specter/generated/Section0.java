@@ -68,7 +68,11 @@ public class Section0 extends SectionBase {
         }
         else if (CobolRuntime.isTruthy(state.get("ACUP-DETAILS-NOT-FETCHED"))) {
             state.addBranch(7);
-            // empty WHEN
+            // First entry: show the account lookup screen
+            performThru(state, "3000-SEND-MAP", "3000-SEND-MAP-EXIT");
+            state.put("CDEMO-PGM-REENTER", true);
+            registry.get("COMMON-RETURN").execute(state);
+            return;
         }
         else if (java.util.Objects.equals(state.get("CDEMO-FROM-PROGRAM"), state.get("LIT-MENUPGM"))) {
             state.addBranch(8);

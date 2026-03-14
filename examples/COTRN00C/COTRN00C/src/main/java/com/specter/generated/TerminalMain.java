@@ -28,6 +28,16 @@ public class TerminalMain {
         state.put("EIBCALEN", 0);
         state.put("WS-TRANID", "COTR");
         state.put("WS-PGMNAME", "COTRN00C");
+        state.put("LIT-THISTRANID", "COTR");
+        state.put("LIT-THISPGM", "COTRN00C");
+        state.put("LIT-THISMAP", "COTRN0A");
+        state.put("LIT-THISMAPSET", "COTRN0");
+        state.put("LIT-MENUPGM", "COMEN01C");
+        state.put("LIT-MENUTRANID", "COME");
+        state.put("CCDA-TITLE01", "Credit Card Demo Application");
+        state.put("CCDA-TITLE02", "COTRN00C - Account Update");
+        state.put("CCDA-MSG-THANK-YOU", "Thank you for using the application");
+        state.put("CCDA-MSG-INVALID-KEY", "Invalid key pressed");
         try {
             boolean running = true;
             while (running) {

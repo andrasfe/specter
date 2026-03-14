@@ -11,31 +11,35 @@ import java.util.List;
 public class ScreenLayout {
 
     public static final List<BmsScreen.Field> FIELDS = List.of(
+        // Row 0-1: Titles
         new BmsScreen.Field("TITLE01O", 0, 0, 80, BmsScreen.FieldType.CENTER, null, false),
         new BmsScreen.Field("TITLE02O", 1, 0, 80, BmsScreen.FieldType.CENTER, null, false),
-        new BmsScreen.Field("PGMNAMEO", 2, 2, 12, BmsScreen.FieldType.DISPLAY, "Pgmname", false),
-        new BmsScreen.Field("TRNNAMEO", 2, 24, 12, BmsScreen.FieldType.DISPLAY, "Trnname", false),
-        new BmsScreen.Field("CURDATEO", 2, 50, 10, BmsScreen.FieldType.DISPLAY, "Curdate", false),
-        new BmsScreen.Field("CURTIMEO", 2, 68, 10, BmsScreen.FieldType.DISPLAY, "Curtime", false),
-        new BmsScreen.Field("AADDGRPO", 4, 2, 35, BmsScreen.FieldType.DISPLAY, "Aaddgrp", false),
-        new BmsScreen.Field("ACCTSIDC", 4, 42, 35, BmsScreen.FieldType.DISPLAY, "Acctsidc", false),
-        new BmsScreen.Field("ACCTSIDO", 5, 2, 35, BmsScreen.FieldType.DISPLAY, "Acctsid", false),
-        new BmsScreen.Field("ACRCYCRO", 5, 42, 35, BmsScreen.FieldType.DISPLAY, "Acrcycr", false),
-        new BmsScreen.Field("AADDGRPI", 6, 30, 20, BmsScreen.FieldType.INPUT, "Aaddgrp", false),
-        new BmsScreen.Field("ACCTSIDI", 7, 30, 20, BmsScreen.FieldType.INPUT, "Acctsid", false),
-        new BmsScreen.Field("ACRCYCRI", 8, 30, 20, BmsScreen.FieldType.INPUT, "Acrcycr", false),
-        new BmsScreen.Field("ACRCYDBI", 9, 30, 20, BmsScreen.FieldType.INPUT, "Acrcydb", false),
-        new BmsScreen.Field("ACRDLIMI", 10, 30, 20, BmsScreen.FieldType.INPUT, "Acrdlim", false),
-        new BmsScreen.Field("ACSADL1I", 11, 30, 20, BmsScreen.FieldType.INPUT, "Acsadl1", false),
-        new BmsScreen.Field("ACSADL2I", 12, 30, 20, BmsScreen.FieldType.INPUT, "Acsadl2", false),
-        new BmsScreen.Field("ACSCITYI", 13, 30, 20, BmsScreen.FieldType.INPUT, "Acscity", false),
-        new BmsScreen.Field("ACSCTRYI", 14, 30, 20, BmsScreen.FieldType.INPUT, "Acsctry", false),
-        new BmsScreen.Field("ACSEFTCI", 15, 30, 20, BmsScreen.FieldType.INPUT, "Acseftc", false),
-        new BmsScreen.Field("ACSFNAMI", 16, 30, 20, BmsScreen.FieldType.INPUT, "Acsfnam", false),
-        new BmsScreen.Field("ACSGOVTI", 17, 30, 20, BmsScreen.FieldType.INPUT, "Acsgovt", false),
-        new BmsScreen.Field("ACSHLIMI", 18, 30, 20, BmsScreen.FieldType.INPUT, "Acshlim", false),
-        new BmsScreen.Field("ACSLNAMI", 19, 30, 20, BmsScreen.FieldType.INPUT, "Acslnam", false),
-        new BmsScreen.Field("ACSMNAMI", 20, 30, 20, BmsScreen.FieldType.INPUT, "Acsmnam", false),
+        // Row 2: Program info
+        new BmsScreen.Field("PGMNAMEO", 2, 2, 12, BmsScreen.FieldType.DISPLAY, "Program", false),
+        new BmsScreen.Field("TRNNAMEO", 2, 24, 12, BmsScreen.FieldType.DISPLAY, "Trans", false),
+        new BmsScreen.Field("CURDATEO", 2, 50, 10, BmsScreen.FieldType.DISPLAY, "Date", false),
+        new BmsScreen.Field("CURTIMEO", 2, 68, 10, BmsScreen.FieldType.DISPLAY, "Time", false),
+        // Row 4: Account search
+        new BmsScreen.Field("ACCTSIDI", 4, 18, 20, BmsScreen.FieldType.INPUT, "Account ID", false),
+        new BmsScreen.Field("AADDGRPI", 4, 55, 20, BmsScreen.FieldType.INPUT, "Group", false),
+        // Row 6-7: Customer name
+        new BmsScreen.Field("ACSFNAMI", 6, 18, 20, BmsScreen.FieldType.INPUT, "First Name", false),
+        new BmsScreen.Field("ACSLNAMI", 6, 55, 20, BmsScreen.FieldType.INPUT, "Last Name", false),
+        new BmsScreen.Field("ACSMNAMI", 7, 18, 20, BmsScreen.FieldType.INPUT, "Middle Name", false),
+        // Row 9-11: Address
+        new BmsScreen.Field("ACSADL1I", 9, 18, 40, BmsScreen.FieldType.INPUT, "Address Line 1", false),
+        new BmsScreen.Field("ACSADL2I", 10, 18, 40, BmsScreen.FieldType.INPUT, "Address Line 2", false),
+        new BmsScreen.Field("ACSCITYI", 11, 18, 20, BmsScreen.FieldType.INPUT, "City", false),
+        new BmsScreen.Field("ACSCTRYI", 11, 55, 20, BmsScreen.FieldType.INPUT, "Country", false),
+        // Row 13-14: Financial
+        new BmsScreen.Field("ACRDLIMI", 13, 18, 18, BmsScreen.FieldType.INPUT, "Credit Limit", false),
+        new BmsScreen.Field("ACSHLIMI", 13, 55, 18, BmsScreen.FieldType.INPUT, "Cash Limit", false),
+        new BmsScreen.Field("ACRCYCRI", 14, 18, 18, BmsScreen.FieldType.INPUT, "Cycle Credit", false),
+        new BmsScreen.Field("ACRCYDBI", 14, 55, 18, BmsScreen.FieldType.INPUT, "Cycle Debit", false),
+        // Row 16: Other
+        new BmsScreen.Field("ACSEFTCI", 16, 18, 20, BmsScreen.FieldType.INPUT, "EFT Account", false),
+        new BmsScreen.Field("ACSGOVTI", 16, 55, 20, BmsScreen.FieldType.INPUT, "Govt ID", false),
+        // Row 21-22: Messages
         new BmsScreen.Field("ERRMSGO", 21, 2, 76, BmsScreen.FieldType.MESSAGE, null, false),
         new BmsScreen.Field("INFOMSGO", 22, 2, 76, BmsScreen.FieldType.MESSAGE, null, false)
     );

@@ -25,12 +25,12 @@ public class SectionMain extends SectionBase {
             perform(state, "SEND-SIGNON-SCREEN");
         } else {
             state.addBranch(-1);
-            Object _evalSubject = state.get("EIBAID");
-            if (java.util.Objects.equals(_evalSubject, "DFHENTER")) {
+            Object _evalSubject1 = state.get("EIBAID");
+            if (java.util.Objects.equals(_evalSubject1, "DFHENTER")) {
                 state.addBranch(2);
                 perform(state, "PROCESS-ENTER-KEY");
             }
-            else if (java.util.Objects.equals(_evalSubject, "DFHPF3")) {
+            else if (java.util.Objects.equals(_evalSubject1, "DFHPF3")) {
                 state.addBranch(3);
                 state.put("WS-MESSAGE", state.get("CCDA-MSG-THANK-YOU"));
                 perform(state, "SEND-PLAIN-TEXT");
@@ -106,9 +106,9 @@ public class SectionMain extends SectionBase {
 
     void do_READ_USER_SEC_FILE(ProgramState state) {
         stubs.cicsRead(state, "WS-USRSEC-FILE", "WS-USER-ID", "SEC-USER-DATA", "WS-RESP-CD", "WS-REAS-CD");
-        Object _evalSubject = state.get("WS-RESP-CD");
-        _evalSubject = CobolRuntime.toNum(_evalSubject);
-        if (java.util.Objects.equals(_evalSubject, CobolRuntime.toNum(0))) {
+        Object _evalSubject3 = state.get("WS-RESP-CD");
+        _evalSubject3 = CobolRuntime.toNum(_evalSubject3);
+        if (java.util.Objects.equals(_evalSubject3, CobolRuntime.toNum(0))) {
             state.addBranch(9);
             if (java.util.Objects.equals(state.get("SEC-USR-PWD"), state.get("WS-USER-PWD"))) {
                 state.addBranch(10);
@@ -131,7 +131,7 @@ public class SectionMain extends SectionBase {
                 perform(state, "SEND-SIGNON-SCREEN");
             }
         }
-        else if (java.util.Objects.equals(_evalSubject, CobolRuntime.toNum(13))) {
+        else if (java.util.Objects.equals(_evalSubject3, CobolRuntime.toNum(13))) {
             state.addBranch(12);
             state.put("WS-ERR-FLG", "Y");
             state.put("WS-MESSAGE", "User not found. Try again ...");

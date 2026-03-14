@@ -19,8 +19,8 @@ public class ScreenLayout {
         new BmsScreen.Field("CURTIMEO", 2, 68, 10, BmsScreen.FieldType.DISPLAY, "Curtime", false),
         new BmsScreen.Field("APPLIDO", 3, 2, 10, BmsScreen.FieldType.DISPLAY, "Applid", false),
         new BmsScreen.Field("SYSIDO", 3, 24, 10, BmsScreen.FieldType.DISPLAY, "Sysid", false),
-        new BmsScreen.Field("USERIDI", 10, 30, 20, BmsScreen.FieldType.INPUT, "Userid", false),
-        new BmsScreen.Field("PASSWDI", 12, 30, 20, BmsScreen.FieldType.INPUT, "Passwd", true),
-        new BmsScreen.Field("ERRMSGO", 20, 2, 76, BmsScreen.FieldType.MESSAGE, null, false)
+        new BmsScreen.Field("USERIDI", 5, 30, 20, BmsScreen.FieldType.INPUT, "Userid", false),
+        new BmsScreen.Field("PASSWDI", 6, 30, 20, BmsScreen.FieldType.INPUT, "Passwd", true),
+        new BmsScreen.Field("ERRMSGO", 21, 2, 76, BmsScreen.FieldType.MESSAGE, null, false)
     );
 }
