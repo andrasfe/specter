@@ -47,19 +47,6 @@ public class BmsScreen implements AutoCloseable {
 
     /** Render output fields from program state onto the screen. */
     public void sendMap(ProgramState state) throws IOException {
-        // Pre-populate input fields from corresponding output values (I→O)
-        for (Field field : fields) {
-            if (field.type == FieldType.INPUT && field.name.endsWith("I")) {
-                String outputName = field.name.substring(0, field.name.length() - 1) + "O";
-                if (state.containsKey(outputName)) {
-                    String val = String.valueOf(state.get(outputName));
-                    if (!"null".equals(val) && !val.isBlank()) {
-                        inputValues.put(field.name, val);
-                    }
-                }
-            }
-        }
-
         screen.clear();
         graphics.setForegroundColor(TextColor.ANSI.GREEN);
         graphics.setBackgroundColor(TextColor.ANSI.BLACK);
