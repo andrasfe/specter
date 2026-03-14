@@ -1,0 +1,61 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: specter
+      POSTGRES_USER: specter
+      POSTGRES_PASSWORD: specter
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U specter"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  activemq:
+    image: apache/activemq-artemis:2.31.2
+    environment:
+      ARTEMIS_USER: admin
+      ARTEMIS_PASSWORD: admin
+    ports:
+      - "61616:61616"
+      - "8161:8161"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8161 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+      activemq:
+        condition: service_healthy
+    environment:
+      SPECTER_DB_URL: jdbc:postgresql://db:5432/specter
+      SPECTER_DB_USER: specter
+      SPECTER_DB_PASSWORD: specter
+      SPECTER_JMS_URL: tcp://activemq:61616
+
+  terminal:
+    build: .
+    stdin_open: true
+    tty: true
+    entrypoint: ["java", "-cp", "app.jar", "com.specter.generated.TerminalMain"]
+    depends_on:
+      db:
+        condition: service_healthy
+      activemq:
+        condition: service_healthy
+    environment:
+      SPECTER_DB_URL: jdbc:postgresql://db:5432/specter
+      SPECTER_DB_USER: specter
+      SPECTER_DB_PASSWORD: specter
+      SPECTER_JMS_URL: tcp://activemq:61616
