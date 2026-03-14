@@ -2646,25 +2646,48 @@ def _extract_bms_info(program: Program) -> dict | None:
     maps: dict[str, dict[str, set[str]]] = {}
 
     # Pass 1: find map names from SEND MAP / RECEIVE MAP
+    # Also discover record names from FROM(...) / INTO(...) clauses
+    records: dict[str, dict[str, str | None]] = {}  # map_name -> {out_record, in_record}
     for para in program.paragraphs:
         for stmt in _walk_all_statements(para.statements):
             if stmt.type != "EXEC_CICS":
                 continue
             raw = stmt.attributes.get("raw_text", "") + " " + stmt.text
+            # Literal map name: MAP('NAME')
             for pat in [r"SEND\s+MAP\s*\('([^']+)'\)",
                         r"RECEIVE\s+MAP\s*\('([^']+)'\)"]:
                 m = re.search(pat, raw, re.IGNORECASE)
                 if m:
                     maps.setdefault(m.group(1).upper(),
                                     {"output": set(), "input": set()})
+            # Variable map name: MAP(VAR) with FROM/INTO record
+            if re.search(r"(?:SEND|RECEIVE)\s+MAP", raw, re.IGNORECASE):
+                from_m = re.search(r"FROM\((\w+)\)", raw, re.IGNORECASE)
+                into_m = re.search(r"INTO\((\w+)\)", raw, re.IGNORECASE)
+                if from_m:
+                    rec = from_m.group(1).upper()
+                    # Derive map name from record: CACTUPAO -> CACTUPA
+                    if rec.endswith("O"):
+                        derived = rec[:-1]
+                        entry = maps.setdefault(derived, {"output": set(), "input": set()})
+                        records.setdefault(derived, {"out_record": None, "in_record": None})
+                        records[derived]["out_record"] = rec
+                if into_m:
+                    rec = into_m.group(1).upper()
+                    if rec.endswith("I"):
+                        derived = rec[:-1]
+                        entry = maps.setdefault(derived, {"output": set(), "input": set()})
+                        records.setdefault(derived, {"out_record": None, "in_record": None})
+                        records[derived]["in_record"] = rec
 
     if not maps:
         return None
 
     # Pass 2: collect field references from OF <RECORD> patterns
     for map_name, info in maps.items():
-        out_record = map_name + "O"
-        in_record = map_name + "I"
+        rec_info = records.get(map_name, {})
+        out_record = rec_info.get("out_record") or (map_name + "O")
+        in_record = rec_info.get("in_record") or (map_name + "I")
         for para in program.paragraphs:
             for stmt in _walk_all_statements(para.statements):
                 text = stmt.text + " " + stmt.attributes.get("source", "")
@@ -2680,18 +2703,26 @@ def _extract_bms_info(program: Program) -> dict | None:
                 ):
                     info["input"].add(m.group(1).upper())
 
-    # Separate length fields from value fields in input
+    # Separate length/attribute fields from value fields in input
     result = {}
     for map_name, info in maps.items():
-        value_inputs = sorted(
-            f for f in info["input"] if not f.endswith("L")
+        # Only keep "I" suffixed fields (data), skip "A" (attribute) and "L" (length)
+        data_inputs = sorted(
+            f for f in info["input"]
+            if f.endswith("I") and not f.endswith("LI")
         )
+        # If no "I"-suffixed fields, fall back to all non-L/non-A fields
+        if not data_inputs:
+            data_inputs = sorted(
+                f for f in info["input"]
+                if not f.endswith("L") and not f.endswith("A")
+            )
         length_fields = sorted(
             f for f in info["input"] if f.endswith("L")
         )
         result[map_name] = {
             "output": sorted(info["output"]),
-            "input": value_inputs,
+            "input": data_inputs,
             "length_fields": length_fields,
         }
     return result
@@ -2769,33 +2800,74 @@ def _compute_screen_layout(
     covered = {d["name"] for d in layout}
     msg_fields = [f for f in output if any(x in f for x in ("ERRMSG", "MSG"))]
     remaining = [f for f in output if f not in covered and f not in msg_fields]
-    for f in sorted(remaining):
+
+    # Reserve rows: 22 for messages, 23 for status bar
+    max_data_row = 21
+    avail_rows = max_data_row - row
+
+    # Budget: split available rows between output (display) and input
+    n_out = len(remaining)
+    n_in = len(input_fields)
+    total = n_out + n_in
+
+    if total <= avail_rows:
+        # Everything fits in single column
+        out_budget = n_out
+        in_budget = n_in
+    else:
+        # Prioritise input fields; output fields get 2-column layout
+        in_budget = min(n_in, avail_rows - 2)  # at least 2 rows for output
+        out_budget_rows = avail_rows - in_budget
+        out_budget = out_budget_rows * 2  # 2-column
+
+    # Output fields
+    placed_out = 0
+    for i, f in enumerate(sorted(remaining)):
+        if placed_out >= out_budget:
+            break
         label = f.rstrip("O").replace("-", " ").title()
+        if total > avail_rows:
+            # 2-column layout
+            c = 2 if i % 2 == 0 else 42
+            r = row + i // 2
+        else:
+            c = 2
+            r = row + i
+        if r >= max_data_row:
+            break
         layout.append({
-            "name": f, "row": row, "col": 2, "width": 40,
+            "name": f, "row": r, "col": c, "width": 35,
             "type": "DISPLAY", "label": label, "masked": False,
         })
-        row += 1
+        placed_out += 1
+    if placed_out > 0:
+        if total > avail_rows:
+            row += (placed_out + 1) // 2
+        else:
+            row += placed_out
 
-    # Input fields (centered vertically)
-    # Sort: non-password fields first (User ID before Password)
+    # Input fields
     def _input_sort_key(f: str) -> tuple:
         is_pw = any(x in f.upper() for x in ("PASSW", "PWD", "PIN"))
         return (1 if is_pw else 0, f)
 
-    input_start = max(row + 1, 10)
-    for i, f in enumerate(sorted(input_fields, key=_input_sort_key)):
+    sorted_inputs = sorted(input_fields, key=_input_sort_key)
+    for i, f in enumerate(sorted_inputs):
+        if i >= in_budget:
+            break
+        r = row + i
+        if r >= max_data_row:
+            break
         base = f[:-1] if f.endswith("I") else f
         label = base.replace("-", " ").replace("_", " ").title()
         is_password = any(x in f.upper() for x in ("PASSW", "PWD", "PIN"))
-        r = input_start + i * 2
         layout.append({
             "name": f, "row": r, "col": 30, "width": 20,
             "type": "INPUT", "label": label, "masked": is_password,
         })
 
     # Message/error fields near bottom
-    msg_row = 20
+    msg_row = max_data_row
     for f in sorted(msg_fields):
         layout.append({
             "name": f, "row": msg_row, "col": 2, "width": 76,
