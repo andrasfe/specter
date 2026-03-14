@@ -21,7 +21,7 @@ public class TerminalStubExecutor extends DefaultStubExecutor {
     private static final Pattern SEND_TEXT_PAT =
             Pattern.compile("SEND\\s+TEXT", Pattern.CASE_INSENSITIVE);
     private static final Pattern XCTL_PAT =
-            Pattern.compile("XCTL\\s+PROGRAM\\s*\\('([^']+)'\\)",
+            Pattern.compile("XCTL\\s+PROGRAM\\s*\\(?'?([^)']+)'?\\)?",
                     Pattern.CASE_INSENSITIVE);
     private static final Pattern RETURN_TRANSID_PAT =
             Pattern.compile("RETURN\\s+TRANSID", Pattern.CASE_INSENSITIVE);
@@ -58,7 +58,14 @@ public class TerminalStubExecutor extends DefaultStubExecutor {
             } else if (XCTL_PAT.matcher(rawText).find()) {
                 Matcher m = XCTL_PAT.matcher(rawText);
                 m.find();
-                String program = m.group(1);
+                String program = m.group(1).trim();
+                // Resolve variable reference: if it's not a literal, look up in state
+                if (program.contains("-") || program.equals(program.toUpperCase())) {
+                    Object resolved = state.get(program);
+                    if (resolved != null && !String.valueOf(resolved).isBlank()) {
+                        program = String.valueOf(resolved).trim();
+                    }
+                }
                 bmsScreen.showXctl(program);
                 state.execs.add(java.util.Map.of("op", "XCTL:" + program));
                 throw new GobackSignal();

@@ -31,6 +31,7 @@ public class Section0 extends SectionBase {
         if ((((CobolRuntime.isTruthy(state.get("CCARD-AID-ENTER"))) || (CobolRuntime.isTruthy(state.get("CCARD-AID-PFK03")))) || ((CobolRuntime.isTruthy(state.get("CCARD-AID-PFK05"))) && (CobolRuntime.isTruthy(state.get("ACUP-CHANGES-OK-NOT-CONFIRMED"))))) || ((CobolRuntime.isTruthy(state.get("CCARD-AID-PFK12"))) && (!(CobolRuntime.isTruthy(state.get("ACUP-DETAILS-NOT-FETCHED")))))) {
             state.addBranch(2);
             state.put("PFK-VALID", true);
+            state.put("PFK-INVALID", false);
         } else {
             state.addBranch(-2);
         }
