@@ -20,9 +20,12 @@ import java.util.List;
 public class TerminalMain {
 
     public static void main(String[] args) throws IOException {
-        List<BmsScreen.Field> layout = ScreenLayout.FIELDS;
-        BmsScreen bmsScreen = new BmsScreen(layout);
-        TerminalStubExecutor stubs = new TerminalStubExecutor(bmsScreen);
+        List<CicsScreen.Field> layout = ScreenLayout.FIELDS;
+        boolean headless = args.length > 0 && "--headless".equals(args[0]);
+        CicsScreen screen = headless
+                ? new HeadlessScreen(layout)
+                : new BmsScreen(layout);
+        TerminalStubExecutor stubs = new TerminalStubExecutor(screen);
 
         ProgramState state = new ProgramState();
         state.put("EIBCALEN", 0);
@@ -51,24 +54,15 @@ public class TerminalMain {
                         running = false;
                     } else {
                         // Pseudo-conversational: wait for user action
-                        String eibaid = bmsScreen.waitForAction();
+                        String eibaid = screen.waitForAction();
                         // Preserve state across turns, update CICS fields
                         state.put("EIBAID", eibaid);
                         state.put("EIBCALEN", 1);
-                        // Reset AID flags (CSSTRPFY copybook)
-                        state.put("CCARD-AID-ENTER", false);
-                        state.put("CCARD-AID-PFK03", false);
-                        state.put("CCARD-AID-PFK05", false);
-                        state.put("CCARD-AID-PFK12", false);
-                        if ("DFHENTER".equals(eibaid)) {
-                            state.put("CCARD-AID-ENTER", true);
-                        } else if ("DFHPF3".equals(eibaid)) {
-                            state.put("CCARD-AID-PFK03", true);
-                        } else if ("DFHPF5".equals(eibaid)) {
-                            state.put("CCARD-AID-PFK05", true);
-                        } else if ("DFHPF12".equals(eibaid)) {
-                            state.put("CCARD-AID-PFK12", true);
-                        }
+                        // Map EIBAID to CCARD-AID flags (CSSTRPFY copybook)
+                        state.put("CCARD-AID-ENTER", "DFHENTER".equals(eibaid));
+                        state.put("CCARD-AID-PFK03", "DFHPF3".equals(eibaid));
+                        state.put("CCARD-AID-PFK05", "DFHPF5".equals(eibaid));
+                        state.put("CCARD-AID-PFK12", "DFHPF12".equals(eibaid));
                         state.abended = false;
                         state.trace.clear();
                         state.execs.clear();
@@ -78,7 +72,7 @@ public class TerminalMain {
                 }
             }
         } finally {
-            bmsScreen.close();
+            screen.close();
         }
     }
 }

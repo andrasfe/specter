@@ -6,7 +6,7 @@ import java.util.regex.Pattern;
 
 /**
  * Stub executor that intercepts CICS screen operations and delegates
- * them to a {@link BmsScreen} for Lanterna terminal rendering.
+ * them to a {@link CicsScreen} for rendering (Lanterna or headless).
  *
  * <p>Non-screen operations (READ, WRITE, etc.) are forwarded to the
  * wrapped {@link DefaultStubExecutor} so that FIFO stub queues still
@@ -32,9 +32,9 @@ public class TerminalStubExecutor extends DefaultStubExecutor {
                     "ASSIGN\\s+(\\w+)\\s*\\(([^)]+)\\)",
                     Pattern.CASE_INSENSITIVE);
 
-    private final BmsScreen bmsScreen;
+    private final CicsScreen bmsScreen;
 
-    public TerminalStubExecutor(BmsScreen bmsScreen) {
+    public TerminalStubExecutor(CicsScreen bmsScreen) {
         this.bmsScreen = bmsScreen;
     }
 
@@ -59,7 +59,7 @@ public class TerminalStubExecutor extends DefaultStubExecutor {
                 Matcher m = XCTL_PAT.matcher(rawText);
                 m.find();
                 String program = m.group(1).trim();
-                // Resolve variable reference: if it's not a literal, look up in state
+                // Resolve variable reference
                 if (program.contains("-") || program.equals(program.toUpperCase())) {
                     Object resolved = state.get(program);
                     if (resolved != null && !String.valueOf(resolved).isBlank()) {
@@ -95,19 +95,56 @@ public class TerminalStubExecutor extends DefaultStubExecutor {
     @Override
     public void cicsRead(ProgramState state, String dataset, String ridfld,
                          String intoRecord, String respVar, String resp2Var) {
-        // In interactive terminal mode there is no real file.
-        // Simulate a successful read: echo the entered password back so
-        // credential checks pass, and set RESP=0.
         state.put(respVar, 0);
         state.put(resp2Var, 0);
-        // Mirror user-entered password into the security record field
-        // so the password comparison succeeds.
-        Object pwd = state.get("WS-USER-PWD");
-        if (pwd != null) {
-            state.put("SEC-USR-PWD", pwd);
+
+        // Populate mock record data based on the target record type.
+        if ("CARD-XREF-RECORD".equals(intoRecord)) {
+            String acctId = String.valueOf(state.get(ridfld)).trim();
+            state.put("XREF-CUST-ID", acctId);
+            state.put("XREF-CARD-NUM", "4111111111111111");
+        } else if ("ACCOUNT-RECORD".equals(intoRecord)) {
+            String acctId = String.valueOf(state.get(ridfld)).trim();
+            state.put("ACCT-ID", acctId);
+            state.put("ACCT-ACTIVE-STATUS", "Y");
+            state.put("ACCT-CURR-BAL", 1500.00);
+            state.put("ACCT-CREDIT-LIMIT", 5000.00);
+            state.put("ACCT-CASH-CREDIT-LIMIT", 1000.00);
+            state.put("ACCT-CURR-CYC-CREDIT", 200.00);
+            state.put("ACCT-CURR-CYC-DEBIT", 100.00);
+            state.put("ACCT-OPEN-DATE", "2020-01-15");
+            state.put("ACCT-EXPIRAION-DATE", "2027-12-31");
+            state.put("ACCT-REISSUE-DATE", "2024-01-15");
+            state.put("ACCT-GROUP-ID", "RETAIL");
+        } else if ("CUSTOMER-RECORD".equals(intoRecord)) {
+            Object custId = state.get("WS-CARD-RID-CUST-ID");
+            state.put("CUST-ID", custId != null ? custId : "00001");
+            state.put("CUST-FIRST-NAME", "John");
+            state.put("CUST-MIDDLE-NAME", "M");
+            state.put("CUST-LAST-NAME", "Smith");
+            state.put("CUST-SSN", "123456789");
+            state.put("CUST-DOB-YYYY-MM-DD", "1985-06-15");
+            state.put("CUST-FICO-CREDIT-SCORE", 750);
+            state.put("CUST-ADDR-LINE-1", "123 Main Street");
+            state.put("CUST-ADDR-LINE-2", "Apt 4B");
+            state.put("CUST-ADDR-LINE-3", "Springfield");
+            state.put("CUST-ADDR-STATE-CD", "IL");
+            state.put("CUST-ADDR-COUNTRY-CD", "US");
+            state.put("CUST-ADDR-ZIP", "62701");
+            state.put("CUST-PHONE-NUM-1", "(217)555-1234");
+            state.put("CUST-PHONE-NUM-2", "(217)555-5678");
+            state.put("CUST-GOVT-ISSUED-ID", "IL-DL-12345");
+            state.put("CUST-EFT-ACCOUNT-ID", "9876543210");
+            state.put("CUST-PRI-CARD-HOLDER-IND", "Y");
+        } else {
+            // Security or other file — mirror password for auth checks
+            Object pwd = state.get("WS-USER-PWD");
+            if (pwd != null) {
+                state.put("SEC-USR-PWD", pwd);
+            }
+            state.putIfAbsent("SEC-USR-TYPE", "U");
         }
-        // Default user type to regular (not admin)
-        state.putIfAbsent("SEC-USR-TYPE", "U");
+
         state.execs.add(java.util.Map.of("op",
                 "READ DATASET(" + dataset + ") [simulated]"));
     }

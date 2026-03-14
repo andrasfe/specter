@@ -26,7 +26,7 @@ public class Section7 extends SectionBase {
         state.put("W02-BUFFLEN", state.get("WS-RESP-LENGTH"));
         stubs.mqPut1(state, "WS-REPLY-QNAME", "W02-PUT-BUFFER", "W02-BUFLEN");
         if (!java.util.Objects.equals(state.get("WS-COMPCODE"), state.get("MQCC-OK"))) {
-            state.addBranch(38);
+            state.addBranch(36);
             state.put("ERR-LOCATION", "M004");
             state.put("ERR-CRITICAL", true);
             state.put("ERR-MQ", true);
@@ -41,7 +41,7 @@ public class Section7 extends SectionBase {
             state.put("ERR-EVENT-KEY", state.get("PA-CARD-NUM"));
             perform(state, "9500-LOG-ERROR");
         } else {
-            state.addBranch(-38);
+            state.addBranch(-36);
         }
     }
 

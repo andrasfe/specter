@@ -40,6 +40,7 @@ public class Section1 extends SectionBase {
         stubs.mqOpen(state, "WS-REQUEST-QNAME");
         if (java.util.Objects.equals(state.get("WS-COMPCODE"), state.get("MQCC-OK"))) {
             state.addBranch(2);
+            state.put("WS-REQUEST-MQ-CLSE", false);
             state.put("WS-REQUEST-MQ-OPEN", true);
         } else {
             state.addBranch(-2);
@@ -72,6 +73,7 @@ public class Section1 extends SectionBase {
         }
         if (CobolRuntime.isTruthy(state.get("STATUS-OK"))) {
             state.addBranch(4);
+            state.put("IMS-PSB-NOT-SCHD", false);
             state.put("IMS-PSB-SCHD", true);
         } else {
             state.addBranch(-4);

@@ -26,11 +26,11 @@ public class SectionMain extends SectionBase {
         } else {
             state.addBranch(-1);
             Object _evalSubject1 = state.get("EIBAID");
-            if (java.util.Objects.equals(_evalSubject1, "DFHENTER")) {
+            if ((java.util.Objects.equals(_evalSubject1, "DFHENTER"))) {
                 state.addBranch(2);
                 perform(state, "PROCESS-ENTER-KEY");
             }
-            else if (java.util.Objects.equals(_evalSubject1, "DFHPF3")) {
+            else if ((java.util.Objects.equals(_evalSubject1, "DFHPF3"))) {
                 state.addBranch(3);
                 state.put("WS-MESSAGE", state.get("CCDA-MSG-THANK-YOU"));
                 perform(state, "SEND-PLAIN-TEXT");
@@ -47,14 +47,14 @@ public class SectionMain extends SectionBase {
 
     void do_PROCESS_ENTER_KEY(ProgramState state) {
         stubs.dummyExec(state, "CICS", "EXEC CICS RECEIVE MAP('COSGN0A') MAPSET('COSGN00') RESP(WS-RESP-CD) RESP2(WS-REAS-CD) END-EXEC.");
-        if (java.util.List.of(" ", "\u0000").contains(state.get("USERIDI"))) {
+        if ((java.util.List.of(" ", "\u0000").contains(state.get("USERIDI")))) {
             state.addBranch(5);
             state.put("WS-ERR-FLG", "Y");
             state.put("WS-MESSAGE", "Please enter User ID ...");
             state.put("USERIDL", -1);
             perform(state, "SEND-SIGNON-SCREEN");
         }
-        else if (java.util.List.of(" ", "\u0000").contains(state.get("PASSWDI"))) {
+        else if ((java.util.List.of(" ", "\u0000").contains(state.get("PASSWDI")))) {
             state.addBranch(6);
             state.put("WS-ERR-FLG", "Y");
             state.put("WS-MESSAGE", "Please enter Password ...");
@@ -108,7 +108,7 @@ public class SectionMain extends SectionBase {
         stubs.cicsRead(state, "WS-USRSEC-FILE", "WS-USER-ID", "SEC-USER-DATA", "WS-RESP-CD", "WS-REAS-CD");
         Object _evalSubject3 = state.get("WS-RESP-CD");
         _evalSubject3 = CobolRuntime.toNum(_evalSubject3);
-        if (java.util.Objects.equals(_evalSubject3, CobolRuntime.toNum(0))) {
+        if ((java.util.Objects.equals(_evalSubject3, CobolRuntime.toNum(0)))) {
             state.addBranch(9);
             if (java.util.Objects.equals(state.get("SEC-USR-PWD"), state.get("WS-USER-PWD"))) {
                 state.addBranch(10);
@@ -131,7 +131,7 @@ public class SectionMain extends SectionBase {
                 perform(state, "SEND-SIGNON-SCREEN");
             }
         }
-        else if (java.util.Objects.equals(_evalSubject3, CobolRuntime.toNum(13))) {
+        else if ((java.util.Objects.equals(_evalSubject3, CobolRuntime.toNum(13)))) {
             state.addBranch(12);
             state.put("WS-ERR-FLG", "Y");
             state.put("WS-MESSAGE", "User not found. Try again ...");

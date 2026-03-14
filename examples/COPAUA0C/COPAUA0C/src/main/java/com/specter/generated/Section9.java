@@ -19,10 +19,10 @@ public class Section9 extends SectionBase {
 
     void do_9000_TERMINATE(ProgramState state) {
         if (CobolRuntime.isTruthy(state.get("IMS-PSB-SCHD"))) {
-            state.addBranch(45);
+            state.addBranch(43);
             stubs.dliTerminate(state);
         } else {
-            state.addBranch(-45);
+            state.addBranch(-43);
         }
         performThru(state, "9100-CLOSE-REQUEST-QUEUE", "9100-EXIT");
     }
@@ -33,13 +33,14 @@ public class Section9 extends SectionBase {
 
     void do_9100_CLOSE_REQUEST_QUEUE(ProgramState state) {
         if (CobolRuntime.isTruthy(state.get("WS-REQUEST-MQ-OPEN"))) {
-            state.addBranch(46);
+            state.addBranch(44);
             stubs.mqClose(state);
             if (java.util.Objects.equals(state.get("WS-COMPCODE"), state.get("MQCC-OK"))) {
-                state.addBranch(47);
+                state.addBranch(45);
+                state.put("WS-REQUEST-MQ-OPEN", false);
                 state.put("WS-REQUEST-MQ-CLSE", true);
             } else {
-                state.addBranch(-47);
+                state.addBranch(-45);
                 state.put("ERR-LOCATION", "M005");
                 state.put("ERR-WARNING", true);
                 state.put("ERR-MQ", true);
@@ -53,7 +54,7 @@ public class Section9 extends SectionBase {
                 perform(state, "9500-LOG-ERROR");
             }
         } else {
-            state.addBranch(-46);
+            state.addBranch(-44);
         }
     }
 
@@ -70,10 +71,10 @@ public class Section9 extends SectionBase {
         state.put("ERR-TIME", state.get("WS-CUR-TIME-X6"));
         stubs.cicsWriteqTd(state, "CSSL", "ERROR-LOG-RECORD");
         if (CobolRuntime.isTruthy(state.get("ERR-CRITICAL"))) {
-            state.addBranch(48);
+            state.addBranch(46);
             perform(state, "9990-END-ROUTINE");
         } else {
-            state.addBranch(-48);
+            state.addBranch(-46);
         }
     }
 

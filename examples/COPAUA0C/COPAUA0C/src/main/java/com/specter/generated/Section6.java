@@ -44,11 +44,13 @@ public class Section6 extends SectionBase {
         }
         if (CobolRuntime.isTruthy(state.get("DECLINE-AUTH"))) {
             state.addBranch(27);
+            state.put("AUTH-RESP-APPROVED", false);
             state.put("AUTH-RESP-DECLINED", true);
             state.put("PA-RL-AUTH-RESP-CODE", "05");
             state.put("PA-RL-APPROVED-AMT", 0);
         } else {
             state.addBranch(-27);
+            state.put("AUTH-RESP-DECLINED", false);
             state.put("AUTH-RESP-APPROVED", true);
             state.put("PA-RL-AUTH-RESP-CODE", "00");
             state.put("PA-RL-APPROVED-AMT", state.get("PA-RQ-TRANSACTION-AMT"));
@@ -56,40 +58,32 @@ public class Section6 extends SectionBase {
         state.put("PA-RL-AUTH-RESP-REASON", "0000");
         if (CobolRuntime.isTruthy(state.get("AUTH-RESP-DECLINED"))) {
             state.addBranch(28);
-            if (CobolRuntime.isTruthy(state.get("CARD-NFOUND-XREF"))) {
+            if ((CobolRuntime.isTruthy(state.get("CARD-NFOUND-XREF"))) || (CobolRuntime.isTruthy(state.get("NFOUND-ACCT-IN-MSTR"))) || (CobolRuntime.isTruthy(state.get("NFOUND-CUST-IN-MSTR")))) {
                 state.addBranch(29);
-                // empty WHEN
-            }
-            else if (CobolRuntime.isTruthy(state.get("NFOUND-ACCT-IN-MSTR"))) {
-                state.addBranch(30);
-                // empty WHEN
-            }
-            else if (CobolRuntime.isTruthy(state.get("NFOUND-CUST-IN-MSTR"))) {
-                state.addBranch(31);
                 state.put("PA-RL-AUTH-RESP-REASON", "3100");
             }
-            else if (CobolRuntime.isTruthy(state.get("INSUFFICIENT-FUND"))) {
-                state.addBranch(32);
+            else if ((CobolRuntime.isTruthy(state.get("INSUFFICIENT-FUND")))) {
+                state.addBranch(30);
                 state.put("PA-RL-AUTH-RESP-REASON", "4100");
             }
-            else if (CobolRuntime.isTruthy(state.get("CARD-NOT-ACTIVE"))) {
-                state.addBranch(33);
+            else if ((CobolRuntime.isTruthy(state.get("CARD-NOT-ACTIVE")))) {
+                state.addBranch(31);
                 state.put("PA-RL-AUTH-RESP-REASON", "4200");
             }
-            else if (CobolRuntime.isTruthy(state.get("ACCOUNT-CLOSED"))) {
-                state.addBranch(34);
+            else if ((CobolRuntime.isTruthy(state.get("ACCOUNT-CLOSED")))) {
+                state.addBranch(32);
                 state.put("PA-RL-AUTH-RESP-REASON", "4300");
             }
-            else if (CobolRuntime.isTruthy(state.get("CARD-FRAUD"))) {
-                state.addBranch(35);
+            else if ((CobolRuntime.isTruthy(state.get("CARD-FRAUD")))) {
+                state.addBranch(33);
                 state.put("PA-RL-AUTH-RESP-REASON", "5100");
             }
-            else if (CobolRuntime.isTruthy(state.get("MERCHANT-FRAUD"))) {
-                state.addBranch(36);
+            else if ((CobolRuntime.isTruthy(state.get("MERCHANT-FRAUD")))) {
+                state.addBranch(34);
                 state.put("PA-RL-AUTH-RESP-REASON", "5200");
             }
             else {
-                state.addBranch(37);
+                state.addBranch(35);
                 state.put("PA-RL-AUTH-RESP-REASON", "9000");
             }
         } else {

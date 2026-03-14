@@ -36,174 +36,301 @@ public class SectionMain extends SectionBase {
 
     void do_EDIT_AREA_CODE(ProgramState state) {
         if ((java.util.Objects.equals(state.get("WS-EDIT-US-PHONE-NUMA"), " ")) || (java.util.Objects.equals(state.get("WS-EDIT-US-PHONE-NUMA"), "\u0000"))) {
-            state.addBranch(12);
+            state.addBranch(10);
+            state.put("INPUT-OK", false);
             state.put("INPUT-ERROR", true);
+            state.put("FLG-EDIT-US-PHONEA-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEA-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEB-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEB-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEB-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEC-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEC-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEC-NOT-OK", false);
+            state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
             state.put("FLG-EDIT-US-PHONEA-BLANK", true);
             if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
-                state.addBranch(13);
+                state.addBranch(11);
                 state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Area code must be supplied.");
+            } else {
+                state.addBranch(-11);
+            }
+            registry.get("EDIT-US-PHONE-PREFIX").execute(state);
+            return;
+        } else {
+            state.addBranch(-10);
+            // CONTINUE
+        }
+        if (CobolRuntime.isNumeric(state.get("WS-EDIT-US-PHONE-NUMA"))) {
+            state.addBranch(12);
+            // CONTINUE
+        } else {
+            state.addBranch(-12);
+            state.put("INPUT-OK", false);
+            state.put("INPUT-ERROR", true);
+            state.put("FLG-EDIT-US-PHONEA-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEA-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEB-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEB-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEB-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEC-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEC-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEC-NOT-OK", false);
+            state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEA-NOT-OK", true);
+            if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
+                state.addBranch(13);
+                state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Area code must be A 3 digit number.");
             } else {
                 state.addBranch(-13);
             }
             registry.get("EDIT-US-PHONE-PREFIX").execute(state);
             return;
-        } else {
-            state.addBranch(-12);
-            // CONTINUE
         }
-        if (CobolRuntime.isNumeric(state.get("WS-EDIT-US-PHONE-NUMA"))) {
+        if (java.util.Objects.equals(state.get("WS-EDIT-US-PHONE-NUMA-N"), 0)) {
             state.addBranch(14);
-            // CONTINUE
-        } else {
-            state.addBranch(-14);
+            state.put("INPUT-OK", false);
             state.put("INPUT-ERROR", true);
+            state.put("FLG-EDIT-US-PHONEA-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEA-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEB-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEB-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEB-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEC-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEC-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEC-NOT-OK", false);
+            state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
             state.put("FLG-EDIT-US-PHONEA-NOT-OK", true);
             if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
                 state.addBranch(15);
-                state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Area code must be A 3 digit number.");
+                state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Area code cannot be zero");
             } else {
                 state.addBranch(-15);
             }
             registry.get("EDIT-US-PHONE-PREFIX").execute(state);
             return;
+        } else {
+            state.addBranch(-14);
+            // CONTINUE
         }
-        if (java.util.Objects.equals(state.get("WS-EDIT-US-PHONE-NUMA-N"), 0)) {
+        state.put("WS-US-PHONE-AREA-CODE-TO-EDIT", state.get("FUNCTION TRIM (WS-EDIT-US-PHONE-NUMA)"));
+        if (CobolRuntime.isTruthy(state.get("VALID-GENERAL-PURP-CODE"))) {
             state.addBranch(16);
+            // CONTINUE
+        } else {
+            state.addBranch(-16);
+            state.put("INPUT-OK", false);
             state.put("INPUT-ERROR", true);
+            state.put("FLG-EDIT-US-PHONEA-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEA-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEB-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEB-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEB-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEC-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEC-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEC-NOT-OK", false);
+            state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
             state.put("FLG-EDIT-US-PHONEA-NOT-OK", true);
             if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
                 state.addBranch(17);
-                state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Area code cannot be zero");
+                state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Not valid North America general purpose area code");
             } else {
                 state.addBranch(-17);
             }
             registry.get("EDIT-US-PHONE-PREFIX").execute(state);
             return;
-        } else {
-            state.addBranch(-16);
-            // CONTINUE
         }
-        state.put("WS-US-PHONE-AREA-CODE-TO-EDIT", state.get("FUNCTION TRIM (WS-EDIT-US-PHONE-NUMA)"));
-        if (CobolRuntime.isTruthy(state.get("VALID-GENERAL-PURP-CODE"))) {
-            state.addBranch(18);
-            // CONTINUE
-        } else {
-            state.addBranch(-18);
-            state.put("INPUT-ERROR", true);
-            state.put("FLG-EDIT-US-PHONEA-NOT-OK", true);
-            if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
-                state.addBranch(19);
-                state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Not valid North America general purpose area code");
-            } else {
-                state.addBranch(-19);
-            }
-            registry.get("EDIT-US-PHONE-PREFIX").execute(state);
-            return;
-        }
+        state.put("FLG-EDIT-US-PHONEA-BLANK", false);
+        state.put("FLG-EDIT-US-PHONEA-NOT-OK", false);
+        state.put("FLG-EDIT-US-PHONEB-BLANK", false);
+        state.put("FLG-EDIT-US-PHONEB-ISVALID", false);
+        state.put("FLG-EDIT-US-PHONEB-NOT-OK", false);
+        state.put("FLG-EDIT-US-PHONEC-BLANK", false);
+        state.put("FLG-EDIT-US-PHONEC-ISVALID", false);
+        state.put("FLG-EDIT-US-PHONEC-NOT-OK", false);
+        state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
         state.put("FLG-EDIT-US-PHONEA-ISVALID", true);
     }
 
     void do_EDIT_US_PHONE_PREFIX(ProgramState state) {
         if ((java.util.Objects.equals(state.get("WS-EDIT-US-PHONE-NUMB"), " ")) || (java.util.Objects.equals(state.get("WS-EDIT-US-PHONE-NUMB"), "\u0000"))) {
-            state.addBranch(20);
+            state.addBranch(18);
+            state.put("INPUT-OK", false);
             state.put("INPUT-ERROR", true);
+            state.put("FLG-EDIT-US-PHONEA-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEA-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEA-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEB-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEB-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEC-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEC-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEC-NOT-OK", false);
+            state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
             state.put("FLG-EDIT-US-PHONEB-BLANK", true);
             if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
-                state.addBranch(21);
+                state.addBranch(19);
                 state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Prefix code must be supplied.");
+            } else {
+                state.addBranch(-19);
+            }
+            registry.get("EDIT-US-PHONE-LINENUM").execute(state);
+            return;
+        } else {
+            state.addBranch(-18);
+            // CONTINUE
+        }
+        if (CobolRuntime.isNumeric(state.get("WS-EDIT-US-PHONE-NUMB"))) {
+            state.addBranch(20);
+            // CONTINUE
+        } else {
+            state.addBranch(-20);
+            state.put("INPUT-OK", false);
+            state.put("INPUT-ERROR", true);
+            state.put("FLG-EDIT-US-PHONEA-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEA-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEA-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEB-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEB-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEC-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEC-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEC-NOT-OK", false);
+            state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEB-NOT-OK", true);
+            if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
+                state.addBranch(21);
+                state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Prefix code must be A 3 digit number.");
             } else {
                 state.addBranch(-21);
             }
             registry.get("EDIT-US-PHONE-LINENUM").execute(state);
             return;
-        } else {
-            state.addBranch(-20);
-            // CONTINUE
         }
-        if (CobolRuntime.isNumeric(state.get("WS-EDIT-US-PHONE-NUMB"))) {
+        if (java.util.Objects.equals(state.get("WS-EDIT-US-PHONE-NUMB-N"), 0)) {
             state.addBranch(22);
-            // CONTINUE
-        } else {
-            state.addBranch(-22);
+            state.put("INPUT-OK", false);
             state.put("INPUT-ERROR", true);
+            state.put("FLG-EDIT-US-PHONEA-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEA-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEA-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEB-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEB-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEC-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEC-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEC-NOT-OK", false);
+            state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
             state.put("FLG-EDIT-US-PHONEB-NOT-OK", true);
             if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
                 state.addBranch(23);
-                state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Prefix code must be A 3 digit number.");
+                state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Prefix code cannot be zero");
             } else {
                 state.addBranch(-23);
             }
             registry.get("EDIT-US-PHONE-LINENUM").execute(state);
             return;
-        }
-        if (java.util.Objects.equals(state.get("WS-EDIT-US-PHONE-NUMB-N"), 0)) {
-            state.addBranch(24);
-            state.put("INPUT-ERROR", true);
-            state.put("FLG-EDIT-US-PHONEB-NOT-OK", true);
-            if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
-                state.addBranch(25);
-                state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Prefix code cannot be zero");
-            } else {
-                state.addBranch(-25);
-            }
-            registry.get("EDIT-US-PHONE-LINENUM").execute(state);
-            return;
         } else {
-            state.addBranch(-24);
+            state.addBranch(-22);
             // CONTINUE
         }
+        state.put("FLG-EDIT-US-PHONEA-BLANK", false);
+        state.put("FLG-EDIT-US-PHONEA-ISVALID", false);
+        state.put("FLG-EDIT-US-PHONEA-NOT-OK", false);
+        state.put("FLG-EDIT-US-PHONEB-BLANK", false);
+        state.put("FLG-EDIT-US-PHONEB-NOT-OK", false);
+        state.put("FLG-EDIT-US-PHONEC-BLANK", false);
+        state.put("FLG-EDIT-US-PHONEC-ISVALID", false);
+        state.put("FLG-EDIT-US-PHONEC-NOT-OK", false);
+        state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
         state.put("FLG-EDIT-US-PHONEB-ISVALID", true);
     }
 
     void do_EDIT_US_PHONE_LINENUM(ProgramState state) {
         if ((java.util.Objects.equals(state.get("WS-EDIT-US-PHONE-NUMC"), " ")) || (java.util.Objects.equals(state.get("WS-EDIT-US-PHONE-NUMC"), "\u0000"))) {
-            state.addBranch(26);
+            state.addBranch(24);
+            state.put("INPUT-OK", false);
             state.put("INPUT-ERROR", true);
+            state.put("FLG-EDIT-US-PHONEA-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEA-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEA-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEB-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEB-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEB-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEC-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEC-NOT-OK", false);
+            state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
             state.put("FLG-EDIT-US-PHONEC-BLANK", true);
             if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
-                state.addBranch(27);
+                state.addBranch(25);
                 state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Line number code must be supplied.");
+            } else {
+                state.addBranch(-25);
+            }
+            registry.get("EDIT-US-PHONE-EXIT").execute(state);
+            return;
+        } else {
+            state.addBranch(-24);
+            // CONTINUE
+        }
+        if (CobolRuntime.isNumeric(state.get("WS-EDIT-US-PHONE-NUMC"))) {
+            state.addBranch(26);
+            // CONTINUE
+        } else {
+            state.addBranch(-26);
+            state.put("INPUT-OK", false);
+            state.put("INPUT-ERROR", true);
+            state.put("FLG-EDIT-US-PHONEA-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEA-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEA-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEB-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEB-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEB-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEC-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEC-ISVALID", false);
+            state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEC-NOT-OK", true);
+            if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
+                state.addBranch(27);
+                state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Line number code must be A 4 digit number.");
             } else {
                 state.addBranch(-27);
             }
             registry.get("EDIT-US-PHONE-EXIT").execute(state);
             return;
-        } else {
-            state.addBranch(-26);
-            // CONTINUE
         }
-        if (CobolRuntime.isNumeric(state.get("WS-EDIT-US-PHONE-NUMC"))) {
+        if (java.util.Objects.equals(state.get("WS-EDIT-US-PHONE-NUMC-N"), 0)) {
             state.addBranch(28);
-            // CONTINUE
-        } else {
-            state.addBranch(-28);
+            state.put("INPUT-OK", false);
             state.put("INPUT-ERROR", true);
+            state.put("FLG-EDIT-US-PHONEA-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEA-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEA-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEB-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEB-ISVALID", false);
+            state.put("FLG-EDIT-US-PHONEB-NOT-OK", false);
+            state.put("FLG-EDIT-US-PHONEC-BLANK", false);
+            state.put("FLG-EDIT-US-PHONEC-ISVALID", false);
+            state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
             state.put("FLG-EDIT-US-PHONEC-NOT-OK", true);
             if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
                 state.addBranch(29);
-                state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Line number code must be A 4 digit number.");
+                state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Line number code cannot be zero");
             } else {
                 state.addBranch(-29);
             }
             registry.get("EDIT-US-PHONE-EXIT").execute(state);
             return;
-        }
-        if (java.util.Objects.equals(state.get("WS-EDIT-US-PHONE-NUMC-N"), 0)) {
-            state.addBranch(30);
-            state.put("INPUT-ERROR", true);
-            state.put("FLG-EDIT-US-PHONEC-NOT-OK", true);
-            if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
-                state.addBranch(31);
-                state.put("WS-RETURN-MSG", String.valueOf(state.get("FUNCTION")) + String.valueOf(state.get("TRIM")) + String.valueOf(state.get("WS-EDIT-VARIABLE-NAME")) + ": Line number code cannot be zero");
-            } else {
-                state.addBranch(-31);
-            }
-            registry.get("EDIT-US-PHONE-EXIT").execute(state);
-            return;
         } else {
-            state.addBranch(-30);
+            state.addBranch(-28);
             // CONTINUE
         }
+        state.put("FLG-EDIT-US-PHONEA-BLANK", false);
+        state.put("FLG-EDIT-US-PHONEA-ISVALID", false);
+        state.put("FLG-EDIT-US-PHONEA-NOT-OK", false);
+        state.put("FLG-EDIT-US-PHONEB-BLANK", false);
+        state.put("FLG-EDIT-US-PHONEB-ISVALID", false);
+        state.put("FLG-EDIT-US-PHONEB-NOT-OK", false);
+        state.put("FLG-EDIT-US-PHONEC-BLANK", false);
+        state.put("FLG-EDIT-US-PHONEC-NOT-OK", false);
+        state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
         state.put("FLG-EDIT-US-PHONEC-ISVALID", true);
     }
 
@@ -213,10 +340,10 @@ public class SectionMain extends SectionBase {
 
     void do_ABEND_ROUTINE(ProgramState state) {
         if (java.util.Objects.equals(state.get("ABEND-MSG"), "\u0000")) {
-            state.addBranch(32);
+            state.addBranch(30);
             state.put("ABEND-MSG", "UNEXPECTED ABEND OCCURRED.");
         } else {
-            state.addBranch(-32);
+            state.addBranch(-30);
         }
         state.put("ABEND-CULPRIT", state.get("LIT-THISPGM"));
         stubs.dummyExec(state, "CICS", "EXEC CICS SEND FROM (ABEND-DATA) LENGTH(LENGTH OF ABEND-DATA) NOHANDLE ERASE END-EXEC");

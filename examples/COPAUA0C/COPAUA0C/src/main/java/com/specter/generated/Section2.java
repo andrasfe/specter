@@ -21,6 +21,7 @@ public class Section2 extends SectionBase {
             performThru(state, "5000-PROCESS-AUTH", "5000-EXIT");
             state.put("WS-MSG-PROCESSED", CobolRuntime.toNum(state.get("WS-MSG-PROCESSED")) + 1);
             stubs.cicsSyncpoint(state);
+            state.put("IMS-PSB-SCHD", false);
             state.put("IMS-PSB-NOT-SCHD", true);
             if (CobolRuntime.toNum(state.get("WS-MSG-PROCESSED")) > CobolRuntime.toNum(state.get("WS-REQSTS-PROCESS-LIMIT"))) {
                 state.addBranch(6);

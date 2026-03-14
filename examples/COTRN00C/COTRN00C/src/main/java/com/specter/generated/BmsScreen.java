@@ -21,20 +21,15 @@ import java.util.*;
  * {@link ProgramState} and collecting input field values from the user.
  * Supports Enter, F3, and Tab key handling.
  */
-public class BmsScreen implements AutoCloseable {
-
-    public enum FieldType { CENTER, DISPLAY, INPUT, MESSAGE }
-
-    public record Field(String name, int row, int col, int width,
-                        FieldType type, String label, boolean masked) {}
+public class BmsScreen implements CicsScreen {
 
     private final Screen screen;
     private final TextGraphics graphics;
-    private final List<Field> fields;
+    private final List<CicsScreen.Field> fields;
     private final Map<String, String> inputValues = new LinkedHashMap<>();
     private int activeFieldIndex = 0;
 
-    public BmsScreen(List<Field> fields) throws IOException {
+    public BmsScreen(List<CicsScreen.Field> fields) throws IOException {
         this.fields = fields;
         Terminal terminal = new DefaultTerminalFactory()
                 .setInitialTerminalSize(new TerminalSize(80, 24))
@@ -45,8 +40,21 @@ public class BmsScreen implements AutoCloseable {
         this.graphics = screen.newTextGraphics();
     }
 
-    /** Render output fields from program state onto the screen. */
+    @Override
     public void sendMap(ProgramState state) throws IOException {
+        // Pre-populate input fields from corresponding output values.
+        for (CicsScreen.Field field : fields) {
+            if (field.type() == CicsScreen.FieldType.INPUT && field.name().endsWith("I")) {
+                String outName = field.name().substring(0, field.name().length() - 1) + "O";
+                if (state.containsKey(outName)) {
+                    String v = String.valueOf(state.get(outName));
+                    if (!"null".equals(v) && !v.isBlank()) {
+                        inputValues.put(field.name(), v);
+                    }
+                }
+            }
+        }
+
         screen.clear();
         graphics.setForegroundColor(TextColor.ANSI.GREEN);
         graphics.setBackgroundColor(TextColor.ANSI.BLACK);
@@ -56,60 +64,60 @@ public class BmsScreen implements AutoCloseable {
             graphics.putString(0, r, " ".repeat(80));
         }
 
-        for (Field field : fields) {
-            String val = state.containsKey(field.name)
-                    ? String.valueOf(state.get(field.name))
+        for (CicsScreen.Field field : fields) {
+            String val = state.containsKey(field.name())
+                    ? String.valueOf(state.get(field.name()))
                     : "";
             if (val.equals("null")) val = "";
 
-            switch (field.type) {
+            switch (field.type()) {
                 case CENTER -> {
                     graphics.setForegroundColor(TextColor.ANSI.WHITE);
                     graphics.enableModifiers(SGR.BOLD);
                     int offset = Math.max(0, (80 - val.length()) / 2);
-                    graphics.putString(offset, field.row, val);
+                    graphics.putString(offset, field.row(), val);
                     graphics.disableModifiers(SGR.BOLD);
                     graphics.setForegroundColor(TextColor.ANSI.GREEN);
                 }
                 case DISPLAY -> {
-                    if (field.label != null && !field.label.isEmpty()) {
+                    if (field.label() != null && !field.label().isEmpty()) {
                         graphics.setForegroundColor(TextColor.ANSI.WHITE);
                         graphics.enableModifiers(SGR.BOLD);
-                        graphics.putString(field.col, field.row, field.label + ":");
+                        graphics.putString(field.col(), field.row(), field.label() + ":");
                         graphics.disableModifiers(SGR.BOLD);
                         graphics.setForegroundColor(TextColor.ANSI.GREEN);
                         graphics.putString(
-                                field.col + field.label.length() + 2,
-                                field.row, val);
+                                field.col() + field.label().length() + 2,
+                                field.row(), val);
                     } else {
-                        graphics.putString(field.col, field.row, val);
+                        graphics.putString(field.col(), field.row(), val);
                     }
                 }
                 case INPUT -> {
                     graphics.setForegroundColor(TextColor.ANSI.WHITE);
                     graphics.enableModifiers(SGR.BOLD);
-                    int labelCol = Math.max(0, field.col - (field.label != null
-                            ? field.label.length() + 2 : 0));
-                    if (field.label != null) {
-                        graphics.putString(labelCol, field.row,
-                                field.label + ":");
+                    int labelCol = Math.max(0, field.col() - (field.label() != null
+                            ? field.label().length() + 2 : 0));
+                    if (field.label() != null) {
+                        graphics.putString(labelCol, field.row(),
+                                field.label() + ":");
                     }
                     graphics.disableModifiers(SGR.BOLD);
                     graphics.setForegroundColor(TextColor.ANSI.GREEN);
-                    String cur = inputValues.getOrDefault(field.name, "");
-                    String display = field.masked
+                    String cur = inputValues.getOrDefault(field.name(), "");
+                    String display = field.masked()
                             ? "*".repeat(cur.length()) : cur;
-                    String padded = (display + "_".repeat(field.width))
-                            .substring(0, field.width);
+                    String padded = (display + "_".repeat(field.width()))
+                            .substring(0, field.width());
                     graphics.setForegroundColor(TextColor.ANSI.WHITE);
-                    graphics.putString(field.col, field.row, padded);
+                    graphics.putString(field.col(), field.row(), padded);
                     graphics.setForegroundColor(TextColor.ANSI.GREEN);
                 }
                 case MESSAGE -> {
                     if (!val.isBlank()) {
                         graphics.setForegroundColor(TextColor.ANSI.RED);
                         graphics.enableModifiers(SGR.BOLD);
-                        graphics.putString(field.col, field.row, val);
+                        graphics.putString(field.col(), field.row(), val);
                         graphics.disableModifiers(SGR.BOLD);
                         graphics.setForegroundColor(TextColor.ANSI.GREEN);
                     }
@@ -125,7 +133,7 @@ public class BmsScreen implements AutoCloseable {
         graphics.setBackgroundColor(TextColor.ANSI.BLACK);
         graphics.setForegroundColor(TextColor.ANSI.GREEN);
 
-        screen.refresh();
+        screen.refresh(Screen.RefreshType.COMPLETE);
     }
 
     /**
@@ -134,9 +142,10 @@ public class BmsScreen implements AutoCloseable {
      *
      * @return the EIBAID value corresponding to the key pressed
      */
+    @Override
     public String waitForAction() throws IOException {
-        List<Field> inputFields = fields.stream()
-                .filter(f -> f.type == FieldType.INPUT)
+        List<CicsScreen.Field> inputFields = fields.stream()
+                .filter(f -> f.type() == CicsScreen.FieldType.INPUT)
                 .toList();
 
         if (inputFields.isEmpty()) {
@@ -151,9 +160,9 @@ public class BmsScreen implements AutoCloseable {
         activeFieldIndex = 0;
         StringBuilder currentInput = new StringBuilder(
                 inputValues.getOrDefault(
-                        inputFields.get(activeFieldIndex).name, ""));
+                        inputFields.get(activeFieldIndex).name(), ""));
         positionCursor(inputFields.get(activeFieldIndex), currentInput.length());
-        screen.refresh();
+        screen.refresh(Screen.RefreshType.COMPLETE);
 
         while (true) {
             KeyStroke key = screen.readInput();
@@ -162,7 +171,7 @@ public class BmsScreen implements AutoCloseable {
             String aid = mapKeyToEibaid(key);
             if (aid != null) {
                 // Save current field
-                inputValues.put(inputFields.get(activeFieldIndex).name,
+                inputValues.put(inputFields.get(activeFieldIndex).name(),
                         currentInput.toString().trim());
                 return aid;
             }
@@ -170,7 +179,7 @@ public class BmsScreen implements AutoCloseable {
             if (key.getKeyType() == KeyType.Tab
                     || key.getKeyType() == KeyType.ReverseTab) {
                 // Save current and move to next/prev field
-                inputValues.put(inputFields.get(activeFieldIndex).name,
+                inputValues.put(inputFields.get(activeFieldIndex).name(),
                         currentInput.toString().trim());
                 if (key.getKeyType() == KeyType.Tab) {
                     activeFieldIndex =
@@ -181,10 +190,10 @@ public class BmsScreen implements AutoCloseable {
                 }
                 currentInput = new StringBuilder(
                         inputValues.getOrDefault(
-                                inputFields.get(activeFieldIndex).name, ""));
+                                inputFields.get(activeFieldIndex).name(), ""));
                 positionCursor(inputFields.get(activeFieldIndex),
                         currentInput.length());
-                screen.refresh();
+                screen.refresh(Screen.RefreshType.COMPLETE);
                 continue;
             }
 
@@ -195,24 +204,24 @@ public class BmsScreen implements AutoCloseable {
                             currentInput.toString());
                     positionCursor(inputFields.get(activeFieldIndex),
                             currentInput.length());
-                    screen.refresh();
+                    screen.refresh(Screen.RefreshType.COMPLETE);
                 }
                 continue;
             }
 
             if (key.getKeyType() == KeyType.Character) {
-                Field f = inputFields.get(activeFieldIndex);
-                if (currentInput.length() < f.width) {
+                CicsScreen.Field f = inputFields.get(activeFieldIndex);
+                if (currentInput.length() < f.width()) {
                     currentInput.append(key.getCharacter());
                     redrawInputField(f, currentInput.toString());
                     positionCursor(f, currentInput.length());
-                    screen.refresh();
+                    screen.refresh(Screen.RefreshType.COMPLETE);
                 }
             }
         }
     }
 
-    /** Populate state with collected input values. */
+    @Override
     public void receiveMap(ProgramState state) {
         for (Map.Entry<String, String> entry : inputValues.entrySet()) {
             state.put(entry.getKey(), entry.getValue());
@@ -222,7 +231,7 @@ public class BmsScreen implements AutoCloseable {
         state.put("WS-REAS-CD", 0);
     }
 
-    /** Display plain text (SEND TEXT). */
+    @Override
     public void sendText(ProgramState state, String text) throws IOException {
         screen.clear();
         graphics.setForegroundColor(TextColor.ANSI.GREEN);
@@ -237,11 +246,11 @@ public class BmsScreen implements AutoCloseable {
         graphics.putString(0, 23, " ".repeat(80));
         graphics.putString(1, 23, "Press any key to exit...");
         graphics.setBackgroundColor(TextColor.ANSI.BLACK);
-        screen.refresh();
+        screen.refresh(Screen.RefreshType.COMPLETE);
         screen.readInput();
     }
 
-    /** Show a transfer-control message. */
+    @Override
     public void showXctl(String programName) throws IOException {
         screen.clear();
         graphics.setForegroundColor(TextColor.ANSI.YELLOW);
@@ -257,7 +266,7 @@ public class BmsScreen implements AutoCloseable {
         graphics.putString(0, 23, " ".repeat(80));
         graphics.putString(1, 23, "Press any key to exit...");
         graphics.setBackgroundColor(TextColor.ANSI.BLACK);
-        screen.refresh();
+        screen.refresh(Screen.RefreshType.COMPLETE);
         screen.readInput();
     }
 
@@ -288,20 +297,20 @@ public class BmsScreen implements AutoCloseable {
         };
     }
 
-    private void positionCursor(Field field, int offset) {
+    private void positionCursor(CicsScreen.Field field, int offset) {
         screen.setCursorPosition(
                 new com.googlecode.lanterna.TerminalPosition(
-                        field.col + Math.min(offset, field.width - 1),
-                        field.row));
+                        field.col() + Math.min(offset, field.width() - 1),
+                        field.row()));
     }
 
-    private void redrawInputField(Field field, String value) {
-        String display = field.masked
+    private void redrawInputField(CicsScreen.Field field, String value) {
+        String display = field.masked()
                 ? "*".repeat(value.length()) : value;
-        String padded = (display + "_".repeat(field.width))
-                .substring(0, field.width);
+        String padded = (display + "_".repeat(field.width()))
+                .substring(0, field.width());
         graphics.setForegroundColor(TextColor.ANSI.WHITE);
-        graphics.putString(field.col, field.row, padded);
+        graphics.putString(field.col(), field.row(), padded);
         graphics.setForegroundColor(TextColor.ANSI.GREEN);
     }
 }

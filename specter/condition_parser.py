@@ -527,7 +527,9 @@ def parse_when_value(text: str) -> tuple[str, bool]:
     Returns (value_expr, is_other) where value_expr is a Python expression
     and is_other is True for WHEN OTHER.
     """
-    stripped = text.strip()
+    # Normalize multi-line WHEN text into a single line so compound
+    # conditions like "WHEN A\nAND B" are preserved.
+    stripped = " ".join(text.split())
 
     # "WHEN OTHER"
     if re.match(r"WHEN\s+OTHER", stripped, re.IGNORECASE):

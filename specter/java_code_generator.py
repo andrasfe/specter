@@ -52,12 +52,170 @@ from .java_templates.runtime import (
 from .java_templates.terminal import (
     BMS_SCREEN_JAVA,
     CICS_RETURN_SIGNAL_JAVA,
+    HEADLESS_SCREEN_JAVA,
     SCREEN_LAYOUT_JAVA,
     TERMINAL_MAIN_JAVA,
+    TERMINAL_SCREEN_JAVA,
     TERMINAL_STUB_EXECUTOR_JAVA,
 )
 from .models import Program, Statement
 from .variable_extractor import VariableReport, extract_variables
+
+# ---------------------------------------------------------------------------
+# 88-level mutual exclusion detection
+# ---------------------------------------------------------------------------
+
+# Map from variable name to set of sibling names (populated per-program).
+_88_LEVEL_SIBLINGS: dict[str, set[str]] = {}
+
+
+def _detect_88_level_groups(program: Program) -> dict[str, set[str]]:
+    """Detect 88-level sibling groups from SET TO TRUE targets.
+
+    In COBOL, 88-level variables on the same parent field are mutually
+    exclusive.  We detect sibling groups by collecting all variables that
+    are targets of ``SET X TO TRUE`` and grouping them by shared naming
+    prefix (the part before the last hyphen-separated component varies).
+
+    We then validate each candidate group against EVALUATE TRUE usage:
+    at least 2 members must appear as simple conditions in the same
+    EVALUATE TRUE statement.
+
+    Returns a dict mapping each variable to its set of siblings.
+    """
+    # Step 1: collect all SET TO TRUE targets
+    set_true_vars: set[str] = set()
+    _VN = r"[A-Z0-9][A-Z0-9-]*"
+
+    def _collect_set_true(stmts: list[Statement]) -> None:
+        for s in stmts:
+            if s.type == "SET":
+                m = re.search(
+                    rf"SET\s+({_VN})\s+TO\s+TRUE", s.text, re.IGNORECASE
+                )
+                if m:
+                    set_true_vars.add(m.group(1).upper())
+            if s.children:
+                _collect_set_true(s.children)
+
+    for para in program.paragraphs:
+        _collect_set_true(para.statements)
+
+    # Step 2: collect EVALUATE TRUE simple conditions
+    eval_groups: list[set[str]] = []
+
+    def _scan_evaluate(stmt: Statement) -> None:
+        subject = stmt.attributes.get("subject", "TRUE")
+        if subject.upper() != "TRUE":
+            return
+        when_vars: set[str] = set()
+        for child in stmt.children:
+            if child.type != "WHEN":
+                continue
+            vt, is_other = parse_when_value(child.text)
+            if is_other:
+                continue
+            vt_stripped = vt.strip()
+            if re.match(r"^[A-Z0-9][A-Z0-9-]*$", vt_stripped, re.IGNORECASE):
+                v = vt_stripped.upper()
+                # Only include if also a SET TO TRUE target
+                if v in set_true_vars:
+                    when_vars.add(v)
+        if len(when_vars) >= 2:
+            eval_groups.append(when_vars)
+
+    def _walk(stmts: list[Statement]) -> None:
+        for s in stmts:
+            if s.type == "EVALUATE":
+                _scan_evaluate(s)
+            if s.children:
+                _walk(s.children)
+
+    for para in program.paragraphs:
+        _walk(para.statements)
+
+    # Step 3: split each EVALUATE group by naming prefix to separate
+    # different 88-level families that appear in the same EVALUATE.
+    # The first hyphen-separated component is used as the prefix.
+    refined_groups: list[set[str]] = []
+    for eg in eval_groups:
+        by_prefix: dict[str, set[str]] = {}
+        for v in eg:
+            prefix = v.split("-")[0] if "-" in v else v
+            by_prefix.setdefault(prefix, set()).add(v)
+
+        has_multi = any(len(s) >= 2 for s in by_prefix.values())
+        if has_multi:
+            # Keep only sub-groups with 2+ members
+            for sub in by_prefix.values():
+                if len(sub) >= 2:
+                    refined_groups.append(sub)
+        elif len(eg) >= 3 and len(by_prefix) == len(eg):
+            # All singletons with 3+ members — likely one 88-level
+            # family with non-prefix-matching names (e.g. COULD-NOT-...,
+            # LOCKED-BUT-..., DATA-WAS-...)
+            refined_groups.append(eg)
+
+    # Step 4: supplementary prefix-based detection for SET TO TRUE
+    # targets not found in any EVALUATE group.  Variables sharing a
+    # 2-component prefix (e.g. "CDEMO-PGM") are likely 88-level siblings.
+    eval_covered: set[str] = set()
+    for rg in refined_groups:
+        eval_covered |= rg
+
+    by_prefix2: dict[str, set[str]] = {}
+    for v in set_true_vars:
+        parts = v.split("-")
+        if len(parts) >= 3:
+            prefix = "-".join(parts[:2])
+            by_prefix2.setdefault(prefix, set()).add(v)
+    for prefix, members in by_prefix2.items():
+        if len(members) >= 2:
+            # Only add members not already in a refined group, OR
+            # add the whole group if it improves coverage
+            uncovered = members - eval_covered
+            if uncovered and len(members) >= 2:
+                refined_groups.append(members)
+
+    # Step 4b: detect boolean opposite pairs among SET TO TRUE targets.
+    # Variables like PFK-VALID/PFK-INVALID, INPUT-OK/INPUT-ERROR share
+    # a common stem with opposite suffixes and are 88-level siblings.
+    _OPPOSITE_SUFFIXES = [
+        ("-VALID", "-INVALID"), ("-OK", "-ERROR"),
+        ("-ON", "-OFF"), ("-YES", "-NO"),
+        ("-TRUE", "-FALSE"), ("-ACTIVE", "-INACTIVE"),
+        ("-OPEN", "-CLOSED"), ("-FOUND", "-NOT-FOUND"),
+    ]
+    for v in set_true_vars:
+        if v in eval_covered:
+            continue
+        vu = v.upper()
+        for pos_sfx, neg_sfx in _OPPOSITE_SUFFIXES:
+            for my_sfx, other_sfx in [(pos_sfx, neg_sfx), (neg_sfx, pos_sfx)]:
+                if vu.endswith(my_sfx):
+                    partner = vu[: -len(my_sfx)] + other_sfx
+                    if partner in set_true_vars:
+                        pair = {v, partner}
+                        refined_groups.append(pair)
+                        eval_covered |= pair
+                    break
+
+    # Step 5: build sibling map — use the largest refined group per var
+    var_best: dict[str, set[str]] = {}
+    for rg in refined_groups:
+        for v in rg:
+            existing = var_best.get(v)
+            if existing is None or len(rg) > len(existing):
+                var_best[v] = rg
+
+    siblings: dict[str, set[str]] = {}
+    for var, group in var_best.items():
+        sibs = group - {var}
+        if sibs:
+            siblings[var] = sibs
+
+    return siblings
+
 
 # ---------------------------------------------------------------------------
 # Java figurative constants (double-quoted strings)
@@ -885,43 +1043,69 @@ def _gen_evaluate_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
         if has_numeric_when:
             cb.stmt(f"{eval_var} = CobolRuntime.toNum({eval_var})")
 
-    first_when = True
+    # Process non-WHEN children (statements outside WHEN clauses).
     for child in stmt.children:
         if child.type != "WHEN":
             _gen_statement_java(cb, child)
-            continue
 
-        value_text, is_other = parse_when_value(child.text)
+    # Group stacked WHENs.  In COBOL, consecutive WHEN clauses where
+    # all but the last have no body share the last clause's body:
+    #     WHEN condition-a          -- empty
+    #     WHEN condition-b          -- has body
+    #         statements            -- executed for a OR b
+    when_children = [c for c in stmt.children if c.type == "WHEN"]
+    groups: list[list[Statement]] = []
+    current_group: list[Statement] = []
+    for wc in when_children:
+        body = [c for c in wc.children if c.type != "WHEN"]
+        _, is_other = parse_when_value(wc.text)
+        current_group.append(wc)
+        if body or is_other:
+            groups.append(current_group)
+            current_group = []
+    if current_group:
+        groups.append(current_group)
 
-        if is_other:
+    first_when = True
+    for group in groups:
+        owner = group[-1]  # last WHEN has the body
+        owner_vt, owner_is_other = parse_when_value(owner.text)
+
+        if owner_is_other:
             cb.open_block("else")
         else:
-            resolved = resolve_when_value_java(value_text, is_true)
-            if is_true:
-                keyword = "if" if first_when else "else if"
-                cb.open_block(f"{keyword} ({resolved})")
-            else:
-                keyword = "if" if first_when else "else if"
-                # When subject was coerced to double via toNum, wrap
-                # WHEN values in toNum too so Double==Double comparison works.
-                cmp_val = resolved
-                if has_numeric_when:
-                    cmp_val = f"CobolRuntime.toNum({resolved})"
-                cb.open_block(
-                    f"{keyword} (java.util.Objects.equals({eval_var}, {cmp_val}))"
-                )
+            # Combine all conditions in the group with ||
+            parts: list[str] = []
+            for wc in group:
+                vt, _ = parse_when_value(wc.text)
+                resolved = resolve_when_value_java(vt, is_true)
+                if is_true:
+                    parts.append(f"({resolved})")
+                else:
+                    cmp_val = resolved
+                    if has_numeric_when:
+                        cmp_val = f"CobolRuntime.toNum({resolved})"
+                    parts.append(
+                        f"(java.util.Objects.equals({eval_var}, {cmp_val}))"
+                    )
+            combined = " || ".join(parts)
+            keyword = "if" if first_when else "else if"
+            cb.open_block(f"{keyword} ({combined})")
             first_when = False
 
         bid = cb.next_branch_id()
+        cond_label = " OR ".join(
+            parse_when_value(wc.text)[0] for wc in group
+        ) if not owner_is_other else "OTHER"
         cb.branch_meta[bid] = {
-            "condition": value_text if not is_other else "OTHER",
+            "condition": cond_label,
             "paragraph": cb.current_para,
             "type": "EVALUATE",
             "subject": subject,
         }
         cb.stmt(f"state.addBranch({bid})")
 
-        when_body = [c for c in child.children if c.type != "WHEN"]
+        when_body = [c for c in owner.children if c.type != "WHEN"]
         if not when_body:
             cb.comment("empty WHEN")
         else:
@@ -1130,7 +1314,12 @@ def _gen_set_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
     _VN = r"[A-Z0-9][A-Z0-9-]*"
     m = re.search(rf"SET\s+({_VN})\s+TO\s+TRUE", stmt.text, re.IGNORECASE)
     if m:
-        cb.stmt(f'state.put("{m.group(1).upper()}", true)')
+        varname = m.group(1).upper()
+        # Clear 88-level siblings (mutual exclusion)
+        siblings = _88_LEVEL_SIBLINGS.get(varname, set())
+        for sib in sorted(siblings):
+            cb.stmt(f'state.put("{sib}", false)')
+        cb.stmt(f'state.put("{varname}", true)')
         return
     m = re.search(rf"SET\s+({_VN})\s+TO\s+FALSE", stmt.text, re.IGNORECASE)
     if m:
@@ -2000,28 +2189,28 @@ def _generate_paragraph_method(
             body_cb.comment(
                 "Implements CSSTRPFY copybook: map EIBAID to CCARD-AID flags"
             )
-            body_cb.emit('state.put("CCARD-AID-ENTER", false);')
-            body_cb.emit('state.put("CCARD-AID-PFK03", false);')
-            body_cb.emit('state.put("CCARD-AID-PFK05", false);')
-            body_cb.emit('state.put("CCARD-AID-PFK12", false);')
-            body_cb.emit('Object eibaid = state.get("EIBAID");')
-            body_cb.emit('if ("DFHENTER".equals(eibaid)) {')
+            body_cb.stmt('state.put("CCARD-AID-ENTER", false)')
+            body_cb.stmt('state.put("CCARD-AID-PFK03", false)')
+            body_cb.stmt('state.put("CCARD-AID-PFK05", false)')
+            body_cb.stmt('state.put("CCARD-AID-PFK12", false)')
+            body_cb.stmt('Object eibaid = state.get("EIBAID")')
+            body_cb.line('if ("DFHENTER".equals(eibaid)) {')
             body_cb._indent += 1
-            body_cb.emit('state.put("CCARD-AID-ENTER", true);')
+            body_cb.stmt('state.put("CCARD-AID-ENTER", true)')
             body_cb._indent -= 1
-            body_cb.emit('} else if ("DFHPF3".equals(eibaid)) {')
+            body_cb.line('} else if ("DFHPF3".equals(eibaid)) {')
             body_cb._indent += 1
-            body_cb.emit('state.put("CCARD-AID-PFK03", true);')
+            body_cb.stmt('state.put("CCARD-AID-PFK03", true)')
             body_cb._indent -= 1
-            body_cb.emit('} else if ("DFHPF5".equals(eibaid)) {')
+            body_cb.line('} else if ("DFHPF5".equals(eibaid)) {')
             body_cb._indent += 1
-            body_cb.emit('state.put("CCARD-AID-PFK05", true);')
+            body_cb.stmt('state.put("CCARD-AID-PFK05", true)')
             body_cb._indent -= 1
-            body_cb.emit('} else if ("DFHPF12".equals(eibaid)) {')
+            body_cb.line('} else if ("DFHPF12".equals(eibaid)) {')
             body_cb._indent += 1
-            body_cb.emit('state.put("CCARD-AID-PFK12", true);')
+            body_cb.stmt('state.put("CCARD-AID-PFK12", true)')
             body_cb._indent -= 1
-            body_cb.emit("}")
+            body_cb.line("}")
         else:
             body_cb.comment("empty paragraph")
     else:
@@ -2668,10 +2857,15 @@ def _extract_bms_info(program: Program) -> dict | None:
     Scans EXEC CICS SEND MAP / RECEIVE MAP statements and collects field
     names from ``FIELD OF <RECORD>`` patterns in MOVE statements.
 
+    Field order is preserved from the AST paragraph order — this matches
+    the original BMS map layout, which is critical for correct screen
+    rendering.
+
     Returns a dict keyed by map name, each with 'output' and 'input' field
     lists, or None if no BMS operations are found.
     """
-    maps: dict[str, dict[str, set[str]]] = {}
+    maps: dict[str, dict[str, list[str]]] = {}
+    _seen: dict[str, dict[str, set[str]]] = {}  # dedup tracking
 
     # Pass 1: find map names from SEND MAP / RECEIVE MAP
     # Also discover record names from FROM(...) / INTO(...) clauses
@@ -2686,8 +2880,9 @@ def _extract_bms_info(program: Program) -> dict | None:
                         r"RECEIVE\s+MAP\s*\('([^']+)'\)"]:
                 m = re.search(pat, raw, re.IGNORECASE)
                 if m:
-                    maps.setdefault(m.group(1).upper(),
-                                    {"output": set(), "input": set()})
+                    mn = m.group(1).upper()
+                    maps.setdefault(mn, {"output": [], "input": []})
+                    _seen.setdefault(mn, {"output": set(), "input": set()})
             # Variable map name: MAP(VAR) with FROM/INTO record
             if re.search(r"(?:SEND|RECEIVE)\s+MAP", raw, re.IGNORECASE):
                 from_m = re.search(r"FROM\((\w+)\)", raw, re.IGNORECASE)
@@ -2697,22 +2892,26 @@ def _extract_bms_info(program: Program) -> dict | None:
                     # Derive map name from record: CACTUPAO -> CACTUPA
                     if rec.endswith("O"):
                         derived = rec[:-1]
-                        entry = maps.setdefault(derived, {"output": set(), "input": set()})
+                        maps.setdefault(derived, {"output": [], "input": []})
+                        _seen.setdefault(derived, {"output": set(), "input": set()})
                         records.setdefault(derived, {"out_record": None, "in_record": None})
                         records[derived]["out_record"] = rec
                 if into_m:
                     rec = into_m.group(1).upper()
                     if rec.endswith("I"):
                         derived = rec[:-1]
-                        entry = maps.setdefault(derived, {"output": set(), "input": set()})
+                        maps.setdefault(derived, {"output": [], "input": []})
+                        _seen.setdefault(derived, {"output": set(), "input": set()})
                         records.setdefault(derived, {"out_record": None, "in_record": None})
                         records[derived]["in_record"] = rec
 
     if not maps:
         return None
 
-    # Pass 2: collect field references from OF <RECORD> patterns
+    # Pass 2: collect field references from OF <RECORD> patterns,
+    # preserving first-seen order (AST paragraph order = BMS map order).
     for map_name, info in maps.items():
+        seen = _seen[map_name]
         rec_info = records.get(map_name, {})
         out_record = rec_info.get("out_record") or (map_name + "O")
         in_record = rec_info.get("in_record") or (map_name + "I")
@@ -2724,32 +2923,38 @@ def _extract_bms_info(program: Program) -> dict | None:
                     rf"([A-Z][A-Z0-9-]+)\s+OF\s+{re.escape(out_record)}\b",
                     text, re.IGNORECASE,
                 ):
-                    info["output"].add(m.group(1).upper())
+                    fname = m.group(1).upper()
+                    if fname not in seen["output"]:
+                        seen["output"].add(fname)
+                        info["output"].append(fname)
                 for m in re.finditer(
                     rf"([A-Z][A-Z0-9-]+)\s+OF\s+{re.escape(in_record)}\b",
                     text, re.IGNORECASE,
                 ):
-                    info["input"].add(m.group(1).upper())
+                    fname = m.group(1).upper()
+                    if fname not in seen["input"]:
+                        seen["input"].add(fname)
+                        info["input"].append(fname)
 
     # Separate length/attribute fields from value fields in input
     result = {}
     for map_name, info in maps.items():
         # Only keep "I" suffixed fields (data), skip "A" (attribute) and "L" (length)
-        data_inputs = sorted(
+        data_inputs = [
             f for f in info["input"]
             if f.endswith("I") and not f.endswith("LI")
-        )
+        ]
         # If no "I"-suffixed fields, fall back to all non-L/non-A fields
         if not data_inputs:
-            data_inputs = sorted(
+            data_inputs = [
                 f for f in info["input"]
                 if not f.endswith("L") and not f.endswith("A")
-            )
-        length_fields = sorted(
+            ]
+        length_fields = [
             f for f in info["input"] if f.endswith("L")
-        )
+        ]
         result[map_name] = {
-            "output": sorted(info["output"]),
+            "output": info["output"],
             "input": data_inputs,
             "length_fields": length_fields,
         }
@@ -2927,9 +3132,9 @@ def _compute_screen_layout(
         out_budget_rows = avail_rows - in_budget
         out_budget = out_budget_rows * 2  # 2-column
 
-    # Output fields
+    # Output fields (order preserved from AST = BMS map order)
     placed_out = 0
-    for i, f in enumerate(sorted(remaining)):
+    for i, f in enumerate(remaining):
         if placed_out >= out_budget:
             break
         label = _bms_label(f)
@@ -2953,13 +3158,13 @@ def _compute_screen_layout(
         else:
             row += placed_out
 
-    # Input fields
-    def _input_sort_key(f: str) -> tuple:
-        is_pw = any(x in f.upper() for x in ("PASSW", "PWD", "PIN"))
-        return (1 if is_pw else 0, f)
-
-    sorted_inputs = sorted(input_fields, key=_input_sort_key)
-    for i, f in enumerate(sorted_inputs):
+    # Input fields (order preserved from AST = BMS map order,
+    # but push password fields to the end)
+    pw_inputs = [f for f in input_fields
+                 if any(x in f.upper() for x in ("PASSW", "PWD", "PIN"))]
+    non_pw_inputs = [f for f in input_fields if f not in pw_inputs]
+    ordered_inputs = non_pw_inputs + pw_inputs
+    for i, f in enumerate(ordered_inputs):
         if i >= in_budget:
             break
         r = row + i
@@ -2995,9 +3200,9 @@ def _generate_screen_layout_java(
         masked = "true" if f["masked"] else "false"
         label = f'"{f["label"]}"' if f["label"] else "null"
         entries.append(
-            f'        new BmsScreen.Field("{f["name"]}", '
+            f'        new CicsScreen.Field("{f["name"]}", '
             f'{f["row"]}, {f["col"]}, {f["width"]}, '
-            f'BmsScreen.FieldType.{f["type"]}, {label}, {masked})'
+            f'CicsScreen.FieldType.{f["type"]}, {label}, {masked})'
         )
     field_entries = ",\n".join(entries)
     return SCREEN_LAYOUT_JAVA.format(
@@ -3040,6 +3245,10 @@ def generate_java_project(
     import specter.code_generator as _cg
 
     _cg._PARAGRAPH_ORDER[:] = [p.name for p in program.paragraphs]
+
+    # Detect 88-level mutual exclusion groups
+    global _88_LEVEL_SIBLINGS
+    _88_LEVEL_SIBLINGS = _detect_88_level_groups(program)
 
     # Naming
     program_id = program.program_id
@@ -3242,6 +3451,8 @@ def generate_java_project(
         # Static terminal classes
         _terminal_files = {
             "CicsReturnSignal.java": CICS_RETURN_SIGNAL_JAVA,
+            "CicsScreen.java": TERMINAL_SCREEN_JAVA,
+            "HeadlessScreen.java": HEADLESS_SCREEN_JAVA,
             "BmsScreen.java": BMS_SCREEN_JAVA,
             "TerminalStubExecutor.java": TERMINAL_STUB_EXECUTOR_JAVA,
         }

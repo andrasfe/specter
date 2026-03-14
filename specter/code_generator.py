@@ -725,36 +725,60 @@ def _gen_evaluate(cb: _CodeBuilder, stmt: Statement):
         if _has_numeric_when:
             cb.line(f"_eval_subject = _to_num(_eval_subject)")
 
-    first_when = True
+    # Process non-WHEN children.
     for child in stmt.children:
         if child.type != "WHEN":
             _gen_statement(cb, child)
-            continue
 
-        value_text, is_other = parse_when_value(child.text)
+    # Group stacked WHENs.  In COBOL, consecutive WHEN clauses where
+    # all but the last have no body share the last clause's body.
+    when_children = [c for c in stmt.children if c.type == "WHEN"]
+    groups: list[list] = []
+    current_group: list = []
+    for wc in when_children:
+        body = [c for c in wc.children if c.type != "WHEN"]
+        _, io = parse_when_value(wc.text)
+        current_group.append(wc)
+        if body or io:
+            groups.append(current_group)
+            current_group = []
+    if current_group:
+        groups.append(current_group)
 
-        if is_other:
+    first_when = True
+    for group in groups:
+        owner = group[-1]
+        owner_vt, owner_is_other = parse_when_value(owner.text)
+
+        if owner_is_other:
             cb.line("else:")
         else:
-            resolved = resolve_when_value(value_text, is_true)
-            if is_true:
-                keyword = "if" if first_when else "elif"
-                cb.line(f"{keyword} {resolved}:")
-            else:
-                keyword = "if" if first_when else "elif"
-                cb.line(f"{keyword} _eval_subject == {resolved}:")
+            parts: list[str] = []
+            for wc in group:
+                vt, _ = parse_when_value(wc.text)
+                resolved = resolve_when_value(vt, is_true)
+                if is_true:
+                    parts.append(f"({resolved})")
+                else:
+                    parts.append(f"(_eval_subject == {resolved})")
+            combined = " or ".join(parts)
+            keyword = "if" if first_when else "elif"
+            cb.line(f"{keyword} {combined}:")
             first_when = False
 
         cb.indent()
         bid = cb.next_branch_id()
+        cond_label = " OR ".join(
+            parse_when_value(wc.text)[0] for wc in group
+        ) if not owner_is_other else "OTHER"
         cb.branch_meta[bid] = {
-            "condition": value_text if not is_other else "OTHER",
+            "condition": cond_label,
             "paragraph": cb.current_para,
             "type": "EVALUATE",
             "subject": subject,
         }
         cb.line(f"state.get('_branches', set()).add({bid})")
-        when_body = [c for c in child.children if c.type != "WHEN"]
+        when_body = [c for c in owner.children if c.type != "WHEN"]
         if not when_body:
             cb.line("pass")
         else:

@@ -29,28 +29,28 @@ public class Section9 extends SectionBase {
         state.put("ACUP-OLD-ACCT-ID", state.get("CC-ACCT-ID"));
         performThru(state, "9200-GETCARDXREF-BYACCT", "9200-GETCARDXREF-BYACCT-EXIT");
         if (CobolRuntime.isTruthy(state.get("FLG-ACCTFILTER-NOT-OK"))) {
-            state.addBranch(268);
+            state.addBranch(223);
             registry.get("9000-READ-ACCT-EXIT").execute(state);
             return;
         } else {
-            state.addBranch(-268);
+            state.addBranch(-223);
         }
         performThru(state, "9300-GETACCTDATA-BYACCT", "9300-GETACCTDATA-BYACCT-EXIT");
         if (CobolRuntime.isTruthy(state.get("DID-NOT-FIND-ACCT-IN-ACCTDAT"))) {
-            state.addBranch(269);
+            state.addBranch(224);
             registry.get("9000-READ-ACCT-EXIT").execute(state);
             return;
         } else {
-            state.addBranch(-269);
+            state.addBranch(-224);
         }
         state.put("WS-CARD-RID-CUST-ID", state.get("CDEMO-CUST-ID"));
         performThru(state, "9400-GETCUSTDATA-BYCUST", "9400-GETCUSTDATA-BYCUST-EXIT");
         if (CobolRuntime.isTruthy(state.get("DID-NOT-FIND-CUST-IN-CUSTDAT"))) {
-            state.addBranch(270);
+            state.addBranch(225);
             registry.get("9000-READ-ACCT-EXIT").execute(state);
             return;
         } else {
-            state.addBranch(-270);
+            state.addBranch(-225);
         }
         performThru(state, "9500-STORE-FETCHED-DATA", "9500-STORE-FETCHED-DATA-EXIT");
     }
@@ -62,27 +62,39 @@ public class Section9 extends SectionBase {
     void do_9200_GETCARDXREF_BYACCT(ProgramState state) {
         stubs.cicsRead(state, "LIT-CARDXREFNAME-ACCT-PATH", "WS-CARD-RID-ACCT-ID-X", "CARD-XREF-RECORD", "WS-RESP-CD", "WS-REAS-CD");
         Object _evalSubject8 = state.get("WS-RESP-CD");
-        if (java.util.Objects.equals(_evalSubject8, 0)) {
-            state.addBranch(271);
+        if ((java.util.Objects.equals(_evalSubject8, 0))) {
+            state.addBranch(226);
             state.put("CDEMO-CUST-ID", state.get("XREF-CUST-ID"));
             state.put("CDEMO-CARD-NUM", state.get("XREF-CARD-NUM"));
         }
-        else if (java.util.Objects.equals(_evalSubject8, 13)) {
-            state.addBranch(272);
+        else if ((java.util.Objects.equals(_evalSubject8, 13))) {
+            state.addBranch(227);
+            state.put("INPUT-OK", false);
             state.put("INPUT-ERROR", true);
+            state.put("FLG-ACCTFILTER-BLANK", false);
+            state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
+            state.put("FLG-FICO-SCORE-NOT-OK", false);
+            state.put("FLG-STATE-NOT-OK", false);
+            state.put("FLG-ZIPCODE-NOT-OK", false);
             state.put("FLG-ACCTFILTER-NOT-OK", true);
             if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
-                state.addBranch(273);
+                state.addBranch(228);
                 state.put("ERROR-RESP", state.get("WS-RESP-CD"));
                 state.put("ERROR-RESP2", state.get("WS-REAS-CD"));
                 state.put("WS-RETURN-MSG", "Account:" + String.valueOf(state.get("WS-CARD-RID-ACCT-ID-X")) + " not found in" + " Cross ref file.  Resp:" + String.valueOf(state.get("ERROR-RESP")) + " Reas:" + String.valueOf(state.get("ERROR-RESP2")));
             } else {
-                state.addBranch(-273);
+                state.addBranch(-228);
             }
         }
         else {
-            state.addBranch(274);
+            state.addBranch(229);
+            state.put("INPUT-OK", false);
             state.put("INPUT-ERROR", true);
+            state.put("FLG-ACCTFILTER-BLANK", false);
+            state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
+            state.put("FLG-FICO-SCORE-NOT-OK", false);
+            state.put("FLG-STATE-NOT-OK", false);
+            state.put("FLG-ZIPCODE-NOT-OK", false);
             state.put("FLG-ACCTFILTER-NOT-OK", true);
             state.put("ERROR-OPNAME", "READ");
             state.put("ERROR-FILE", state.get("LIT-CARDXREFNAME-ACCT-PATH"));
@@ -99,26 +111,38 @@ public class Section9 extends SectionBase {
     void do_9300_GETACCTDATA_BYACCT(ProgramState state) {
         stubs.cicsRead(state, "LIT-ACCTFILENAME", "WS-CARD-RID-ACCT-ID-X", "ACCOUNT-RECORD", "WS-RESP-CD", "WS-REAS-CD");
         Object _evalSubject9 = state.get("WS-RESP-CD");
-        if (java.util.Objects.equals(_evalSubject9, 0)) {
-            state.addBranch(275);
+        if ((java.util.Objects.equals(_evalSubject9, 0))) {
+            state.addBranch(230);
             state.put("FOUND-ACCT-IN-MASTER", true);
         }
-        else if (java.util.Objects.equals(_evalSubject9, 13)) {
-            state.addBranch(276);
+        else if ((java.util.Objects.equals(_evalSubject9, 13))) {
+            state.addBranch(231);
+            state.put("INPUT-OK", false);
             state.put("INPUT-ERROR", true);
+            state.put("FLG-ACCTFILTER-BLANK", false);
+            state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
+            state.put("FLG-FICO-SCORE-NOT-OK", false);
+            state.put("FLG-STATE-NOT-OK", false);
+            state.put("FLG-ZIPCODE-NOT-OK", false);
             state.put("FLG-ACCTFILTER-NOT-OK", true);
             if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
-                state.addBranch(277);
+                state.addBranch(232);
                 state.put("ERROR-RESP", state.get("WS-RESP-CD"));
                 state.put("ERROR-RESP2", state.get("WS-REAS-CD"));
                 state.put("WS-RETURN-MSG", "Account:" + String.valueOf(state.get("WS-CARD-RID-ACCT-ID-X")) + " not found in" + " Acct Master file.Resp:" + String.valueOf(state.get("ERROR-RESP")) + " Reas:" + String.valueOf(state.get("ERROR-RESP2")));
             } else {
-                state.addBranch(-277);
+                state.addBranch(-232);
             }
         }
         else {
-            state.addBranch(278);
+            state.addBranch(233);
+            state.put("INPUT-OK", false);
             state.put("INPUT-ERROR", true);
+            state.put("FLG-ACCTFILTER-BLANK", false);
+            state.put("FLG-EDIT-US-SSN-PART1-NOT-OK", false);
+            state.put("FLG-FICO-SCORE-NOT-OK", false);
+            state.put("FLG-STATE-NOT-OK", false);
+            state.put("FLG-ZIPCODE-NOT-OK", false);
             state.put("FLG-ACCTFILTER-NOT-OK", true);
             state.put("ERROR-OPNAME", "READ");
             state.put("ERROR-FILE", state.get("LIT-ACCTFILENAME"));
@@ -135,26 +159,30 @@ public class Section9 extends SectionBase {
     void do_9400_GETCUSTDATA_BYCUST(ProgramState state) {
         stubs.cicsRead(state, "LIT-CUSTFILENAME", "WS-CARD-RID-CUST-ID-X", "CUSTOMER-RECORD", "WS-RESP-CD", "WS-REAS-CD");
         Object _evalSubject10 = state.get("WS-RESP-CD");
-        if (java.util.Objects.equals(_evalSubject10, 0)) {
-            state.addBranch(279);
+        if ((java.util.Objects.equals(_evalSubject10, 0))) {
+            state.addBranch(234);
             state.put("FOUND-CUST-IN-MASTER", true);
         }
-        else if (java.util.Objects.equals(_evalSubject10, 13)) {
-            state.addBranch(280);
+        else if ((java.util.Objects.equals(_evalSubject10, 13))) {
+            state.addBranch(235);
+            state.put("INPUT-OK", false);
             state.put("INPUT-ERROR", true);
+            state.put("FLG-CUSTFILTER-ISVALID", false);
             state.put("FLG-CUSTFILTER-NOT-OK", true);
             state.put("ERROR-RESP", state.get("WS-RESP-CD"));
             state.put("ERROR-RESP2", state.get("WS-REAS-CD"));
             if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
-                state.addBranch(281);
+                state.addBranch(236);
                 state.put("WS-RETURN-MSG", "CustId:" + String.valueOf(state.get("WS-CARD-RID-CUST-ID-X")) + " not found" + " in customer master.Resp: " + String.valueOf(state.get("ERROR-RESP")) + " REAS:" + String.valueOf(state.get("ERROR-RESP2")));
             } else {
-                state.addBranch(-281);
+                state.addBranch(-236);
             }
         }
         else {
-            state.addBranch(282);
+            state.addBranch(237);
+            state.put("INPUT-OK", false);
             state.put("INPUT-ERROR", true);
+            state.put("FLG-CUSTFILTER-ISVALID", false);
             state.put("FLG-CUSTFILTER-NOT-OK", true);
             state.put("ERROR-OPNAME", "READ");
             state.put("ERROR-FILE", state.get("LIT-CUSTFILENAME"));
@@ -224,16 +252,19 @@ public class Section9 extends SectionBase {
         state.put("WS-CARD-RID-ACCT-ID", state.get("CC-ACCT-ID"));
         stubs.dummyExec(state, "CICS", "EXEC CICS READ FILE      (LIT-ACCTFILENAME) UPDATE RIDFLD    (WS-CARD-RID-ACCT-ID-X) KEYLENGTH (LENGTH OF WS-CARD-RID-ACCT-ID-X) INTO      (ACCOUNT-RECORD) LENGTH    (LENGTH OF ACCOUNT-RECORD) RESP   ...");
         if (java.util.Objects.equals(state.get("WS-RESP-CD"), 0)) {
-            state.addBranch(283);
+            state.addBranch(238);
             // CONTINUE
         } else {
-            state.addBranch(-283);
+            state.addBranch(-238);
+            state.put("INPUT-OK", false);
             state.put("INPUT-ERROR", true);
             if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
-                state.addBranch(284);
+                state.addBranch(239);
+                state.put("DATA-WAS-CHANGED-BEFORE-UPDATE", false);
+                state.put("LOCKED-BUT-UPDATE-FAILED", false);
                 state.put("COULD-NOT-LOCK-ACCT-FOR-UPDATE", true);
             } else {
-                state.addBranch(-284);
+                state.addBranch(-239);
             }
             registry.get("9600-WRITE-PROCESSING-EXIT").execute(state);
             return;
@@ -241,27 +272,29 @@ public class Section9 extends SectionBase {
         state.put("WS-CARD-RID-CUST-ID", state.get("CDEMO-CUST-ID"));
         stubs.dummyExec(state, "CICS", "EXEC CICS READ FILE      (LIT-CUSTFILENAME) UPDATE RIDFLD    (WS-CARD-RID-CUST-ID-X) KEYLENGTH (LENGTH OF WS-CARD-RID-CUST-ID-X) INTO      (CUSTOMER-RECORD) LENGTH    (LENGTH OF CUSTOMER-RECORD) RESP ...");
         if (java.util.Objects.equals(state.get("WS-RESP-CD"), 0)) {
-            state.addBranch(285);
+            state.addBranch(240);
             // CONTINUE
         } else {
-            state.addBranch(-285);
+            state.addBranch(-240);
+            state.put("INPUT-OK", false);
             state.put("INPUT-ERROR", true);
             if (CobolRuntime.isTruthy(state.get("WS-RETURN-MSG-OFF"))) {
-                state.addBranch(286);
+                state.addBranch(241);
+                state.put("COULD-NOT-LOCK-ACCT-FOR-UPDATE", false);
                 state.put("COULD-NOT-LOCK-CUST-FOR-UPDATE", true);
             } else {
-                state.addBranch(-286);
+                state.addBranch(-241);
             }
             registry.get("9600-WRITE-PROCESSING-EXIT").execute(state);
             return;
         }
         performThru(state, "9700-CHECK-CHANGE-IN-REC", "9700-CHECK-CHANGE-IN-REC-EXIT");
         if (CobolRuntime.isTruthy(state.get("DATA-WAS-CHANGED-BEFORE-UPDATE"))) {
-            state.addBranch(287);
+            state.addBranch(242);
             registry.get("9600-WRITE-PROCESSING-EXIT").execute(state);
             return;
         } else {
-            state.addBranch(-287);
+            state.addBranch(-242);
         }
         state.put("ACCT-UPDATE-RECORD", state.get("ACCT-UPDATE-RECORD") instanceof Number ? 0 : "");
         state.put("ACCT-UPDATE-ID", state.get("ACUP-NEW-ACCT-ID"));
@@ -297,20 +330,24 @@ public class Section9 extends SectionBase {
         state.put("CUST-UPDATE-FICO-CREDIT-SCORE", state.get("ACUP-NEW-CUST-FICO-SCORE"));
         stubs.dummyExec(state, "CICS", "EXEC CICS REWRITE FILE(LIT-ACCTFILENAME) FROM(ACCT-UPDATE-RECORD) LENGTH(LENGTH OF ACCT-UPDATE-RECORD) RESP      (WS-RESP-CD) RESP2     (WS-REAS-CD) END-EXEC.");
         if (java.util.Objects.equals(state.get("WS-RESP-CD"), 0)) {
-            state.addBranch(288);
+            state.addBranch(243);
             // CONTINUE
         } else {
-            state.addBranch(-288);
+            state.addBranch(-243);
+            state.put("COULD-NOT-LOCK-ACCT-FOR-UPDATE", false);
+            state.put("DATA-WAS-CHANGED-BEFORE-UPDATE", false);
             state.put("LOCKED-BUT-UPDATE-FAILED", true);
             registry.get("9600-WRITE-PROCESSING-EXIT").execute(state);
             return;
         }
         stubs.dummyExec(state, "CICS", "EXEC CICS REWRITE FILE(LIT-CUSTFILENAME) FROM(CUST-UPDATE-RECORD) LENGTH(LENGTH OF CUST-UPDATE-RECORD) RESP      (WS-RESP-CD) RESP2     (WS-REAS-CD) END-EXEC.");
         if (java.util.Objects.equals(state.get("WS-RESP-CD"), 0)) {
-            state.addBranch(289);
+            state.addBranch(244);
             // CONTINUE
         } else {
-            state.addBranch(-289);
+            state.addBranch(-244);
+            state.put("COULD-NOT-LOCK-ACCT-FOR-UPDATE", false);
+            state.put("DATA-WAS-CHANGED-BEFORE-UPDATE", false);
             state.put("LOCKED-BUT-UPDATE-FAILED", true);
             stubs.cicsSyncpoint(state);
             registry.get("9600-WRITE-PROCESSING-EXIT").execute(state);
@@ -324,19 +361,23 @@ public class Section9 extends SectionBase {
 
     void do_9700_CHECK_CHANGE_IN_REC(ProgramState state) {
         if ((((((((((((((((java.util.Objects.equals(state.get("ACCT-ACTIVE-STATUS"), state.get("ACUP-OLD-ACTIVE-STATUS"))) && (java.util.Objects.equals(state.get("ACCT-CURR-BAL"), state.get("ACUP-OLD-CURR-BAL-N")))) && (java.util.Objects.equals(state.get("ACCT-CREDIT-LIMIT"), state.get("ACUP-OLD-CREDIT-LIMIT-N")))) && (java.util.Objects.equals(state.get("ACCT-CASH-CREDIT-LIMIT"), state.get("ACUP-OLD-CASH-CREDIT-LIMIT-N")))) && (java.util.Objects.equals(state.get("ACCT-CURR-CYC-CREDIT"), state.get("ACUP-OLD-CURR-CYC-CREDIT-N")))) && (java.util.Objects.equals(state.get("ACCT-CURR-CYC-DEBIT"), state.get("ACUP-OLD-CURR-CYC-DEBIT-N")))) && (java.util.Objects.equals(state.get("ACCT-OPEN-DATE(1:4)"), state.get("ACUP-OLD-OPEN-YEAR")))) && (java.util.Objects.equals(state.get("ACCT-OPEN-DATE(6:2)"), state.get("ACUP-OLD-OPEN-MON")))) && (java.util.Objects.equals(state.get("ACCT-OPEN-DATE(9:2)"), state.get("ACUP-OLD-OPEN-DAY")))) && (java.util.Objects.equals(state.get("ACCT-EXPIRAION-DATE(1:4)"), state.get("ACUP-OLD-EXP-YEAR")))) && (java.util.Objects.equals(state.get("ACCT-EXPIRAION-DATE(6:2)"), state.get("ACUP-OLD-EXP-MON")))) && (java.util.Objects.equals(state.get("ACCT-EXPIRAION-DATE(9:2)"), state.get("ACUP-OLD-EXP-DAY")))) && (java.util.Objects.equals(state.get("ACCT-REISSUE-DATE(1:4)"), state.get("ACUP-OLD-REISSUE-YEAR")))) && (java.util.Objects.equals(state.get("ACCT-REISSUE-DATE(6:2)"), state.get("ACUP-OLD-REISSUE-MON")))) && (java.util.Objects.equals(state.get("ACCT-REISSUE-DATE(9:2)"), state.get("ACUP-OLD-REISSUE-DAY")))) && (CobolRuntime.isTruthy(state.get("FUNCTION")))) {
-            state.addBranch(290);
+            state.addBranch(245);
             // CONTINUE
         } else {
-            state.addBranch(-290);
+            state.addBranch(-245);
+            state.put("COULD-NOT-LOCK-ACCT-FOR-UPDATE", false);
+            state.put("LOCKED-BUT-UPDATE-FAILED", false);
             state.put("DATA-WAS-CHANGED-BEFORE-UPDATE", true);
             registry.get("9600-WRITE-PROCESSING-EXIT").execute(state);
             return;
         }
         if (CobolRuntime.isTruthy(state.get("FUNCTION"))) {
-            state.addBranch(291);
+            state.addBranch(246);
             // CONTINUE
         } else {
-            state.addBranch(-291);
+            state.addBranch(-246);
+            state.put("COULD-NOT-LOCK-ACCT-FOR-UPDATE", false);
+            state.put("LOCKED-BUT-UPDATE-FAILED", false);
             state.put("DATA-WAS-CHANGED-BEFORE-UPDATE", true);
             registry.get("9600-WRITE-PROCESSING-EXIT").execute(state);
             return;

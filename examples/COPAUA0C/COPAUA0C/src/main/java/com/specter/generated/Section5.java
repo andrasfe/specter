@@ -53,14 +53,15 @@ public class Section5 extends SectionBase {
     void do_5100_READ_XREF_RECORD(ProgramState state) {
         state.put("XREF-CARD-NUM", state.get("PA-RQ-CARD-NUM"));
         stubs.cicsRead(state, "WS-CCXREF-FILE", "XREF-CARD-NUM", "CARD-XREF-RECORD", "WS-RESP-CD", "WS-REAS-CD");
-        Object _evalSubject = state.get("WS-RESP-CD");
-        if (java.util.Objects.equals(_evalSubject, 0)) {
+        Object _evalSubject1 = state.get("WS-RESP-CD");
+        if ((java.util.Objects.equals(_evalSubject1, 0))) {
             state.addBranch(11);
             state.put("CARD-FOUND-XREF", true);
         }
-        else if (java.util.Objects.equals(_evalSubject, 13)) {
+        else if ((java.util.Objects.equals(_evalSubject1, 13))) {
             state.addBranch(12);
             state.put("CARD-NFOUND-XREF", true);
+            state.put("NFOUND-CUST-IN-MSTR", false);
             state.put("NFOUND-ACCT-IN-MSTR", true);
             state.put("ERR-LOCATION", "A001");
             state.put("ERR-WARNING", true);
@@ -93,13 +94,14 @@ public class Section5 extends SectionBase {
     void do_5200_READ_ACCT_RECORD(ProgramState state) {
         state.put("WS-CARD-RID-ACCT-ID", state.get("XREF-ACCT-ID"));
         stubs.cicsRead(state, "WS-ACCTFILENAME", "WS-CARD-RID-ACCT-ID-X", "ACCOUNT-RECORD", "WS-RESP-CD", "WS-REAS-CD");
-        Object _evalSubject = state.get("WS-RESP-CD");
-        if (java.util.Objects.equals(_evalSubject, 0)) {
+        Object _evalSubject2 = state.get("WS-RESP-CD");
+        if ((java.util.Objects.equals(_evalSubject2, 0))) {
             state.addBranch(14);
             state.put("FOUND-ACCT-IN-MSTR", true);
         }
-        else if (java.util.Objects.equals(_evalSubject, 13)) {
+        else if ((java.util.Objects.equals(_evalSubject2, 13))) {
             state.addBranch(15);
+            state.put("NFOUND-CUST-IN-MSTR", false);
             state.put("NFOUND-ACCT-IN-MSTR", true);
             state.put("ERR-LOCATION", "A002");
             state.put("ERR-WARNING", true);
@@ -132,13 +134,14 @@ public class Section5 extends SectionBase {
     void do_5300_READ_CUST_RECORD(ProgramState state) {
         state.put("WS-CARD-RID-CUST-ID", state.get("XREF-CUST-ID"));
         stubs.cicsRead(state, "WS-CUSTFILENAME", "WS-CARD-RID-CUST-ID-X", "CUSTOMER-RECORD", "WS-RESP-CD", "WS-REAS-CD");
-        Object _evalSubject = state.get("WS-RESP-CD");
-        if (java.util.Objects.equals(_evalSubject, 0)) {
+        Object _evalSubject3 = state.get("WS-RESP-CD");
+        if ((java.util.Objects.equals(_evalSubject3, 0))) {
             state.addBranch(17);
             state.put("FOUND-CUST-IN-MSTR", true);
         }
-        else if (java.util.Objects.equals(_evalSubject, 13)) {
+        else if ((java.util.Objects.equals(_evalSubject3, 13))) {
             state.addBranch(18);
+            state.put("NFOUND-ACCT-IN-MSTR", false);
             state.put("NFOUND-CUST-IN-MSTR", true);
             state.put("ERR-LOCATION", "A003");
             state.put("ERR-WARNING", true);
@@ -172,11 +175,11 @@ public class Section5 extends SectionBase {
         state.put("PA-ACCT-ID", state.get("XREF-ACCT-ID"));
         stubs.dliGetUnique(state, "PAUTSUM0", "PENDING-AUTH-SUMMARY", "ACCNTID", "PA-ACCT-ID");
         state.put("IMS-RETURN-CODE", state.get("DIBSTAT"));
-        if (CobolRuntime.isTruthy(state.get("STATUS-OK"))) {
+        if ((CobolRuntime.isTruthy(state.get("STATUS-OK")))) {
             state.addBranch(20);
             state.put("FOUND-PAUT-SMRY-SEG", true);
         }
-        else if (CobolRuntime.isTruthy(state.get("SEGMENT-NOT-FOUND"))) {
+        else if ((CobolRuntime.isTruthy(state.get("SEGMENT-NOT-FOUND")))) {
             state.addBranch(21);
             state.put("NFOUND-PAUT-SMRY-SEG", true);
         }

@@ -26,39 +26,39 @@ public class Section8 extends SectionBase {
 
     void do_8400_UPDATE_SUMMARY(ProgramState state) {
         if (CobolRuntime.isTruthy(state.get("NFOUND-PAUT-SMRY-SEG"))) {
-            state.addBranch(39);
+            state.addBranch(37);
             state.put("PENDING-AUTH-SUMMARY", state.get("PENDING-AUTH-SUMMARY") instanceof Number ? 0 : "");
             state.put("PA-ACCT-ID", state.get("XREF-ACCT-ID"));
             state.put("PA-CUST-ID", state.get("XREF-CUST-ID"));
         } else {
-            state.addBranch(-39);
+            state.addBranch(-37);
         }
         state.put("PA-CREDIT-LIMIT", state.get("ACCT-CREDIT-LIMIT"));
         state.put("PA-CASH-LIMIT", state.get("ACCT-CASH-CREDIT-LIMIT"));
         if (CobolRuntime.isTruthy(state.get("AUTH-RESP-APPROVED"))) {
-            state.addBranch(40);
+            state.addBranch(38);
             state.put("PA-APPROVED-AUTH-CNT", CobolRuntime.toNum(state.get("PA-APPROVED-AUTH-CNT")) + 1);
             state.put("PA-APPROVED-AUTH-AMT", CobolRuntime.toNum(state.get("PA-APPROVED-AUTH-AMT")) + CobolRuntime.toNum(state.get("WS-APPROVED-AMT")));
             state.put("PA-CREDIT-BALANCE", CobolRuntime.toNum(state.get("PA-CREDIT-BALANCE")) + CobolRuntime.toNum(state.get("WS-APPROVED-AMT")));
             state.put("PA-CASH-BALANCE", 0);
         } else {
-            state.addBranch(-40);
+            state.addBranch(-38);
             state.put("PA-DECLINED-AUTH-CNT", CobolRuntime.toNum(state.get("PA-DECLINED-AUTH-CNT")) + 1);
             state.put("PA-DECLINED-AUTH-AMT", CobolRuntime.toNum(state.get("PA-DECLINED-AUTH-AMT")) + CobolRuntime.toNum(state.get("PA-TRANSACTION-AMT")));
         }
         if (CobolRuntime.isTruthy(state.get("FOUND-PAUT-SMRY-SEG"))) {
-            state.addBranch(41);
+            state.addBranch(39);
             stubs.dliReplace(state, "PAUTSUM0", "PENDING-AUTH-SUMMARY");
         } else {
-            state.addBranch(-41);
+            state.addBranch(-39);
             stubs.dliInsert(state, "PAUTSUM0", "PENDING-AUTH-SUMMARY");
         }
         state.put("IMS-RETURN-CODE", state.get("DIBSTAT"));
         if (CobolRuntime.isTruthy(state.get("STATUS-OK"))) {
-            state.addBranch(42);
+            state.addBranch(40);
             // CONTINUE
         } else {
-            state.addBranch(-42);
+            state.addBranch(-40);
             state.put("ERR-LOCATION", "I003");
             state.put("ERR-CRITICAL", true);
             state.put("ERR-IMS", true);
@@ -104,10 +104,12 @@ public class Section8 extends SectionBase {
         state.put("PA-AUTH-RESP-REASON", state.get("PA-RL-AUTH-RESP-REASON"));
         state.put("PA-APPROVED-AMT", state.get("PA-RL-APPROVED-AMT"));
         if (CobolRuntime.isTruthy(state.get("AUTH-RESP-APPROVED"))) {
-            state.addBranch(43);
+            state.addBranch(41);
+            state.put("PA-MATCH-AUTH-DECLINED", false);
             state.put("PA-MATCH-PENDING", true);
         } else {
-            state.addBranch(-43);
+            state.addBranch(-41);
+            state.put("PA-MATCH-PENDING", false);
             state.put("PA-MATCH-AUTH-DECLINED", true);
         }
         state.put("PA-AUTH-FRAUD", " ");
@@ -115,10 +117,10 @@ public class Section8 extends SectionBase {
         stubs.dliInsertChild(state, "PAUTSUM0", "ACCNTID", "PA-ACCT-ID", "PAUTDTL1", "PENDING-AUTH-DETAILS");
         state.put("IMS-RETURN-CODE", state.get("DIBSTAT"));
         if (CobolRuntime.isTruthy(state.get("STATUS-OK"))) {
-            state.addBranch(44);
+            state.addBranch(42);
             // CONTINUE
         } else {
-            state.addBranch(-44);
+            state.addBranch(-42);
             state.put("ERR-LOCATION", "I004");
             state.put("ERR-CRITICAL", true);
             state.put("ERR-IMS", true);

@@ -70,35 +70,31 @@ public class Section3 extends SectionBase {
 
     void do_3200_SETUP_SCREEN_VARS(ProgramState state) {
         if (CobolRuntime.isTruthy(state.get("CDEMO-PGM-ENTER"))) {
-            state.addBranch(152);
+            state.addBranch(149);
             // CONTINUE
         } else {
-            state.addBranch(-152);
+            state.addBranch(-149);
             if ((java.util.Objects.equals(state.get("CC-ACCT-ID-N"), 0)) && (CobolRuntime.isTruthy(state.get("FLG-ACCTFILTER-ISVALID")))) {
-                state.addBranch(153);
+                state.addBranch(150);
                 state.put("ACCTSIDO", "\u0000");
             } else {
-                state.addBranch(-153);
+                state.addBranch(-150);
                 state.put("ACCTSIDO", state.get("CC-ACCT-ID"));
             }
-            if (CobolRuntime.isTruthy(state.get("ACUP-DETAILS-NOT-FETCHED"))) {
-                state.addBranch(154);
-                // empty WHEN
-            }
-            else if (java.util.Objects.equals(state.get("CC-ACCT-ID-N"), 0)) {
-                state.addBranch(155);
+            if ((CobolRuntime.isTruthy(state.get("ACUP-DETAILS-NOT-FETCHED"))) || (java.util.Objects.equals(state.get("CC-ACCT-ID-N"), 0))) {
+                state.addBranch(151);
                 performThru(state, "3201-SHOW-INITIAL-VALUES", "3201-SHOW-INITIAL-VALUES-EXIT");
             }
-            else if (CobolRuntime.isTruthy(state.get("ACUP-SHOW-DETAILS"))) {
-                state.addBranch(156);
+            else if ((CobolRuntime.isTruthy(state.get("ACUP-SHOW-DETAILS")))) {
+                state.addBranch(152);
                 performThru(state, "3202-SHOW-ORIGINAL-VALUES", "3202-SHOW-ORIGINAL-VALUES-EXIT");
             }
-            else if (CobolRuntime.isTruthy(state.get("ACUP-CHANGES-MADE"))) {
-                state.addBranch(157);
+            else if ((CobolRuntime.isTruthy(state.get("ACUP-CHANGES-MADE")))) {
+                state.addBranch(153);
                 performThru(state, "3203-SHOW-UPDATED-VALUES", "3203-SHOW-UPDATED-VALUES-EXIT");
             }
             else {
-                state.addBranch(158);
+                state.addBranch(154);
                 performThru(state, "3202-SHOW-ORIGINAL-VALUES", "3202-SHOW-ORIGINAL-VALUES-EXIT");
             }
         }
@@ -118,9 +114,11 @@ public class Section3 extends SectionBase {
 
     void do_3202_SHOW_ORIGINAL_VALUES(ProgramState state) {
         state.put("WS-NON-KEY-FLAGS", "\u0000");
+        state.put("PROMPT-FOR-CONFIRMATION", false);
+        state.put("PROMPT-FOR-SEARCH-KEYS", false);
         state.put("PROMPT-FOR-CHANGES", true);
         if ((CobolRuntime.isTruthy(state.get("FOUND-ACCT-IN-MASTER"))) || (CobolRuntime.isTruthy(state.get("FOUND-CUST-IN-MASTER")))) {
-            state.addBranch(159);
+            state.addBranch(155);
             state.put("ACSTTUSO", state.get("ACUP-OLD-ACTIVE-STATUS"));
             state.put("WS-EDIT-CURRENCY-9-2-F", state.get("ACUP-OLD-CURR-BAL-N"));
             state.put("ACURBALO", state.get("WS-EDIT-CURRENCY-9-2-F"));
@@ -143,10 +141,10 @@ public class Section3 extends SectionBase {
             state.put("RISDAYO", state.get("ACUP-OLD-REISSUE-DAY"));
             state.put("AADDGRPO", state.get("ACUP-OLD-GROUP-ID"));
         } else {
-            state.addBranch(-159);
+            state.addBranch(-155);
         }
         if (CobolRuntime.isTruthy(state.get("FOUND-CUST-IN-MASTER"))) {
-            state.addBranch(160);
+            state.addBranch(156);
             state.put("ACSTNUMO", state.get("ACUP-OLD-CUST-ID-X"));
             state.put("ACTSSN1O", (String.valueOf(state.get("ACUP-OLD-CUST-SSN-X")).length() > 0 ? String.valueOf(state.get("ACUP-OLD-CUST-SSN-X")).substring(0, Math.min(3, String.valueOf(state.get("ACUP-OLD-CUST-SSN-X")).length())) : ""));
             state.put("ACTSSN2O", (String.valueOf(state.get("ACUP-OLD-CUST-SSN-X")).length() > 3 ? String.valueOf(state.get("ACUP-OLD-CUST-SSN-X")).substring(3, Math.min(5, String.valueOf(state.get("ACUP-OLD-CUST-SSN-X")).length())) : ""));
@@ -174,7 +172,7 @@ public class Section3 extends SectionBase {
             state.put("ACSEFTCO", state.get("ACUP-OLD-CUST-EFT-ACCOUNT-ID"));
             state.put("ACSPFLGO", state.get("ACUP-OLD-CUST-PRI-HOLDER-IND"));
         } else {
-            state.addBranch(-160);
+            state.addBranch(-156);
         }
     }
 
@@ -185,43 +183,43 @@ public class Section3 extends SectionBase {
     void do_3203_SHOW_UPDATED_VALUES(ProgramState state) {
         state.put("ACSTTUSO", state.get("ACUP-NEW-ACTIVE-STATUS"));
         if (CobolRuntime.isTruthy(state.get("FLG-CRED-LIMIT-ISVALID"))) {
-            state.addBranch(161);
+            state.addBranch(157);
             state.put("WS-EDIT-CURRENCY-9-2-F", state.get("ACUP-NEW-CREDIT-LIMIT-N"));
             state.put("ACRDLIMO", state.get("WS-EDIT-CURRENCY-9-2-F"));
         } else {
-            state.addBranch(-161);
+            state.addBranch(-157);
             state.put("ACRDLIMO", state.get("ACUP-NEW-CREDIT-LIMIT-X"));
         }
         if (CobolRuntime.isTruthy(state.get("FLG-CASH-CREDIT-LIMIT-ISVALID"))) {
-            state.addBranch(162);
+            state.addBranch(158);
             state.put("WS-EDIT-CURRENCY-9-2-F", state.get("ACUP-NEW-CASH-CREDIT-LIMIT-N"));
             state.put("ACSHLIMO", state.get("WS-EDIT-CURRENCY-9-2-F"));
         } else {
-            state.addBranch(-162);
+            state.addBranch(-158);
             state.put("ACSHLIMO", state.get("ACUP-NEW-CASH-CREDIT-LIMIT-X"));
         }
         if (CobolRuntime.isTruthy(state.get("FLG-CURR-BAL-ISVALID"))) {
-            state.addBranch(163);
+            state.addBranch(159);
             state.put("WS-EDIT-CURRENCY-9-2-F", state.get("ACUP-NEW-CURR-BAL-N"));
             state.put("ACURBALO", state.get("WS-EDIT-CURRENCY-9-2-F"));
         } else {
-            state.addBranch(-163);
+            state.addBranch(-159);
             state.put("ACURBALO", state.get("ACUP-NEW-CURR-BAL-X"));
         }
         if (CobolRuntime.isTruthy(state.get("FLG-CURR-CYC-CREDIT-ISVALID"))) {
-            state.addBranch(164);
+            state.addBranch(160);
             state.put("WS-EDIT-CURRENCY-9-2-F", state.get("ACUP-NEW-CURR-CYC-CREDIT-N"));
             state.put("ACRCYCRO", state.get("WS-EDIT-CURRENCY-9-2-F"));
         } else {
-            state.addBranch(-164);
+            state.addBranch(-160);
             state.put("ACRCYCRO", state.get("ACUP-NEW-CURR-CYC-CREDIT-X"));
         }
         if (CobolRuntime.isTruthy(state.get("FLG-CURR-CYC-DEBIT-ISVALID"))) {
-            state.addBranch(165);
+            state.addBranch(161);
             state.put("WS-EDIT-CURRENCY-9-2-F", state.get("ACUP-NEW-CURR-CYC-DEBIT-N"));
             state.put("ACRCYDBO", state.get("WS-EDIT-CURRENCY-9-2-F"));
         } else {
-            state.addBranch(-165);
+            state.addBranch(-161);
             state.put("ACRCYDBO", state.get("ACUP-NEW-CURR-CYC-DEBIT-X"));
         }
         state.put("OPNYEARO", state.get("ACUP-NEW-OPEN-YEAR"));
@@ -267,40 +265,52 @@ public class Section3 extends SectionBase {
     }
 
     void do_3250_SETUP_INFOMSG(ProgramState state) {
-        if (CobolRuntime.isTruthy(state.get("CDEMO-PGM-ENTER"))) {
+        if ((CobolRuntime.isTruthy(state.get("CDEMO-PGM-ENTER")))) {
+            state.addBranch(162);
+            state.put("PROMPT-FOR-CHANGES", false);
+            state.put("PROMPT-FOR-CONFIRMATION", false);
+            state.put("PROMPT-FOR-SEARCH-KEYS", true);
+        }
+        else if ((CobolRuntime.isTruthy(state.get("ACUP-DETAILS-NOT-FETCHED")))) {
+            state.addBranch(163);
+            state.put("PROMPT-FOR-CHANGES", false);
+            state.put("PROMPT-FOR-CONFIRMATION", false);
+            state.put("PROMPT-FOR-SEARCH-KEYS", true);
+        }
+        else if ((CobolRuntime.isTruthy(state.get("ACUP-SHOW-DETAILS")))) {
+            state.addBranch(164);
+            state.put("PROMPT-FOR-CONFIRMATION", false);
+            state.put("PROMPT-FOR-SEARCH-KEYS", false);
+            state.put("PROMPT-FOR-CHANGES", true);
+        }
+        else if ((CobolRuntime.isTruthy(state.get("ACUP-CHANGES-NOT-OK")))) {
+            state.addBranch(165);
+            state.put("PROMPT-FOR-CONFIRMATION", false);
+            state.put("PROMPT-FOR-SEARCH-KEYS", false);
+            state.put("PROMPT-FOR-CHANGES", true);
+        }
+        else if ((CobolRuntime.isTruthy(state.get("ACUP-CHANGES-OK-NOT-CONFIRMED")))) {
             state.addBranch(166);
-            state.put("PROMPT-FOR-SEARCH-KEYS", true);
-        }
-        else if (CobolRuntime.isTruthy(state.get("ACUP-DETAILS-NOT-FETCHED"))) {
-            state.addBranch(167);
-            state.put("PROMPT-FOR-SEARCH-KEYS", true);
-        }
-        else if (CobolRuntime.isTruthy(state.get("ACUP-SHOW-DETAILS"))) {
-            state.addBranch(168);
-            state.put("PROMPT-FOR-CHANGES", true);
-        }
-        else if (CobolRuntime.isTruthy(state.get("ACUP-CHANGES-NOT-OK"))) {
-            state.addBranch(169);
-            state.put("PROMPT-FOR-CHANGES", true);
-        }
-        else if (CobolRuntime.isTruthy(state.get("ACUP-CHANGES-OK-NOT-CONFIRMED"))) {
-            state.addBranch(170);
+            state.put("PROMPT-FOR-CHANGES", false);
+            state.put("PROMPT-FOR-SEARCH-KEYS", false);
             state.put("PROMPT-FOR-CONFIRMATION", true);
         }
-        else if (CobolRuntime.isTruthy(state.get("ACUP-CHANGES-OKAYED-AND-DONE"))) {
-            state.addBranch(171);
+        else if ((CobolRuntime.isTruthy(state.get("ACUP-CHANGES-OKAYED-AND-DONE")))) {
+            state.addBranch(167);
             state.put("CONFIRM-UPDATE-SUCCESS", true);
         }
-        else if (CobolRuntime.isTruthy(state.get("ACUP-CHANGES-OKAYED-LOCK-ERROR"))) {
-            state.addBranch(172);
+        else if ((CobolRuntime.isTruthy(state.get("ACUP-CHANGES-OKAYED-LOCK-ERROR")))) {
+            state.addBranch(168);
             state.put("INFORM-FAILURE", true);
         }
-        else if (CobolRuntime.isTruthy(state.get("ACUP-CHANGES-OKAYED-BUT-FAILED"))) {
-            state.addBranch(173);
+        else if ((CobolRuntime.isTruthy(state.get("ACUP-CHANGES-OKAYED-BUT-FAILED")))) {
+            state.addBranch(169);
             state.put("INFORM-FAILURE", true);
         }
-        else if (CobolRuntime.isTruthy(state.get("WS-NO-INFO-MESSAGE"))) {
-            state.addBranch(174);
+        else if ((CobolRuntime.isTruthy(state.get("WS-NO-INFO-MESSAGE")))) {
+            state.addBranch(170);
+            state.put("PROMPT-FOR-CHANGES", false);
+            state.put("PROMPT-FOR-CONFIRMATION", false);
             state.put("PROMPT-FOR-SEARCH-KEYS", true);
         }
         state.put("INFOMSGO", state.get("WS-INFO-MSG"));
@@ -313,375 +323,211 @@ public class Section3 extends SectionBase {
 
     void do_3300_SETUP_SCREEN_ATTRS(ProgramState state) {
         performThru(state, "3310-PROTECT-ALL-ATTRS", "3310-PROTECT-ALL-ATTRS-EXIT");
-        if (CobolRuntime.isTruthy(state.get("ACUP-DETAILS-NOT-FETCHED"))) {
-            state.addBranch(175);
+        if ((CobolRuntime.isTruthy(state.get("ACUP-DETAILS-NOT-FETCHED")))) {
+            state.addBranch(171);
             state.put("ACCTSIDA", state.get("DFHBMFSE"));
         }
-        else if (CobolRuntime.isTruthy(state.get("ACUP-SHOW-DETAILS"))) {
-            state.addBranch(176);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("ACUP-CHANGES-NOT-OK"))) {
-            state.addBranch(177);
+        else if ((CobolRuntime.isTruthy(state.get("ACUP-SHOW-DETAILS"))) || (CobolRuntime.isTruthy(state.get("ACUP-CHANGES-NOT-OK")))) {
+            state.addBranch(172);
             performThru(state, "3320-UNPROTECT-FEW-ATTRS", "3320-UNPROTECT-FEW-ATTRS-EXIT");
         }
-        else if (CobolRuntime.isTruthy(state.get("ACUP-CHANGES-OK-NOT-CONFIRMED"))) {
-            state.addBranch(178);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("ACUP-CHANGES-OKAYED-AND-DONE"))) {
-            state.addBranch(179);
+        else if ((CobolRuntime.isTruthy(state.get("ACUP-CHANGES-OK-NOT-CONFIRMED"))) || (CobolRuntime.isTruthy(state.get("ACUP-CHANGES-OKAYED-AND-DONE")))) {
+            state.addBranch(173);
             // CONTINUE
         }
         else {
-            state.addBranch(180);
+            state.addBranch(174);
             state.put("ACCTSIDA", state.get("DFHBMFSE"));
         }
-        if (CobolRuntime.isTruthy(state.get("FOUND-ACCOUNT-DATA"))) {
-            state.addBranch(181);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("NO-CHANGES-DETECTED"))) {
-            state.addBranch(182);
+        if ((CobolRuntime.isTruthy(state.get("FOUND-ACCOUNT-DATA"))) || (CobolRuntime.isTruthy(state.get("NO-CHANGES-DETECTED")))) {
+            state.addBranch(175);
             state.put("ACSTTUSL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-ACCTFILTER-NOT-OK"))) {
-            state.addBranch(183);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-ACCTFILTER-BLANK"))) {
-            state.addBranch(184);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-ACCTFILTER-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-ACCTFILTER-BLANK")))) {
+            state.addBranch(176);
             state.put("ACCTSIDL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-ACCT-STATUS-NOT-OK"))) {
-            state.addBranch(185);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-ACCT-STATUS-BLANK"))) {
-            state.addBranch(186);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-ACCT-STATUS-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-ACCT-STATUS-BLANK")))) {
+            state.addBranch(177);
             state.put("ACSTTUSL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-OPEN-YEAR-NOT-OK"))) {
-            state.addBranch(187);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-OPEN-YEAR-BLANK"))) {
-            state.addBranch(188);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-OPEN-YEAR-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-OPEN-YEAR-BLANK")))) {
+            state.addBranch(178);
             state.put("OPNYEARL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-OPEN-MONTH-NOT-OK"))) {
-            state.addBranch(189);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-OPEN-MONTH-BLANK"))) {
-            state.addBranch(190);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-OPEN-MONTH-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-OPEN-MONTH-BLANK")))) {
+            state.addBranch(179);
             state.put("OPNMONL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-OPEN-DAY-NOT-OK"))) {
-            state.addBranch(191);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-OPEN-DAY-BLANK"))) {
-            state.addBranch(192);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-OPEN-DAY-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-OPEN-DAY-BLANK")))) {
+            state.addBranch(180);
             state.put("OPNDAYL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-CRED-LIMIT-NOT-OK"))) {
-            state.addBranch(193);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-CRED-LIMIT-BLANK"))) {
-            state.addBranch(194);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-CRED-LIMIT-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-CRED-LIMIT-BLANK")))) {
+            state.addBranch(181);
             state.put("ACRDLIML", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-EXPIRY-YEAR-NOT-OK"))) {
-            state.addBranch(195);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-EXPIRY-YEAR-BLANK"))) {
-            state.addBranch(196);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-EXPIRY-YEAR-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-EXPIRY-YEAR-BLANK")))) {
+            state.addBranch(182);
             state.put("EXPYEARL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-EXPIRY-MONTH-NOT-OK"))) {
-            state.addBranch(197);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-EXPIRY-MONTH-BLANK"))) {
-            state.addBranch(198);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-EXPIRY-MONTH-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-EXPIRY-MONTH-BLANK")))) {
+            state.addBranch(183);
             state.put("EXPMONL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-EXPIRY-DAY-NOT-OK"))) {
-            state.addBranch(199);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-EXPIRY-DAY-BLANK"))) {
-            state.addBranch(200);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-EXPIRY-DAY-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-EXPIRY-DAY-BLANK")))) {
+            state.addBranch(184);
             state.put("EXPDAYL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-CASH-CREDIT-LIMIT-NOT-OK"))) {
-            state.addBranch(201);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-CASH-CREDIT-LIMIT-BLANK"))) {
-            state.addBranch(202);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-CASH-CREDIT-LIMIT-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-CASH-CREDIT-LIMIT-BLANK")))) {
+            state.addBranch(185);
             state.put("ACSHLIML", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-REISSUE-YEAR-NOT-OK"))) {
-            state.addBranch(203);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-REISSUE-YEAR-BLANK"))) {
-            state.addBranch(204);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-REISSUE-YEAR-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-REISSUE-YEAR-BLANK")))) {
+            state.addBranch(186);
             state.put("RISYEARL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-REISSUE-MONTH-NOT-OK"))) {
-            state.addBranch(205);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-REISSUE-MONTH-BLANK"))) {
-            state.addBranch(206);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-REISSUE-MONTH-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-REISSUE-MONTH-BLANK")))) {
+            state.addBranch(187);
             state.put("RISMONL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-REISSUE-DAY-NOT-OK"))) {
-            state.addBranch(207);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-REISSUE-DAY-BLANK"))) {
-            state.addBranch(208);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-REISSUE-DAY-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-REISSUE-DAY-BLANK")))) {
+            state.addBranch(188);
             state.put("RISDAYL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-CURR-BAL-NOT-OK"))) {
-            state.addBranch(209);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-CURR-BAL-BLANK"))) {
-            state.addBranch(210);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-CURR-BAL-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-CURR-BAL-BLANK")))) {
+            state.addBranch(189);
             state.put("ACURBALL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-CURR-CYC-CREDIT-NOT-OK"))) {
-            state.addBranch(211);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-CURR-CYC-CREDIT-BLANK"))) {
-            state.addBranch(212);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-CURR-CYC-CREDIT-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-CURR-CYC-CREDIT-BLANK")))) {
+            state.addBranch(190);
             state.put("ACRCYCRL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-CURR-CYC-DEBIT-NOT-OK"))) {
-            state.addBranch(213);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-CURR-CYC-DEBIT-BLANK"))) {
-            state.addBranch(214);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-CURR-CYC-DEBIT-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-CURR-CYC-DEBIT-BLANK")))) {
+            state.addBranch(191);
             state.put("ACRCYDBL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-EDIT-US-SSN-PART1-NOT-OK"))) {
-            state.addBranch(215);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-EDIT-US-SSN-PART1-BLANK"))) {
-            state.addBranch(216);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-EDIT-US-SSN-PART1-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-EDIT-US-SSN-PART1-BLANK")))) {
+            state.addBranch(192);
             state.put("ACTSSN1L", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-EDIT-US-SSN-PART2-NOT-OK"))) {
-            state.addBranch(217);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-EDIT-US-SSN-PART2-BLANK"))) {
-            state.addBranch(218);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-EDIT-US-SSN-PART2-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-EDIT-US-SSN-PART2-BLANK")))) {
+            state.addBranch(193);
             state.put("ACTSSN2L", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-EDIT-US-SSN-PART3-NOT-OK"))) {
-            state.addBranch(219);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-EDIT-US-SSN-PART3-BLANK"))) {
-            state.addBranch(220);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-EDIT-US-SSN-PART3-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-EDIT-US-SSN-PART3-BLANK")))) {
+            state.addBranch(194);
             state.put("ACTSSN3L", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-DT-OF-BIRTH-YEAR-NOT-OK"))) {
-            state.addBranch(221);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-DT-OF-BIRTH-YEAR-BLANK"))) {
-            state.addBranch(222);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-DT-OF-BIRTH-YEAR-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-DT-OF-BIRTH-YEAR-BLANK")))) {
+            state.addBranch(195);
             state.put("DOBYEARL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-DT-OF-BIRTH-MONTH-NOT-OK"))) {
-            state.addBranch(223);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-DT-OF-BIRTH-MONTH-BLANK"))) {
-            state.addBranch(224);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-DT-OF-BIRTH-MONTH-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-DT-OF-BIRTH-MONTH-BLANK")))) {
+            state.addBranch(196);
             state.put("DOBMONL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-DT-OF-BIRTH-DAY-NOT-OK"))) {
-            state.addBranch(225);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-DT-OF-BIRTH-DAY-BLANK"))) {
-            state.addBranch(226);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-DT-OF-BIRTH-DAY-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-DT-OF-BIRTH-DAY-BLANK")))) {
+            state.addBranch(197);
             state.put("DOBDAYL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-FICO-SCORE-NOT-OK"))) {
-            state.addBranch(227);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-FICO-SCORE-BLANK"))) {
-            state.addBranch(228);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-FICO-SCORE-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-FICO-SCORE-BLANK")))) {
+            state.addBranch(198);
             state.put("ACSTFCOL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-FIRST-NAME-NOT-OK"))) {
-            state.addBranch(229);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-FIRST-NAME-BLANK"))) {
-            state.addBranch(230);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-FIRST-NAME-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-FIRST-NAME-BLANK")))) {
+            state.addBranch(199);
             state.put("ACSFNAML", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-MIDDLE-NAME-NOT-OK"))) {
-            state.addBranch(231);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-MIDDLE-NAME-NOT-OK")))) {
+            state.addBranch(200);
             state.put("ACSMNAML", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-LAST-NAME-NOT-OK"))) {
-            state.addBranch(232);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-LAST-NAME-BLANK"))) {
-            state.addBranch(233);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-LAST-NAME-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-LAST-NAME-BLANK")))) {
+            state.addBranch(201);
             state.put("ACSLNAML", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-ADDRESS-LINE-1-NOT-OK"))) {
-            state.addBranch(234);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-ADDRESS-LINE-1-BLANK"))) {
-            state.addBranch(235);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-ADDRESS-LINE-1-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-ADDRESS-LINE-1-BLANK")))) {
+            state.addBranch(202);
             state.put("ACSADL1L", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-STATE-NOT-OK"))) {
-            state.addBranch(236);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-STATE-BLANK"))) {
-            state.addBranch(237);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-STATE-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-STATE-BLANK")))) {
+            state.addBranch(203);
             state.put("ACSSTTEL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-ZIPCODE-NOT-OK"))) {
-            state.addBranch(238);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-ZIPCODE-BLANK"))) {
-            state.addBranch(239);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-ZIPCODE-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-ZIPCODE-BLANK")))) {
+            state.addBranch(204);
             state.put("ACSZIPCL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-CITY-NOT-OK"))) {
-            state.addBranch(240);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-CITY-BLANK"))) {
-            state.addBranch(241);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-CITY-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-CITY-BLANK")))) {
+            state.addBranch(205);
             state.put("ACSCITYL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-COUNTRY-NOT-OK"))) {
-            state.addBranch(242);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-COUNTRY-BLANK"))) {
-            state.addBranch(243);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-COUNTRY-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-COUNTRY-BLANK")))) {
+            state.addBranch(206);
             state.put("ACSCTRYL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-1A-NOT-OK"))) {
-            state.addBranch(244);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-1A-BLANK"))) {
-            state.addBranch(245);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-1A-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-1A-BLANK")))) {
+            state.addBranch(207);
             state.put("ACSPH1AL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-1B-NOT-OK"))) {
-            state.addBranch(246);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-1B-BLANK"))) {
-            state.addBranch(247);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-1B-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-1B-BLANK")))) {
+            state.addBranch(208);
             state.put("ACSPH1BL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-1C-NOT-OK"))) {
-            state.addBranch(248);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-1C-BLANK"))) {
-            state.addBranch(249);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-1C-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-1C-BLANK")))) {
+            state.addBranch(209);
             state.put("ACSPH1CL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-2A-NOT-OK"))) {
-            state.addBranch(250);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-2A-BLANK"))) {
-            state.addBranch(251);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-2A-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-2A-BLANK")))) {
+            state.addBranch(210);
             state.put("ACSPH2AL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-2B-NOT-OK"))) {
-            state.addBranch(252);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-2B-BLANK"))) {
-            state.addBranch(253);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-2B-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-2B-BLANK")))) {
+            state.addBranch(211);
             state.put("ACSPH2BL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-2C-NOT-OK"))) {
-            state.addBranch(254);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-2C-BLANK"))) {
-            state.addBranch(255);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-2C-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-PHONE-NUM-2C-BLANK")))) {
+            state.addBranch(212);
             state.put("ACSPH2CL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-EFT-ACCOUNT-ID-NOT-OK"))) {
-            state.addBranch(256);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-EFT-ACCOUNT-ID-BLANK"))) {
-            state.addBranch(257);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-EFT-ACCOUNT-ID-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-EFT-ACCOUNT-ID-BLANK")))) {
+            state.addBranch(213);
             state.put("ACSEFTCL", -1);
         }
-        else if (CobolRuntime.isTruthy(state.get("FLG-PRI-CARDHOLDER-NOT-OK"))) {
-            state.addBranch(258);
-            // empty WHEN
-        }
-        else if (CobolRuntime.isTruthy(state.get("FLG-PRI-CARDHOLDER-BLANK"))) {
-            state.addBranch(259);
+        else if ((CobolRuntime.isTruthy(state.get("FLG-PRI-CARDHOLDER-NOT-OK"))) || (CobolRuntime.isTruthy(state.get("FLG-PRI-CARDHOLDER-BLANK")))) {
+            state.addBranch(214);
             state.put("ACSPFLGL", -1);
         }
         else {
-            state.addBranch(260);
+            state.addBranch(215);
             state.put("ACCTSIDL", -1);
         }
         if (java.util.Objects.equals(state.get("CDEMO-LAST-MAPSET"), state.get("LIT-CCLISTMAPSET"))) {
-            state.addBranch(261);
+            state.addBranch(216);
             state.put("ACCTSIDC", state.get("DFHDFCOL"));
         } else {
-            state.addBranch(-261);
+            state.addBranch(-216);
         }
         if (CobolRuntime.isTruthy(state.get("FLG-ACCTFILTER-NOT-OK"))) {
-            state.addBranch(262);
+            state.addBranch(217);
             state.put("ACCTSIDC", state.get("DFHRED"));
         } else {
-            state.addBranch(-262);
+            state.addBranch(-217);
         }
         if ((CobolRuntime.isTruthy(state.get("FLG-ACCTFILTER-BLANK"))) && (CobolRuntime.isTruthy(state.get("CDEMO-PGM-REENTER")))) {
-            state.addBranch(263);
+            state.addBranch(218);
             state.put("ACCTSIDO", "*");
             state.put("ACCTSIDC", state.get("DFHRED"));
         } else {
-            state.addBranch(-263);
+            state.addBranch(-218);
         }
         if (((CobolRuntime.isTruthy(state.get("ACUP-DETAILS-NOT-FETCHED"))) || (CobolRuntime.isTruthy(state.get("FLG-ACCTFILTER-BLANK")))) || (CobolRuntime.isTruthy(state.get("FLG-ACCTFILTER-NOT-OK")))) {
-            state.addBranch(264);
+            state.addBranch(219);
             registry.get("3300-SETUP-SCREEN-ATTRS-EXIT").execute(state);
             return;
         } else {
-            state.addBranch(-264);
+            state.addBranch(-219);
             // CONTINUE
         }
         // UNKNOWN: COPY CSSETATY REPLACING ==(TESTVAR1)== BY ==OPEN-YEAR== ==(S
@@ -753,24 +599,24 @@ public class Section3 extends SectionBase {
 
     void do_3390_SETUP_INFOMSG_ATTRS(ProgramState state) {
         if (CobolRuntime.isTruthy(state.get("WS-NO-INFO-MESSAGE"))) {
-            state.addBranch(265);
+            state.addBranch(220);
             state.put("INFOMSGA", state.get("DFHBMDAR"));
         } else {
-            state.addBranch(-265);
+            state.addBranch(-220);
             state.put("INFOMSGA", state.get("DFHBMASB"));
         }
         if ((CobolRuntime.isTruthy(state.get("ACUP-CHANGES-MADE"))) && (!(CobolRuntime.isTruthy(state.get("ACUP-CHANGES-OKAYED-AND-DONE"))))) {
-            state.addBranch(266);
+            state.addBranch(221);
             state.put("FKEY12A", state.get("DFHBMASB"));
         } else {
-            state.addBranch(-266);
+            state.addBranch(-221);
         }
         if (CobolRuntime.isTruthy(state.get("PROMPT-FOR-CONFIRMATION"))) {
-            state.addBranch(267);
+            state.addBranch(222);
             state.put("FKEY05A", state.get("DFHBMASB"));
             state.put("FKEY12A", state.get("DFHBMASB"));
         } else {
-            state.addBranch(-267);
+            state.addBranch(-222);
         }
     }
 

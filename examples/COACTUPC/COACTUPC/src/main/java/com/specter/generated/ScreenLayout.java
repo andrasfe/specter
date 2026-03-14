@@ -10,37 +10,33 @@ import java.util.List;
  */
 public class ScreenLayout {
 
-    public static final List<BmsScreen.Field> FIELDS = List.of(
-        // Row 0-1: Titles
-        new BmsScreen.Field("TITLE01O", 0, 0, 80, BmsScreen.FieldType.CENTER, null, false),
-        new BmsScreen.Field("TITLE02O", 1, 0, 80, BmsScreen.FieldType.CENTER, null, false),
-        // Row 2: Program info
-        new BmsScreen.Field("PGMNAMEO", 2, 2, 12, BmsScreen.FieldType.DISPLAY, "Program", false),
-        new BmsScreen.Field("TRNNAMEO", 2, 24, 12, BmsScreen.FieldType.DISPLAY, "Trans", false),
-        new BmsScreen.Field("CURDATEO", 2, 50, 10, BmsScreen.FieldType.DISPLAY, "Date", false),
-        new BmsScreen.Field("CURTIMEO", 2, 68, 10, BmsScreen.FieldType.DISPLAY, "Time", false),
-        // Row 4: Account search
-        new BmsScreen.Field("ACCTSIDI", 4, 18, 20, BmsScreen.FieldType.INPUT, "Account ID", false),
-        new BmsScreen.Field("AADDGRPI", 4, 55, 20, BmsScreen.FieldType.INPUT, "Group", false),
-        // Row 6-7: Customer name
-        new BmsScreen.Field("ACSFNAMI", 6, 18, 20, BmsScreen.FieldType.INPUT, "First Name", false),
-        new BmsScreen.Field("ACSLNAMI", 6, 55, 20, BmsScreen.FieldType.INPUT, "Last Name", false),
-        new BmsScreen.Field("ACSMNAMI", 7, 18, 20, BmsScreen.FieldType.INPUT, "Middle Name", false),
-        // Row 9-11: Address
-        new BmsScreen.Field("ACSADL1I", 9, 18, 40, BmsScreen.FieldType.INPUT, "Address Line 1", false),
-        new BmsScreen.Field("ACSADL2I", 10, 18, 40, BmsScreen.FieldType.INPUT, "Address Line 2", false),
-        new BmsScreen.Field("ACSCITYI", 11, 18, 20, BmsScreen.FieldType.INPUT, "City", false),
-        new BmsScreen.Field("ACSCTRYI", 11, 55, 20, BmsScreen.FieldType.INPUT, "Country", false),
-        // Row 13-14: Financial
-        new BmsScreen.Field("ACRDLIMI", 13, 18, 18, BmsScreen.FieldType.INPUT, "Credit Limit", false),
-        new BmsScreen.Field("ACSHLIMI", 13, 55, 18, BmsScreen.FieldType.INPUT, "Cash Limit", false),
-        new BmsScreen.Field("ACRCYCRI", 14, 18, 18, BmsScreen.FieldType.INPUT, "Cycle Credit", false),
-        new BmsScreen.Field("ACRCYDBI", 14, 55, 18, BmsScreen.FieldType.INPUT, "Cycle Debit", false),
-        // Row 16: Other
-        new BmsScreen.Field("ACSEFTCI", 16, 18, 20, BmsScreen.FieldType.INPUT, "EFT Account", false),
-        new BmsScreen.Field("ACSGOVTI", 16, 55, 20, BmsScreen.FieldType.INPUT, "Govt ID", false),
-        // Row 21-22: Messages
-        new BmsScreen.Field("ERRMSGO", 21, 2, 76, BmsScreen.FieldType.MESSAGE, null, false),
-        new BmsScreen.Field("INFOMSGO", 22, 2, 76, BmsScreen.FieldType.MESSAGE, null, false)
+    public static final List<CicsScreen.Field> FIELDS = List.of(
+        new CicsScreen.Field("TITLE01O", 0, 0, 80, CicsScreen.FieldType.CENTER, null, false),
+        new CicsScreen.Field("TITLE02O", 1, 0, 80, CicsScreen.FieldType.CENTER, null, false),
+        new CicsScreen.Field("PGMNAMEO", 2, 2, 12, CicsScreen.FieldType.DISPLAY, "Program", false),
+        new CicsScreen.Field("TRNNAMEO", 2, 24, 12, CicsScreen.FieldType.DISPLAY, "Trans", false),
+        new CicsScreen.Field("CURDATEO", 2, 50, 10, CicsScreen.FieldType.DISPLAY, "Date", false),
+        new CicsScreen.Field("CURTIMEO", 2, 68, 10, CicsScreen.FieldType.DISPLAY, "Time", false),
+        new CicsScreen.Field("ACCTSIDO", 4, 2, 35, CicsScreen.FieldType.DISPLAY, "Account ID", false),
+        new CicsScreen.Field("ACSTTUSO", 4, 42, 35, CicsScreen.FieldType.DISPLAY, "Status", false),
+        new CicsScreen.Field("ACRDLIMO", 5, 2, 35, CicsScreen.FieldType.DISPLAY, "Credit Limit", false),
+        new CicsScreen.Field("ACURBALO", 5, 42, 35, CicsScreen.FieldType.DISPLAY, "Current Balance", false),
+        new CicsScreen.Field("ACCTSIDI", 6, 30, 20, CicsScreen.FieldType.INPUT, "Account ID", false),
+        new CicsScreen.Field("ACSTTUSI", 7, 30, 20, CicsScreen.FieldType.INPUT, "Status", false),
+        new CicsScreen.Field("ACRDLIMI", 8, 30, 20, CicsScreen.FieldType.INPUT, "Credit Limit", false),
+        new CicsScreen.Field("ACSHLIMI", 9, 30, 20, CicsScreen.FieldType.INPUT, "Cash Limit", false),
+        new CicsScreen.Field("ACRCYCRI", 10, 30, 20, CicsScreen.FieldType.INPUT, "Cycle Credit", false),
+        new CicsScreen.Field("ACRCYDBI", 11, 30, 20, CicsScreen.FieldType.INPUT, "Cycle Debit", false),
+        new CicsScreen.Field("OPNYEARI", 12, 30, 20, CicsScreen.FieldType.INPUT, "Open Year", false),
+        new CicsScreen.Field("OPNMONI", 13, 30, 20, CicsScreen.FieldType.INPUT, "Open Month", false),
+        new CicsScreen.Field("OPNDAYI", 14, 30, 20, CicsScreen.FieldType.INPUT, "Open Day", false),
+        new CicsScreen.Field("EXPYEARI", 15, 30, 20, CicsScreen.FieldType.INPUT, "Exp Year", false),
+        new CicsScreen.Field("EXPMONI", 16, 30, 20, CicsScreen.FieldType.INPUT, "Exp Month", false),
+        new CicsScreen.Field("EXPDAYI", 17, 30, 20, CicsScreen.FieldType.INPUT, "Exp Day", false),
+        new CicsScreen.Field("RISYEARI", 18, 30, 20, CicsScreen.FieldType.INPUT, "Reissue Year", false),
+        new CicsScreen.Field("RISMONI", 19, 30, 20, CicsScreen.FieldType.INPUT, "Reissue Month", false),
+        new CicsScreen.Field("RISDAYI", 20, 30, 20, CicsScreen.FieldType.INPUT, "Reissue Day", false),
+        new CicsScreen.Field("ERRMSGO", 21, 2, 76, CicsScreen.FieldType.MESSAGE, null, false),
+        new CicsScreen.Field("INFOMSGO", 22, 2, 76, CicsScreen.FieldType.MESSAGE, null, false)
     );
 }
