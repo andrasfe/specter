@@ -21,12 +21,12 @@ public class CoactupcProgram implements CicsProgram {
     public CoactupcProgram(StubExecutor stubs) {
         this.stubs = stubs;
         this.registry = new ParagraphRegistry();
-        new Section0(registry, stubs);
-        new SectionMain(registry, stubs);
-        new Section1(registry, stubs);
-        new Section2(registry, stubs);
-        new Section3(registry, stubs);
-        new Section9(registry, stubs);
+        new Section0_COACTUPC(registry, stubs);
+        new SectionMain_COACTUPC(registry, stubs);
+        new Section1_COACTUPC(registry, stubs);
+        new Section2_COACTUPC(registry, stubs);
+        new Section3_COACTUPC(registry, stubs);
+        new Section9_COACTUPC(registry, stubs);
     }
 
     public static Map<String, Object> defaultState() {
@@ -885,6 +885,22 @@ public class CoactupcProgram implements CicsProgram {
 
     @Override
     public List<CicsScreen.Field> screenLayout() {
-        return ScreenLayout.FIELDS;
+        return ScreenLayout_COACTUPC.FIELDS;
+    }
+
+    @Override
+    public void initState(ProgramState state) {
+        state.put("WS-TRANID", "COAC");
+        state.put("WS-PGMNAME", "COACTUPC");
+        state.put("LIT-THISTRANID", "COAC");
+        state.put("LIT-THISPGM", "COACTUPC");
+        state.put("LIT-THISMAP", "CACTUPA");
+        state.put("LIT-THISMAPSET", "CACTUP");
+        state.put("LIT-MENUPGM", "COMEN01C");
+        state.put("LIT-MENUTRANID", "COME");
+        state.put("CCDA-TITLE01", "Credit Card Demo Application");
+        state.put("CCDA-TITLE02", "COACTUPC - Account Update");
+        state.put("CCDA-MSG-THANK-YOU", "Thank you for using the application");
+        state.put("CCDA-MSG-INVALID-KEY", "Invalid key pressed");
     }
 }

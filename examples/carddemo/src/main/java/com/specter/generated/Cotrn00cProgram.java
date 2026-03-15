@@ -21,7 +21,7 @@ public class Cotrn00cProgram implements CicsProgram {
     public Cotrn00cProgram(StubExecutor stubs) {
         this.stubs = stubs;
         this.registry = new ParagraphRegistry();
-        new SectionMain(registry, stubs);
+        new SectionMain_COTRN00C(registry, stubs);
     }
 
     public static Map<String, Object> defaultState() {
@@ -233,6 +233,22 @@ public class Cotrn00cProgram implements CicsProgram {
 
     @Override
     public List<CicsScreen.Field> screenLayout() {
-        return ScreenLayout.FIELDS;
+        return ScreenLayout_COTRN00C.FIELDS;
+    }
+
+    @Override
+    public void initState(ProgramState state) {
+        state.put("WS-TRANID", "COTR");
+        state.put("WS-PGMNAME", "COTRN00C");
+        state.put("LIT-THISTRANID", "COTR");
+        state.put("LIT-THISPGM", "COTRN00C");
+        state.put("LIT-THISMAP", "COTRN0A");
+        state.put("LIT-THISMAPSET", "COTRN0");
+        state.put("LIT-MENUPGM", "COMEN01C");
+        state.put("LIT-MENUTRANID", "COME");
+        state.put("CCDA-TITLE01", "Credit Card Demo Application");
+        state.put("CCDA-TITLE02", "COTRN00C - Account Update");
+        state.put("CCDA-MSG-THANK-YOU", "Thank you for using the application");
+        state.put("CCDA-MSG-INVALID-KEY", "Invalid key pressed");
     }
 }

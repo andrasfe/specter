@@ -109,7 +109,10 @@ def main(argv: list[str] | None = None) -> int:
         prog="specter",
         description="COBOL AST to executable Python code generator",
     )
-    parser.add_argument("ast_file", help="Path to JSON AST file (.ast)")
+    parser.add_argument(
+        "ast_file", nargs="+",
+        help="Path to JSON AST file(s) (.ast). Multiple files with --multi.",
+    )
     parser.add_argument(
         "--output", "-o",
         help="Output Python file (default: <ast_file>.py)",
@@ -247,6 +250,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Generate Mockito integration tests (with --java)",
     )
     parser.add_argument(
+        "--multi",
+        action="store_true",
+        help="Multi-program XCTL routing: generate all AST files into one project (with --java)",
+    )
+    parser.add_argument(
         "--mock-cobol",
         action="store_true",
         help="Instrument COBOL source for standalone mock execution (input is .cbl/.cob/.cobol)",
@@ -276,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.extract_docs:
         from .doc_generator import generate_docs
         # The ast_file arg doubles as the generated .py path for --extract-docs
-        py_path = Path(args.ast_file)
+        py_path = Path(args.ast_file[0])
         if not py_path.exists():
             # Try .py extension
             py_path = py_path.with_suffix(".py")
@@ -288,13 +296,37 @@ def main(argv: list[str] | None = None) -> int:
         print(md)
         return 0
 
-    source_path = Path(args.ast_file)
+    # --multi --java: multi-program XCTL routing project
+    if args.multi:
+        if not args.java:
+            print("Error: --multi requires --java", file=sys.stderr)
+            return 1
+        if not args.output:
+            print("Error: --multi requires -o <output_dir>", file=sys.stderr)
+            return 1
+        # Validate all AST files exist
+        for ast_file in args.ast_file:
+            if not Path(ast_file).exists():
+                print(f"Error: AST file not found: {ast_file}", file=sys.stderr)
+                return 1
+        from .java_code_generator import generate_multi_program_project
+        output_dir = Path(args.output)
+        print(f"Generating multi-program Java project → {output_dir}/ ...")
+        print(f"  Programs: {len(args.ast_file)}")
+        project_path = generate_multi_program_project(
+            ast_paths=args.ast_file,
+            output_dir=str(output_dir),
+        )
+        print(f"  Project: {project_path}")
+        return 0
+
+    source_path = Path(args.ast_file[0])
     cobol_suffixes = {".cbl", ".cob", ".cobol"}
 
     # Convenience auto-detect: treat .cbl/.cob input as mock mode when related
     # flags are present (or output is a COBOL file), so older invocation patterns
     # still work.
-    cbl_path = Path(args.ast_file)
+    cbl_path = Path(args.ast_file[0])
     if not args.mock_cobol and cbl_path.suffix.lower() in cobol_suffixes:
         output_looks_cobol = bool(args.output and Path(args.output).suffix.lower() in cobol_suffixes)
         if args.copybook_dir or args.init_var or output_looks_cobol:

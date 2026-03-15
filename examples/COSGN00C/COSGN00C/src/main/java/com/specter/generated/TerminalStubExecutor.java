@@ -66,9 +66,8 @@ public class TerminalStubExecutor extends DefaultStubExecutor {
                         program = String.valueOf(resolved).trim();
                     }
                 }
-                bmsScreen.showXctl(program);
                 state.execs.add(java.util.Map.of("op", "XCTL:" + program));
-                throw new GobackSignal();
+                throw new XctlSignal(program);
             } else if (ASSIGN_PAT.matcher(rawText).find()) {
                 Matcher m = ASSIGN_PAT.matcher(rawText);
                 while (m.find()) {

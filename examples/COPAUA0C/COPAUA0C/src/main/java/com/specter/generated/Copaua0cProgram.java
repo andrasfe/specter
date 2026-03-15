@@ -347,4 +347,8 @@ public class Copaua0cProgram {
     public StubExecutor getStubs() {
         return stubs;
     }
+
+    public String programId() {
+        return "COPAUA0C";
+    }
 }

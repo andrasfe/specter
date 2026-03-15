@@ -21,7 +21,7 @@ public class Cosgn00cProgram implements CicsProgram {
     public Cosgn00cProgram(StubExecutor stubs) {
         this.stubs = stubs;
         this.registry = new ParagraphRegistry();
-        new SectionMain(registry, stubs);
+        new SectionMain_COSGN00C(registry, stubs);
     }
 
     public static Map<String, Object> defaultState() {
@@ -142,6 +142,22 @@ public class Cosgn00cProgram implements CicsProgram {
 
     @Override
     public List<CicsScreen.Field> screenLayout() {
-        return ScreenLayout.FIELDS;
+        return ScreenLayout_COSGN00C.FIELDS;
+    }
+
+    @Override
+    public void initState(ProgramState state) {
+        state.put("WS-TRANID", "COSG");
+        state.put("WS-PGMNAME", "COSGN00C");
+        state.put("LIT-THISTRANID", "COSG");
+        state.put("LIT-THISPGM", "COSGN00C");
+        state.put("LIT-THISMAP", "COSGN0A");
+        state.put("LIT-THISMAPSET", "COSGN0");
+        state.put("LIT-MENUPGM", "COMEN01C");
+        state.put("LIT-MENUTRANID", "COME");
+        state.put("CCDA-TITLE01", "Credit Card Demo Application");
+        state.put("CCDA-TITLE02", "COSGN00C - Account Update");
+        state.put("CCDA-MSG-THANK-YOU", "Thank you for using the application");
+        state.put("CCDA-MSG-INVALID-KEY", "Invalid key pressed");
     }
 }
