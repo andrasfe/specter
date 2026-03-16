@@ -4,7 +4,7 @@ import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 
 /**
- * Docker / standalone entrypoint for {@link CoactupcProgram}.
+ * Docker / standalone entrypoint for {@link Cosgn00cProgram}.
  *
  * <p>Creates a {@link HikariDataSource} from {@link AppConfig},
  * optionally creates a JMS {@code ConnectionFactory}, wires a
@@ -38,7 +38,7 @@ public class Main {
 
         // Wire and run
         try (JdbcStubExecutor stubs = new JdbcStubExecutor(dataSource, jmsFactory)) {
-            CoactupcProgram program = new CoactupcProgram(stubs);
+            Cosgn00cProgram program = new Cosgn00cProgram(stubs);
             ProgramState result = program.run();
 
             // Print results

@@ -18,6 +18,7 @@ public class SectionMain_COSGN00C extends SectionBase {
     void do_MAIN_PARA(ProgramState state) {
         state.put("ERR-FLG-OFF", true);
         state.put("WS-MESSAGE", " ");
+        state.put("ERRMSGO", " ");
         if (java.util.Objects.equals(state.get("EIBCALEN"), 0)) {
             state.addBranch(1);
             state.put("COSGN0AO", "\u0000");
@@ -46,7 +47,7 @@ public class SectionMain_COSGN00C extends SectionBase {
     }
 
     void do_PROCESS_ENTER_KEY(ProgramState state) {
-        stubs.dummyExec(state, "CICS", "EXEC CICS RECEIVE MAP('COSGN0A') MAPSET('COSGN00') RESP(WS-RESP-CD) RESP2(WS-REAS-CD) END-EXEC.");
+        stubs.dummyExec(state, "CICS", "EXEC CICS RECEIVE MAP('COSGN0A') MAPSET('COSGN00') RESP(WS-RESP-CD) RESP2(WS-REAS-CD) END-EXEC");
         if ((java.util.List.of(" ", "\u0000").contains(state.get("USERIDI")))) {
             state.addBranch(5);
             state.put("WS-ERR-FLG", "Y");
@@ -66,6 +67,7 @@ public class SectionMain_COSGN00C extends SectionBase {
             // CONTINUE
         }
         state.put("WS-USER-ID", String.valueOf(state.get("USERIDI")).toUpperCase());
+        state.put("CDEMO-USER-ID", String.valueOf(state.get("USERIDI")).toUpperCase());
         state.put("WS-USER-PWD", String.valueOf(state.get("PASSWDI")).toUpperCase());
         if (!(CobolRuntime.isTruthy(state.get("ERR-FLG-ON")))) {
             state.addBranch(8);
@@ -78,11 +80,11 @@ public class SectionMain_COSGN00C extends SectionBase {
     void do_SEND_SIGNON_SCREEN(ProgramState state) {
         perform(state, "POPULATE-HEADER-INFO");
         state.put("ERRMSGO", state.get("WS-MESSAGE"));
-        stubs.dummyExec(state, "CICS", "EXEC CICS SEND MAP('COSGN0A') MAPSET('COSGN00') FROM(COSGN0AO) ERASE CURSOR END-EXEC.");
+        stubs.dummyExec(state, "CICS", "EXEC CICS SEND MAP('COSGN0A') MAPSET('COSGN00') FROM(COSGN0AO) ERASE CURSOR END-EXEC");
     }
 
     void do_SEND_PLAIN_TEXT(ProgramState state) {
-        stubs.dummyExec(state, "CICS", "EXEC CICS SEND TEXT FROM(WS-MESSAGE) LENGTH(LENGTH OF WS-MESSAGE) ERASE FREEKB END-EXEC.");
+        stubs.dummyExec(state, "CICS", "EXEC CICS SEND TEXT FROM(WS-MESSAGE) LENGTH(LENGTH OF WS-MESSAGE) ERASE FREEKB END-EXEC");
         stubs.cicsReturn(state, false);
     }
 
@@ -100,8 +102,7 @@ public class SectionMain_COSGN00C extends SectionBase {
         state.put("WS-CURTIME-MM", state.get("WS-CURTIME-MINUTE"));
         state.put("WS-CURTIME-SS", state.get("WS-CURTIME-SECOND"));
         state.put("CURTIMEO", state.get("WS-CURTIME-HH-MM-SS"));
-        stubs.dummyExec(state, "CICS", "EXEC CICS ASSIGN APPLID(APPLIDO OF COSGN0AO) END-EXEC");
-        stubs.dummyExec(state, "CICS", "EXEC CICS ASSIGN SYSID(SYSIDO OF COSGN0AO) END-EXEC.");
+        stubs.dummyExec(state, "CICS", "EXEC CICS ASSIGN APPLID(APPLIDO OF COSGN0AO) END-EXEC EXEC CICS ASSIGN SYSID(SYSIDO OF COSGN0AO) END-EXEC");
     }
 
     void do_READ_USER_SEC_FILE(ProgramState state) {
@@ -141,11 +142,7 @@ public class SectionMain_COSGN00C extends SectionBase {
         else {
             state.addBranch(13);
             state.put("WS-ERR-FLG", "Y");
-            state.put("VERIFY", state.get("UNABLE"));
-            state.put("THE", state.get("UNABLE"));
-            state.put("USER", state.get("UNABLE"));
-            state.put("TO", state.get("UNABLE"));
-            state.put("WS-MESSAGE", state.get("UNABLE"));
+            state.put("WS-MESSAGE", "Unable to verify the User ...");
             state.put("USERIDL", -1);
             perform(state, "SEND-SIGNON-SCREEN");
         }

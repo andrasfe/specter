@@ -29,10 +29,19 @@ public class MultiProgramRunner {
 
     public MultiProgramRunner(boolean headless) {
         this.headless = headless;
-        firstProgram = "COACTUPC";
-        registry.put("COACTUPC", (stubs) -> new CoactupcProgram(stubs));
+        firstProgram = "COSGN00C";
         registry.put("COSGN00C", (stubs) -> new Cosgn00cProgram(stubs));
+        registry.put("COMEN01C", (stubs) -> new Comen01cProgram(stubs));
+        registry.put("COACTUPC", (stubs) -> new CoactupcProgram(stubs));
+        registry.put("COADM01C", (stubs) -> new Coadm01cProgram(stubs));
         registry.put("COTRN00C", (stubs) -> new Cotrn00cProgram(stubs));
+        registry.put("COTRN01C", (stubs) -> new Cotrn01cProgram(stubs));
+        registry.put("COTRN02C", (stubs) -> new Cotrn02cProgram(stubs));
+        registry.put("COBIL00C", (stubs) -> new Cobil00cProgram(stubs));
+        registry.put("COUSR00C", (stubs) -> new Cousr00cProgram(stubs));
+        registry.put("COUSR01C", (stubs) -> new Cousr01cProgram(stubs));
+        registry.put("COUSR02C", (stubs) -> new Cousr02cProgram(stubs));
+        registry.put("COUSR03C", (stubs) -> new Cousr03cProgram(stubs));
     }
 
     public void run() throws IOException {
