@@ -2548,6 +2548,7 @@ def _generate_program_class(
 def _generate_test_class(
     program: Program,
     package_name: str,
+    resource_name: str = "test_store.jsonl",
 ) -> str:
     """Generate a JUnit 5 test class with parameterized tests from test store."""
     class_name = _program_class_name(program.program_id)
@@ -2575,7 +2576,7 @@ import java.util.stream.*;
 /**
  * Generated integration tests for {class_name}.
  *
- * <p>Loads test cases from the JSONL test store (src/test/resources/test_store.jsonl).
+ * <p>Loads test cases from the JSONL test store (src/test/resources/{resource_name}).
  * Each test case provides input state, stub outcomes, and stub defaults that
  * reproduce a specific execution path through the COBOL program.
  */
@@ -2605,7 +2606,7 @@ class {test_class_name} {{
     // --- Parameterized integration tests from test store ---
 
     static Stream<TestCaseData> testCases() throws IOException {{
-        InputStream is = {test_class_name}.class.getResourceAsStream("/test_store.jsonl");
+        InputStream is = {test_class_name}.class.getResourceAsStream("/{resource_name}");
         if (is == null) {{
             return Stream.empty();
         }}
@@ -3594,6 +3595,7 @@ def generate_multi_program_project(
     ast_paths: list[str],
     output_dir: str = ".",
     package_name: str = "com.specter.generated",
+    per_program_stores: dict[str, str] | None = None,
 ) -> str:
     """Generate a single Maven project containing multiple CICS programs.
 
@@ -3606,6 +3608,9 @@ def generate_multi_program_project(
         ast_paths: Paths to JSON AST files.
         output_dir: Root directory for the Maven project.
         package_name: Java package name for generated classes.
+        per_program_stores: Optional mapping of program_id → JSONL test
+            store path.  When provided, a JUnit test class and test
+            resource are generated for each program that has a store.
 
     Returns:
         The absolute path to the generated Maven project directory.
@@ -3807,6 +3812,23 @@ def generate_multi_program_project(
         print(f"  Generated {prog_class_name}: "
               f"{len(section_classes)} sections, "
               f"terminal={'yes' if is_terminal else 'no'}")
+
+        # Per-program test class + test store resource
+        if per_program_stores and program_id in per_program_stores:
+            store_path = per_program_stores[program_id]
+            resource_name = f"test_store_{program_id}.jsonl"
+            test_src = _generate_test_class(
+                program, package_name, resource_name=resource_name,
+            )
+            (src_test / f"{prog_class_name}Test.java").write_text(
+                test_src, encoding="utf-8"
+            )
+            # Copy JSONL to test resources
+            src_resources = out / "src" / "test" / "resources"
+            src_resources.mkdir(parents=True, exist_ok=True)
+            import shutil
+            shutil.copy2(store_path, str(src_resources / resource_name))
+            print(f"  Tests for {prog_class_name}: {resource_name}")
 
     # Generate MultiProgramRunner with Function<StubExecutor, CicsProgram>
     # factories so the runner can wire TerminalStubExecutor per program.

@@ -309,13 +309,114 @@ def main(argv: list[str] | None = None) -> int:
             if not Path(ast_file).exists():
                 print(f"Error: AST file not found: {ast_file}", file=sys.stderr)
                 return 1
+
         from .java_code_generator import generate_multi_program_project
+
+        per_program_stores: dict[str, str] | None = None
         output_dir = Path(args.output)
-        print(f"Generating multi-program Java project → {output_dir}/ ...")
+
+        if args.synthesize:
+            import tempfile
+            from .monte_carlo import _load_module
+            from .test_synthesis import synthesize_test_set
+
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s %(levelname)-7s %(message)s",
+                datefmt="%H:%M:%S",
+                stream=sys.stderr,
+                force=True,
+            )
+
+            analysis_dir = (
+                Path(args.analysis_output) if args.analysis_output
+                else output_dir / "test-data"
+            )
+            analysis_dir.mkdir(parents=True, exist_ok=True)
+            per_program_stores = {}
+
+            with tempfile.TemporaryDirectory(prefix="specter_synth_") as tmpdir:
+                tmpdir_path = Path(tmpdir)
+
+                # Phase 1: generate Python modules and run synthesis
+                for ast_file in args.ast_file:
+                    ast_path = Path(ast_file)
+                    program = parse_ast(ast_path)
+                    var_report = extract_variables(program)
+                    program_id = program.program_id
+
+                    print(f"\n--- Synthesizing {program_id} ---")
+                    print(f"  Paragraphs: {len(program.paragraphs)}, "
+                          f"Variables: {len(var_report.variables)}")
+
+                    # Generate instrumented Python module
+                    code = generate_code(program, var_report, instrument=True)
+                    py_path = tmpdir_path / f"{program_id}.py"
+                    py_path.write_text(code)
+
+                    module = _load_module(py_path)
+
+                    # Static analysis
+                    call_graph = build_static_call_graph(program)
+                    gating_conds = extract_gating_conditions(program, call_graph)
+                    stub_mapping = extract_stub_status_mapping(program, var_report)
+                    seq_gates = extract_sequential_gates(program)
+                    if seq_gates:
+                        gating_conds = augment_gating_with_sequential_gates(
+                            gating_conds, seq_gates, call_graph,
+                        )
+                    eq_constraints = extract_equality_constraints(program)
+
+                    store_path = analysis_dir / f"{program_id}_testset.jsonl"
+
+                    synth_report = synthesize_test_set(
+                        module=module,
+                        program=program,
+                        var_report=var_report,
+                        call_graph=call_graph,
+                        gating_conditions=gating_conds,
+                        stub_mapping=stub_mapping,
+                        equality_constraints=eq_constraints,
+                        store_path=store_path,
+                        max_time_seconds=args.synthesis_timeout,
+                        max_layers=args.synthesis_layers,
+                    )
+                    print(synth_report.summary())
+                    per_program_stores[program_id] = str(store_path)
+
+                # Phase 2: generate catalog while Python modules still exist
+                catalog_sections: list[str] = []
+                for ast_file in args.ast_file:
+                    ast_path = Path(ast_file)
+                    program = parse_ast(ast_path)
+                    program_id = program.program_id
+                    if program_id in per_program_stores:
+                        py_path = tmpdir_path / f"{program_id}.py"
+                        store_path = per_program_stores[program_id]
+                        from .paragraph_catalog import generate_paragraph_catalog
+                        try:
+                            catalog_md = generate_paragraph_catalog(
+                                py_path, store_path, program,
+                            )
+                            catalog_sections.append(
+                                f"# {program_id}\n\n{catalog_md}"
+                            )
+                        except Exception as e:
+                            print(f"  Warning: catalog generation failed "
+                                  f"for {program_id}: {e}", file=sys.stderr)
+
+                if catalog_sections:
+                    combined = "\n\n---\n\n".join(catalog_sections)
+                    catalog_path = analysis_dir / "tests.catalog.md"
+                    catalog_path.write_text(combined)
+                    print(f"\nCatalog: {catalog_path}")
+
+        print(f"\nGenerating multi-program Java project → {output_dir}/ ...")
         print(f"  Programs: {len(args.ast_file)}")
         project_path = generate_multi_program_project(
             ast_paths=args.ast_file,
             output_dir=str(output_dir),
+            per_program_stores=per_program_stores,
         )
         print(f"  Project: {project_path}")
         return 0
