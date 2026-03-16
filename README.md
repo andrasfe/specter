@@ -34,14 +34,28 @@ See [JAVAGEN.md](JAVAGEN.md) for full details on the Java generation approach, t
 The `--synthesize` flag builds a minimal set of test cases targeting maximum code coverage:
 
 ```bash
-# Generate test store
+# Single program: generate test store
 specter program.ast --synthesize --test-store tests.jsonl
 
 # Then use it for Java generation
 specter program.ast --java --test-store tests.jsonl -o output/
+
+# Multi-program: synthesize + generate Java project with per-program tests + catalog
+specter --multi --java --synthesize \
+  COSGN00C.cbl.ast COMEN01C.cbl.ast COACTUPC.cbl.ast \
+  -o carddemo/ \
+  --analysis-output carddemo/test-data \
+  --synthesis-layers 7 \
+  --synthesis-timeout 300
+
+# Exclude sensitive values from generated test data
+specter --multi --java --synthesize \
+  *.ast -o output/ --exclude-values excluded.txt
 ```
 
-Each test case is a complete execution spec: input variables + mock orchestration for all external interactions (SQL results, CICS EIBRESP codes, file status codes). The synthesis engine uses five layers — from deterministic constraint solving to targeted mutation walks.
+Multi-program synthesis generates per-program JSONL test stores, a combined `tests.catalog.md` documenting every paragraph's test coverage, and JUnit 5 parameterized test classes with the stores as test resources.
+
+Each test case is a complete execution spec: input variables + mock orchestration for all external interactions (SQL results, CICS EIBRESP codes, file status codes). The synthesis engine uses seven layers — from deterministic constraint solving to targeted mutation walks and random exploration.
 
 ## Analysis Modes
 
