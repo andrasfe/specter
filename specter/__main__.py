@@ -335,6 +335,18 @@ def main(argv: list[str] | None = None) -> int:
             analysis_dir.mkdir(parents=True, exist_ok=True)
             per_program_stores = {}
 
+            excluded_values: set[str] | None = None
+            if args.exclude_values:
+                exclude_path = Path(args.exclude_values)
+                if not exclude_path.exists():
+                    print(f"Error: exclude-values file not found: {exclude_path}", file=sys.stderr)
+                    return 1
+                excluded_values = {
+                    line.strip()
+                    for line in exclude_path.read_text().splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                }
+
             with tempfile.TemporaryDirectory(prefix="specter_synth_") as tmpdir:
                 tmpdir_path = Path(tmpdir)
 
@@ -380,6 +392,7 @@ def main(argv: list[str] | None = None) -> int:
                         store_path=store_path,
                         max_time_seconds=args.synthesis_timeout,
                         max_layers=args.synthesis_layers,
+                        excluded_values=excluded_values,
                     )
                     print(synth_report.summary())
                     per_program_stores[program_id] = str(store_path)
