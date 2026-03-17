@@ -51,6 +51,8 @@ class MockConfig:
     stop_on_exec_return: bool = True  # EXEC CICS RETURN → STOP RUN
     stop_on_exec_xctl: bool = True   # EXEC CICS XCTL → STOP RUN
     initial_values: dict[str, str] = field(default_factory=dict)  # var→value MOVEs after OPEN
+    eib_calen: int = 0                # Initial EIBCALEN VALUE in EIB stub
+    eib_aid: str = "SPACES"           # Initial EIBAID VALUE in EIB stub (hex literal or SPACES)
 
 
 @dataclass
@@ -152,7 +154,7 @@ def instrument_cobol(
     lines = _strip_skip_directives(lines)
 
     # Phase 11: Add common stub definitions (DFHAID, DFHBMSCA, DFHRESP)
-    lines = _add_common_stubs(lines)
+    lines = _add_common_stubs(lines, config)
 
     # Phase 12: Auto-stub unresolved symbols reported by cobc (if available)
     lines = _auto_stub_undefined_with_cobc(lines)
@@ -492,12 +494,36 @@ def _mock_cics(
             lines.append(f"{_B}DISPLAY 'SPECTER-CICS:RETURN'\n")
             lines.append(f"{_B}GO TO SPECTER-EXIT-PARA{dot}\n")
             return lines
+        else:
+            # Coverage mode: read mock data and continue instead of terminating
+            lines.append(f"{_B}DISPLAY 'SPECTER-MOCK:CICS-RETURN'\n")
+            lines.append(f"{_B}READ MOCK-FILE INTO MOCK-RECORD\n")
+            lines.append(f"{_CONT}AT END\n")
+            lines.append(f"{_CONT}  MOVE '00' TO MOCK-ALPHA-STATUS\n")
+            lines.append(f"{_CONT}  MOVE 0 TO MOCK-NUM-STATUS\n")
+            lines.append(f"{_B}END-READ\n")
+            if resp_var:
+                lines.append(f"{_B}MOVE MOCK-NUM-STATUS TO {resp_var}\n")
+            lines.append(f"{_B}CONTINUE{dot}\n")
+            return lines
     elif re.search(r"\bXCTL\b", block_text):
         prog_match = re.search(r"PROGRAM\s*\(\s*([^)]+)\s*\)", block_text)
         prog = prog_match.group(1).strip() if prog_match else "?"
         if config.stop_on_exec_xctl:
             lines.append(f"{_B}DISPLAY 'SPECTER-CICS:XCTL:{prog}'\n")
             lines.append(f"{_B}GO TO SPECTER-EXIT-PARA{dot}\n")
+            return lines
+        else:
+            # Coverage mode: read mock data and continue
+            lines.append(f"{_B}DISPLAY 'SPECTER-MOCK:CICS-XCTL:{prog}'\n")
+            lines.append(f"{_B}READ MOCK-FILE INTO MOCK-RECORD\n")
+            lines.append(f"{_CONT}AT END\n")
+            lines.append(f"{_CONT}  MOVE '00' TO MOCK-ALPHA-STATUS\n")
+            lines.append(f"{_CONT}  MOVE 0 TO MOCK-NUM-STATUS\n")
+            lines.append(f"{_B}END-READ\n")
+            if resp_var:
+                lines.append(f"{_B}MOVE MOCK-NUM-STATUS TO {resp_var}\n")
+            lines.append(f"{_B}CONTINUE{dot}\n")
             return lines
     elif re.search(r"\bSYNCPOINT\b", block_text):
         lines.append(f"{_B}DISPLAY 'SPECTER-CICS:SYNCPOINT'\n")
@@ -506,12 +532,14 @@ def _mock_cics(
 
     # For READ, SEND, RECEIVE, WRITE, DELETE, etc:
     op = "CICS"
+    is_receive = False
     for verb in ["READ", "WRITE", "SEND", "RECEIVE", "DELETE",
                   "STARTBR", "READNEXT", "READPREV", "ENDBR",
                   "LINK", "START", "INQUIRE", "WRITEQ", "READQ",
                   "DELETEQ", "UNLOCK"]:
         if re.search(rf"\b{verb}\b", block_text):
             op = f"CICS-{verb}"
+            is_receive = (verb == "RECEIVE")
             break
 
     lines.append(f"{_B}DISPLAY 'SPECTER-MOCK:{op}'\n")
@@ -520,6 +548,11 @@ def _mock_cics(
     lines.append(f"{_CONT}  MOVE '00' TO MOCK-ALPHA-STATUS\n")
     lines.append(f"{_CONT}  MOVE 0 TO MOCK-NUM-STATUS\n")
     lines.append(f"{_B}END-READ\n")
+
+    # CICS RECEIVE MAP: set EIBAID from mock alpha status so that
+    # downstream EVALUATE EIBAID branches become reachable.
+    if is_receive:
+        lines.append(f"{_B}MOVE MOCK-ALPHA-STATUS(1:1) TO EIBAID\n")
 
     if resp_var:
         lines.append(f"{_B}MOVE MOCK-NUM-STATUS TO {resp_var}\n")
@@ -1464,7 +1497,7 @@ def _add_mock_file_handling(
 # Phase 11: Common stubs (DFHAID, DFHBMSCA, DFHRESP)
 # ---------------------------------------------------------------------------
 
-def _add_common_stubs(lines: list[str]) -> list[str]:
+def _add_common_stubs(lines: list[str], config: MockConfig | None = None) -> list[str]:
     """Add stub definitions for common CICS/IMS constants if referenced."""
     full_text = "".join(lines).upper()
 
@@ -1545,8 +1578,10 @@ def _add_common_stubs(lines: list[str]) -> list[str]:
             f"{_B}05 EIBTASKN        PIC S9(7) COMP-3 VALUE 0.\n",
             f"{_B}05 EIBTRMID        PIC X(4) VALUE SPACES.\n",
             f"{_B}05 EIBCPOSN        PIC S9(4) COMP VALUE 0.\n",
-            f"{_B}05 EIBCALEN        PIC S9(4) COMP VALUE 0.\n",
-            f"{_B}05 EIBAID          PIC X VALUE SPACES.\n",
+            f"{_B}05 EIBCALEN        PIC S9(4) COMP VALUE "
+            f"{config.eib_calen if config else 0}.\n",
+            f"{_B}05 EIBAID          PIC X VALUE "
+            f"{config.eib_aid if config and config.eib_aid != 'SPACES' else 'SPACES'}.\n",
             f"{_B}05 EIBFN           PIC X(2) VALUE SPACES.\n",
             f"{_B}05 EIBRCODE        PIC X(6) VALUE SPACES.\n",
             f"{_B}05 EIBDS           PIC X(8) VALUE SPACES.\n",

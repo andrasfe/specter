@@ -380,17 +380,21 @@ def run_cobol_coverage(
     py_path.write_text(code)
     module = _load_module(py_path)
 
-    # Collect injectable variables: input/status/flag vars not set by stubs.
-    # Limit to variables that appear in condition_literals or are key EIB fields,
-    # to avoid overwhelming the init record mechanism.
-    _ALWAYS_INJECT = {"EIBCALEN", "EIBAID", "EIBTRNID"}
+    # Injectable variables for the init dispatch.
+    # EIB fields are now set via VALUE clauses in the stubs (not init records).
+    # The init dispatch mechanism can be fragile (Phase 12 may comment it out),
+    # so we only register variables that are both:
+    # 1. Referenced in conditions (have condition_literals/88_values)
+    # 2. Not EIB or other auto-stubbed fields
+    _EIB_NAMES = {"EIBCALEN", "EIBAID", "EIBTRNID", "EIBTIME", "EIBDATE",
+                  "EIBTASKN", "EIBTRMID", "EIBCPOSN", "EIBFN", "EIBRCODE",
+                  "EIBDS", "EIBREQID", "EIBRSRCE", "EIBRESP", "EIBRESP2"}
     injectable = [
         name for name, dom in domains.items()
         if dom.classification in ("input", "status", "flag")
         and not dom.set_by_stub
-        and (dom.condition_literals or dom.valid_88_values
-             or name.upper() in _ALWAYS_INJECT
-             or dom.semantic_type in ("status_file", "status_sql", "status_cics", "flag_bool"))
+        and name.upper() not in _EIB_NAMES
+        and (dom.condition_literals or dom.valid_88_values)
     ]
     log.info("Injectable variables: %d", len(injectable))
 
@@ -402,6 +406,7 @@ def run_cobol_coverage(
             enable_branch_tracing=True,
             work_dir=work_dir,
             injectable_vars=injectable,
+            coverage_mode=True,
         )
     except RuntimeError as e:
         log.error("COBOL compilation failed: %s", e)

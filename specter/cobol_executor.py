@@ -87,6 +87,7 @@ def prepare_context(
     enable_branch_tracing: bool = True,
     work_dir: str | Path | None = None,
     injectable_vars: list[str] | None = None,
+    coverage_mode: bool = False,
 ) -> CobolExecutionContext:
     """Instrument and compile a COBOL source for repeated execution.
 
@@ -119,16 +120,29 @@ def prepare_context(
     # Actual values come from INIT records in the mock data file at runtime.
     # Use a non-numeric placeholder so the generated COBOL uses
     # MOVE MOCK-ALPHA-STATUS TO <var> (reads from the data file).
+    # Exclude EIB fields — those are set via VALUE clauses in the stubs.
+    _EIB_FIELDS = {"EIBCALEN", "EIBAID", "EIBTRNID", "EIBTIME", "EIBDATE",
+                   "EIBTASKN", "EIBTRMID", "EIBCPOSN", "EIBFN", "EIBRCODE",
+                   "EIBDS", "EIBREQID", "EIBRSRCE", "EIBSYNC", "EIBFREE",
+                   "EIBRECV", "EIBSIG", "EIBCONF", "EIBERR", "EIBERRCD",
+                   "EIBSYNRB", "EIBNODAT", "EIBRESP", "EIBRESP2"}
     init_values: dict[str, str] = {}
     if injectable_vars:
         for var in injectable_vars:
-            init_values[var] = "__DYNAMIC__"
+            if var.upper() not in _EIB_FIELDS:
+                init_values[var] = "__DYNAMIC__"
 
-    # Instrument
+    # Instrument — in coverage mode, don't terminate on CICS RETURN/XCTL
+    # so that coverage engine can explore post-transaction logic.
+    # Also set EIBCALEN > 0 so CICS programs get past first-time init.
     config = MockConfig(
         copybook_dirs=copybook_paths,
         trace_paragraphs=True,
         initial_values=init_values,
+        stop_on_exec_return=not coverage_mode,
+        stop_on_exec_xctl=not coverage_mode,
+        eib_calen=100 if coverage_mode else 0,
+        eib_aid="X'7D'" if coverage_mode else "SPACES",  # X'7D' = DFHENTER
     )
     result = instrument_cobol(cobol_source, config)
 
@@ -202,11 +216,15 @@ def run_test_case(
     init_data = generate_init_records(init_values) if init_values else ""
     stub_data = generate_mock_data_ordered(stub_log) if stub_log else ""
 
-    # Concatenate: init records first, then stub records
-    if init_data and stub_data:
-        mock_data = init_data + "\n" + stub_data
-    else:
-        mock_data = init_data or stub_data or "\n"
+    # In coverage mode (RETURN/XCTL don't terminate), the COBOL program
+    # consumes more mock records than the Python pre-run produces.
+    # Pad with extra success records so the COBOL doesn't hit EOF early.
+    pad_record = f"{'CICS':<30}{'00':<20}{'0':>10}{' ' * 20}"[:80]
+    pad_data = "\n".join([pad_record] * 50) + "\n"
+
+    # Concatenate: init records first, then stub records, then padding
+    parts = [p for p in [init_data, stub_data, pad_data] if p]
+    mock_data = "\n".join(parts) if parts else "\n"
 
     # Write temp data file
     with tempfile.NamedTemporaryFile(
