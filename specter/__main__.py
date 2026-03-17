@@ -273,6 +273,26 @@ def main(argv: list[str] | None = None) -> int:
         metavar="NAME=VALUE",
         help="Set initial variable value for --mock-cobol (can repeat)",
     )
+    parser.add_argument(
+        "--cobol-coverage",
+        action="store_true",
+        help="Run coverage-guided test generation against real COBOL (GnuCOBOL)",
+    )
+    parser.add_argument(
+        "--cobol-source",
+        metavar="PATH",
+        help="Path to COBOL source file (.cbl) for --cobol-coverage",
+    )
+    parser.add_argument(
+        "--coverage-budget",
+        type=int, default=5000, metavar="N",
+        help="Max test cases to generate for --cobol-coverage (default: 5000)",
+    )
+    parser.add_argument(
+        "--coverage-timeout",
+        type=int, default=600, metavar="N",
+        help="Max seconds for --cobol-coverage (default: 600)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -499,15 +519,63 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"    - ... and {len(result.warnings) - 20} more")
         return 0
 
+    # --cobol-coverage: coverage-guided test generation against real COBOL
+    if args.cobol_coverage:
+        if not args.cobol_source:
+            print("Error: --cobol-coverage requires --cobol-source PATH", file=sys.stderr)
+            return 1
+        cobol_path = Path(args.cobol_source)
+        if not cobol_path.exists():
+            print(f"Error: COBOL source not found: {cobol_path}", file=sys.stderr)
+            return 1
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)-7s %(message)s",
+            datefmt="%H:%M:%S",
+            stream=sys.stderr,
+            force=True,
+        )
+
+        from .cobol_coverage import run_cobol_coverage
+
+        analysis_dir = Path(args.analysis_output) if args.analysis_output else Path("/tmp")
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+
+        if args.test_store:
+            cov_store = Path(args.test_store)
+        else:
+            cov_store = analysis_dir / f"{source_path.stem}_cobol_testset.jsonl"
+
+        print(f"Running COBOL coverage-guided test generation ...")
+        print(f"  AST:    {source_path}")
+        print(f"  COBOL:  {cobol_path}")
+        print(f"  Budget: {args.coverage_budget} TCs, timeout {args.coverage_timeout}s")
+        print(f"  Store:  {cov_store}")
+
+        cov_report = run_cobol_coverage(
+            ast_file=source_path,
+            cobol_source=cobol_path,
+            copybook_dirs=[Path(d) for d in args.copybook_dir],
+            budget=args.coverage_budget,
+            timeout=args.coverage_timeout,
+            store_path=cov_store,
+            seed=args.seed,
+        )
+        print()
+        print(cov_report.summary())
+        print(f"\nTest store: {cov_store}")
+        return 0
+
     if args.init_var and not args.mock_cobol:
         print(
             "Error: --init-var requires --mock-cobol (or a .cbl input with mock mode).",
             file=sys.stderr,
         )
         return 1
-    if args.copybook_dir and not args.mock_cobol and not args.java:
+    if args.copybook_dir and not args.mock_cobol and not args.java and not args.cobol_coverage:
         print(
-            "Error: --copybook-dir requires --mock-cobol or --java.",
+            "Error: --copybook-dir requires --mock-cobol, --java, or --cobol-coverage.",
             file=sys.stderr,
         )
         return 1

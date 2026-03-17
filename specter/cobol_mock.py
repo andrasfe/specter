@@ -804,6 +804,212 @@ def _add_paragraph_tracing(lines: list[str]) -> tuple[list[str], int]:
 
 
 # ---------------------------------------------------------------------------
+# Phase 6b: Add branch tracing (IF/EVALUATE probes)
+# ---------------------------------------------------------------------------
+
+def _add_branch_tracing(
+    lines: list[str],
+) -> tuple[list[str], dict, int]:
+    """Add branch coverage probes (@@B:<id>:<direction>) for IF and EVALUATE.
+
+    Inserts DISPLAY statements at each branch direction so the coverage engine
+    can determine which branches were taken during execution.
+
+    Returns:
+        (modified_lines, branch_meta, total_branch_probes)
+        branch_meta maps branch_id (str) to {paragraph, condition, type}.
+    """
+    result: list[str] = []
+    branch_id = 0
+    branch_meta: dict[str, dict] = {}
+    in_procedure = False
+    current_para = ""
+
+    # Local state for nesting tracking
+    id_stack: list[str] = []
+    needs_else: dict[str, bool] = {}
+    eval_stack: list[tuple[str, int]] = []
+
+    para_re = re.compile(
+        r"^(\s{7})([A-Z0-9][A-Z0-9_-]*)\s*\.\s*$",
+        re.IGNORECASE,
+    )
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        upper_stripped = line.upper().strip()
+
+        if "PROCEDURE DIVISION" in upper_stripped:
+            in_procedure = True
+            result.append(line)
+            i += 1
+            continue
+
+        if not in_procedure:
+            result.append(line)
+            i += 1
+            continue
+
+        # Track current paragraph
+        m_para = para_re.match(line)
+        if m_para:
+            current_para = m_para.group(2).upper()
+
+        # Detect IF statement (starts with IF, not END-IF)
+        content = _get_cobol_content(line).strip().upper() if len(line) > 7 else ""
+        if content.startswith("IF ") and not content.startswith("IF-"):
+            branch_id += 1
+            bid = str(branch_id)
+            condition_text = content[3:].rstrip(".")
+            branch_meta[bid] = {
+                "paragraph": current_para,
+                "condition": condition_text,
+                "type": "IF",
+            }
+
+            # Consume all continuation lines that are part of the condition.
+            # A multi-line IF condition continues until we hit the first COBOL
+            # verb (MOVE, DISPLAY, PERFORM, IF, EVALUATE, etc.) or END-IF/ELSE.
+            result.append(line)
+            j = i + 1
+            while j < len(lines):
+                next_content = _get_cobol_content(lines[j]).strip().upper() if len(lines[j]) > 7 else ""
+                # Skip blank/comment lines
+                if not next_content or next_content.startswith("*"):
+                    result.append(lines[j])
+                    j += 1
+                    continue
+                # If the next line starts with a COBOL verb or control keyword,
+                # the condition is complete — this is the body.
+                if _is_body_start(next_content):
+                    break
+                # Otherwise it's a continuation of the condition
+                result.append(lines[j])
+                j += 1
+
+            # Now insert the TRUE probe before the first body line
+            result.append(
+                f"{_B}DISPLAY '@@B:{bid}:T'\n"
+            )
+
+            has_else = _scan_for_else(lines, i + 1)
+            needs_else[bid] = not has_else
+            id_stack.append(bid)
+            i = j  # continue from the body line (don't skip it)
+            continue
+
+        # Detect ELSE
+        if content == "ELSE" or content.startswith("ELSE "):
+            if id_stack:
+                bid = id_stack[-1]
+                result.append(line)
+                result.append(
+                    f"{_B}DISPLAY '@@B:{bid}:F'\n"
+                )
+                i += 1
+                continue
+
+        # Detect END-IF
+        if content.startswith("END-IF"):
+            if id_stack:
+                bid = id_stack.pop()
+                if needs_else.get(bid, False):
+                    result.append(f"{_B}ELSE\n")
+                    result.append(
+                        f"{_B}DISPLAY '@@B:{bid}:F'\n"
+                    )
+                    needs_else.pop(bid, None)
+            result.append(line)
+            i += 1
+            continue
+
+        # Detect EVALUATE
+        if content.startswith("EVALUATE "):
+            branch_id += 1
+            bid = str(branch_id)
+            subject = content[9:].rstrip(".")
+            branch_meta[bid] = {
+                "paragraph": current_para,
+                "condition": subject,
+                "type": "EVALUATE",
+            }
+            eval_stack.append((bid, 0))
+            result.append(line)
+            i += 1
+            continue
+
+        # Detect WHEN inside EVALUATE
+        if content.startswith("WHEN ") and eval_stack:
+            base_bid, when_count = eval_stack[-1]
+            when_count += 1
+            eval_stack[-1] = (base_bid, when_count)
+
+            if content.startswith("WHEN OTHER"):
+                direction = "WO"
+            else:
+                direction = f"W{when_count}"
+
+            result.append(line)
+            result.append(
+                f"{_B}DISPLAY '@@B:{base_bid}:{direction}'\n"
+            )
+            i += 1
+            continue
+
+        # Detect END-EVALUATE
+        if content.startswith("END-EVALUATE"):
+            if eval_stack:
+                eval_stack.pop()
+            result.append(line)
+            i += 1
+            continue
+
+        result.append(line)
+        i += 1
+
+    return result, branch_meta, len(branch_meta)
+
+
+def _scan_for_else(lines: list[str], start: int) -> bool:
+    """Scan forward from start to find an ELSE at the same nesting level."""
+    depth = 1  # We're inside one IF
+    for j in range(start, len(lines)):
+        content = _get_cobol_content(lines[j]).strip().upper() if len(lines[j]) > 7 else ""
+        if content.startswith("IF ") and not content.startswith("IF-"):
+            depth += 1
+        elif content.startswith("END-IF"):
+            depth -= 1
+            if depth == 0:
+                return False  # Hit END-IF without finding ELSE at our level
+        elif (content == "ELSE" or content.startswith("ELSE ")) and depth == 1:
+            return True
+    return False
+
+
+# COBOL verbs / keywords that indicate the start of an IF body (not
+# part of the condition).  Keep sorted for readability.
+_BODY_VERBS = frozenset({
+    "ACCEPT", "ADD", "CALL", "CLOSE", "COMPUTE", "CONTINUE",
+    "DELETE", "DISPLAY", "DIVIDE", "ELSE", "END-EVALUATE",
+    "END-IF", "END-PERFORM", "END-READ", "END-STRING",
+    "EVALUATE", "EXEC", "EXIT", "GO", "GOBACK", "IF",
+    "INITIALIZE", "INSPECT", "MOVE", "MULTIPLY", "OPEN",
+    "PERFORM", "READ", "REWRITE", "SEARCH", "SET", "SORT",
+    "START", "STOP", "STRING", "SUBTRACT", "UNSTRING",
+    "WRITE",
+})
+
+
+def _is_body_start(content_upper: str) -> bool:
+    """Return True if content_upper looks like the start of a COBOL statement (not a condition continuation)."""
+    if not content_upper:
+        return False
+    first_word = content_upper.split()[0].rstrip(".")
+    return first_word in _BODY_VERBS
+
+
+# ---------------------------------------------------------------------------
 # Phase 7: Add mock infrastructure
 # ---------------------------------------------------------------------------
 
