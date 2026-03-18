@@ -323,28 +323,47 @@ def _build_success_stubs(
     stub_mapping: dict[str, list[str]],
     domains: dict[str, VariableDomain],
 ) -> tuple[dict[str, list], dict[str, list]]:
-    """Build all-success stub outcomes and defaults."""
+    """Build all-success stub outcomes and defaults.
+
+    For READ operations: generates multiple success records followed by EOF
+    ('10'), with default set to EOF so PERFORM UNTIL loops terminate.
+    For other operations: single success entry with success default.
+    """
     outcomes: dict[str, list] = {}
     defaults: dict[str, list] = {}
 
     for op_key, status_vars in stub_mapping.items():
-        entries: list = []
+        is_read = op_key.startswith("READ:")
+
+        success_entries: list = []
+        eof_entries: list = []
         for var in status_vars:
             dom = domains.get(var)
             if dom and dom.semantic_type == "status_file":
-                entries.append((var, "00"))
+                success_entries.append((var, "00"))
+                eof_entries.append((var, "10"))
             elif dom and dom.semantic_type == "status_sql":
-                entries.append((var, 0))
+                success_entries.append((var, 0))
+                eof_entries.append((var, 100))
             elif dom and dom.semantic_type == "status_cics":
-                entries.append((var, 0))
+                success_entries.append((var, 0))
+                eof_entries.append((var, 0))
             elif op_key.startswith("DLI") or "PCB" in var.upper():
-                entries.append((var, "  "))  # DLI success = spaces
+                success_entries.append((var, "  "))
+                eof_entries.append((var, "GB"))
             else:
-                entries.append((var, "00"))
+                success_entries.append((var, "00"))
+                eof_entries.append((var, "10"))
 
-        if entries:
-            outcomes.setdefault(op_key, []).append(entries)
-            defaults[op_key] = entries
+        if success_entries:
+            if is_read:
+                # 5 success reads then EOF — enough for loop body coverage
+                outcome_list = [success_entries] * 5 + [eof_entries]
+                outcomes[op_key] = outcome_list
+                defaults[op_key] = eof_entries  # loop terminates on exhaustion
+            else:
+                outcomes.setdefault(op_key, []).append(success_entries)
+                defaults[op_key] = success_entries
 
     return outcomes, defaults
 

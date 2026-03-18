@@ -641,10 +641,33 @@ def _mock_dli(block_text: str, ind: str, has_period: bool = False) -> list[str]:
 # Phase 4: Replace file I/O verbs
 # ---------------------------------------------------------------------------
 
+def _extract_file_status_map(lines: list[str]) -> dict[str, str]:
+    """Extract FILE STATUS IS <var> from SELECT clauses.
+
+    Returns a dict mapping file name to status variable name.
+    """
+    status_map: dict[str, str] = {}
+    # Join all lines in FILE-CONTROL to parse multi-line SELECT statements
+    text = "".join(lines).upper()
+    # Match: SELECT <file> ASSIGN TO ... FILE STATUS IS <var>
+    for m in re.finditer(
+        r"SELECT\s+([A-Z0-9_-]+).*?FILE\s+STATUS\s+(?:IS\s+)?([A-Z0-9_-]+)",
+        text, re.DOTALL,
+    ):
+        fname = m.group(1).strip()
+        status_var = m.group(2).strip().rstrip(".")
+        status_map[fname] = status_var
+    return status_map
+
+
 def _replace_io_verbs(lines: list[str]) -> tuple[list[str], int]:
     """Replace standalone READ/WRITE/OPEN/CLOSE/START/DELETE with mocks."""
     result: list[str] = []
     count = 0
+
+    # Extract file → status variable mapping from SELECT clauses
+    file_status_map = _extract_file_status_map(lines)
+
     # Match standalone file I/O at area B (not inside EXEC blocks)
     io_re = re.compile(
         r"^(\s{6}\s+)(READ|WRITE|REWRITE|OPEN|CLOSE|START|DELETE)"
@@ -723,6 +746,34 @@ def _replace_io_verbs(lines: list[str]) -> tuple[list[str], int]:
             result.append(f"{_CONT}  MOVE '00' TO MOCK-ALPHA-STATUS\n")
             result.append(f"{_CONT}  MOVE 0 TO MOCK-NUM-STATUS\n")
             result.append(f"{_B}END-READ\n")
+
+            # Move mock status to the actual file status variable so that
+            # 88-level conditions (WS-FILE-OK, WS-FILE-EOF) evaluate correctly.
+            # For OPEN, the regex captures the access mode (INPUT/OUTPUT) as
+            # target, so extract the actual file name from the block text.
+            file_target = target
+            if verb == "OPEN":
+                # OPEN INPUT/OUTPUT/I-O/EXTEND <file-name>
+                block_text = "".join(block).upper()
+                om = re.search(
+                    r"OPEN\s+(?:INPUT|OUTPUT|I-O|EXTEND)\s+([A-Z0-9_-]+)",
+                    block_text,
+                )
+                if om:
+                    file_target = om.group(1)
+
+            status_var = file_status_map.get(file_target)
+            if not status_var:
+                # Try fuzzy matching (record name vs file name)
+                for fk, sv in file_status_map.items():
+                    if file_target.startswith(fk) or fk.startswith(file_target):
+                        status_var = sv
+                        break
+            if status_var:
+                result.append(
+                    f"{_B}MOVE MOCK-ALPHA-STATUS TO {status_var}\n"
+                )
+
             result.append(
                 f"{_B}DISPLAY 'SPECTER-STATUS:' MOCK-ALPHA-STATUS\n"
             )
