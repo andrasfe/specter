@@ -35,6 +35,7 @@ _A = "       "         # Cols 1-7: area A start (col 8)
 _B = "           "     # Cols 1-11: area B start (col 12)
 _CONT = "              "  # Continuation indent (col 15)
 _CMT = "      *"       # Comment line prefix (col 7 = *)
+_COBC_SYNTAX_TIMEOUT = 90
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +77,7 @@ class InstrumentResult:
 def instrument_cobol(
     source_path: str | Path,
     config: MockConfig | None = None,
+    allow_hardening_fallback: bool = True,
 ) -> InstrumentResult:
     """Instrument a COBOL source file for standalone mock execution.
 
@@ -156,8 +158,15 @@ def instrument_cobol(
     # Phase 11: Add common stub definitions (DFHAID, DFHBMSCA, DFHRESP)
     lines = _add_common_stubs(lines, config)
 
+    # Phase 11b: Normalize legacy paragraph labels ending with ellipsis
+    # (e.g. "3136-INT-NO-CARGADOS-ALL...") into valid headers.
+    lines = _normalize_paragraph_ellipsis(lines)
+
     # Phase 12: Auto-stub unresolved symbols reported by cobc (if available)
-    lines = _auto_stub_undefined_with_cobc(lines)
+    lines = _auto_stub_undefined_with_cobc(
+        lines,
+        allow_hardening_fallback=allow_hardening_fallback,
+    )
 
     # Phase 12b: Re-insert paragraph trace probes that Phase 12 may have
     # destroyed when neutralizing bad paragraphs.  This runs AFTER all
@@ -170,6 +179,11 @@ def instrument_cobol(
             1 for l in lines
             if "SPECTER-TRACE:" in l and not l.strip().startswith("*")
         )
+
+    # Phase 12c: Ensure sentence boundaries before paragraph headers so
+    # inserted probes don't cause the next paragraph label to be parsed
+    # as an identifier in the same sentence.
+    lines = _ensure_sentence_break_before_paragraphs(lines)
 
     # Phase 13: Normalize source characters to ASCII-safe content so cobc does
     # not choke on legacy encoded literals in transformed sources.
@@ -892,7 +906,7 @@ def _add_paragraph_tracing(lines: list[str]) -> tuple[list[str], int]:
                 if para_name.endswith("-SECTION"):
                     continue
                 result.append(
-                    f"{_B}DISPLAY 'SPECTER-TRACE:{para_name}'\n"
+                    f"{_B}DISPLAY 'SPECTER-TRACE:{para_name}'.\n"
                 )
                 count += 1
 
@@ -955,14 +969,8 @@ def _add_branch_tracing(
         # Detect IF statement (starts with IF, not END-IF)
         content = _get_cobol_content(line).strip().upper() if len(line) > 7 else ""
         if content.startswith("IF ") and not content.startswith("IF-"):
-            branch_id += 1
-            bid = str(branch_id)
-            condition_text = content[3:].rstrip(".")
-            branch_meta[bid] = {
-                "paragraph": current_para,
-                "condition": condition_text,
-                "type": "IF",
-            }
+            cond_parts: list[str] = [content[3:].rstrip(".")]
+            saw_comment_between_if_and_body = False
 
             # Consume all continuation lines that are part of the condition.
             # A multi-line IF condition continues until we hit the first COBOL
@@ -970,10 +978,14 @@ def _add_branch_tracing(
             result.append(line)
             j = i + 1
             while j < len(lines):
-                next_content = _get_cobol_content(lines[j]).strip().upper() if len(lines[j]) > 7 else ""
+                next_line = lines[j]
+                next_content = _get_cobol_content(next_line).strip().upper() if len(next_line) > 7 else ""
+                is_comment_line = len(next_line) > 6 and next_line[6] in ("*", "/")
                 # Skip blank/comment lines
-                if not next_content or next_content.startswith("*"):
-                    result.append(lines[j])
+                if not next_content or is_comment_line:
+                    if is_comment_line:
+                        saw_comment_between_if_and_body = True
+                    result.append(next_line)
                     j += 1
                     continue
                 # If the next line starts with a COBOL verb or control keyword,
@@ -982,7 +994,27 @@ def _add_branch_tracing(
                     break
                 # Otherwise it's a continuation of the condition
                 result.append(lines[j])
+                cond_parts.append(next_content.rstrip("."))
                 j += 1
+
+            full_condition = " ".join(cond_parts)
+            open_parens = full_condition.count("(")
+            close_parens = full_condition.count(")")
+            trailing_bool = re.search(r"\b(?:AND|OR)\s*$", full_condition, re.IGNORECASE) is not None
+
+            # Conservative guard: avoid probing IFs that likely became malformed
+            # after prior neutralization/commenting passes.
+            if saw_comment_between_if_and_body or open_parens != close_parens or trailing_bool:
+                i = j
+                continue
+
+            branch_id += 1
+            bid = str(branch_id)
+            branch_meta[bid] = {
+                "paragraph": current_para,
+                "condition": full_condition,
+                "type": "IF",
+            }
 
             # Now insert the TRUE probe before the first body line
             result.append(
@@ -1122,7 +1154,7 @@ def _restore_paragraph_tracing(lines: list[str]) -> list[str]:
 
         if not has_trace:
             result.append(
-                f"{_B}DISPLAY 'SPECTER-TRACE:{para_name}'\n"
+                f"{_B}DISPLAY 'SPECTER-TRACE:{para_name}'.\n"
             )
 
     return result
@@ -1894,7 +1926,11 @@ def _add_fallback_symbols(lines: list[str]) -> list[str]:
     return out
 
 
-def _auto_stub_undefined_with_cobc(lines: list[str], max_passes: int = 48) -> list[str]:
+def _auto_stub_undefined_with_cobc(
+    lines: list[str],
+    max_passes: int = 48,
+    allow_hardening_fallback: bool = True,
+) -> list[str]:
     """Use cobc diagnostics to add only missing symbols as fallbacks.
 
     This keeps instrumentation robust without broad keyword heuristics.
@@ -1902,7 +1938,7 @@ def _auto_stub_undefined_with_cobc(lines: list[str], max_passes: int = 48) -> li
     current = list(lines)
     start_ts = time.time()
     max_seconds = 180.0
-    syntax_timeout = 20
+    syntax_timeout = _COBC_SYNTAX_TIMEOUT
     for _ in range(max_passes):
         if (time.time() - start_ts) > max_seconds:
             break
@@ -1921,14 +1957,19 @@ def _auto_stub_undefined_with_cobc(lines: list[str], max_passes: int = 48) -> li
                 return current
 
             stderr = (proc.stderr or "") + "\n" + (proc.stdout or "")
-            if _is_cobc_internal_abort(stderr):
-                return _mitigate_cobc_internal_abort(current, stderr)
             err_rows = re.findall(r":(\d+):\s+error:\s+(.*)", stderr)
+            if _is_cobc_internal_abort(stderr) and not err_rows:
+                return _mitigate_cobc_internal_abort(
+                    current,
+                    stderr,
+                    allow_hardening_fallback=allow_hardening_fallback,
+                )
             if not err_rows:
                 return current
 
             missing_data: set[str] = set()
             missing_para: set[str] = set()
+            canonicalize_para_lines: set[int] = set()
             numeric_names: set[str] = set()
             multidim_names: set[str] = set()
             bad_paragraphs: set[str] = {
@@ -1958,9 +1999,9 @@ def _auto_stub_undefined_with_cobc(lines: list[str], max_passes: int = 48) -> li
                 if m_undef:
                     raw_sym = m_undef.group(1)
                     if " IN " in raw_sym:
-                        para = _paragraph_for_line(current, ln)
-                        if para:
-                            bad_paragraphs.add(para)
+                        # Qualified-name resolution failures are often
+                        # line-local; do not wipe the entire paragraph.
+                        procedure_single_comment_lines.add(ln)
                         continue
                     sym = raw_sym.split(" IN ", 1)[0].strip().upper()
                     if not re.match(r"^[A-Z0-9-]+$", sym):
@@ -1968,8 +2009,16 @@ def _auto_stub_undefined_with_cobc(lines: list[str], max_passes: int = 48) -> li
                     line_txt = ""
                     if 1 <= ln <= len(current):
                         line_txt = _get_cobol_content(current[ln - 1]).upper()
-                    if re.search(rf"\b(PERFORM|THRU|GO\s+TO)\b[^\n.]*\b{re.escape(sym)}\b", line_txt):
+                    if (
+                        re.search(rf"\b(PERFORM|THRU|GO\s+TO)\b[^\n.]*\b{re.escape(sym)}\b", line_txt)
+                        or re.match(rf"^\s*{re.escape(sym)}\s*\.?\s*$", line_txt)
+                        or re.match(rf"^\s*{re.escape(sym)}\s*\.{2,}\s*$", line_txt)
+                        or line_txt.strip().startswith(f"{sym}.")
+                        or line_txt.strip().startswith(sym)
+                    ):
                         missing_para.add(sym)
+                        if re.match(rf"^\s*{re.escape(sym)}\s*\.{2,}\s*$", line_txt):
+                            canonicalize_para_lines.add(ln)
                     else:
                         missing_data.add(sym)
                     continue
@@ -2021,6 +2070,15 @@ def _auto_stub_undefined_with_cobc(lines: list[str], max_passes: int = 48) -> li
                 current = _inject_fallback_data_items(current, sorted(missing_data))
                 current = _inject_fallback_paragraphs(current, sorted(missing_para))
 
+            # Some legacy paragraph labels can appear syntactically present but
+            # still be rejected by cobc as undefined (name-form quirks). In that
+            # case, rewrite to a safe alpha-prefixed symbol and retarget refs.
+            for sym in sorted(missing_para):
+                current = _retarget_problematic_paragraph_symbol(current, sym)
+
+            if canonicalize_para_lines:
+                current = _canonicalize_paragraph_header_lines(current, canonicalize_para_lines)
+
             if numeric_names or multidim_names:
                 current = _promote_fallback_types(current, numeric_names, multidim_names)
 
@@ -2045,6 +2103,7 @@ def _auto_stub_undefined_with_cobc(lines: list[str], max_passes: int = 48) -> li
 
             current = _cleanup_unbalanced_procedure(current)
             current = _normalize_subscript_forms(current)
+            current = _normalize_paragraph_ellipsis(current)
             current = _force_neutralize_paragraphs(current, bad_paragraphs)
 
     # Last resort path: first try targeted recovery from final diagnostics,
@@ -2062,8 +2121,13 @@ def _auto_stub_undefined_with_cobc(lines: list[str], max_passes: int = 48) -> li
             )
             if proc.returncode != 0:
                 stderr = (proc.stderr or "") + "\n" + (proc.stdout or "")
-                if _is_cobc_internal_abort(stderr):
-                    return _mitigate_cobc_internal_abort(current, stderr)
+                final_err_rows = re.findall(r":(\d+):\s+error:\s+(.*)", stderr)
+                if _is_cobc_internal_abort(stderr) and not final_err_rows:
+                    return _mitigate_cobc_internal_abort(
+                        current,
+                        stderr,
+                        allow_hardening_fallback=allow_hardening_fallback,
+                    )
 
                 # First, neutralize only paragraphs explicitly named by cobc.
                 final_bad_paras = set(re.findall(r"in paragraph '([^']+)'", stderr, re.IGNORECASE))
@@ -2072,12 +2136,31 @@ def _auto_stub_undefined_with_cobc(lines: list[str], max_passes: int = 48) -> li
                 else:
                     tentative = list(current)
 
+                # Final-row recovery: inject paragraph stubs for unresolved
+                # label-like symbols before escalating to hardening.
+                final_missing_para: set[str] = set()
+                for _ln_s, msg in final_err_rows:
+                    m_undef = re.search(r"'([^']+)'\s+is\s+not\s+defined", msg)
+                    if not m_undef:
+                        continue
+                    sym = m_undef.group(1).split(" IN ", 1)[0].strip().upper()
+                    if re.match(r"^[A-Z0-9-]+$", sym):
+                        final_missing_para.add(sym)
+                if final_missing_para:
+                    tentative = _inject_fallback_paragraphs(
+                        tentative,
+                        sorted(final_missing_para),
+                    )
+                    for sym in sorted(final_missing_para):
+                        tentative = _retarget_problematic_paragraph_symbol(tentative, sym)
+
                 # Also comment explicitly errored procedure lines.
                 err_lines = {
                     int(m.group(1))
                     for m in re.finditer(r":(\d+):\s+error:", stderr)
                     if m.group(1).isdigit()
                 }
+                tentative = _canonicalize_paragraph_header_lines(tentative, err_lines)
                 if err_lines:
                     tentative = _comment_specific_lines(tentative, err_lines)
 
@@ -2097,11 +2180,12 @@ def _auto_stub_undefined_with_cobc(lines: list[str], max_passes: int = 48) -> li
                     return _mitigate_cobc_internal_abort(
                         tentative,
                         (proc2.stderr or "") + "\n" + (proc2.stdout or ""),
+                        allow_hardening_fallback=allow_hardening_fallback,
                     )
 
                 # Keep as much runnable logic as possible by progressively
                 # neutralizing exact cobc-reported error lines before giving up.
-                salvage = _progressive_syntax_salvage(tentative)
+                salvage = _progressive_syntax_salvage(tentative, max_rounds=80)
                 with tempfile.TemporaryDirectory(prefix="specter-mock-") as td3:
                     tmp_src3 = Path(td3) / "autocheck-salvage.cbl"
                     tmp_src3.write_text("".join(salvage))
@@ -2118,17 +2202,41 @@ def _auto_stub_undefined_with_cobc(lines: list[str], max_passes: int = 48) -> li
                     return _mitigate_cobc_internal_abort(
                         salvage,
                         (proc3.stderr or "") + "\n" + (proc3.stdout or ""),
+                        allow_hardening_fallback=allow_hardening_fallback,
+                    )
+
+                salvage2 = _progressive_syntax_salvage(current, max_rounds=180)
+                with tempfile.TemporaryDirectory(prefix="specter-mock-") as td4:
+                    tmp_src4 = Path(td4) / "autocheck-salvage2.cbl"
+                    tmp_src4.write_text("".join(salvage2))
+                    proc4 = subprocess.run(
+                        ["cobc", "-fsyntax-only", str(tmp_src4)],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=syntax_timeout,
+                    )
+                if proc4.returncode == 0:
+                    return salvage2
+                if _is_cobc_internal_abort((proc4.stderr or "") + "\n" + (proc4.stdout or "")):
+                    return _mitigate_cobc_internal_abort(
+                        salvage2,
+                        (proc4.stderr or "") + "\n" + (proc4.stdout or ""),
                     )
 
                 _write_hardening_diagnostics(
                     stage="post-salvage",
-                    diagnostics=(proc3.stderr or "") + "\n" + (proc3.stdout or ""),
+                    diagnostics=(proc4.stderr or "") + "\n" + (proc4.stdout or ""),
                 )
 
-                return _hard_comment_procedure(current)
+                if allow_hardening_fallback:
+                    return _hard_comment_procedure(current)
+                return current
     except Exception:
         _write_hardening_diagnostics(stage="exception", diagnostics="exception during auto-stub recovery")
-        return _hard_comment_procedure(current)
+        if allow_hardening_fallback:
+            return _hard_comment_procedure(current)
+        return current
 
     return current
 
@@ -2267,7 +2375,7 @@ def _progressive_syntax_salvage(lines: list[str], max_rounds: int = 20) -> list[
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=20,
+                timeout=_COBC_SYNTAX_TIMEOUT,
             )
         if proc.returncode == 0:
             return current
@@ -2605,12 +2713,12 @@ def _hard_comment_procedure(lines: list[str]) -> list[str]:
         for name in para_names:
             stub.extend([
                 f"{_A}{name}.\n",
-                f"{_B}DISPLAY 'SPECTER-TRACE:{name}'\n",
+                f"{_B}DISPLAY 'SPECTER-TRACE:{name}'.\n",
                 f"{_B}CONTINUE.\n",
             ])
     else:
         stub.extend([
-            f"{_B}DISPLAY 'SPECTER-TRACE:HARDENED'\n",
+            f"{_B}DISPLAY 'SPECTER-TRACE:HARDENED'.\n",
             f"{_B}CONTINUE.\n",
             f"{_B}GOBACK.\n",
         ])
@@ -2644,17 +2752,44 @@ def _is_cobc_internal_abort(diag: str) -> bool:
     return ("unknown (signal)" in d) or ("please report this" in d)
 
 
-def _mitigate_cobc_internal_abort(lines: list[str], diag: str, rounds: int = 6) -> list[str]:
+def _mitigate_cobc_internal_abort(
+    lines: list[str],
+    diag: str,
+    rounds: int = 6,
+    allow_hardening_fallback: bool = True,
+) -> list[str]:
     """Mitigate cobc internal aborts by neutralizing local crash-line windows."""
     current = list(lines)
     details = diag or ""
     for _ in range(rounds):
         m = re.search(r"at line\s+(\d+)", details, re.IGNORECASE)
         if not m:
-            return _hard_comment_procedure(current)
+            salvage = _progressive_syntax_salvage(current, max_rounds=180)
+            with tempfile.TemporaryDirectory(prefix="specter-mock-") as td:
+                tmp_src = Path(td) / "abort-salvage.cbl"
+                tmp_src.write_text("".join(salvage))
+                proc = subprocess.run(
+                    ["cobc", "-fsyntax-only", str(tmp_src)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=_COBC_SYNTAX_TIMEOUT,
+                )
+            if proc.returncode == 0:
+                return salvage
+            _write_hardening_diagnostics(
+                stage="abort-mitigate-no-line",
+                diagnostics=(proc.stderr or "") + "\n" + (proc.stdout or ""),
+            )
+            if allow_hardening_fallback:
+                return _hard_comment_procedure(salvage)
+            return salvage
         ln = int(m.group(1))
-        targets = set(range(max(1, ln - 2), ln + 3))
+        targets = set(range(max(1, ln - 10), ln + 11))
         current = _comment_exact_lines(current, targets)
+        crash_para = _paragraph_for_line(current, ln)
+        if crash_para:
+            current = _force_neutralize_paragraphs(current, {crash_para.upper()})
         current = _cleanup_unbalanced_procedure(current)
 
         with tempfile.TemporaryDirectory(prefix="specter-mock-") as td:
@@ -2665,7 +2800,7 @@ def _mitigate_cobc_internal_abort(lines: list[str], diag: str, rounds: int = 6) 
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=20,
+                timeout=_COBC_SYNTAX_TIMEOUT,
             )
         details = (proc.stderr or "") + "\n" + (proc.stdout or "")
         if proc.returncode == 0:
@@ -2673,7 +2808,26 @@ def _mitigate_cobc_internal_abort(lines: list[str], diag: str, rounds: int = 6) 
         if not _is_cobc_internal_abort(details):
             return current
 
-    return _hard_comment_procedure(current)
+    salvage = _progressive_syntax_salvage(current, max_rounds=220)
+    with tempfile.TemporaryDirectory(prefix="specter-mock-") as td:
+        tmp_src = Path(td) / "abort-salvage-final.cbl"
+        tmp_src.write_text("".join(salvage))
+        proc = subprocess.run(
+            ["cobc", "-fsyntax-only", str(tmp_src)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_COBC_SYNTAX_TIMEOUT,
+        )
+    if proc.returncode == 0:
+        return salvage
+    _write_hardening_diagnostics(
+        stage="abort-mitigate-fallback",
+        diagnostics=(proc.stderr or "") + "\n" + (proc.stdout or ""),
+    )
+    if allow_hardening_fallback:
+        return _hard_comment_procedure(salvage)
+    return salvage
 
 
 # ---------------------------------------------------------------------------
@@ -2708,6 +2862,146 @@ def _sanitize_source_ascii(lines: list[str]) -> list[str]:
                 sanitized_chars.append(" ")
         sanitized = "".join(sanitized_chars)
         out.append(sanitized + ("\n" if has_nl else ""))
+    return out
+
+
+def _normalize_paragraph_ellipsis(lines: list[str]) -> list[str]:
+    """Normalize paragraph labels that end with multiple dots.
+
+    Some transformed sources contain labels like ``FOO-BAR...`` in area A,
+    which GnuCOBOL does not reliably treat as paragraph headers. Convert such
+    lines to canonical ``FOO-BAR.`` form.
+    """
+    out: list[str] = []
+    proc_seen = False
+    label_re = re.compile(r"^\s*([A-Z0-9][A-Z0-9-]*)\.{2,}\s*$", re.IGNORECASE)
+    for line in lines:
+        content = _get_cobol_content(line)
+        upper = content.upper().strip()
+        if "PROCEDURE DIVISION" in upper:
+            proc_seen = True
+            out.append(line)
+            continue
+        if not proc_seen or len(line) <= 6 or line[6] in ("*", "/"):
+            out.append(line)
+            continue
+
+        m = label_re.match(content)
+        if m:
+            name = m.group(1).upper()
+            out.append(f"{_A}{name}.\n")
+            continue
+        out.append(line)
+    return out
+
+
+def _canonicalize_paragraph_header_lines(lines: list[str], line_numbers: set[int]) -> list[str]:
+    """Rewrite exact physical lines to canonical paragraph headers when safe."""
+    if not line_numbers:
+        return lines
+    out = list(lines)
+    proc_idx = _find_divisions(lines).get("procedure")
+    if proc_idx is None:
+        return out
+    label_re = re.compile(r"^\s*([A-Z0-9][A-Z0-9-]*)\s*\.{2,}\s*$", re.IGNORECASE)
+    for ln in line_numbers:
+        if ln <= (proc_idx + 1) or ln < 1 or ln > len(out):
+            continue
+        line = out[ln - 1]
+        if len(line) <= 6 or line[6] in ("*", "/"):
+            continue
+        content = _get_cobol_content(line)
+        m = label_re.match(content)
+        if not m:
+            continue
+        out[ln - 1] = f"{_A}{m.group(1).upper()}.\n"
+    return out
+
+
+def _ensure_sentence_break_before_paragraphs(lines: list[str]) -> list[str]:
+    """Ensure previous active statement ends with a period before each paragraph header."""
+    out = list(lines)
+    proc_seen = False
+    para_re = re.compile(r"^\s{7}[A-Z0-9][A-Z0-9_-]*\s*\.\s*(?:EXIT\.)?\s*$", re.IGNORECASE)
+    section_re = re.compile(r"^\s{7}[A-Z0-9][A-Z0-9_-]*\s+SECTION\s*\.\s*$", re.IGNORECASE)
+
+    for i, line in enumerate(out):
+        c = _get_cobol_content(line).upper().strip()
+        if "PROCEDURE DIVISION" in c:
+            proc_seen = True
+            continue
+        if not proc_seen:
+            continue
+
+        if not para_re.match(line) or section_re.match(line):
+            continue
+
+        # Find nearest previous active line
+        j = i - 1
+        while j >= 0:
+            prev = out[j]
+            pc = _get_cobol_content(prev)
+            if not pc.strip():
+                j -= 1
+                continue
+            if len(prev) > 6 and prev[6] in ("*", "/"):
+                j -= 1
+                continue
+            break
+        if j < 0:
+            continue
+
+        prev = out[j]
+        pc = _get_cobol_content(prev).rstrip()
+        if pc.endswith("."):
+            continue
+
+        # Add sentence terminator at end of active content region.
+        has_nl = prev.endswith("\n")
+        body = prev[:-1] if has_nl else prev
+        trimmed = body.rstrip()
+        out[j] = trimmed + "." + ("\n" if has_nl else "")
+
+    return out
+
+
+def _retarget_problematic_paragraph_symbol(lines: list[str], symbol: str) -> list[str]:
+    """Rename a paragraph symbol to an alpha-prefixed safe name and retarget refs."""
+    if not symbol or not re.match(r"^[A-Z0-9-]+$", symbol):
+        return lines
+
+    safe_name = f"S-{symbol}"[:30]
+    if safe_name == symbol:
+        return lines
+
+    out = list(lines)
+    proc_idx = _find_divisions(lines).get("procedure")
+    if proc_idx is None:
+        return out
+
+    # Only rewrite when a concrete paragraph header already exists.
+    header_re = re.compile(rf"^\s*{re.escape(symbol)}\s*\.(?:\s+EXIT\.)?\s*$", re.IGNORECASE)
+    found_header = False
+    for i in range(proc_idx + 1, len(out)):
+        if len(out[i]) > 6 and out[i][6] in ("*", "/"):
+            continue
+        c = _get_cobol_content(out[i]).upper().strip()
+        if header_re.match(c):
+            found_header = True
+            break
+    if not found_header:
+        return out
+
+    sym_pat = re.compile(rf"(?<![A-Z0-9-]){re.escape(symbol)}(?![A-Z0-9-])", re.IGNORECASE)
+    for i in range(proc_idx + 1, len(out)):
+        line = out[i]
+        if len(line) <= 6 or line[6] in ("*", "/"):
+            continue
+        content = _get_cobol_content(line)
+        new_content = sym_pat.sub(safe_name, content)
+        if new_content != content:
+            out[i] = line[:6] + new_content + ("\n" if line.endswith("\n") else "")
+
     return out
 
 

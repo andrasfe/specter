@@ -12,6 +12,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 
 from .cobol_mock import (
     InstrumentResult,
@@ -41,6 +42,7 @@ class CobolExecutionContext:
     injectable_vars: list[str] = field(default_factory=list)
     total_paragraphs: int = 0
     total_branches: int = 0
+    hardened_mode: bool = False
 
 
 @dataclass
@@ -88,6 +90,7 @@ def prepare_context(
     work_dir: str | Path | None = None,
     injectable_vars: list[str] | None = None,
     coverage_mode: bool = False,
+    allow_hardening_fallback: bool = True,
 ) -> CobolExecutionContext:
     """Instrument and compile a COBOL source for repeated execution.
 
@@ -144,17 +147,31 @@ def prepare_context(
         eib_calen=100 if coverage_mode else 0,
         eib_aid="X'7D'" if coverage_mode else "SPACES",  # X'7D' = DFHENTER
     )
-    result = instrument_cobol(cobol_source, config)
+    result = instrument_cobol(
+        cobol_source,
+        config,
+        allow_hardening_fallback=allow_hardening_fallback,
+    )
 
     # Apply branch tracing if requested
     source_text = result.source
     branch_meta: dict = {}
     total_branches = 0
+    hardened_mode = "SPECTER-HARDENED-ENTRY" in source_text
     if enable_branch_tracing:
-        from .cobol_mock import _add_branch_tracing
+        from .cobol_mock import _add_branch_tracing, _ensure_sentence_break_before_paragraphs
         lines = source_text.splitlines(keepends=True)
         lines, branch_meta, total_branches = _add_branch_tracing(lines)
+        lines = _ensure_sentence_break_before_paragraphs(lines)
         source_text = "".join(lines)
+        if hardened_mode and total_branches == 0:
+            log.warning(
+                "Branch tracing disabled by hardening fallback: instrumented source "
+                "contains SPECTER-HARDENED-ENTRY and no active IF/EVALUATE "
+                "constructs remain. Paragraph coverage is still valid, but branch "
+                "coverage will report 0/0 until compilation succeeds without full "
+                "procedure hardening."
+            )
 
     # Write instrumented source
     instrumented_path = work_dir / (cobol_source.stem + ".mock.cbl")
@@ -165,6 +182,39 @@ def prepare_context(
     success, message = compile_cobol(
         instrumented_path, executable_path, copybook_paths,
     )
+    if not success and "unknown (signal)" in (message or "").lower():
+        # cobc internal abort: attempt targeted local mitigation while preserving
+        # strict mode semantics (no full hardening fallback).
+        from .cobol_mock import _mitigate_cobc_internal_abort
+
+        mitigated_lines = _mitigate_cobc_internal_abort(
+            source_text.splitlines(keepends=True),
+            message,
+            allow_hardening_fallback=False,
+        )
+        mitigated_source = "".join(mitigated_lines)
+        if mitigated_source != source_text:
+            source_text = mitigated_source
+            instrumented_path.write_text(source_text)
+            success, message = compile_cobol(
+                instrumented_path, executable_path, copybook_paths,
+            )
+            if not success:
+                missing = {
+                    sym.strip().upper()
+                    for sym in re.findall(r"'([^']+)'\s+is\s+not\s+defined", message or "", re.IGNORECASE)
+                    if re.match(r"^[A-Z0-9-]+$", sym.strip().upper())
+                }
+                if missing:
+                    from .cobol_mock import _inject_fallback_paragraphs
+
+                    lines = source_text.splitlines(keepends=True)
+                    lines = _inject_fallback_paragraphs(lines, sorted(missing))
+                    source_text = "".join(lines)
+                    instrumented_path.write_text(source_text)
+                    success, message = compile_cobol(
+                        instrumented_path, executable_path, copybook_paths,
+                    )
     if not success:
         raise RuntimeError(f"COBOL compilation failed: {message}")
 
@@ -178,6 +228,7 @@ def prepare_context(
         injectable_vars=[],  # populated by caller from domain model
         total_paragraphs=result.paragraphs_traced,
         total_branches=total_branches,
+        hardened_mode=hardened_mode,
     )
 
 

@@ -37,9 +37,11 @@ def _to_num(v):
 
 def _apply_stub_outcome(state, key):
     """Apply a queued stub outcome (set status variables after external op)."""
+    _applied = None
     _ol = state.get('_stub_outcomes', {}).get(key, [])
     if _ol:
         _entry = _ol.pop(0)
+        _applied = _entry
         if isinstance(_entry, list):
             for _var, _val in _entry:
                 state[_var] = _val
@@ -50,8 +52,12 @@ def _apply_stub_outcome(state, key):
         # Apply default when stub outcomes exhausted
         _dm = state.get('_stub_defaults', {}).get(key)
         if _dm:
+            _applied = list(_dm)
             for _var, _val in _dm:
                 state[_var] = _val
+    _log = state.get('_stub_log')
+    if _log is not None:
+        _log.append((key, _applied))
 
 
 def _dummy_call(name, state, *args):
@@ -776,10 +782,10 @@ def para_5100_READ_XREF_RECORD(state):
         state['XREF-CARD-NUM'] = state.get('PA-RQ-CARD-NUM', '')
         _dummy_exec('CICS', 'EXEC CICS READ DATASET   (WS-CCXREF-FILE) INTO      (CARD-XREF-RECORD) LENGTH    (LENGTH OF CARD-XREF-RECORD) RIDFLD    (XREF-CARD-NUM) KEYLENGTH (LENGTH OF XREF-CARD-NUM) RESP      (WS-RESP-CD) RESP2...', state)
         _eval_subject = state.get('WS-RESP-CD', '')
-        if _eval_subject == 0:
+        if (_eval_subject == 0):
             state.get('_branches', set()).add(11)
             state['CARD-FOUND-XREF'] = True
-        elif _eval_subject == 13:
+        elif (_eval_subject == 13):
             state.get('_branches', set()).add(12)
             state['CARD-NFOUND-XREF'] = True
             state['NFOUND-ACCT-IN-MSTR'] = True
@@ -835,10 +841,10 @@ def para_5200_READ_ACCT_RECORD(state):
         state['WS-CARD-RID-ACCT-ID'] = state.get('XREF-ACCT-ID', '')
         _dummy_exec('CICS', 'EXEC CICS READ DATASET   (WS-ACCTFILENAME) RIDFLD    (WS-CARD-RID-ACCT-ID-X) KEYLENGTH (LENGTH OF WS-CARD-RID-ACCT-ID-X) INTO      (ACCOUNT-RECORD) LENGTH    (LENGTH OF ACCOUNT-RECORD) RESP      (WS-R...', state)
         _eval_subject = state.get('WS-RESP-CD', '')
-        if _eval_subject == 0:
+        if (_eval_subject == 0):
             state.get('_branches', set()).add(14)
             state['FOUND-ACCT-IN-MSTR'] = True
-        elif _eval_subject == 13:
+        elif (_eval_subject == 13):
             state.get('_branches', set()).add(15)
             state['NFOUND-ACCT-IN-MSTR'] = True
             state['ERR-LOCATION'] = 'A002'
@@ -893,10 +899,10 @@ def para_5300_READ_CUST_RECORD(state):
         state['WS-CARD-RID-CUST-ID'] = state.get('XREF-CUST-ID', '')
         _dummy_exec('CICS', 'EXEC CICS READ DATASET   (WS-CUSTFILENAME) RIDFLD    (WS-CARD-RID-CUST-ID-X) KEYLENGTH (LENGTH OF WS-CARD-RID-CUST-ID-X) INTO      (CUSTOMER-RECORD) LENGTH    (LENGTH OF CUSTOMER-RECORD) RESP      (WS...', state)
         _eval_subject = state.get('WS-RESP-CD', '')
-        if _eval_subject == 0:
+        if (_eval_subject == 0):
             state.get('_branches', set()).add(17)
             state['FOUND-CUST-IN-MSTR'] = True
-        elif _eval_subject == 13:
+        elif (_eval_subject == 13):
             state.get('_branches', set()).add(18)
             state['NFOUND-CUST-IN-MSTR'] = True
             state['ERR-LOCATION'] = 'A003'
@@ -951,10 +957,10 @@ def para_5500_READ_AUTH_SUMMRY(state):
         state['PA-ACCT-ID'] = state.get('XREF-ACCT-ID', '')
         _dummy_exec('DLI', 'EXEC DLI GU USING PCB(PAUT-PCB-NUM) SEGMENT (PAUTSUM0) INTO (PENDING-AUTH-SUMMARY) WHERE (ACCNTID = PA-ACCT-ID) END-EXEC', state)
         state['IMS-RETURN-CODE'] = state.get('DIBSTAT', '')
-        if state['STATUS-OK']:
+        if (state['STATUS-OK']):
             state.get('_branches', set()).add(20)
             state['FOUND-PAUT-SMRY-SEG'] = True
-        elif state['SEGMENT-NOT-FOUND']:
+        elif (state['SEGMENT-NOT-FOUND']):
             state.get('_branches', set()).add(21)
             state['NFOUND-PAUT-SMRY-SEG'] = True
         else:
@@ -1064,32 +1070,26 @@ def para_6000_MAKE_DECISION(state):
         state['PA-RL-AUTH-RESP-REASON'] = '0000'
         if state['AUTH-RESP-DECLINED']:
             state.get('_branches', set()).add(28)
-            if state['CARD-NFOUND-XREF']:
+            if (state['CARD-NFOUND-XREF']) or (state['NFOUND-ACCT-IN-MSTR']) or (state['NFOUND-CUST-IN-MSTR']):
                 state.get('_branches', set()).add(29)
-                pass
-            elif state['NFOUND-ACCT-IN-MSTR']:
-                state.get('_branches', set()).add(30)
-                pass
-            elif state['NFOUND-CUST-IN-MSTR']:
-                state.get('_branches', set()).add(31)
                 state['PA-RL-AUTH-RESP-REASON'] = '3100'
-            elif state['INSUFFICIENT-FUND']:
-                state.get('_branches', set()).add(32)
+            elif (state['INSUFFICIENT-FUND']):
+                state.get('_branches', set()).add(30)
                 state['PA-RL-AUTH-RESP-REASON'] = '4100'
-            elif state['CARD-NOT-ACTIVE']:
-                state.get('_branches', set()).add(33)
+            elif (state['CARD-NOT-ACTIVE']):
+                state.get('_branches', set()).add(31)
                 state['PA-RL-AUTH-RESP-REASON'] = '4200'
-            elif state['ACCOUNT-CLOSED']:
-                state.get('_branches', set()).add(34)
+            elif (state['ACCOUNT-CLOSED']):
+                state.get('_branches', set()).add(32)
                 state['PA-RL-AUTH-RESP-REASON'] = '4300'
-            elif state['CARD-FRAUD']:
-                state.get('_branches', set()).add(35)
+            elif (state['CARD-FRAUD']):
+                state.get('_branches', set()).add(33)
                 state['PA-RL-AUTH-RESP-REASON'] = '5100'
-            elif state['MERCHANT-FRAUD']:
-                state.get('_branches', set()).add(36)
+            elif (state['MERCHANT-FRAUD']):
+                state.get('_branches', set()).add(34)
                 state['PA-RL-AUTH-RESP-REASON'] = '5200'
             else:
-                state.get('_branches', set()).add(37)
+                state.get('_branches', set()).add(35)
                 state['PA-RL-AUTH-RESP-REASON'] = '9000'
         else:
             state.get('_branches', set()).add(-28)
@@ -1158,7 +1158,7 @@ def para_7100_SEND_RESPONSE(state):
         state['W02-BUFFLEN'] = state.get('WS-RESP-LENGTH', '')
         _dummy_call('MQPUT1', state)
         if state['WS-COMPCODE'] != state['MQCC-OK']:
-            state.get('_branches', set()).add(38)
+            state.get('_branches', set()).add(36)
             state['ERR-LOCATION'] = 'M004'
             state['ERR-CRITICAL'] = True
             state['ERR-MQ'] = True
@@ -1173,7 +1173,7 @@ def para_7100_SEND_RESPONSE(state):
             state['ERR-EVENT-KEY'] = state.get('PA-CARD-NUM', '')
             para_9500_LOG_ERROR(state)
         else:
-            state.get('_branches', set()).add(-38)
+            state.get('_branches', set()).add(-36)
     finally:
         state._exit_para('7100-SEND-RESPONSE')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
@@ -1237,36 +1237,36 @@ def para_8400_UPDATE_SUMMARY(state):
     try:
         state._enter_para('8400-UPDATE-SUMMARY')
         if state['NFOUND-PAUT-SMRY-SEG']:
-            state.get('_branches', set()).add(39)
+            state.get('_branches', set()).add(37)
             state['PENDING-AUTH-SUMMARY'] = 0 if isinstance(state.get('PENDING-AUTH-SUMMARY', ''), (int, float)) else ''
             state['PA-ACCT-ID'] = state.get('XREF-ACCT-ID', '')
             state['PA-CUST-ID'] = state.get('XREF-CUST-ID', '')
         else:
-            state.get('_branches', set()).add(-39)
+            state.get('_branches', set()).add(-37)
         state['PA-CREDIT-LIMIT'] = state.get('ACCT-CREDIT-LIMIT', '')
         state['PA-CASH-LIMIT'] = state.get('ACCT-CASH-CREDIT-LIMIT', '')
         if state['AUTH-RESP-APPROVED']:
-            state.get('_branches', set()).add(40)
+            state.get('_branches', set()).add(38)
             state['PA-APPROVED-AUTH-CNT'] = _to_num(state.get('PA-APPROVED-AUTH-CNT', 0)) + 1
             state['PA-APPROVED-AUTH-AMT'] = _to_num(state.get('PA-APPROVED-AUTH-AMT', 0)) + _to_num(state.get('WS-APPROVED-AMT', 0))
             state['PA-CREDIT-BALANCE'] = _to_num(state.get('PA-CREDIT-BALANCE', 0)) + _to_num(state.get('WS-APPROVED-AMT', 0))
             state['PA-CASH-BALANCE'] = 0
         else:
-            state.get('_branches', set()).add(-40)
+            state.get('_branches', set()).add(-38)
             state['PA-DECLINED-AUTH-CNT'] = _to_num(state.get('PA-DECLINED-AUTH-CNT', 0)) + 1
             state['PA-DECLINED-AUTH-AMT'] = _to_num(state.get('PA-DECLINED-AUTH-AMT', 0)) + _to_num(state.get('PA-TRANSACTION-AMT', 0))
         if state['FOUND-PAUT-SMRY-SEG']:
-            state.get('_branches', set()).add(41)
+            state.get('_branches', set()).add(39)
             _dummy_exec('DLI', 'EXEC DLI REPL USING PCB(PAUT-PCB-NUM) SEGMENT (PAUTSUM0) FROM (PENDING-AUTH-SUMMARY) END-EXEC', state)
         else:
-            state.get('_branches', set()).add(-41)
+            state.get('_branches', set()).add(-39)
             _dummy_exec('DLI', 'EXEC DLI ISRT USING PCB(PAUT-PCB-NUM) SEGMENT (PAUTSUM0) FROM (PENDING-AUTH-SUMMARY) END-EXEC', state)
         state['IMS-RETURN-CODE'] = state.get('DIBSTAT', '')
         if state['STATUS-OK']:
-            state.get('_branches', set()).add(42)
+            state.get('_branches', set()).add(40)
             pass  # CONTINUE
         else:
-            state.get('_branches', set()).add(-42)
+            state.get('_branches', set()).add(-40)
             state['ERR-LOCATION'] = 'I003'
             state['ERR-CRITICAL'] = True
             state['ERR-IMS'] = True
@@ -1333,20 +1333,20 @@ def para_8500_INSERT_AUTH(state):
         state['PA-AUTH-RESP-REASON'] = state.get('PA-RL-AUTH-RESP-REASON', '')
         state['PA-APPROVED-AMT'] = state.get('PA-RL-APPROVED-AMT', '')
         if state['AUTH-RESP-APPROVED']:
-            state.get('_branches', set()).add(43)
+            state.get('_branches', set()).add(41)
             state['PA-MATCH-PENDING'] = True
         else:
-            state.get('_branches', set()).add(-43)
+            state.get('_branches', set()).add(-41)
             state['PA-MATCH-AUTH-DECLINED'] = True
         state['PA-AUTH-FRAUD'] = ' '
         state['PA-ACCT-ID'] = state.get('XREF-ACCT-ID', '')
         _dummy_exec('DLI', 'EXEC DLI ISRT USING PCB(PAUT-PCB-NUM) SEGMENT (PAUTSUM0) WHERE (ACCNTID = PA-ACCT-ID) SEGMENT (PAUTDTL1) FROM (PENDING-AUTH-DETAILS) SEGLENGTH (LENGTH OF PENDING-AUTH-DETAILS) END-EXEC', state)
         state['IMS-RETURN-CODE'] = state.get('DIBSTAT', '')
         if state['STATUS-OK']:
-            state.get('_branches', set()).add(44)
+            state.get('_branches', set()).add(42)
             pass  # CONTINUE
         else:
-            state.get('_branches', set()).add(-44)
+            state.get('_branches', set()).add(-42)
             state['ERR-LOCATION'] = 'I004'
             state['ERR-CRITICAL'] = True
             state['ERR-IMS'] = True
@@ -1384,10 +1384,10 @@ def para_9000_TERMINATE(state):
     try:
         state._enter_para('9000-TERMINATE')
         if state['IMS-PSB-SCHD']:
-            state.get('_branches', set()).add(45)
+            state.get('_branches', set()).add(43)
             _dummy_exec('DLI', 'EXEC DLI TERM END-EXEC', state)
         else:
-            state.get('_branches', set()).add(-45)
+            state.get('_branches', set()).add(-43)
         para_9100_CLOSE_REQUEST_QUEUE(state)
         para_9100_EXIT(state)
     finally:
@@ -1420,13 +1420,13 @@ def para_9100_CLOSE_REQUEST_QUEUE(state):
     try:
         state._enter_para('9100-CLOSE-REQUEST-QUEUE')
         if state['WS-REQUEST-MQ-OPEN']:
-            state.get('_branches', set()).add(46)
+            state.get('_branches', set()).add(44)
             _dummy_call('MQCLOSE', state)
             if state['WS-COMPCODE'] == state['MQCC-OK']:
-                state.get('_branches', set()).add(47)
+                state.get('_branches', set()).add(45)
                 state['WS-REQUEST-MQ-CLSE'] = True
             else:
-                state.get('_branches', set()).add(-47)
+                state.get('_branches', set()).add(-45)
                 state['ERR-LOCATION'] = 'M005'
                 state['ERR-WARNING'] = True
                 state['ERR-MQ'] = True
@@ -1439,7 +1439,7 @@ def para_9100_CLOSE_REQUEST_QUEUE(state):
                 state['MQ'] = state.get('FAILED', '')
                 para_9500_LOG_ERROR(state)
         else:
-            state.get('_branches', set()).add(-46)
+            state.get('_branches', set()).add(-44)
     finally:
         state._exit_para('9100-CLOSE-REQUEST-QUEUE')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
@@ -1477,10 +1477,10 @@ def para_9500_LOG_ERROR(state):
         state['ERR-TIME'] = state.get('WS-CUR-TIME-X6', '')
         _dummy_exec('CICS', 'EXEC CICS WRITEQ TD QUEUE(\'CSSL\') FROM (ERROR-LOG-RECORD) LENGTH (LENGTH OF ERROR-LOG-RECORD) NOHANDLE END-EXEC', state)
         if state['ERR-CRITICAL']:
-            state.get('_branches', set()).add(48)
+            state.get('_branches', set()).add(46)
             para_9990_END_ROUTINE(state)
         else:
-            state.get('_branches', set()).add(-48)
+            state.get('_branches', set()).add(-46)
     finally:
         state._exit_para('9500-LOG-ERROR')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
@@ -1533,7 +1533,7 @@ def para_9990_EXIT(state):
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
-_BRANCH_META = {1: {'condition': 'EIBRESP = DFHRESP(NORMAL)', 'paragraph': '1000-INITIALIZE', 'type': 'IF'}, 2: {'condition': 'WS-COMPCODE = MQCC-OK', 'paragraph': '1100-OPEN-REQUEST-QUEUE', 'type': 'IF'}, 3: {'condition': 'PSB-SCHEDULED-MORE-THAN-ONCE', 'paragraph': '1200-SCHEDULE-PSB', 'type': 'IF'}, 4: {'condition': 'STATUS-OK', 'paragraph': '1200-SCHEDULE-PSB', 'type': 'IF'}, 5: {'condition': 'NO-MORE-MSG-AVAILABLE OR WS-LOOP-END', 'paragraph': '2000-MAIN-PROCESS', 'type': 'PERFORM_UNTIL'}, 6: {'condition': 'WS-MSG-PROCESSED > WS-REQSTS-PROCESS-LIMIT', 'paragraph': '2000-MAIN-PROCESS', 'type': 'IF'}, 7: {'condition': 'WS-COMPCODE = MQCC-OK', 'paragraph': '3100-READ-REQUEST-MQ', 'type': 'IF'}, 8: {'condition': 'WS-REASON = MQRC-NO-MSG-AVAILABLE', 'paragraph': '3100-READ-REQUEST-MQ', 'type': 'IF'}, 9: {'condition': 'CARD-FOUND-XREF', 'paragraph': '5000-PROCESS-AUTH', 'type': 'IF'}, 10: {'condition': 'CARD-FOUND-XREF', 'paragraph': '5000-PROCESS-AUTH', 'type': 'IF'}, 11: {'condition': 'DFHRESP(NORMAL)', 'paragraph': '5100-READ-XREF-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 12: {'condition': 'DFHRESP(NOTFND)', 'paragraph': '5100-READ-XREF-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 13: {'condition': 'OTHER', 'paragraph': '5100-READ-XREF-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 14: {'condition': 'DFHRESP(NORMAL)', 'paragraph': '5200-READ-ACCT-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 15: {'condition': 'DFHRESP(NOTFND)', 'paragraph': '5200-READ-ACCT-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 16: {'condition': 'OTHER', 'paragraph': '5200-READ-ACCT-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 17: {'condition': 'DFHRESP(NORMAL)', 'paragraph': '5300-READ-CUST-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 18: {'condition': 'DFHRESP(NOTFND)', 'paragraph': '5300-READ-CUST-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 19: {'condition': 'OTHER', 'paragraph': '5300-READ-CUST-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 20: {'condition': 'STATUS-OK', 'paragraph': '5500-READ-AUTH-SUMMRY', 'type': 'EVALUATE', 'subject': 'TRUE'}, 21: {'condition': 'SEGMENT-NOT-FOUND', 'paragraph': '5500-READ-AUTH-SUMMRY', 'type': 'EVALUATE', 'subject': 'TRUE'}, 22: {'condition': 'OTHER', 'paragraph': '5500-READ-AUTH-SUMMRY', 'type': 'EVALUATE', 'subject': 'TRUE'}, 23: {'condition': 'FOUND-PAUT-SMRY-SEG', 'paragraph': '6000-MAKE-DECISION', 'type': 'IF'}, 24: {'condition': 'WS-TRANSACTION-AMT > WS-AVAILABLE-AMT', 'paragraph': '6000-MAKE-DECISION', 'type': 'IF'}, 25: {'condition': 'FOUND-ACCT-IN-MSTR', 'paragraph': '6000-MAKE-DECISION', 'type': 'IF'}, 26: {'condition': 'WS-TRANSACTION-AMT > WS-AVAILABLE-AMT', 'paragraph': '6000-MAKE-DECISION', 'type': 'IF'}, 27: {'condition': 'DECLINE-AUTH', 'paragraph': '6000-MAKE-DECISION', 'type': 'IF'}, 28: {'condition': 'AUTH-RESP-DECLINED', 'paragraph': '6000-MAKE-DECISION', 'type': 'IF'}, 29: {'condition': 'CARD-NFOUND-XREF', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 30: {'condition': 'NFOUND-ACCT-IN-MSTR', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 31: {'condition': 'NFOUND-CUST-IN-MSTR', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 32: {'condition': 'INSUFFICIENT-FUND', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 33: {'condition': 'CARD-NOT-ACTIVE', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 34: {'condition': 'ACCOUNT-CLOSED', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 35: {'condition': 'CARD-FRAUD', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 36: {'condition': 'MERCHANT-FRAUD', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 37: {'condition': 'OTHER', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 38: {'condition': 'WS-COMPCODE NOT = MQCC-OK', 'paragraph': '7100-SEND-RESPONSE', 'type': 'IF'}, 39: {'condition': 'NFOUND-PAUT-SMRY-SEG', 'paragraph': '8400-UPDATE-SUMMARY', 'type': 'IF'}, 40: {'condition': 'AUTH-RESP-APPROVED', 'paragraph': '8400-UPDATE-SUMMARY', 'type': 'IF'}, 41: {'condition': 'FOUND-PAUT-SMRY-SEG', 'paragraph': '8400-UPDATE-SUMMARY', 'type': 'IF'}, 42: {'condition': 'STATUS-OK', 'paragraph': '8400-UPDATE-SUMMARY', 'type': 'IF'}, 43: {'condition': 'AUTH-RESP-APPROVED', 'paragraph': '8500-INSERT-AUTH', 'type': 'IF'}, 44: {'condition': 'STATUS-OK', 'paragraph': '8500-INSERT-AUTH', 'type': 'IF'}, 45: {'condition': 'IMS-PSB-SCHD', 'paragraph': '9000-TERMINATE', 'type': 'IF'}, 46: {'condition': 'WS-REQUEST-MQ-OPEN', 'paragraph': '9100-CLOSE-REQUEST-QUEUE', 'type': 'IF'}, 47: {'condition': 'WS-COMPCODE = MQCC-OK', 'paragraph': '9100-CLOSE-REQUEST-QUEUE', 'type': 'IF'}, 48: {'condition': 'ERR-CRITICAL', 'paragraph': '9500-LOG-ERROR', 'type': 'IF'}}
+_BRANCH_META = {1: {'condition': 'EIBRESP = DFHRESP(NORMAL)', 'paragraph': '1000-INITIALIZE', 'type': 'IF'}, 2: {'condition': 'WS-COMPCODE = MQCC-OK', 'paragraph': '1100-OPEN-REQUEST-QUEUE', 'type': 'IF'}, 3: {'condition': 'PSB-SCHEDULED-MORE-THAN-ONCE', 'paragraph': '1200-SCHEDULE-PSB', 'type': 'IF'}, 4: {'condition': 'STATUS-OK', 'paragraph': '1200-SCHEDULE-PSB', 'type': 'IF'}, 5: {'condition': 'NO-MORE-MSG-AVAILABLE OR WS-LOOP-END', 'paragraph': '2000-MAIN-PROCESS', 'type': 'PERFORM_UNTIL'}, 6: {'condition': 'WS-MSG-PROCESSED > WS-REQSTS-PROCESS-LIMIT', 'paragraph': '2000-MAIN-PROCESS', 'type': 'IF'}, 7: {'condition': 'WS-COMPCODE = MQCC-OK', 'paragraph': '3100-READ-REQUEST-MQ', 'type': 'IF'}, 8: {'condition': 'WS-REASON = MQRC-NO-MSG-AVAILABLE', 'paragraph': '3100-READ-REQUEST-MQ', 'type': 'IF'}, 9: {'condition': 'CARD-FOUND-XREF', 'paragraph': '5000-PROCESS-AUTH', 'type': 'IF'}, 10: {'condition': 'CARD-FOUND-XREF', 'paragraph': '5000-PROCESS-AUTH', 'type': 'IF'}, 11: {'condition': 'DFHRESP(NORMAL)', 'paragraph': '5100-READ-XREF-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 12: {'condition': 'DFHRESP(NOTFND)', 'paragraph': '5100-READ-XREF-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 13: {'condition': 'OTHER', 'paragraph': '5100-READ-XREF-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 14: {'condition': 'DFHRESP(NORMAL)', 'paragraph': '5200-READ-ACCT-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 15: {'condition': 'DFHRESP(NOTFND)', 'paragraph': '5200-READ-ACCT-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 16: {'condition': 'OTHER', 'paragraph': '5200-READ-ACCT-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 17: {'condition': 'DFHRESP(NORMAL)', 'paragraph': '5300-READ-CUST-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 18: {'condition': 'DFHRESP(NOTFND)', 'paragraph': '5300-READ-CUST-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 19: {'condition': 'OTHER', 'paragraph': '5300-READ-CUST-RECORD', 'type': 'EVALUATE', 'subject': 'WS-RESP-CD'}, 20: {'condition': 'STATUS-OK', 'paragraph': '5500-READ-AUTH-SUMMRY', 'type': 'EVALUATE', 'subject': 'TRUE'}, 21: {'condition': 'SEGMENT-NOT-FOUND', 'paragraph': '5500-READ-AUTH-SUMMRY', 'type': 'EVALUATE', 'subject': 'TRUE'}, 22: {'condition': 'OTHER', 'paragraph': '5500-READ-AUTH-SUMMRY', 'type': 'EVALUATE', 'subject': 'TRUE'}, 23: {'condition': 'FOUND-PAUT-SMRY-SEG', 'paragraph': '6000-MAKE-DECISION', 'type': 'IF'}, 24: {'condition': 'WS-TRANSACTION-AMT > WS-AVAILABLE-AMT', 'paragraph': '6000-MAKE-DECISION', 'type': 'IF'}, 25: {'condition': 'FOUND-ACCT-IN-MSTR', 'paragraph': '6000-MAKE-DECISION', 'type': 'IF'}, 26: {'condition': 'WS-TRANSACTION-AMT > WS-AVAILABLE-AMT', 'paragraph': '6000-MAKE-DECISION', 'type': 'IF'}, 27: {'condition': 'DECLINE-AUTH', 'paragraph': '6000-MAKE-DECISION', 'type': 'IF'}, 28: {'condition': 'AUTH-RESP-DECLINED', 'paragraph': '6000-MAKE-DECISION', 'type': 'IF'}, 29: {'condition': 'CARD-NFOUND-XREF OR NFOUND-ACCT-IN-MSTR OR NFOUND-CUST-IN-MSTR', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 30: {'condition': 'INSUFFICIENT-FUND', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 31: {'condition': 'CARD-NOT-ACTIVE', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 32: {'condition': 'ACCOUNT-CLOSED', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 33: {'condition': 'CARD-FRAUD', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 34: {'condition': 'MERCHANT-FRAUD', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 35: {'condition': 'OTHER', 'paragraph': '6000-MAKE-DECISION', 'type': 'EVALUATE', 'subject': 'TRUE'}, 36: {'condition': 'WS-COMPCODE NOT = MQCC-OK', 'paragraph': '7100-SEND-RESPONSE', 'type': 'IF'}, 37: {'condition': 'NFOUND-PAUT-SMRY-SEG', 'paragraph': '8400-UPDATE-SUMMARY', 'type': 'IF'}, 38: {'condition': 'AUTH-RESP-APPROVED', 'paragraph': '8400-UPDATE-SUMMARY', 'type': 'IF'}, 39: {'condition': 'FOUND-PAUT-SMRY-SEG', 'paragraph': '8400-UPDATE-SUMMARY', 'type': 'IF'}, 40: {'condition': 'STATUS-OK', 'paragraph': '8400-UPDATE-SUMMARY', 'type': 'IF'}, 41: {'condition': 'AUTH-RESP-APPROVED', 'paragraph': '8500-INSERT-AUTH', 'type': 'IF'}, 42: {'condition': 'STATUS-OK', 'paragraph': '8500-INSERT-AUTH', 'type': 'IF'}, 43: {'condition': 'IMS-PSB-SCHD', 'paragraph': '9000-TERMINATE', 'type': 'IF'}, 44: {'condition': 'WS-REQUEST-MQ-OPEN', 'paragraph': '9100-CLOSE-REQUEST-QUEUE', 'type': 'IF'}, 45: {'condition': 'WS-COMPCODE = MQCC-OK', 'paragraph': '9100-CLOSE-REQUEST-QUEUE', 'type': 'IF'}, 46: {'condition': 'ERR-CRITICAL', 'paragraph': '9500-LOG-ERROR', 'type': 'IF'}}
 
 
 def run(initial_state=None):
@@ -1546,6 +1546,7 @@ def run(initial_state=None):
     state.setdefault('_writes', [])
     state.setdefault('_abended', False)
     state.setdefault('_branches', set())
+    state.setdefault('_stub_log', [])
     dict.__setitem__(state, '_initial_snapshot', {k: v for k, v in state.items() if not k.startswith('_')})
     try:
         para_MAIN_PARA(state)

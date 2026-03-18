@@ -624,7 +624,7 @@ def run_cobol_coverage(
     cobol_source: str | Path,
     copybook_dirs: list[str | Path] | None = None,
     budget: int = 5000,
-    timeout: int = 600,
+    timeout: int = 1800,
     store_path: str | Path | None = None,
     seed: int = 42,
     work_dir: str | Path | None = None,
@@ -632,6 +632,7 @@ def run_cobol_coverage(
     llm_model: str | None = None,
     max_rounds: int = 0,
     batch_size: int = 200,
+    strict_branch_coverage: bool = False,
 ) -> CobolCoverageReport:
     """Run coverage-guided test generation against real COBOL.
 
@@ -712,10 +713,25 @@ def run_cobol_coverage(
             work_dir=work_dir,
             injectable_vars=[],
             coverage_mode=True,
+            allow_hardening_fallback=not strict_branch_coverage,
         )
     except RuntimeError as e:
         log.error("COBOL compilation failed: %s", e)
+        if strict_branch_coverage:
+            raise
         return CobolCoverageReport(elapsed_seconds=time.time() - start_time)
+
+    if strict_branch_coverage and context.total_branches == 0:
+        msg = (
+            "Strict branch coverage requested, but no COBOL branch probes were "
+            "generated (0/0)."
+        )
+        if context.hardened_mode:
+            msg += (
+                " Hardening fallback is active (SPECTER-HARDENED-ENTRY), which "
+                "typically removes executable IF/EVALUATE constructs."
+            )
+        raise RuntimeError(msg)
 
     # Setup store
     if store_path is None:
@@ -938,7 +954,7 @@ def run_coverage(
     copybook_dirs: list[str | Path] | None = None,
     cobol_source: str | Path | None = None,
     budget: int = 5000,
-    timeout: int | float = 600,
+    timeout: int | float = 1800,
     store_path: str | Path | None = None,
     seed: int = 42,
     llm_provider=None,
