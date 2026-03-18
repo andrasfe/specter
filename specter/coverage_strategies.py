@@ -11,7 +11,7 @@ import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Optional, Tuple
 
 from .cobol_executor import CobolExecutionContext
 from .models import Program
@@ -26,7 +26,7 @@ from .variable_extractor import VariableReport
 log = logging.getLogger(__name__)
 
 # Type alias for what strategies yield
-CaseT = tuple[dict, dict | None, dict | None, str]
+CaseT = Tuple[dict, Optional[dict], Optional[dict], str]
 
 
 # ---------------------------------------------------------------------------
@@ -729,10 +729,18 @@ class DirectParagraphStrategy(Strategy):
                     if not condition:
                         continue
 
-                    # Find the branch check line
+                    # Find the branch check line.  In COBOL mode branch IDs
+                    # are strings ("1", "2"); in Python mode they are ints.
                     branch_line = None
+                    try:
+                        bid_int = int(bid)
+                    except (ValueError, TypeError):
+                        bid_int = None
                     for line_idx, check_bid, _cond_line, _indent in branch_checks:
-                        if check_bid == bid or check_bid == -bid:
+                        if check_bid == bid or check_bid == bid_int:
+                            branch_line = line_idx
+                            break
+                        if bid_int is not None and check_bid == -bid_int:
                             branch_line = line_idx
                             break
                     if branch_line is None:
