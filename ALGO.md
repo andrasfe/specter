@@ -5,11 +5,13 @@ Specter uses a strategy-based agentic loop to explore execution paths through ge
 ## Pipeline
 
 ```
-COBOL AST
+COBOL AST + COBOL source (.cbl) + copybooks (.cpy)
   → variable extraction (classify each var as status/flag/input/internal)
   → static analysis (call graph, gating conditions, equality constraints)
   → Python code generation (instrumented: traces paragraphs, tracks branches)
-  → strategy-based coverage loop
+  → upfront program analysis (static JSON per paragraph — no LLM)
+  → LLM seed generation (one-time, from analysis JSON)
+  → strategy-based coverage loop (7-phase rotation)
 ```
 
 ## State Model
@@ -52,6 +54,34 @@ For each paragraph, extracts the IF conditions that guard entry along the call p
 ### Equality Constraints
 Detects `IF A NOT EQUAL B` patterns where both operands are variables. Applied when generating success states to ensure constrained variable pairs hold equal values.
 
+## Upfront Program Analysis
+
+Before the coverage loop starts, `prepare_program_analysis()` builds a structured JSON per paragraph from the AST, COBOL source, and domain model — **no LLM calls**. This is saved as `.analysis.json` alongside the test store.
+
+Per paragraph:
+- **Comments** extracted from COBOL source (comment lines between paragraph boundaries)
+- **Calls** (PERFORM targets from the call graph)
+- **Stub operations** (EXEC CICS/SQL/DLI, file I/O within the paragraph)
+- **Gating conditions** (IF conditions that must be satisfied to reach the paragraph)
+- **Condition variables** (variables referenced in branch conditions + their known values)
+- **Branch count** (number of branch directions: T/F for IFs, W1/W2/... for EVALUATEs)
+
+Per stub operation:
+- **Status variables** and their **known values** (condition literals, 88-level values, generic fault codes)
+
+Per input variable:
+- **Data type**, PIC, range, condition literals, 88-level values, semantic type
+
+## LLM Seed Generation
+
+After the static analysis, the LLM is queried **once** to generate initial seed test states. The analysis JSON is sent in **paragraph batches** (10 per call) to handle large programs without exceeding token limits.
+
+Each batch includes the paragraph's comments, condition variables, stub operations, and gating conditions — enough context for the LLM to generate realistic inputs without seeing the full COBOL source.
+
+The LLM responds in **YAML format** (more reliable than JSON for LLM output). Seeds are cached as `_seeds.json` for reuse on subsequent runs.
+
+Seeds are injected as a one-shot strategy (`_LLMSeedInjector`) that runs before all other strategies. These provide high-quality starting points that the coverage engine then amplifies through its 7 phases.
+
 ## Strategy-Based Agentic Loop
 
 The coverage engine uses a **strategy selector** that picks the next strategy based on coverage feedback. Each strategy generates `(input_state, stubs, defaults, target)` tuples. The agentic loop executes them and saves test cases that discover new coverage.
@@ -63,12 +93,14 @@ The coverage engine uses a **strategy selector** that picks the next strategy ba
 
 ### Strategy Rotation
 
-The primary strategy is `DirectParagraphStrategy`, which rotates through **six phases** on each invocation. Each phase uses direct paragraph invocation for speed and benefits from coverage gains made by the previous phases.
+The primary strategy is `DirectParagraphStrategy`, which rotates through **seven phases** on each invocation. Each phase uses direct paragraph invocation for speed and benefits from coverage gains made by the previous phases.
 
 ```
 Phase 0: Param    → Phase 1: Stub    → Phase 2: Dataflow
   ↑                                           ↓
-Phase 5: Inverse  ← Phase 4: Harvest ← Phase 3: Frontier
+Phase 6: LLM Gap  Phase 5: Inverse   Phase 3: Frontier
+  ↑                   ↑                       ↓
+  └─────────────────  ← Phase 4: Harvest ←────┘
 ```
 
 #### Phase 0 — Param (Hill-Climb Inputs)
@@ -129,12 +161,26 @@ For each uncovered branch gated by arithmetic, **dynamically generates and `exec
 
 This is effectively on-the-fly program synthesis — creating the inverse of a paragraph's computation chain as executable code.
 
+#### Phase 6 — LLM Gap (Progressive Refinement)
+
+After every full cycle of the 6 deterministic phases, queries the LLM with a **coverage gap report** showing:
+- Which branches are still uncovered and their exact conditions
+- The best existing test cases for each paragraph
+- Which variable values have been tried
+
+The LLM suggests targeted inputs based on business logic reasoning ("this is an account update screen — the error path requires an invalid account format"). Each suggestion is then **perturbed 50-100 times** via direct paragraph invocation to hill-climb around the LLM's starting point.
+
+This combines LLM reasoning (understands business semantics, variable naming conventions, error scenarios) with mechanical search (finds the exact values that flip the condition). The LLM provides the smart initialization, perturbations find the precise solution.
+
+Only activates when an LLM provider is configured. Without LLM, falls back to an extra param round.
+
 ### Supporting Strategies
 
 In addition to `DirectParagraphStrategy`, the loop includes:
 
 | Strategy | Priority | Purpose |
 |----------|----------|---------|
+| **_LLMSeedInjector** | 5 | One-shot: inject pre-generated LLM seeds |
 | **BaselineStrategy** | 20 | Initial seeds: 5 value-generation strategies + condition literal sweeps |
 | **ConstraintSolverStrategy** | 30 | Path-constraint satisfaction for uncovered paragraphs |
 | **BranchSolverStrategy** | 40 | Per-branch condition solving via full program run |
@@ -149,6 +195,8 @@ In addition to `DirectParagraphStrategy`, the loop includes:
 - **Yield bonus**: strategies that found coverage recently get priority boost
 - **Staleness penalty**: strategies that haven't yielded in 3+ rounds get deprioritized
 - Exhausted deterministic strategies self-disable until new coverage appears from other strategies
+
+When an LLM provider is configured, `LLMSelector` periodically consults the LLM for strategy decisions based on coverage progress.
 
 ### Termination
 
@@ -169,6 +217,14 @@ External operations are stubbed with pre-generated return values. Each outcome e
 | OPEN/CLOSE | 3 | Typically invoked once or twice |
 
 When stub outcomes are exhausted at runtime, a **default fallback** is applied. Defaults prefer harvested condition literals (the first value the variable is compared against in IF conditions), which captures domain-specific success conventions — e.g., IMS PCB status codes use spaces `' '` for success rather than file-status `'00'`.
+
+### Domain-Aware Fault Values
+
+The stub and dataflow phases use `_fault_values_for_op()` to compute fault values per operation, preferring program-specific values over generic tables:
+
+1. **Condition literals** — actual values the program checks in IF/EVALUATE conditions
+2. **88-level values** — COBOL-declared named values (e.g., `88 FILE-NOT-FOUND VALUE '23'`)
+3. **Generic fault tables** — fallback: file status codes, SQL codes, CICS EIBRESP codes, DLI PCB status codes
 
 ## Branch Instrumentation
 
@@ -209,7 +265,7 @@ The agentic loop uses two execution modes:
 | Target | Execution | Speed | Use case |
 |--------|-----------|-------|----------|
 | Full program | Python pre-run → COBOL binary | ~10-50ms | Baseline, fault injection, monte carlo |
-| Direct paragraph | Python only | ~0.01ms | DirectParagraphStrategy's 6 phases |
+| Direct paragraph | Python only | ~0.01ms | DirectParagraphStrategy's 7 phases |
 
 Direct paragraph invocation can't run through COBOL (no way to enter mid-program), so it uses the Python simulation. Python branch IDs are prefixed with `py:` to avoid collision with COBOL `@@B:` IDs. Only COBOL branches count toward the reported coverage percentage.
 
@@ -234,17 +290,28 @@ File READ/WRITE/OPEN/CLOSE verbs are replaced with sequential reads from a mock 
 
 Phase 12 (`_auto_stub_undefined_with_cobc`) neutralizes paragraphs with undefined symbols by replacing their bodies with `CONTINUE`. This destroys trace probes and branch probes. Phase 12b (`_restore_paragraph_tracing`) re-inserts `DISPLAY 'SPECTER-TRACE:<para>'` for any paragraph header missing one after all compilation fixes are done.
 
-### Results
+## Results
 
-Tested on 14 CardDemo programs:
+Tested on 14 CardDemo programs (Python-only mode with LLM seeds):
 
-| Category | Programs | Paragraph Coverage |
-|----------|----------|-------------------|
-| CICS online | 11 | **100%** (all 11) |
-| IMS batch | 1 (COPAUA0C) | **100%** (43/43) |
-| Batch file I/O | 3 (CBEXPORT, CBACT04C, CBTRN02C) | 52-73% |
+| Program | Paragraphs | Stubs | Branch Coverage |
+|---------|-----------|-------|-----------------|
+| COACTUPC | 85 | 1 | **329/492 (66.9%)** |
+| COADM01C | 8 | 1 | 26/42 (61.9%) |
+| COBIL00C | 16 | 0 | 36/76 (47.4%) |
+| COMEN01C | 7 | 1 | 29/54 (53.7%) |
+| COPAUA0C | 43 | 5 | 59/92 (64.1%) |
+| CORPT00C | 10 | 0 | 27/80 (33.8%) |
+| COSGN00C | 6 | 0 | 17/26 (65.4%) |
+| COTRN00C | 16 | 0 | 94/158 (59.5%) |
+| COTRN01C | 9 | 0 | 22/34 (64.7%) |
+| COTRN02C | 18 | 1 | 63/122 (51.6%) |
+| COUSR00C | 16 | 0 | 92/158 (58.2%) |
+| COUSR01C | 9 | 0 | 19/34 (55.9%) |
+| COUSR02C | 11 | 0 | 42/66 (63.6%) |
+| COUSR03C | 11 | 0 | 28/48 (58.3%) |
 
-Branch coverage ranges 26-62% across all programs.
+All programs achieve **100% paragraph coverage**. Branch coverage averages ~57% with the 7-phase engine + LLM seeds.
 
 ## Coverage Ceiling
 
