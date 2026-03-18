@@ -618,11 +618,16 @@ def run_cobol_coverage(
     # Prepare COBOL context (instrument + compile)
     log.info("Instrumenting and compiling COBOL ...")
     try:
+        # Don't pass injectable_vars — the init dispatch EVALUATE that Phase 10
+        # generates often gets destroyed by Phase 12, and the destruction
+        # cascades into neutralizing paragraphs and branches.  EIB fields are
+        # already set via VALUE clauses in coverage mode.  Input values are
+        # varied through the Python pre-run's stub_outcomes instead.
         context = prepare_context(
             cobol_source, copybook_dirs,
             enable_branch_tracing=True,
             work_dir=work_dir,
-            injectable_vars=injectable,
+            injectable_vars=[],
             coverage_mode=True,
         )
     except RuntimeError as e:
