@@ -159,6 +159,18 @@ def instrument_cobol(
     # Phase 12: Auto-stub unresolved symbols reported by cobc (if available)
     lines = _auto_stub_undefined_with_cobc(lines)
 
+    # Phase 12b: Re-insert paragraph trace probes that Phase 12 may have
+    # destroyed when neutralizing bad paragraphs.  This runs AFTER all
+    # compilation fixes, so the probes are syntactically safe (just a
+    # DISPLAY after a paragraph header + CONTINUE).
+    if config.trace_paragraphs:
+        lines = _restore_paragraph_tracing(lines)
+        # Recount actual trace probes (Phase 12 may have removed some)
+        stats["paras_traced"] = sum(
+            1 for l in lines
+            if "SPECTER-TRACE:" in l and not l.strip().startswith("*")
+        )
+
     # Phase 13: Normalize source characters to ASCII-safe content so cobc does
     # not choke on legacy encoded literals in transformed sources.
     lines = _sanitize_source_ascii(lines)
@@ -1011,6 +1023,58 @@ def _add_branch_tracing(
             total_directions += meta.get("when_count", 1)
 
     return result, branch_meta, total_directions
+
+
+def _restore_paragraph_tracing(lines: list[str]) -> list[str]:
+    """Re-insert SPECTER-TRACE probes for paragraphs missing them.
+
+    Phase 12 may neutralize paragraph bodies (replacing them with CONTINUE),
+    which destroys trace probes inserted by Phase 6.  This pass scans for
+    paragraph headers in the PROCEDURE DIVISION and inserts a DISPLAY probe
+    after any header that doesn't already have one in its first few lines.
+    """
+    result: list[str] = []
+    in_procedure = False
+
+    para_re = re.compile(
+        r"^(\s{7})([A-Z0-9][A-Z0-9_-]*)\s*\.\s*",
+        re.IGNORECASE,
+    )
+
+    for i, line in enumerate(lines):
+        upper = line.upper().strip()
+        if "PROCEDURE DIVISION" in upper:
+            in_procedure = True
+        result.append(line)
+
+        if not in_procedure:
+            continue
+
+        m = para_re.match(line)
+        if not m:
+            continue
+        para_name = m.group(2).upper()
+        if para_name.endswith("-SECTION"):
+            continue
+        # Skip SPECTER-generated paragraphs
+        if para_name.startswith("SPECTER-"):
+            continue
+
+        # Check if a SPECTER-TRACE for this paragraph already exists
+        # in the next few lines
+        has_trace = False
+        trace_marker = f"SPECTER-TRACE:{para_name}"
+        for j in range(i + 1, min(i + 5, len(lines))):
+            if trace_marker in lines[j]:
+                has_trace = True
+                break
+
+        if not has_trace:
+            result.append(
+                f"{_B}DISPLAY 'SPECTER-TRACE:{para_name}'\n"
+            )
+
+    return result
 
 
 def _scan_for_else(lines: list[str], start: int) -> bool:
