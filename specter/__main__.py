@@ -337,8 +337,6 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.synthesize:
             import tempfile
-            from .monte_carlo import _load_module
-            from .test_synthesis import synthesize_test_set
 
             logging.basicConfig(
                 level=logging.INFO,
@@ -367,64 +365,61 @@ def main(argv: list[str] | None = None) -> int:
                     if line.strip() and not line.strip().startswith("#")
                 }
 
+            llm_provider_for_synth = None
+            if args.llm_guided or args.llm_provider:
+                from .llm_coverage import get_llm_provider
+                try:
+                    llm_provider_for_synth = get_llm_provider(
+                        provider_name=args.llm_provider, model=args.llm_model,
+                    )
+                    print(f"  LLM provider: {type(llm_provider_for_synth).__name__}")
+                except Exception as e:
+                    print(f"  Warning: LLM init failed: {e}", file=sys.stderr)
+
+            from .cobol_coverage import run_coverage
+
             with tempfile.TemporaryDirectory(prefix="specter_synth_") as tmpdir:
                 tmpdir_path = Path(tmpdir)
 
-                # Phase 1: generate Python modules and run synthesis
+                cov_timeout = args.synthesis_timeout or args.coverage_timeout
+
+                # Phase 1: run strategy-based coverage per program
+                for ast_file in args.ast_file:
+                    ast_path = Path(ast_file)
+                    program = parse_ast(ast_path)
+                    program_id = program.program_id
+
+                    print(f"\n--- Synthesizing {program_id} ---")
+                    print(f"  Paragraphs: {len(program.paragraphs)}")
+
+                    store_path = analysis_dir / f"{program_id}_testset.jsonl"
+
+                    cov_report = run_coverage(
+                        ast_file=ast_path,
+                        budget=args.coverage_budget,
+                        timeout=cov_timeout,
+                        store_path=store_path,
+                        seed=args.seed,
+                        llm_provider=llm_provider_for_synth,
+                        llm_model=args.llm_model,
+                    )
+                    print(cov_report.summary())
+                    per_program_stores[program_id] = str(store_path)
+
+                # Phase 2: generate catalog
+                from .code_generator import generate_code as _gen_code
+
+                catalog_sections: list[str] = []
                 for ast_file in args.ast_file:
                     ast_path = Path(ast_file)
                     program = parse_ast(ast_path)
                     var_report = extract_variables(program)
                     program_id = program.program_id
-
-                    print(f"\n--- Synthesizing {program_id} ---")
-                    print(f"  Paragraphs: {len(program.paragraphs)}, "
-                          f"Variables: {len(var_report.variables)}")
-
-                    # Generate instrumented Python module
-                    code = generate_code(program, var_report, instrument=True)
-                    py_path = tmpdir_path / f"{program_id}.py"
-                    py_path.write_text(code)
-
-                    module = _load_module(py_path)
-
-                    # Static analysis
-                    call_graph = build_static_call_graph(program)
-                    gating_conds = extract_gating_conditions(program, call_graph)
-                    stub_mapping = extract_stub_status_mapping(program, var_report)
-                    seq_gates = extract_sequential_gates(program)
-                    if seq_gates:
-                        gating_conds = augment_gating_with_sequential_gates(
-                            gating_conds, seq_gates, call_graph,
-                        )
-                    eq_constraints = extract_equality_constraints(program)
-
-                    store_path = analysis_dir / f"{program_id}_testset.jsonl"
-
-                    synth_report = synthesize_test_set(
-                        module=module,
-                        program=program,
-                        var_report=var_report,
-                        call_graph=call_graph,
-                        gating_conditions=gating_conds,
-                        stub_mapping=stub_mapping,
-                        equality_constraints=eq_constraints,
-                        store_path=store_path,
-                        max_time_seconds=args.synthesis_timeout,
-                        max_layers=args.synthesis_layers,
-                        excluded_values=excluded_values,
-                    )
-                    print(synth_report.summary())
-                    per_program_stores[program_id] = str(store_path)
-
-                # Phase 2: generate catalog while Python modules still exist
-                catalog_sections: list[str] = []
-                for ast_file in args.ast_file:
-                    ast_path = Path(ast_file)
-                    program = parse_ast(ast_path)
-                    program_id = program.program_id
                     if program_id in per_program_stores:
+                        # Generate .py for catalog (lightweight, no execution)
+                        code = _gen_code(program, var_report, instrument=True)
                         py_path = tmpdir_path / f"{program_id}.py"
+                        py_path.write_text(code)
                         store_path = per_program_stores[program_id]
                         from .paragraph_catalog import generate_paragraph_catalog
                         try:
@@ -547,6 +542,18 @@ def main(argv: list[str] | None = None) -> int:
         else:
             cov_store = analysis_dir / f"{source_path.stem}_cobol_testset.jsonl"
 
+        # Create LLM provider if requested
+        llm_provider_for_cov = None
+        if args.llm_guided or args.llm_provider:
+            from .llm_coverage import get_llm_provider
+            try:
+                llm_provider_for_cov = get_llm_provider(
+                    provider_name=args.llm_provider, model=args.llm_model,
+                )
+                print(f"  LLM provider: {type(llm_provider_for_cov).__name__}")
+            except Exception as e:
+                print(f"  Warning: LLM init failed: {e}", file=sys.stderr)
+
         print(f"Running COBOL coverage-guided test generation ...")
         print(f"  AST:    {source_path}")
         print(f"  COBOL:  {cobol_path}")
@@ -561,6 +568,8 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.coverage_timeout,
             store_path=cov_store,
             seed=args.seed,
+            llm_provider=llm_provider_for_cov,
+            llm_model=args.llm_model,
         )
         print()
         print(cov_report.summary())
@@ -611,8 +620,8 @@ def main(argv: list[str] | None = None) -> int:
             print("Error: --concolic requires z3-solver (pip install z3-solver)", file=sys.stderr)
             return 1
 
-    # --llm-guided implies --guided
-    if args.llm_guided:
+    # --llm-guided implies --guided (unless --synthesize handles it separately)
+    if args.llm_guided and not args.synthesize:
         args.guided = True
 
     # --guided implies --analyze and a higher default iteration count
@@ -730,10 +739,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Synthesis mode
     if args.synthesize:
-        from .monte_carlo import _load_module
-        from .test_synthesis import synthesize_test_set
-
-        module = _load_module(output_path)
+        from .cobol_coverage import run_coverage
 
         analysis_dir = Path(args.analysis_output) if args.analysis_output else Path("/tmp")
         analysis_dir.mkdir(parents=True, exist_ok=True)
@@ -743,43 +749,34 @@ def main(argv: list[str] | None = None) -> int:
         else:
             test_store_path = analysis_dir / f"{ast_path.stem}_testset.jsonl"
 
-        excluded_values: set[str] | None = None
-        if args.exclude_values:
-            exclude_path = Path(args.exclude_values)
-            if not exclude_path.exists():
-                print(f"Error: exclude-values file not found: {exclude_path}", file=sys.stderr)
-                return 1
-            excluded_values = {
-                line.strip()
-                for line in exclude_path.read_text().splitlines()
-                if line.strip() and not line.strip().startswith("#")
-            }
+        llm_provider_for_synth = None
+        if args.llm_guided or args.llm_provider:
+            from .llm_coverage import get_llm_provider
+            try:
+                llm_provider_for_synth = get_llm_provider(
+                    provider_name=args.llm_provider, model=args.llm_model,
+                )
+                print(f"  LLM provider: {type(llm_provider_for_synth).__name__}")
+            except Exception as e:
+                print(f"  Warning: LLM init failed: {e}", file=sys.stderr)
 
-        cobol_executable: str | None = None
-        if args.cobol_validate:
-            cobol_path = Path(args.cobol_validate)
-            if not cobol_path.exists():
-                print(f"Error: COBOL executable not found: {cobol_path}", file=sys.stderr)
-                return 1
-            cobol_executable = str(cobol_path)
+        budget = args.coverage_budget
+        cov_timeout = args.synthesis_timeout or args.coverage_timeout
 
         print(f"Synthesizing test set → {test_store_path} ...")
-        synth_report = synthesize_test_set(
-            module=module,
-            program=program,
-            var_report=var_report,
-            call_graph=call_graph,
-            gating_conditions=gating_conds,
-            stub_mapping=stub_mapping,
-            equality_constraints=eq_constraints,
+        print(f"  Budget: {budget} TCs, timeout {cov_timeout}s")
+        cov_report = run_coverage(
+            ast_file=ast_path,
+            copybook_dirs=[Path(d) for d in args.copybook_dir],
+            budget=budget,
+            timeout=cov_timeout,
             store_path=test_store_path,
-            max_time_seconds=args.synthesis_timeout,
-            max_layers=args.synthesis_layers,
-            excluded_values=excluded_values,
-            cobol_executable=cobol_executable,
+            seed=args.seed,
+            llm_provider=llm_provider_for_synth,
+            llm_model=args.llm_model,
         )
         print()
-        print(synth_report.summary())
+        print(cov_report.summary())
         print(f"\nTest store: {test_store_path}")
         return 0
 

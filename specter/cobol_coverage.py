@@ -1,8 +1,10 @@
-"""Agentic coverage-guided test generation engine for real COBOL programs.
+"""Agentic coverage-guided test generation engine.
 
-Runs a compile-once / execute-many loop with layered strategies to maximize
-paragraph and branch coverage on GnuCOBOL-compiled programs.  All generated
-test cases are persisted to a JSONL test store for downstream use.
+Runs an execute-many loop with pluggable strategies to maximize paragraph and
+branch coverage.  Supports both Python-only execution (from AST) and
+GnuCOBOL-compiled programs.  A strategy selector picks the next strategy based
+on coverage feedback.  All generated test cases are persisted to a JSONL test
+store for downstream use.
 """
 
 from __future__ import annotations
@@ -22,6 +24,24 @@ from .cobol_executor import (
     run_test_case,
 )
 from .cobol_mock import generate_mock_data_ordered
+from .coverage_strategies import (
+    BaselineStrategy,
+    BranchSolverStrategy,
+    ConstraintSolverStrategy,
+    DirectParagraphStrategy,
+    FaultInjectionStrategy,
+    GuidedMutationStrategy,
+    HeuristicSelector,
+    IntentDrivenStrategy,
+    LLMGapStrategy,
+    LLMSeedStrategy,
+    LLMSelector,
+    MonteCarloStrategy,
+    Strategy,
+    StrategyContext,
+    StrategyYield,
+    StubWalkStrategy,
+)
 from .models import Program
 from .static_analysis import (
     StaticCallGraph,
@@ -60,6 +80,11 @@ class CoverageState:
     total_paragraphs: int = 0
     total_branches: int = 0
     test_cases: list[dict] = field(default_factory=list)
+    all_paragraphs: set[str] = field(default_factory=set)
+    strategy_yields: dict[str, StrategyYield] = field(default_factory=dict)
+    stale_rounds: int = 0
+    # Kept for strategies that check stub_mapping availability
+    _stub_mapping: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -74,7 +99,7 @@ class CobolCoverageReport:
     branches_hit: int = 0
     branches_total: int = 0
     elapsed_seconds: float = 0.0
-    layer_stats: dict[int, int] = field(default_factory=dict)
+    layer_stats: dict[str, int] = field(default_factory=dict)
 
     def summary(self) -> str:
         lines = [
@@ -87,9 +112,9 @@ class CobolCoverageReport:
             f"  Time:        {self.elapsed_seconds:.1f}s",
         ]
         if self.layer_stats:
-            lines.append("  Per layer:")
-            for layer, count in sorted(self.layer_stats.items()):
-                lines.append(f"    Layer {layer}: {count} test cases")
+            lines.append("  Per strategy:")
+            for name, count in sorted(self.layer_stats.items()):
+                lines.append(f"    {name}: {count} test cases")
         return "\n".join(lines)
 
 
@@ -111,7 +136,7 @@ def _save_test_case(
     input_state: dict,
     stub_log: list,
     result: CobolTestResult,
-    layer: int,
+    layer: str | int,
     target: str,
 ) -> None:
     """Append a test case to the JSONL store."""
@@ -196,6 +221,64 @@ def _python_pre_run(
         result = state
 
     return result.get("_stub_log", state.get("_stub_log", []))
+
+
+def _python_execute(
+    module,
+    input_state: dict,
+    stub_outcomes: dict | None = None,
+    stub_defaults: dict | None = None,
+    paragraph: str | None = None,
+) -> CobolTestResult:
+    """Run the Python module and return a CobolTestResult-compatible object.
+
+    If *paragraph* is given, invokes that paragraph directly instead of
+    running from the program entry point.  This is much faster and can
+    reach branches not reachable through the normal entry.
+    """
+    from .monte_carlo import _run_paragraph_directly
+
+    default_state_fn = getattr(module, "_default_state", None)
+    state = default_state_fn() if default_state_fn else {}
+    state.update(input_state)
+
+    if stub_outcomes:
+        state["_stub_outcomes"] = {
+            k: [list(e) if isinstance(e, list) else e for e in v]
+            for k, v in stub_outcomes.items()
+        }
+    if stub_defaults:
+        state["_stub_defaults"] = dict(stub_defaults)
+    state["_stub_log"] = []
+
+    try:
+        if paragraph:
+            rs = _run_paragraph_directly(module, paragraph, state)
+            if not rs:
+                return CobolTestResult(error="paragraph not found")
+        else:
+            rs = module.run(state)
+    except Exception as exc:
+        return CobolTestResult(error=f"{type(exc).__name__}: {exc}")
+
+    # Convert integer branches to "bid:T"/"bid:F" string format
+    raw_branches = rs.get("_branches", set())
+    branches_hit: set[str] = set()
+    for b in raw_branches:
+        if b > 0:
+            branches_hit.add(f"{b}:T")
+        elif b < 0:
+            branches_hit.add(f"{abs(b)}:F")
+
+    trace = rs.get("_trace", [])
+    paragraphs_hit = list(dict.fromkeys(trace))
+    display_output = rs.get("_display", [])
+
+    return CobolTestResult(
+        paragraphs_hit=paragraphs_hit,
+        branches_hit=branches_hit,
+        display_output=display_output,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +398,129 @@ def _build_fault_stubs(
 
 
 # ---------------------------------------------------------------------------
+# Stub matching helper
+# ---------------------------------------------------------------------------
+
+def _match_stub_operation(
+    llm_key: str,
+    stub_mapping: dict[str, list[str]],
+) -> str | None:
+    """Match an LLM-provided operation key to a stub_mapping key.
+
+    The LLM might say "READ:XREF" but stub_mapping has "READ:XREF-FILE".
+    Uses fuzzy matching on the operation type and file/program name.
+    """
+    upper = llm_key.upper().strip()
+    # Exact match
+    if upper in stub_mapping:
+        return upper
+    # Try case-insensitive
+    for key in stub_mapping:
+        if key.upper() == upper:
+            return key
+    # Fuzzy: match operation prefix + substring of target
+    if ":" in upper:
+        op_type, target = upper.split(":", 1)
+        for key in stub_mapping:
+            if ":" in key:
+                k_op, k_target = key.split(":", 1)
+                if k_op.upper() == op_type and target in k_target.upper():
+                    return key
+            elif key.upper().startswith(op_type):
+                return key
+    else:
+        # No colon — match if the key starts with the LLM key
+        for key in stub_mapping:
+            if key.upper().startswith(upper):
+                return key
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Standalone execute-and-save
+# ---------------------------------------------------------------------------
+
+def _execute_and_save(
+    ctx: StrategyContext,
+    cov: CoverageState,
+    input_state: dict,
+    stub_outcomes: dict | None,
+    stub_defaults: dict | None,
+    strategy_name: str,
+    target: str,
+    report: CobolCoverageReport,
+    tc_count: int,
+) -> tuple[bool, int]:
+    """Execute a test case and save if new coverage is found.
+
+    Supports both COBOL (ctx.context is set) and Python-only (ctx.context is
+    None) execution modes.  Returns (saved, updated_tc_count).
+    """
+    # Parse direct paragraph invocation from target string
+    direct_para = None
+    if target.startswith("direct:"):
+        direct_para = target[7:].split("|", 1)[0]
+
+    if ctx.context is not None:
+        # COBOL execution path: pre-run Python for stub ordering, then COBOL
+        stub_log = _python_pre_run(ctx.module, input_state, stub_outcomes, stub_defaults)
+        result = run_test_case(ctx.context, input_state, stub_log)
+    else:
+        # Python-only execution path
+        result = _python_execute(
+            ctx.module, input_state, stub_outcomes, stub_defaults,
+            paragraph=direct_para,
+        )
+        stub_log = []
+
+    if result.error:
+        return False, tc_count
+
+    # Check for new coverage
+    new_paras = set(result.paragraphs_hit) - cov.paragraphs_hit
+    new_branches = result.branches_hit - cov.branches_hit
+
+    # Always save first few test cases; after that, only if new coverage
+    force_save = tc_count < 5
+    if not new_paras and not new_branches and not force_save:
+        return False, tc_count
+
+    # Update coverage
+    cov.paragraphs_hit.update(result.paragraphs_hit)
+    cov.branches_hit.update(result.branches_hit)
+
+    # Save
+    tc_id = _compute_tc_id(input_state, stub_log)
+    _save_test_case(
+        ctx.store_path, tc_id, input_state, stub_log, result,
+        strategy_name, target,
+    )
+    tc_count += 1
+    report.layer_stats[strategy_name] = report.layer_stats.get(strategy_name, 0) + 1
+
+    # Keep in-memory test_cases in sync so mid-run strategies can use them
+    cov.test_cases.append({
+        "id": tc_id,
+        "input_state": {k: v for k, v in input_state.items() if not str(k).startswith("_")},
+        "stub_outcomes": [[op, entries] for op, entries in stub_log],
+        "paragraphs_hit": result.paragraphs_hit,
+        "branches_hit": sorted(result.branches_hit),
+        "layer": strategy_name,
+        "target": target,
+    })
+
+    if new_paras:
+        log.info("  [%s] +%d paras -> %d/%d: %s",
+                 strategy_name, len(new_paras), len(cov.paragraphs_hit),
+                 cov.total_paragraphs, sorted(new_paras))
+    if new_branches:
+        log.info("  [%s] +%d branches -> %d/%d",
+                 strategy_name, len(new_branches), len(cov.branches_hit),
+                 cov.total_branches)
+    return True, tc_count
+
+
+# ---------------------------------------------------------------------------
 # Agentic coverage loop
 # ---------------------------------------------------------------------------
 
@@ -327,6 +533,8 @@ def run_cobol_coverage(
     store_path: str | Path | None = None,
     seed: int = 42,
     work_dir: str | Path | None = None,
+    llm_provider=None,
+    llm_model: str | None = None,
 ) -> CobolCoverageReport:
     """Run coverage-guided test generation against real COBOL.
 
@@ -380,12 +588,7 @@ def run_cobol_coverage(
     py_path.write_text(code)
     module = _load_module(py_path)
 
-    # Injectable variables for the init dispatch.
-    # EIB fields are now set via VALUE clauses in the stubs (not init records).
-    # The init dispatch mechanism can be fragile (Phase 12 may comment it out),
-    # so we only register variables that are both:
-    # 1. Referenced in conditions (have condition_literals/88_values)
-    # 2. Not EIB or other auto-stubbed fields
+    # Injectable variables for the init dispatch
     _EIB_NAMES = {"EIBCALEN", "EIBAID", "EIBTRNID", "EIBTIME", "EIBDATE",
                   "EIBTASKN", "EIBTRMID", "EIBCPOSN", "EIBFN", "EIBRCODE",
                   "EIBDS", "EIBREQID", "EIBRSRCE", "EIBRESP", "EIBRESP2"}
@@ -420,6 +623,11 @@ def run_cobol_coverage(
     # Load existing coverage
     existing_tcs, existing_paras, existing_branches = load_existing_coverage(store_path)
 
+    # Build success stubs
+    success_stubs, success_defaults = _build_success_stubs(stub_mapping, domains)
+
+    all_paras = {p.name for p in program.paragraphs}
+
     # Coverage state
     cov = CoverageState(
         paragraphs_hit=existing_paras,
@@ -427,6 +635,8 @@ def run_cobol_coverage(
         total_paragraphs=context.total_paragraphs,
         total_branches=context.total_branches,
         test_cases=existing_tcs,
+        all_paragraphs=all_paras,
+        _stub_mapping=stub_mapping,
     )
     report = CobolCoverageReport(
         total_test_cases=len(existing_tcs),
@@ -438,178 +648,146 @@ def run_cobol_coverage(
         log.info("Loaded %d existing TCs: %d paras, %d branches covered",
                  len(existing_tcs), len(existing_paras), len(existing_branches))
 
-    all_paras = {p.name for p in program.paragraphs}
     tc_count = len(existing_tcs)
 
-    def _time_ok() -> bool:
-        return (time.time() - start_time) < timeout
+    # --- BUILD STRATEGY CONTEXT ---
+    ctx = StrategyContext(
+        module=module,
+        context=context,
+        domains=domains,
+        stub_mapping=stub_mapping,
+        call_graph=call_graph,
+        gating_conds=gating_conds,
+        var_report=var_report,
+        program=program,
+        all_paragraphs=all_paras,
+        success_stubs=success_stubs,
+        success_defaults=success_defaults,
+        rng=rng,
+        store_path=store_path,
+        branch_meta=context.branch_meta,
+        cobol_source_path=Path(cobol_source),
+    )
 
-    def _budget_ok() -> bool:
-        return tc_count < budget
+    # --- REGISTER STRATEGIES ---
+    strategies: list[Strategy] = [
+        BaselineStrategy(),
+        ConstraintSolverStrategy(),
+        DirectParagraphStrategy(),
+        BranchSolverStrategy(),
+        FaultInjectionStrategy(),
+        StubWalkStrategy(),
+        GuidedMutationStrategy(),
+        MonteCarloStrategy(),
+    ]
+    if llm_provider:
+        strategies.extend([
+            LLMSeedStrategy(llm_provider, llm_model),
+            LLMGapStrategy(llm_provider, llm_model),
+            IntentDrivenStrategy(llm_provider, llm_model),
+        ])
 
-    def _execute_and_save(
-        input_state: dict,
-        stub_outcomes: dict | None,
-        stub_defaults: dict | None,
-        layer: int,
-        target: str,
-    ) -> bool:
-        """Run Python pre-run → COBOL execution → save if new coverage."""
-        nonlocal tc_count
+    selector = (
+        LLMSelector(llm_provider, llm_model)
+        if llm_provider
+        else HeuristicSelector()
+    )
 
-        if not _time_ok() or not _budget_ok():
-            return False
+    return _run_agentic_loop(
+        ctx, cov, report, strategies, selector,
+        budget, timeout, start_time, tc_count,
+    )
 
-        # Python pre-run for stub_log ordering
-        stub_log = _python_pre_run(module, input_state, stub_outcomes, stub_defaults)
 
-        # COBOL execution
-        result = run_test_case(context, input_state, stub_log)
-        if result.error:
-            return False
+# ---------------------------------------------------------------------------
+# Shared agentic loop
+# ---------------------------------------------------------------------------
 
-        # Check for new coverage
-        new_paras = set(result.paragraphs_hit) - cov.paragraphs_hit
-        new_branches = result.branches_hit - cov.branches_hit
+def _run_agentic_loop(
+    ctx: StrategyContext,
+    cov: CoverageState,
+    report: CobolCoverageReport,
+    strategies: list[Strategy],
+    selector,
+    budget: int,
+    timeout: int | float,
+    start_time: float,
+    tc_count: int,
+) -> CobolCoverageReport:
+    """Run the strategy-based agentic coverage loop.
 
-        # Always save first few test cases; after that, only if new coverage
-        force_save = tc_count < 5
-        if not new_paras and not new_branches and not force_save:
-            return False
+    Shared between run_cobol_coverage() and run_coverage().
+    """
+    round_num = 0
+    while tc_count < budget and (time.time() - start_time) < timeout:
+        strategy, batch_size = selector.select(strategies, cov, round_num)
+        round_new = 0
+        round_cov_before = len(cov.paragraphs_hit) + len(cov.branches_hit)
 
-        # Update coverage
-        cov.paragraphs_hit.update(result.paragraphs_hit)
-        cov.branches_hit.update(result.branches_hit)
+        log.info("Round %d: %s (batch=%d)", round_num, strategy.name, batch_size)
 
-        # Save
-        tc_id = _compute_tc_id(input_state, stub_log)
-        _save_test_case(store_path, tc_id, input_state, stub_log, result, layer, target)
-        tc_count += 1
-        report.layer_stats[layer] = report.layer_stats.get(layer, 0) + 1
-
-        if new_paras:
-            log.info("  L%d +%d paras → %d/%d: %s",
-                     layer, len(new_paras), len(cov.paragraphs_hit),
-                     cov.total_paragraphs, sorted(new_paras))
-        if new_branches:
-            log.info("  L%d +%d branches → %d/%d",
-                     layer, len(new_branches), len(cov.branches_hit),
-                     cov.total_branches)
-        return True
-
-    # --- LAYER 1: All-Success Baseline ---
-    log.info("Layer 1: All-Success Baseline")
-    success_stubs, success_defaults = _build_success_stubs(stub_mapping, domains)
-
-    strategies = ["condition_literal", "semantic", "random_valid", "88_value", "boundary"]
-    for strat in strategies:
-        if not _time_ok() or not _budget_ok():
-            break
-        input_state = _build_input_state(domains, strat, rng)
-        _execute_and_save(input_state, success_stubs, success_defaults, layer=1, target="baseline")
-
-    # Also try with condition_literal values for each variable individually
-    for name, dom in domains.items():
-        if not _time_ok() or not _budget_ok():
-            break
-        if dom.condition_literals and dom.classification == "input":
-            for lit in dom.condition_literals[:3]:
-                base = _build_input_state(domains, "semantic", rng)
-                base[name] = format_value_for_cobol(dom, lit)
-                _execute_and_save(base, success_stubs, success_defaults, layer=1, target=f"lit:{name}")
-
-    log.info("Layer 1 done: %d paras, %d branches",
-             len(cov.paragraphs_hit), len(cov.branches_hit))
-
-    # --- LAYER 2: Path-Constraint Satisfaction ---
-    if _time_ok() and _budget_ok():
-        log.info("Layer 2: Path-Constraint Satisfaction")
-        uncovered = all_paras - cov.paragraphs_hit
-        for target_para in sorted(uncovered):
-            if not _time_ok() or not _budget_ok():
+        cases_tried = 0
+        for input_state, stubs, defaults, target in strategy.generate_cases(ctx, cov, batch_size):
+            if tc_count >= budget or (time.time() - start_time) >= timeout:
                 break
 
-            constraints = compute_path_constraints(target_para, call_graph, gating_conds)
-            if constraints is None:
-                continue
+            saved, tc_count = _execute_and_save(
+                ctx, cov, input_state, stubs, defaults,
+                strategy.name, target, report, tc_count,
+            )
+            if saved:
+                round_new += 1
 
-            # Try to satisfy constraints
-            for variation in range(6):
-                if not _time_ok() or not _budget_ok():
-                    break
+            cases_tried += 1
+            if round_new >= batch_size:
+                break
 
-                base = _build_input_state(domains, "semantic", rng)
+        # Record yield for this strategy
+        round_cov_after = len(cov.paragraphs_hit) + len(cov.branches_hit)
+        new_coverage = round_cov_after - round_cov_before
 
-                # Apply gating constraints
-                for gc in constraints.constraints:
-                    dom = domains.get(gc.variable)
-                    if dom and gc.values:
-                        if gc.negated:
-                            # Need a value NOT in the constraint set
-                            val = generate_value(dom, "random_valid", rng)
-                            attempts = 0
-                            while val in gc.values and attempts < 10:
-                                val = generate_value(dom, "random_valid", rng)
-                                attempts += 1
-                        else:
-                            if variation < len(gc.values):
-                                val = gc.values[variation]
-                            else:
-                                val = rng.choice(gc.values)
-                        base[gc.variable] = format_value_for_cobol(dom, val)
+        sy = cov.strategy_yields.setdefault(strategy.name, StrategyYield())
+        sy.total_cases += cases_tried
+        sy.total_new_coverage += new_coverage
+        sy.rounds += 1
+        if new_coverage > 0:
+            sy.last_yield_round = round_num
 
-                _execute_and_save(base, success_stubs, success_defaults,
-                                  layer=2, target=target_para)
+        log.info("Round %d done: %s -> %d new TCs, +%d coverage (%d/%d paras, %d/%d branches)",
+                 round_num, strategy.name, round_new, new_coverage,
+                 len(cov.paragraphs_hit), cov.total_paragraphs,
+                 len(cov.branches_hit), cov.total_branches)
 
-        log.info("Layer 2 done: %d paras, %d branches",
-                 len(cov.paragraphs_hit), len(cov.branches_hit))
+        # Staleness detection
+        if new_coverage == 0:
+            cov.stale_rounds += 1
+        else:
+            cov.stale_rounds = 0
 
-    # --- LAYER 3: Branch Solving ---
-    if _time_ok() and _budget_ok():
-        log.info("Layer 3: Branch Solving")
-        _run_branch_solving(
-            context, module, domains, stub_mapping,
-            success_stubs, success_defaults,
-            cov, store_path, report, rng,
-            _time_ok, _budget_ok, _execute_and_save,
-        )
-        log.info("Layer 3 done: %d paras, %d branches",
-                 len(cov.paragraphs_hit), len(cov.branches_hit))
+        # Early termination conditions
+        full_para = (cov.total_paragraphs > 0
+                     and len(cov.paragraphs_hit) >= cov.total_paragraphs)
+        full_branch = (cov.total_branches > 0
+                       and len(cov.branches_hit) >= cov.total_branches)
+        if full_para and full_branch:
+            log.info("Full coverage achieved!")
+            break
 
-    # --- LAYER 4: Stub Fault Injection ---
-    if _time_ok() and _budget_ok():
-        log.info("Layer 4: Stub Fault Injection")
-        _run_fault_injection(
-            module, domains, stub_mapping, cov,
-            store_path, report, rng,
-            _time_ok, _budget_ok, _execute_and_save,
-        )
-        log.info("Layer 4 done: %d paras, %d branches",
-                 len(cov.paragraphs_hit), len(cov.branches_hit))
+        if cov.stale_rounds >= 10 and cov.total_paragraphs > 0:
+            para_pct = len(cov.paragraphs_hit) / cov.total_paragraphs
+            branch_pct = (len(cov.branches_hit) / cov.total_branches
+                          if cov.total_branches > 0 else 1.0)
+            if para_pct > 0.9 and branch_pct > 0.8:
+                log.info("Plateau detected at %.1f%% para / %.1f%% branch, stopping",
+                         para_pct * 100, branch_pct * 100)
+                break
+            # Extended patience when branch coverage is still low
+            if cov.stale_rounds >= 30:
+                log.info("Extended plateau at %.1f%% para / %.1f%% branch, stopping",
+                         para_pct * 100, branch_pct * 100)
+                break
 
-    # --- LAYER 5: Guided Random Walks ---
-    if _time_ok() and _budget_ok():
-        log.info("Layer 5: Guided Random Walks")
-        _run_random_walks(
-            module, domains, stub_mapping, cov,
-            store_path, report, rng,
-            _time_ok, _budget_ok, _execute_and_save,
-            max_walks=200,
-        )
-        log.info("Layer 5 done: %d paras, %d branches",
-                 len(cov.paragraphs_hit), len(cov.branches_hit))
-
-    # --- LAYER 6: Monte Carlo Exploration ---
-    if _time_ok() and _budget_ok():
-        log.info("Layer 6: Monte Carlo Exploration")
-        _run_monte_carlo(
-            module, domains, stub_mapping, cov,
-            store_path, report, rng,
-            _time_ok, _budget_ok, _execute_and_save,
-            max_iterations=min(budget - tc_count, 2000),
-        )
-        log.info("Layer 6 done: %d paras, %d branches",
-                 len(cov.paragraphs_hit), len(cov.branches_hit))
+        round_num += 1
 
     # --- FINALIZE ---
     elapsed = time.time() - start_time
@@ -627,229 +805,143 @@ def run_cobol_coverage(
 
 
 # ---------------------------------------------------------------------------
-# Layer 3: Branch Solving
+# Python-only coverage entry point
 # ---------------------------------------------------------------------------
 
-def _run_branch_solving(
-    context, module, domains, stub_mapping,
-    success_stubs, success_defaults,
-    cov, store_path, report, rng,
-    time_ok, budget_ok, execute_and_save,
-):
-    """For each uncovered branch, try to craft inputs that reach it."""
-    branch_meta = context.branch_meta
-    if not branch_meta:
-        return
+def run_coverage(
+    ast_file: str | Path,
+    *,
+    copybook_dirs: list[str | Path] | None = None,
+    budget: int = 5000,
+    timeout: int | float = 600,
+    store_path: str | Path | None = None,
+    seed: int = 42,
+    llm_provider=None,
+    llm_model: str | None = None,
+) -> CobolCoverageReport:
+    """Run coverage-guided test generation using Python execution only.
 
-    from .static_analysis import _parse_condition_variables
+    No COBOL source or GnuCOBOL required — executes the generated Python
+    module directly and uses the same strategy-based agentic loop.
+    """
+    from .ast_parser import parse_ast
+    from .code_generator import generate_code
+    from .monte_carlo import _load_module
 
-    for bid, meta in branch_meta.items():
-        if not time_ok() or not budget_ok():
-            break
+    start_time = time.time()
+    rng = random.Random(seed)
+    copybook_dirs = list(copybook_dirs or [])
 
-        # Check which directions are uncovered
-        for direction in ("T", "F"):
-            branch_key = f"{bid}:{direction}"
-            if branch_key in cov.branches_hit:
-                continue
+    # --- PARSE + CODEGEN ---
+    log.info("Parsing AST: %s", ast_file)
+    program = parse_ast(ast_file)
+    var_report = extract_variables(program)
+    call_graph = build_static_call_graph(program)
+    gating_conds = extract_gating_conditions(program, call_graph)
+    stub_mapping = extract_stub_status_mapping(program, var_report)
+    seq_gates = extract_sequential_gates(program)
+    if seq_gates:
+        gating_conds = augment_gating_with_sequential_gates(
+            gating_conds, seq_gates, call_graph,
+        )
 
-            condition = meta.get("condition", "")
-            if not condition:
-                continue
+    # Build domain model
+    copybook_records = load_copybooks(copybook_dirs) if copybook_dirs else []
+    domains = build_variable_domains(var_report, copybook_records, stub_mapping)
+    log.info("Domain model: %d variables", len(domains))
 
-            # Parse condition variables
-            try:
-                parsed = _parse_condition_variables(condition)
-            except Exception:
-                continue
+    # Generate + load instrumented Python module
+    import tempfile
+    code = generate_code(program, var_report, instrument=True)
+    tmpdir = Path(tempfile.mkdtemp(prefix="specter_cov_"))
+    py_path = tmpdir / f"{program.program_id}.py"
+    py_path.write_text(code)
+    module = _load_module(py_path)
 
-            for attempt in range(3):
-                if not time_ok() or not budget_ok():
-                    break
+    # Branch metadata (from generated module)
+    raw_branch_meta = getattr(module, "_BRANCH_META", {})
 
-                base = _build_input_state(domains, "semantic", rng)
+    # Compute totals
+    all_paras = {p.name for p in program.paragraphs}
+    total_paragraphs = len(all_paras)
+    total_branches = len(raw_branch_meta) * 2  # each branch: T + F
 
-                for var_name, values, negated in parsed:
-                    dom = domains.get(var_name)
-                    if not dom:
-                        continue
+    # Setup store
+    if store_path is None:
+        store_path = tmpdir / f"{program.program_id}_testset.jsonl"
+    store_path = Path(store_path)
 
-                    want_true = (direction == "T")
-                    want_match = want_true != negated  # XOR
+    # Load existing coverage
+    existing_tcs, existing_paras, existing_branches = load_existing_coverage(store_path)
 
-                    if want_match and values:
-                        # Pick a matching value
-                        val = values[attempt % len(values)] if values else generate_value(dom, "random_valid", rng)
-                    else:
-                        # Pick a non-matching value
-                        val = generate_value(dom, "boundary" if attempt == 0 else "random_valid", rng)
-                        retry = 0
-                        while val in values and retry < 10:
-                            val = generate_value(dom, "random_valid", rng)
-                            retry += 1
+    # Build success stubs
+    success_stubs, success_defaults = _build_success_stubs(stub_mapping, domains)
 
-                    base[var_name] = format_value_for_cobol(dom, val)
+    # Coverage state
+    cov = CoverageState(
+        paragraphs_hit=existing_paras,
+        branches_hit=existing_branches,
+        total_paragraphs=total_paragraphs,
+        total_branches=total_branches,
+        test_cases=existing_tcs,
+        all_paragraphs=all_paras,
+        _stub_mapping=stub_mapping,
+    )
+    report = CobolCoverageReport(
+        total_test_cases=len(existing_tcs),
+        paragraphs_total=total_paragraphs,
+        branches_total=total_branches,
+    )
 
-                execute_and_save(base, success_stubs, success_defaults,
-                                 layer=3, target=f"branch:{bid}:{direction}")
+    if existing_tcs:
+        log.info("Loaded %d existing TCs: %d paras, %d branches covered",
+                 len(existing_tcs), len(existing_paras), len(existing_branches))
 
+    tc_count = len(existing_tcs)
 
-# ---------------------------------------------------------------------------
-# Layer 4: Stub Fault Injection
-# ---------------------------------------------------------------------------
+    # --- BUILD STRATEGY CONTEXT ---
+    ctx = StrategyContext(
+        module=module,
+        context=None,  # Python-only mode
+        domains=domains,
+        stub_mapping=stub_mapping,
+        call_graph=call_graph,
+        gating_conds=gating_conds,
+        var_report=var_report,
+        program=program,
+        all_paragraphs=all_paras,
+        success_stubs=success_stubs,
+        success_defaults=success_defaults,
+        rng=rng,
+        store_path=store_path,
+        branch_meta=raw_branch_meta,
+    )
 
-def _run_fault_injection(
-    module, domains, stub_mapping, cov,
-    store_path, report, rng,
-    time_ok, budget_ok, execute_and_save,
-):
-    """Inject error codes for each stub operation."""
-    fault_tables = {
-        "status_file": ["10", "23", "35", "39", "46", "47"],
-        "status_sql": [0, 100, -803, -805, -904],
-        "status_cics": [0, 12, 13, 16, 22, 27],
-    }
-
-    for op_key, status_vars in stub_mapping.items():
-        if not time_ok() or not budget_ok():
-            break
-
-        # Determine fault values to try
-        fault_values: list = []
-        for var in status_vars:
-            dom = domains.get(var)
-            if dom:
-                table = fault_tables.get(dom.semantic_type, [])
-                fault_values.extend(table)
-
-        # DLI operations
-        if op_key.startswith("DLI") or any("PCB" in v.upper() for v in status_vars):
-            fault_values.extend(["GE", "GB", "II", "AI"])
-
-        if not fault_values:
-            fault_values = ["10", "23", "35"]
-
-        for fv in fault_values[:5]:
-            if not time_ok() or not budget_ok():
-                break
-
-            base = _build_input_state(domains, "semantic", rng)
-            fault_stubs, fault_defaults = _build_fault_stubs(
-                stub_mapping, domains, target_op=op_key, fault_value=fv, rng=rng,
-            )
-            execute_and_save(base, fault_stubs, fault_defaults,
-                             layer=4, target=f"fault:{op_key}={fv}")
-
-
-# ---------------------------------------------------------------------------
-# Layer 5: Guided Random Walks
-# ---------------------------------------------------------------------------
-
-def _run_random_walks(
-    module, domains, stub_mapping, cov,
-    store_path, report, rng,
-    time_ok, budget_ok, execute_and_save,
-    max_walks: int = 200,
-):
-    """Mutate high-coverage test cases to explore nearby coverage."""
-    if not cov.test_cases:
-        return
-
-    # Sort by coverage (most paragraphs first)
-    ranked = sorted(
-        cov.test_cases,
-        key=lambda tc: len(tc.get("paragraphs_hit", [])),
-        reverse=True,
-    )[:10]  # Top 10 as mutation bases
-
-    input_vars = [
-        name for name, dom in domains.items()
-        if dom.classification in ("input", "flag") and not dom.set_by_stub
+    # --- REGISTER STRATEGIES ---
+    strategies: list[Strategy] = [
+        BaselineStrategy(),
+        ConstraintSolverStrategy(),
+        DirectParagraphStrategy(),
+        BranchSolverStrategy(),
+        FaultInjectionStrategy(),
+        StubWalkStrategy(),
+        GuidedMutationStrategy(),
+        MonteCarloStrategy(),
     ]
+    if llm_provider:
+        strategies.extend([
+            LLMSeedStrategy(llm_provider, llm_model),
+            LLMGapStrategy(llm_provider, llm_model),
+            IntentDrivenStrategy(llm_provider, llm_model),
+        ])
 
-    success_stubs, success_defaults = _build_success_stubs(stub_mapping, domains)
+    selector = (
+        LLMSelector(llm_provider, llm_model)
+        if llm_provider
+        else HeuristicSelector()
+    )
 
-    walks_done = 0
-    for tc in ranked:
-        if not time_ok() or not budget_ok() or walks_done >= max_walks:
-            break
-
-        base_state = dict(tc.get("input_state", {}))
-
-        for _ in range(max_walks // len(ranked)):
-            if not time_ok() or not budget_ok() or walks_done >= max_walks:
-                break
-
-            # Mutate 1-3 variables
-            mutated = dict(base_state)
-            n_mutations = rng.randint(1, 3)
-            vars_to_mutate = rng.sample(input_vars, min(n_mutations, len(input_vars)))
-
-            for var_name in vars_to_mutate:
-                dom = domains.get(var_name)
-                if not dom:
-                    continue
-                # 70% condition_literal/88_value, 30% random
-                if rng.random() < 0.7 and (dom.condition_literals or dom.valid_88_values):
-                    strategy = "condition_literal" if dom.condition_literals else "88_value"
-                else:
-                    strategy = "random_valid"
-                val = generate_value(dom, strategy, rng)
-                mutated[var_name] = format_value_for_cobol(dom, val)
-
-            # Occasionally mutate stubs too
-            if rng.random() < 0.3 and stub_mapping:
-                op_key = rng.choice(list(stub_mapping.keys()))
-                stubs, defaults = _build_fault_stubs(stub_mapping, domains, target_op=op_key, rng=rng)
-            else:
-                stubs, defaults = success_stubs, success_defaults
-
-            execute_and_save(mutated, stubs, defaults,
-                             layer=5, target="walk")
-            walks_done += 1
-
-
-# ---------------------------------------------------------------------------
-# Layer 6: Monte Carlo Exploration
-# ---------------------------------------------------------------------------
-
-def _run_monte_carlo(
-    module, domains, stub_mapping, cov,
-    store_path, report, rng,
-    time_ok, budget_ok, execute_and_save,
-    max_iterations: int = 2000,
-):
-    """Broad random search with mixed strategies."""
-    success_stubs, success_defaults = _build_success_stubs(stub_mapping, domains)
-
-    for iteration in range(max_iterations):
-        if not time_ok() or not budget_ok():
-            break
-
-        # Pick strategy mix
-        roll = rng.random()
-        if roll < 0.4:
-            strategy = "random_valid"
-        elif roll < 0.6:
-            strategy = "boundary"
-        elif roll < 0.8:
-            strategy = "adversarial"
-        else:
-            strategy = "semantic"
-
-        input_state = _build_input_state(domains, strategy, rng)
-
-        # Mix stubs: mostly success, sometimes faults
-        if rng.random() < 0.3 and stub_mapping:
-            op_key = rng.choice(list(stub_mapping.keys()))
-            stubs, defaults = _build_fault_stubs(stub_mapping, domains, target_op=op_key, rng=rng)
-        else:
-            stubs, defaults = success_stubs, success_defaults
-
-        execute_and_save(input_state, stubs, defaults,
-                         layer=6, target="monte_carlo")
-
-        # Periodic progress logging
-        if (iteration + 1) % 200 == 0:
-            log.info("  L6 iteration %d: %d paras, %d branches",
-                     iteration + 1, len(cov.paragraphs_hit), len(cov.branches_hit))
+    return _run_agentic_loop(
+        ctx, cov, report, strategies, selector,
+        budget, timeout, start_time, tc_count,
+    )

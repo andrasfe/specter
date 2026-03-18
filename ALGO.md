@@ -1,15 +1,15 @@
-# Specter Fuzzing Algorithm
+# Specter Coverage Algorithm
 
-Specter uses coverage-guided greybox fuzzing to explore execution paths through generated COBOL simulations. The technique is program-agnostic — all heuristics derive from the AST structure, variable naming conventions, and runtime feedback.
+Specter uses a strategy-based agentic loop to explore execution paths through generated COBOL simulations. The technique is program-agnostic — all heuristics derive from the AST structure, variable naming conventions, and runtime feedback.
 
 ## Pipeline
 
 ```
 COBOL AST
-  -> variable extraction (classify each var as status/flag/input/internal)
-  -> static analysis (call graph, gating conditions, equality constraints)
-  -> Python code generation (instrumented: traces paragraphs, tracks var reads/writes)
-  -> coverage-guided fuzzing loop
+  → variable extraction (classify each var as status/flag/input/internal)
+  → static analysis (call graph, gating conditions, equality constraints)
+  → Python code generation (instrumented: traces paragraphs, tracks branches)
+  → strategy-based coverage loop
 ```
 
 ## State Model
@@ -29,113 +29,136 @@ Variables are classified by naming conventions and access patterns:
 | **input** | Read-before-write in the AST (consumed before produced) | `WS-ACCOUNT-NUM` |
 | **internal** | Everything else (written before read, workspace temps) | `WS-WORK-AREA` |
 
+### Domain-Aware Value Generation
+
 Each classification gets domain-aware random value generation:
 - **Status vars**: file status codes (`00`, `10`, `35`...), SQL codes (`0`, `100`, `-803`...), CICS response codes, IMS status codes
 - **Flags**: boolean or harvested condition literals (`Y`/`N`, `True`/`False`)
-- **Inputs**: pattern-matched by name — dates, times, keys, amounts, counts, days
+- **Inputs**: pattern-matched by name — dates, times, keys, amounts, counts
 - **Internals**: seeded from condition literals found in the AST when available
 
-## Condition Literal Harvesting
+### Condition Literal Harvesting
 
-The variable extractor scans all IF/EVALUATE conditions in the AST and collects the literal values each variable is compared against. For example, `IF WS-STATUS = '00' OR '10'` harvests `['00', '10']` for `WS-STATUS`. These harvested literals are used throughout:
-
-- The **first** harvested literal is assumed to be the "success" value
-- Random generation prefers harvested literals 50-70% of the time
-- Literal-guided mutation picks exclusively from harvested values
+The variable extractor scans all IF/EVALUATE conditions in the AST and collects the literal values each variable is compared against. For example, `IF WS-STATUS = '00' OR '10'` harvests `['00', '10']` for `WS-STATUS`. These are used everywhere: stub default generation, value pools for random exploration, and domain-aware fault tables.
 
 ## Static Analysis
 
-Three analyses feed into the fuzzer:
-
 ### Call Graph
-Built by walking PERFORM/CALL statements. Classifies every paragraph as **reachable** or **unreachable** from the entry point. Used to avoid wasting effort on structurally dead code and to compute directed fuzzing paths.
+Built by walking PERFORM/CALL statements. Classifies every paragraph as reachable or unreachable from the entry point.
 
 ### Gating Conditions
-For each paragraph, extracts the IF conditions that guard entry along the call path from the entry point. These are the constraints that must be satisfied for execution to reach a given paragraph. Used by directed fuzzing to set variables that satisfy the path.
+For each paragraph, extracts the IF conditions that guard entry along the call path from the entry point.
 
 ### Equality Constraints
-Detects `IF A NOT EQUAL B` patterns where both operands are variables. These represent implicit invariants (e.g., two date fields that must match). Applied when generating all-success states to ensure constrained variable pairs hold equal values.
+Detects `IF A NOT EQUAL B` patterns where both operands are variables. Applied when generating success states to ensure constrained variable pairs hold equal values.
 
-## Fuzzing Loop
+## Strategy-Based Agentic Loop
 
-### Seed Injection (pre-loop)
+The coverage engine uses a **strategy selector** that picks the next strategy based on coverage feedback. Each strategy generates `(input_state, stubs, defaults, target)` tuples. The agentic loop executes them and saves test cases that discover new coverage.
 
-Before the main loop, inject 3 **all-success seeds** into the corpus:
+### Execution Modes
 
-1. Set every status variable to its success value (first harvested literal, or `"00"`/`0` by convention)
-2. Set every flag to its first harvested literal (or `False`)
-3. Set inputs to sensible non-zero defaults (dates, amounts, counts)
-4. Apply equality constraints (copy var_a's value to var_b)
-5. Generate all-success stub outcomes for every external operation, with EOF/end-of-cursor terminators for reads and SQL cursors
+- **Full run**: `module.run(state)` — executes from the program entry point
+- **Direct paragraph invocation**: `_run_paragraph_directly(module, para, state)` — calls a single paragraph function directly (~1ms), bypassing the entry point. Reaches branches not reachable through normal control flow. Signaled by `target` strings starting with `"direct:"`.
 
-This guarantees the corpus starts with entries that survive initialization gauntlets — sequences of 40+ `OPEN file -> IF status != '00'` checks where P(all pass randomly) is near zero.
+### Strategy Rotation
 
-### Exploration Phase (first 30% of iterations)
+The primary strategy is `DirectParagraphStrategy`, which rotates through **six phases** on each invocation. Each phase uses direct paragraph invocation for speed and benefits from coverage gains made by the previous phases.
 
-Two strategies, mixed:
+```
+Phase 0: Param    → Phase 1: Stub    → Phase 2: Dataflow
+  ↑                                           ↓
+Phase 5: Inverse  ← Phase 4: Harvest ← Phase 3: Frontier
+```
 
-- **30% of explore iterations**: All-success state with random perturbations to non-status variables. Preserves initialization passage while diversifying post-initialization state.
-- **70% of explore iterations**: Fully random state. Status variables get an 80% success bias. Flags and inputs prefer harvested condition literals 70% of the time.
+#### Phase 0 — Param (Hill-Climb Inputs)
 
-### Exploitation Phase (remaining 70%)
+Freeze stubs from the best existing test case for each paragraph. Hill-climb input parameters using condition-aware random perturbation:
+- 40%: pick from condition literals (values seen in IF/EVALUATE conditions)
+- 30%: random domain-aware value (flag, numeric, or string)
+- 30%: leave at base value
 
-Select a seed from the corpus (weighted by energy), then apply one mutation:
+Plus 1-8 extra random variable perturbations per trial. This is the primary coverage driver — handles directly settable conditions.
 
-| Weight | Strategy | Description |
-|---|---|---|
-| 30% | Single-var flip | Replace one variable with a random domain-aware value |
-| 18% | Literal-guided | Pick a variable that has harvested condition literals; set it to one of them |
-| 12% | Gate-preserving | Mutate 1-3 non-status variables only, preserving initialization passage |
-| 12% | Multi-var flip | Replace 2-4 variables simultaneously |
-| 8% | Crossover | Copy 1-3 variables (and stub outcomes) from a different corpus entry |
-| 5% | Reset-to-default | Set one variable to its zero/empty value |
-| 10% | Stub flip | Re-randomize one external operation's return status |
-| 5% | Full stub regen | Regenerate all stub outcomes from scratch |
+#### Phase 1 — Stub (Sweep Fault Configurations)
 
-### Corpus Management
+Freeze inputs from the best test case for each paragraph. Sweep through **domain-aware fault values** for each stub operation:
 
-A new entry is added to the corpus when it discovers:
-- A **new paragraph** (not yet in global coverage), or
-- A **new edge** (caller -> callee transition not yet seen), or
-- A **new branch** (IF true/else or EVALUATE WHEN not yet taken)
+1. **Condition literals** from the status variable's domain (actual values the program checks)
+2. **88-level values** from COBOL declarations
+3. **Generic fault table** fallback (file status codes, SQL codes, CICS codes)
 
-The corpus is capped at 500 entries. When full, the lowest-energy entry whose coverage is fully redundant (subset of other entries' combined coverage) is evicted.
+Each fault config is tried with the frozen inputs via direct invocation. Unlocks stub-dependent branches (error handling, EOF processing, etc.).
 
-### Recursion Avoidance
+#### Phase 2 — Dataflow (Backpropagation of Constraints)
 
-COBOL programs can have mutual recursion via PERFORM (e.g., error handler calls termination, termination calls error handler). The fuzzer:
+For branches where the condition variable is **computed** (not directly settable), traces backward through the generated Python code to find what input values produce the needed output:
 
-1. **Generated code** enforces a call depth limit of 200 per paragraph, with try/finally to always decrement
-2. **Fuzzer** fingerprints the status/flag variable values of any state that triggers RecursionError
-3. Future candidate states matching a known recursion fingerprint are skipped entirely
+1. **Parse paragraph source**: extract `state['VAR'] = expr` assignments and their dependency variables
+2. **Trace backward**: from condition variable through assignment chain (up to 5 levels deep)
+3. **Inter-procedural**: if no local assignment exists, traces through sub-paragraph calls
+4. **Solve inverse**: given the computation type (multiply, add, subtract, divide, modulo, MOVE), compute input values that satisfy the branch condition
+5. **Cross with stubs**: try each solved state with success stubs AND fault configs
 
-Up to 10,000 fingerprints are retained.
+Example: branch checks `IF WS-RESULT > 0` where `WS-RESULT = WS-AMT * WS-RATE`. Backprop determines `WS-AMT` and `WS-RATE` must both be non-zero.
 
-### Energy Scoring
+#### Phase 3 — Frontier (Flip Branches to Unlock Paragraphs)
 
-Every 100 iterations, corpus entry energies are recalculated:
+Goal-directed: identifies branches in covered paragraphs that **gate uncovered paragraphs** via the call graph.
 
-- **Frontier bonus** (+3.0 per covered paragraph that is a caller in the call graph — these are branch points that might lead to uncovered code)
-- **Recency bonus** (0.0 to 1.0, linear by iteration number when added)
-- **Yield penalty** (x0.1 if mutated >10 times with zero children added to corpus)
-- **Floor**: energy never drops below 0.01
+1. Walk call graph: for each covered paragraph A that calls uncovered paragraph B, find untaken branches in A
+2. Run best test case for A, **inspect final runtime state** to see current variable values
+3. Flip the condition: set variables to values that make the branch go the other direction
+4. Also handle stub-controlled variables in the condition
 
-Seed selection uses weighted random sampling by energy.
+#### Phase 4 — Harvest (Rainbow Table)
 
-### Stale Detection and Directed Fuzzing
+Empirical inverse: run each paragraph hundreds of times with random inputs, record `(input_state, final_state)` pairs. Then for each uncovered branch, scan the rainbow table for an input that produces the desired output value.
 
-When 1,000 consecutive iterations produce no new coverage:
+This solves complex multi-variable conditions that symbolic analysis can't crack — the brute-force mapping finds inputs that happen to satisfy the condition through arbitrary computation paths.
 
-1. **Pick a target**: select an uncovered-but-reachable paragraph, weighted by 1/path_length (shorter paths are easier to reach)
-2. **Generate directed input**: start from the corpus entry with maximum overlap on the target's call path, then set variables to satisfy gating conditions along the remaining path
-3. **Attempt limit**: 200 tries per target before switching to a new one
-4. **Fallback**: if no static analysis is available or all reachable paragraphs are covered, emit a burst of 50 fully random iterations to escape local optima
+#### Phase 5 — Inverse (Synthesized Inverse Functions)
+
+For each uncovered branch gated by arithmetic, **dynamically generates and `exec()`s an inverse function**:
+
+1. Parse the paragraph's assignment chain for the condition variable
+2. Identify the computation type (multiply, add, subtract, divide, modulo, MOVE)
+3. Generate Python source for an inverse solver (e.g., `A * B = target → A = sqrt(target) + 1`)
+4. `exec()` the solver with the desired target value
+5. Use the solved input values as test case inputs
+
+This is effectively on-the-fly program synthesis — creating the inverse of a paragraph's computation chain as executable code.
+
+### Supporting Strategies
+
+In addition to `DirectParagraphStrategy`, the loop includes:
+
+| Strategy | Priority | Purpose |
+|----------|----------|---------|
+| **BaselineStrategy** | 20 | Initial seeds: 5 value-generation strategies + condition literal sweeps |
+| **ConstraintSolverStrategy** | 30 | Path-constraint satisfaction for uncovered paragraphs |
+| **BranchSolverStrategy** | 40 | Per-branch condition solving via full program run |
+| **FaultInjectionStrategy** | 50 | Single-fault stub injection with random inputs |
+| **StubWalkStrategy** | 55 | Frozen good inputs × fault sweeps + pairwise faults |
+| **GuidedMutationStrategy** | 60 | Random walks mutating high-coverage test cases |
+| **MonteCarloStrategy** | 70 | Broad random exploration with mixed strategies |
+
+### Selector
+
+`HeuristicSelector` picks the next strategy by priority, adjusted by yield history:
+- **Yield bonus**: strategies that found coverage recently get priority boost
+- **Staleness penalty**: strategies that haven't yielded in 3+ rounds get deprioritized
+- Exhausted deterministic strategies self-disable until new coverage appears from other strategies
+
+### Termination
+
+- **Full coverage**: all paragraphs and all branches covered
+- **Extended plateau**: 30 consecutive rounds with no new coverage (at >90% paragraph coverage and >80% branch coverage, threshold drops to 10 rounds)
+- **Budget/timeout**: configurable test case budget and wall-clock timeout
 
 ## Stub Outcome Generation
 
 External operations are stubbed with pre-generated return values. Each outcome entry is a batch of `(variable, value)` pairs — one per status variable associated with the operation.
-
-Repetition counts per operation type:
 
 | Operation | Success Reps | Notes |
 |---|---|---|
@@ -145,117 +168,23 @@ Repetition counts per operation type:
 | START | 10 | Positioning operations |
 | OPEN/CLOSE | 3 | Typically invoked once or twice |
 
-Random stub generation uses a 60% success bias. All-success stubs use 100% success with explicit EOF terminators.
+When stub outcomes are exhausted at runtime, a **default fallback** is applied. Defaults prefer harvested condition literals (the first value the variable is compared against in IF conditions), which captures domain-specific success conventions — e.g., IMS PCB status codes use spaces `' '` for success rather than file-status `'00'`.
 
-When stub outcomes are exhausted at runtime, a **default fallback** is applied. Defaults prefer harvested condition literals (the first value the variable is compared against in IF conditions), which captures domain-specific success conventions — e.g., IMS PCB status codes use spaces `' '` for success rather than file-status `'00'`. This prevents stub exhaustion from triggering spurious error paths.
-
-## Branch-Level Coverage
-
-In addition to paragraph and edge coverage, the fuzzer tracks **branch-level coverage**. Each IF statement in the generated code is assigned a unique branch ID. When the true branch is taken, the positive ID is recorded; when the else branch is taken, the negative ID is recorded. Similarly, each WHEN clause in an EVALUATE statement gets its own branch ID.
-
-This provides finer-grained feedback than paragraph coverage alone — two executions may reach the same paragraph but take different branches within it. The corpus accepts new entries that discover previously unseen branch IDs.
-
-## COBOL Statement Coverage
-
-### SEARCH (Table Lookup)
-
-COBOL SEARCH statements (sequential table lookup with VARYING index, AT END, and WHEN clauses) are stubbed similarly to external operations. Each SEARCH generates a stub key (`SEARCH:<table_name>`) whose outcomes are boolean found/not-found values. The AT END and WHEN branches are extracted from the statement text and translated to Python assignments, PERFORM calls, and GO TO jumps.
-
-SEARCH outcomes are generated using a separate RNG to avoid disrupting the main fuzzing sequence.
-
-### REWRITE (Record Update)
-
-REWRITE statements are handled identically to WRITE — they apply a stub outcome for the associated file operation, setting the file status variable.
-
-### PERFORM VARYING (Counted Loops)
-
-PERFORM VARYING statements (`PERFORM paragraph VARYING var FROM x BY y UNTIL condition`) generate proper loop initialization and increment logic. The loop variable is set to the FROM value before the loop, and incremented by the BY value after each iteration.
-
-## Generated Code Resilience
-
-The generated Python code includes several safety mechanisms:
-
-- **SafeDict**: returns `''` for missing keys instead of raising KeyError (handles COBOL subscripted variables like `VAR(I)` where the index hasn't been set)
-- **Call depth guard**: every paragraph checks and increments a depth counter on entry, decrements in a `finally` block
-- **ZeroDivisionError catch**: COMPUTE/DIVIDE expressions with zero divisors set `_abended = True` instead of crashing
-- **PERFORM THRU**: executes all paragraphs in program order from target through thru-target, not just the first
-
-## Deterministic Test Set Synthesis (`--synthesize`)
-
-In addition to the random fuzzer, Specter includes a deterministic, layered synthesis engine that generates a minimal test set targeting maximum branch coverage. Unlike the Monte Carlo fuzzer, synthesis is repeatable — given the same AST, it produces the same test set.
-
-### Architecture
-
-The engine runs layers sequentially, each building on prior coverage. Test cases are persisted to a JSONL test store, allowing incremental re-runs (completed layers are skipped).
-
-### Layers
-
-| Layer | Name | Strategy | Typical Yield |
-|-------|------|----------|---------------|
-| 1 | All-Success Seeds | 5 seed TCs with status=success, equality constraints applied | ~200 branch dirs |
-| 2 | Per-Paragraph Direct Invocation | Invoke each paragraph function directly with default state | ~1100 branch dirs |
-| 2.5 | Frontier Expansion | Try adjacent paragraphs from Layer 2's traces | ~40 branch dirs |
-| 3 | Condition-Targeted | Parse each uncovered branch's condition, set variables to satisfy/negate it | ~700 branch dirs |
-| 3.5 | Paragraph Sweep | Full condition sweep per paragraph with cartesian products, Phase 3 targeted flip | ~400 branch dirs |
-| 3.7 | Stub Fault Injection | Dataflow analysis to find stub-dependent branches | 0-5 branch dirs |
-| 3.8 | Dataflow Constraint Propagation | Backward tracing through arithmetic/MOVE chains + inter-procedural analysis | ~30 branch dirs |
-| 4 | Stub Combination | Systematically vary external operation return codes | 0-5 branch dirs |
-| 5 | Mutation Walks | Hill-climbing: mutate best TCs for 100 rounds, keep improvements | ~15 branch dirs |
-| 6 | Branch Direction Flip | For each flippable branch (one direction covered), try to flip via condition manipulation | ~20 branch dirs |
-| 7 | Random Exploration | Targeted random state generation per high-gap paragraph with hill-climbing | ~100+ branch dirs |
-
-### Branch Instrumentation
+## Branch Instrumentation
 
 Every IF statement emits both `+bid` (TRUE taken) and `-bid` (FALSE taken) branch IDs, including an explicit `else` clause for IF-without-ELSE patterns. EVALUATE WHEN clauses emit `+bid` only (FALSE is implicit when a different WHEN matches). PERFORM UNTIL and SEARCH emit both directions.
 
 Branch metadata is stored in `_BRANCH_META`, a module-level dict mapping each absolute branch ID to `{condition, paragraph, type, subject}`.
 
-### Condition Parser
+## Generated Code Resilience
 
-`_parse_condition_variables()` extracts `(variable, values, negated)` triples from COBOL condition strings. It handles:
+- **SafeDict**: returns `''` for missing keys instead of raising KeyError (handles COBOL subscripted variables)
+- **Call depth guard**: every paragraph checks and increments a depth counter on entry, decrements in `finally`
+- **ZeroDivisionError catch**: COMPUTE/DIVIDE expressions with zero divisors set `_abended = True`
+- **PERFORM THRU**: executes all paragraphs in program order from target through thru-target
 
-- Simple comparisons: `WS-STATUS = '00'`
-- Multi-value lists: `FS-FILE NOT EQUAL '00' AND '04' AND '05'`
-- Variable-to-variable: `TRANS-TYPE EQUAL REGLR-DEF-TXN-CODE` (both vars emitted with `[0]` marker)
-- Compound AND/OR: split on top-level logical operators, recurse
-- Figurative constants: ZEROS, SPACES, LOW-VALUES
-- Flag conditions: bare `SCHEDULE-FILE-ERROR` or `NOT C-VSAM-FILE-OK`
-- COBOL decimal commas: `1000000,00` parsed as `1000000.0`
-- Subscripted variables: `VAR(I)` stripped to `VAR`
-
-### Variable-to-Variable Comparisons
-
-When the condition compares two variables (e.g., `A EQUAL B`), the synthesis looks up the current runtime value of the RHS variable in the base state or defaults, then sets the LHS to match (for TRUE) or differ (for FALSE). This avoids the problem of setting both to an arbitrary constant like `42` which fails when the RHS already has a different default value.
-
-### Layer 3.8: Dataflow Constraint Propagation
-
-Layers 3 and 3.5 assume that condition variables are directly settable as inputs. Layer 3.8 handles the case where the condition variable is **computed** by intermediate operations (COMPUTE, MOVE, ADD, etc.) within the paragraph.
-
-For each uncovered branch:
-
-1. **Parse the paragraph's generated Python** to extract a per-paragraph dataflow graph: every `state['VAR'] = expr` assignment and its dependency variables
-2. **Trace backward** from the condition variable through assignments to find the chain of computations. For example, if `BASE-1-WS = AUX-COMPUTE * ORIGINAL-BASE * DAYS` and the branch checks `BASE-1-WS > LIMIT`, the chain traces back to the three operands
-3. **Inter-procedural tracing**: when no local assignment exists, checks sub-paragraph calls before the branch to find which one assigns the condition variable, and traces backward through that sub-paragraph
-4. **Solve backward constraints**: given the chain, compute input values that produce the needed condition. Handles multiplication (set operands to non-zero), division (account for truncation), modulo (find multiples), addition/subtraction, and MOVE chains
-5. **Generate multiple variations** (5 attempts per branch): direct + amplified + computation-only + large-value + override-only
-
-This layer primarily unlocks branches gated by arithmetic (COMPUTE chains), variable-to-variable comparisons where the RHS is computed, and MOVE chains through intermediate variables.
-
-### Layer 7: Random Exploration
-
-The most aggressive layer. For each paragraph with 3+ uncovered branch directions:
-
-1. Collect all condition literals referenced by uncovered branches in that paragraph
-2. For 500 trials, generate a state by randomly setting condition variables to known literals (40%), random domain values (20%), or leaving defaults (40%)
-3. Also perturb 1-8 random variables and occasionally vary stub outcomes
-4. Hill-climbing: when a trial discovers new branches, use that state as the base for subsequent trials (70% of the time; 30% restart from the original base TC)
-
-### Paragraph Name Sanitization
-
-COBOL paragraph names like `R--1CF2` (double dash) are sanitized to Python function names via `re.sub(r"_+", "_", name.replace("-", "_"))`, collapsing consecutive underscores. The synthesis engine and direct invocation use the same sanitization to correctly resolve function names.
-
-### Coverage Ceiling
+## Coverage Ceiling
 
 Some branch directions are structurally unreachable:
-- EVALUATE WHEN FALSE: only TRUE (`+bid`) is instrumented per WHEN clause, since FALSE is implicit
-- Sub-paragraph state overwrite: branches depending on variables set by called sub-paragraphs cannot be controlled via input state alone
+- EVALUATE WHEN FALSE: only TRUE is instrumented per WHEN clause
+- Sub-paragraph state overwrite: branches depending on variables set by called sub-paragraphs may require specific execution ordering not achievable via direct invocation
