@@ -2678,10 +2678,10 @@ def generate_init_records(initial_values: dict[str, str]) -> str:
             num = int(val)
         except (ValueError, TypeError):
             num = 0
-        record = f"{op_key:<30}{alpha:<20}{num:>10}"
+        record = f"{op_key:<30}{alpha:<20}{num:>9}"
         records.append(f"{record:<80}"[:80])
     # Sentinel: non-INIT record to stop the init loop
-    records.append(f"{'END-INIT':<30}{'':<20}{0:>10}"[:80])
+    records.append(f"{'END-INIT':<30}{'':<20}{0:>9}"[:80])
     return "\n".join(records)
 
 
@@ -2729,7 +2729,7 @@ def generate_mock_data(
                             except (ValueError, TypeError):
                                 num_status = 0
 
-            record = f"{op_key:<30}{alpha_status:<20}{num_status:>10}"
+            record = f"{op_key:<30}{alpha_status:<20}{num_status:>9}"
             # Pad/truncate to 80 chars
             record = f"{record:<80}"[:80]
             records.append(record)
@@ -2753,7 +2753,7 @@ def generate_mock_data(
                                     num_status = int(val)
                                 except (ValueError, TypeError):
                                     num_status = 0
-                record = f"{op_key:<30}{alpha_status:<20}{num_status:>10}"
+                record = f"{op_key:<30}{alpha_status:<20}{num_status:>9}"
                 records.append(f"{record:<80}"[:80])
 
     return "\n".join(records) + "\n" if records else "\n"
@@ -2783,7 +2783,7 @@ def generate_mock_data_ordered(stub_log: list[tuple[str, list]]) -> str:
                             num_status = int(val)
                         except (ValueError, TypeError):
                             num_status = 0
-        record = f"{op_key:<30}{alpha_status:<20}{num_status:>10}"
+        record = f"{op_key:<30}{alpha_status:<20}{num_status:>9}"
         records.append(f"{record:<80}"[:80])
     return "\n".join(records) + "\n" if records else "\n"
 

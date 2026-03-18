@@ -219,7 +219,7 @@ def run_test_case(
     # In coverage mode (RETURN/XCTL don't terminate), the COBOL program
     # consumes more mock records than the Python pre-run produces.
     # Pad with extra success records so the COBOL doesn't hit EOF early.
-    pad_record = f"{'CICS':<30}{'00':<20}{'0':>10}{' ' * 20}"[:80]
+    pad_record = f"{'CICS':<30}{'00':<20}{'0':>9}{' ' * 21}"[:80]
     pad_data = "\n".join([pad_record] * 50) + "\n"
 
     # Concatenate: init records first, then stub records, then padding

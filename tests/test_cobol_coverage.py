@@ -511,7 +511,7 @@ class TestMockDataGeneration:
         # INIT records are 80 chars; END-INIT sentinel is 60 chars (existing behavior)
         assert len(lines[0]) == 80
         assert len(lines[1]) == 80
-        assert len(lines[2]) >= 60
+        assert len(lines[2]) >= 59
 
     def test_mock_data_ordered_format(self):
         from specter.cobol_mock import generate_mock_data_ordered
