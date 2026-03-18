@@ -749,6 +749,8 @@ def run_cobol_coverage(
         store_path=store_path,
         branch_meta=context.branch_meta,
         cobol_source_path=Path(cobol_source),
+        llm_provider=llm_provider,
+        llm_model=llm_model,
     )
 
     # --- REGISTER STRATEGIES ---
@@ -1046,6 +1048,8 @@ def run_coverage(
         store_path=store_path,
         branch_meta=raw_branch_meta,
         cobol_source_path=cobol_source_path,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
     )
 
     # --- REGISTER STRATEGIES ---

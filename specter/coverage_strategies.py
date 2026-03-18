@@ -52,6 +52,8 @@ class StrategyContext:
     store_path: Path
     branch_meta: dict = field(default_factory=dict)
     cobol_source_path: Path | None = None
+    llm_provider: object | None = None
+    llm_model: str | None = None
 
 
 @dataclass
@@ -1343,7 +1345,190 @@ class DirectParagraphStrategy(Strategy):
                         break  # found chain for this branch
 
     # ------------------------------------------------------------------
-    # Main: rotate param → stub → dataflow → frontier → harvest → inverse
+    # LLM gap round: ask LLM about uncovered branches, then perturb
+    # ------------------------------------------------------------------
+
+    def _llm_gap_round(self, ctx, cov, batch_size, branch_meta) -> Iterator[CaseT]:
+        """Ask LLM to suggest inputs for uncovered branches, then hill-climb
+        around each suggestion via direct paragraph invocation."""
+        if not ctx.llm_provider:
+            yield from self._param_round(ctx, cov, batch_size, branch_meta)
+            return
+
+        from .llm_coverage import _query_llm_sync
+        from .program_analysis import _parse_yaml_seeds
+
+        sorted_paras = self._paragraphs_with_gaps(branch_meta, cov)
+        if not sorted_paras:
+            return
+
+        # Build gap report: uncovered branches with conditions
+        gap_lines = []
+        for para in sorted_paras[:10]:  # top 10 paragraphs by gap
+            uncov = []
+            for bid, meta in branch_meta.items():
+                if meta.get("paragraph") != para:
+                    continue
+                for d in ("T", "F"):
+                    bk = f"{bid}:{d}"
+                    if bk not in cov.branches_hit:
+                        cond = meta.get("condition", "")
+                        if cond:
+                            uncov.append(f"    {bk}: {d}=={'TRUE' if d == 'T' else 'FALSE'} for: {cond}")
+            if uncov:
+                # Show best TC for this paragraph
+                tc = self._best_tc_for_para(cov, para)
+                tc_snippet = ""
+                if tc:
+                    ivars = tc.get("input_state", {})
+                    top_vars = list(ivars.items())[:5]
+                    tc_snippet = f"  Best TC: {dict(top_vars)}"
+                gap_lines.append(f"  {para} ({len(uncov)} uncovered):")
+                gap_lines.extend(uncov[:5])
+                if tc_snippet:
+                    gap_lines.append(tc_snippet)
+
+        if not gap_lines:
+            yield from self._param_round(ctx, cov, batch_size, branch_meta)
+            return
+
+        # Build compact variable context
+        cond_vars = self._collect_cond_vars(branch_meta, sorted_paras[0], ctx)
+        var_hint_lines = []
+        for var, vals in list(cond_vars.items())[:15]:
+            var_hint_lines.append(f"  {var}: known values {vals[:6]}")
+
+        prompt = f"""\
+You are a COBOL test engineer. We have {len(cov.branches_hit)}/{cov.total_branches} branches covered.
+
+These branches are still uncovered:
+{chr(10).join(gap_lines)}
+
+Key variables:
+{chr(10).join(var_hint_lines)}
+
+Suggest 5-8 test inputs that would flip these uncovered conditions.
+Focus on variable combinations that satisfy the specific conditions shown.
+
+Respond in YAML:
+- target: which branch/paragraph this targets
+  reasoning: why these values should flip the condition
+  input_values:
+    VARIABLE-NAME: value
+  stub_overrides:
+    OPERATION-KEY: status"""
+
+        try:
+            response_text, _tokens = _query_llm_sync(
+                ctx.llm_provider, prompt, ctx.llm_model,
+            )
+            suggestions = _parse_yaml_seeds(response_text)
+            log.info("LLM gap: %d suggestions for %d uncovered paragraphs",
+                     len(suggestions), len(sorted_paras))
+        except Exception as e:
+            log.warning("LLM gap query failed: %s", e)
+            yield from self._param_round(ctx, cov, batch_size, branch_meta)
+            return
+
+        if not suggestions:
+            yield from self._param_round(ctx, cov, batch_size, branch_meta)
+            return
+
+        # For each suggestion: yield the seed + perturbations
+        yielded = 0
+        default_state_fn = getattr(ctx.module, "_default_state", None)
+        ds = default_state_fn() if default_state_fn else {}
+        var_list = list(ds.keys())
+        str_vals = ["", " ", "Y", "N", "00", "04", "05", "10",
+                    "001", "002", "013", "019", "XX", "I", "T", "R"]
+        int_vals = [0, 1, -1, 99, 100, 999, -999, 1000000]
+        flag_vals = [True, False, "Y", "N", " ", "X"]
+
+        perturbations_per = max(10, (batch_size - len(suggestions)) // max(len(suggestions), 1))
+
+        for seed_data in suggestions:
+            if yielded >= batch_size:
+                break
+
+            # Build input state from LLM suggestion
+            base_state = {}
+            for var, val in seed_data.get("input_values", {}).items():
+                dom = ctx.domains.get(var.upper())
+                if dom:
+                    from .variable_domain import format_value_for_cobol
+                    base_state[var.upper()] = format_value_for_cobol(dom, val)
+                else:
+                    base_state[var.upper()] = str(val)
+
+            # Build stubs from overrides
+            stubs = dict(ctx.success_stubs)
+            defaults = dict(ctx.success_defaults)
+            for op_key, status_val in seed_data.get("stub_overrides", {}).items():
+                from .cobol_coverage import _match_stub_operation
+                matched = _match_stub_operation(op_key, ctx.stub_mapping)
+                if matched:
+                    svars = ctx.stub_mapping[matched]
+                    entry = [(sv, status_val) for sv in svars]
+                    stubs[matched] = [entry] * 50
+                    defaults[matched] = entry
+
+            target = seed_data.get("target", "llm_gap")[:40]
+
+            # Yield the raw LLM suggestion
+            # Pick the paragraph with most uncovered branches for direct invocation
+            best_para = sorted_paras[0] if sorted_paras else None
+            if best_para:
+                yield (base_state, stubs, defaults,
+                       f"direct:{best_para}|gap:{target}")
+            else:
+                yield base_state, stubs, defaults, f"gap:{target}"
+            yielded += 1
+
+            # Hill-climb around the suggestion
+            cond_vars_for_para = self._collect_cond_vars(
+                branch_meta, best_para, ctx) if best_para else {}
+
+            for trial in range(perturbations_per):
+                if yielded >= batch_size:
+                    break
+                state = dict(base_state)
+
+                # Perturb condition variables
+                for var, literals in cond_vars_for_para.items():
+                    r = ctx.rng.random()
+                    if r < 0.3 and literals:
+                        state[var] = ctx.rng.choice(literals)
+                    elif r < 0.5:
+                        info = ctx.var_report.variables.get(var)
+                        if info and info.classification == "flag":
+                            state[var] = ctx.rng.choice(flag_vals)
+                        elif isinstance(ds.get(var), int):
+                            state[var] = ctx.rng.choice(int_vals)
+                        else:
+                            state[var] = ctx.rng.choice(str_vals)
+                    # else: keep LLM's value (higher probability to preserve)
+
+                # Light random perturbation
+                for _ in range(ctx.rng.randint(1, 3)):
+                    if not var_list:
+                        break
+                    v = ctx.rng.choice(var_list)
+                    if v not in cond_vars_for_para:
+                        dv = ds.get(v)
+                        if isinstance(dv, int):
+                            state[v] = ctx.rng.choice(int_vals)
+                        elif isinstance(dv, str):
+                            state[v] = ctx.rng.choice(str_vals)
+
+                if best_para:
+                    yield (state, stubs, defaults,
+                           f"direct:{best_para}|gap-perturb:{trial}")
+                else:
+                    yield state, stubs, defaults, f"gap-perturb:{trial}"
+                yielded += 1
+
+    # ------------------------------------------------------------------
+    # Main: rotate param → stub → dataflow → frontier → harvest → inverse → llm_gap
     # ------------------------------------------------------------------
 
     def generate_cases(self, ctx, cov, batch_size) -> Iterator[CaseT]:
@@ -1351,7 +1536,8 @@ class DirectParagraphStrategy(Strategy):
         if not branch_meta:
             return
 
-        phase = self._round % 6
+        n_phases = 7 if ctx.llm_provider else 6
+        phase = self._round % n_phases
         if phase == 0:
             yield from self._param_round(ctx, cov, batch_size, branch_meta)
         elif phase == 1:
@@ -1365,8 +1551,10 @@ class DirectParagraphStrategy(Strategy):
             yield from self._frontier_round(ctx, cov, batch_size, branch_meta)
         elif phase == 4:
             yield from self._harvest_round(ctx, cov, batch_size, branch_meta)
-        else:
+        elif phase == 5:
             yield from self._inverse_round(ctx, cov, batch_size, branch_meta)
+        else:
+            yield from self._llm_gap_round(ctx, cov, batch_size, branch_meta)
 
         self._round += 1
 
