@@ -369,7 +369,7 @@ class TestBranchTracing:
         text = "".join(result)
         assert "@@B:1:T" in text
         assert "@@B:1:F" in text
-        assert count == 1
+        assert count == 2  # 1 IF → 2 directions (T + F)
         assert "1" in meta
         assert meta["1"]["type"] == "IF"
 
@@ -390,7 +390,7 @@ class TestBranchTracing:
         assert "@@B:1:T" in text
         assert "@@B:1:F" in text
         assert "ELSE" in text
-        assert count == 1
+        assert count == 2  # 1 IF → 2 directions
 
     def test_evaluate_when(self):
         """EVALUATE/WHEN gets probes for each WHEN."""
@@ -414,8 +414,9 @@ class TestBranchTracing:
         assert "@@B:1:W1" in text
         assert "@@B:1:W2" in text
         assert "@@B:1:WO" in text
-        assert count == 1
+        assert count == 3  # 1 EVALUATE with 3 WHENs → 3 directions
         assert meta["1"]["type"] == "EVALUATE"
+        assert meta["1"]["when_count"] == 3
 
     def test_nested_if(self):
         """Nested IFs get separate branch IDs."""
@@ -432,7 +433,7 @@ class TestBranchTracing:
             "           END-IF.\n",
         ]
         result, meta, count = _add_branch_tracing(lines)
-        assert count == 2
+        assert count == 4  # 2 IFs × 2 directions each
         assert "1" in meta
         assert "2" in meta
 

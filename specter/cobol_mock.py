@@ -993,7 +993,8 @@ def _add_branch_tracing(
         # Detect END-EVALUATE
         if content.startswith("END-EVALUATE"):
             if eval_stack:
-                eval_stack.pop()
+                base_bid, when_count = eval_stack.pop()
+                branch_meta[base_bid]["when_count"] = when_count
             result.append(line)
             i += 1
             continue
@@ -1001,7 +1002,15 @@ def _add_branch_tracing(
         result.append(line)
         i += 1
 
-    return result, branch_meta, len(branch_meta)
+    # Compute total directions: IFs have 2 (T/F), EVALUATEs have when_count
+    total_directions = 0
+    for meta in branch_meta.values():
+        if meta["type"] == "IF":
+            total_directions += 2
+        elif meta["type"] == "EVALUATE":
+            total_directions += meta.get("when_count", 1)
+
+    return result, branch_meta, total_directions
 
 
 def _scan_for_else(lines: list[str], start: int) -> bool:
