@@ -603,9 +603,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    # --synthesize implies --analyze
+    # --synthesize implies --analyze; validate required inputs early
     if args.synthesize:
-        args.analyze = True
+        if not args.cobol_source:
+            print("Error: --synthesize requires --cobol-source PATH", file=sys.stderr)
+            return 1
+        if not Path(args.cobol_source).exists():
+            print(f"Error: COBOL source not found: {args.cobol_source}", file=sys.stderr)
+            return 1
+
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s %(levelname)-7s %(message)s",
@@ -613,6 +619,21 @@ def main(argv: list[str] | None = None) -> int:
             stream=sys.stderr,
             force=True,
         )
+
+        # Verify LLM connection before doing any work
+        from .llm_coverage import _query_llm_sync, get_llm_provider
+        try:
+            _synth_llm = get_llm_provider(
+                provider_name=args.llm_provider, model=args.llm_model,
+            )
+            print(f"  LLM provider: {type(_synth_llm).__name__}")
+            _query_llm_sync(_synth_llm, "ping", args.llm_model)
+            print("  LLM connection: OK")
+        except Exception as e:
+            print(f"Error: LLM connection required for --synthesize: {e}", file=sys.stderr)
+            return 1
+
+        args.analyze = True
 
     # --diagram implies --analyze
     if args.diagram:
@@ -755,6 +776,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.synthesize:
         from .cobol_coverage import run_coverage
 
+        cobol_src = Path(args.cobol_source)
+
         analysis_dir = Path(args.analysis_output) if args.analysis_output else Path("/tmp")
         analysis_dir.mkdir(parents=True, exist_ok=True)
 
@@ -763,23 +786,13 @@ def main(argv: list[str] | None = None) -> int:
         else:
             test_store_path = analysis_dir / f"{ast_path.stem}_testset.jsonl"
 
-        llm_provider_for_synth = None
-        if args.llm_guided or args.llm_provider:
-            from .llm_coverage import get_llm_provider
-            try:
-                llm_provider_for_synth = get_llm_provider(
-                    provider_name=args.llm_provider, model=args.llm_model,
-                )
-                print(f"  LLM provider: {type(llm_provider_for_synth).__name__}")
-            except Exception as e:
-                print(f"  Warning: LLM init failed: {e}", file=sys.stderr)
+        llm_provider_for_synth = _synth_llm  # validated at startup
 
         budget = args.coverage_budget
         cov_timeout = args.synthesis_timeout or args.coverage_timeout
 
         print(f"Synthesizing test set → {test_store_path} ...")
         print(f"  Budget: {budget} TCs, timeout {cov_timeout}s")
-        cobol_src = Path(args.cobol_source) if args.cobol_source else None
         cov_report = run_coverage(
             ast_file=ast_path,
             copybook_dirs=[Path(d) for d in args.copybook_dir],
