@@ -119,6 +119,50 @@ class CobolCoverageReport:
 
 
 # ---------------------------------------------------------------------------
+# LLM seed injector (one-shot strategy from pre-generated seeds)
+# ---------------------------------------------------------------------------
+
+class _LLMSeedInjector(Strategy):
+    """Injects pre-generated LLM seeds as test cases.  Runs once."""
+
+    name = "llm_seeds"
+    priority = 5  # run first
+
+    def __init__(self, seeds: list[dict], stub_mapping: dict[str, list[str]]):
+        self._seeds = seeds
+        self._stub_mapping = stub_mapping
+        self._ran = False
+
+    def should_run(self, cov, round_num: int) -> bool:
+        return not self._ran
+
+    def generate_cases(self, ctx, cov, batch_size):
+        self._ran = True
+        for seed_data in self._seeds:
+            input_state = {}
+            for var, val in seed_data.get("input_values", {}).items():
+                dom = ctx.domains.get(var.upper())
+                if dom:
+                    input_state[var.upper()] = format_value_for_cobol(dom, val)
+                else:
+                    input_state[var.upper()] = str(val)
+
+            # Build stubs from overrides
+            stubs = dict(ctx.success_stubs)
+            defaults = dict(ctx.success_defaults)
+            for op_key, status_val in seed_data.get("stub_overrides", {}).items():
+                matched = _match_stub_operation(op_key, self._stub_mapping)
+                if matched:
+                    svars = self._stub_mapping[matched]
+                    entry = [(sv, status_val) for sv in svars]
+                    stubs[matched] = [entry] * 50
+                    defaults[matched] = entry
+
+            target = seed_data.get("target", "llm_seed")[:50]
+            yield input_state, stubs, defaults, f"seed:{target}"
+
+
+# ---------------------------------------------------------------------------
 # Test case store (JSONL)
 # ---------------------------------------------------------------------------
 
@@ -950,12 +994,39 @@ def run_coverage(
 
     tc_count = len(existing_tcs)
 
-    # --- BUILD STRATEGY CONTEXT ---
+    # --- UPFRONT ANALYSIS (static, no LLM) ---
+    from .program_analysis import (
+        generate_seeds_from_analysis,
+        prepare_program_analysis,
+    )
+
     cobol_source_path = Path(cobol_source) if cobol_source else None
     if cobol_source_path and not cobol_source_path.exists():
-        log.warning("COBOL source not found: %s (LLM strategies will skip)", cobol_source_path)
+        log.warning("COBOL source not found: %s", cobol_source_path)
         cobol_source_path = None
 
+    analysis = prepare_program_analysis(
+        program, var_report, domains, call_graph, gating_conds,
+        stub_mapping, cobol_source=cobol_source_path,
+        branch_meta=raw_branch_meta,
+    )
+
+    # Save analysis JSON alongside the test store
+    analysis_path = store_path.with_suffix(".analysis.json")
+    analysis_path.write_text(analysis.to_json())
+    log.info("Analysis saved: %s", analysis_path)
+
+    # --- LLM SEED GENERATION (one-time, from analysis JSON) ---
+    llm_seeds: list[dict] = []
+    if llm_provider:
+        seed_cache = store_path.with_name(store_path.stem + "_seeds.json")
+        llm_seeds = generate_seeds_from_analysis(
+            analysis, llm_provider, llm_model,
+            cache_path=seed_cache,
+        )
+        log.info("LLM seeds: %d initial test states", len(llm_seeds))
+
+    # --- BUILD STRATEGY CONTEXT ---
     ctx = StrategyContext(
         module=module,
         context=None,  # Python-only mode
@@ -985,11 +1056,15 @@ def run_coverage(
         GuidedMutationStrategy(),
         MonteCarloStrategy(),
     ]
+
+    # Inject LLM seeds as a one-shot strategy (no per-round LLM calls)
+    if llm_seeds:
+        strategies.insert(0, _LLMSeedInjector(llm_seeds, stub_mapping))
+
+    # LLM selector for per-round strategy steering (optional)
     if llm_provider:
         strategies.extend([
-            LLMSeedStrategy(llm_provider, llm_model),
             LLMGapStrategy(llm_provider, llm_model),
-            IntentDrivenStrategy(llm_provider, llm_model),
         ])
 
     selector = (
