@@ -859,6 +859,7 @@ def run_coverage(
     ast_file: str | Path,
     *,
     copybook_dirs: list[str | Path] | None = None,
+    cobol_source: str | Path | None = None,
     budget: int = 5000,
     timeout: int | float = 600,
     store_path: str | Path | None = None,
@@ -870,8 +871,9 @@ def run_coverage(
 ) -> CobolCoverageReport:
     """Run coverage-guided test generation using Python execution only.
 
-    No COBOL source or GnuCOBOL required — executes the generated Python
-    module directly and uses the same strategy-based agentic loop.
+    No GnuCOBOL required — executes the generated Python module directly.
+    If *cobol_source* is provided, LLM strategies can read the COBOL source
+    to extract paragraph comments and generate business-scenario-aware inputs.
     """
     from .ast_parser import parse_ast
     from .code_generator import generate_code
@@ -949,6 +951,11 @@ def run_coverage(
     tc_count = len(existing_tcs)
 
     # --- BUILD STRATEGY CONTEXT ---
+    cobol_source_path = Path(cobol_source) if cobol_source else None
+    if cobol_source_path and not cobol_source_path.exists():
+        log.warning("COBOL source not found: %s (LLM strategies will skip)", cobol_source_path)
+        cobol_source_path = None
+
     ctx = StrategyContext(
         module=module,
         context=None,  # Python-only mode
@@ -964,6 +971,7 @@ def run_coverage(
         rng=rng,
         store_path=store_path,
         branch_meta=raw_branch_meta,
+        cobol_source_path=cobol_source_path,
     )
 
     # --- REGISTER STRATEGIES ---

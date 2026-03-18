@@ -779,9 +779,11 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"Synthesizing test set → {test_store_path} ...")
         print(f"  Budget: {budget} TCs, timeout {cov_timeout}s")
+        cobol_src = Path(args.cobol_source) if args.cobol_source else None
         cov_report = run_coverage(
             ast_file=ast_path,
             copybook_dirs=[Path(d) for d in args.copybook_dir],
+            cobol_source=cobol_src,
             budget=budget,
             timeout=cov_timeout,
             store_path=test_store_path,

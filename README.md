@@ -37,7 +37,7 @@ There are two modes: **Python-only** (from AST alone) and **GnuCOBOL hybrid** (A
 
 ### Python-only mode (`--synthesize`)
 
-Needs only the AST file. Generates a Python module internally and runs it via direct paragraph invocation (~1ms per trial):
+Needs the AST file. Optionally accepts `--cobol-source` so LLM strategies can read the COBOL source for paragraph comments and business context:
 
 ```bash
 # Basic: generate test store from AST
@@ -50,8 +50,10 @@ specter COACTUPC.cbl.ast --synthesize \
   --coverage-timeout 120 \
   --coverage-batch-size 500
 
-# LLM-assisted: use LLM to generate initial seeds and steer strategy selection
+# With COBOL source + LLM: extract comments, generate business-scenario seeds
 specter COACTUPC.cbl.ast --synthesize \
+  --cobol-source COACTUPC.cbl \
+  --copybook-dir ./copybooks \
   --test-store tests.jsonl \
   --llm-guided --llm-provider anthropic
 ```
