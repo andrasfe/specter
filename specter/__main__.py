@@ -290,8 +290,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--coverage-timeout",
-        type=int, default=600, metavar="N",
-        help="Max seconds for --cobol-coverage (default: 600)",
+        type=int, default=1800, metavar="N",
+        help="Max seconds for --cobol-coverage (default: 1800)",
     )
     parser.add_argument(
         "--coverage-rounds",
@@ -302,6 +302,11 @@ def main(argv: list[str] | None = None) -> int:
         "--coverage-batch-size",
         type=int, default=200, metavar="N",
         help="Cases per strategy round (default: 200)",
+    )
+    parser.add_argument(
+        "--strict-branch-coverage",
+        action="store_true",
+        help="Fail fast for --cobol-coverage when no branch probes are generated",
     )
 
     args = parser.parse_args(argv)
@@ -572,19 +577,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Budget: {args.coverage_budget} TCs, timeout {args.coverage_timeout}s")
         print(f"  Store:  {cov_store}")
 
-        cov_report = run_cobol_coverage(
-            ast_file=source_path,
-            cobol_source=cobol_path,
-            copybook_dirs=[Path(d) for d in args.copybook_dir],
-            budget=args.coverage_budget,
-            timeout=args.coverage_timeout,
-            store_path=cov_store,
-            seed=args.seed,
-            llm_provider=llm_provider_for_cov,
-            llm_model=args.llm_model,
-            max_rounds=args.coverage_rounds,
-            batch_size=args.coverage_batch_size,
-        )
+        try:
+            cov_report = run_cobol_coverage(
+                ast_file=source_path,
+                cobol_source=cobol_path,
+                copybook_dirs=[Path(d) for d in args.copybook_dir],
+                budget=args.coverage_budget,
+                timeout=args.coverage_timeout,
+                store_path=cov_store,
+                seed=args.seed,
+                llm_provider=llm_provider_for_cov,
+                llm_model=args.llm_model,
+                max_rounds=args.coverage_rounds,
+                batch_size=args.coverage_batch_size,
+                strict_branch_coverage=args.strict_branch_coverage,
+            )
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
         print()
         print(cov_report.summary())
         print(f"\nTest store: {cov_store}")

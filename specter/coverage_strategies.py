@@ -435,6 +435,8 @@ class DirectParagraphStrategy(Strategy):
 
     def __init__(self):
         self._round = 0  # 0=param, 1=stub, 2=dataflow, 3=frontier
+        self._llm_feedback: list[str] = []
+        self._llm_prev_branches: list[tuple[str, str]] = []  # (bkey, condition)
 
     def _fault_values_for_op(self, ctx, op_key: str) -> list:
         """Compute interesting fault values for a stub operation.
@@ -612,24 +614,34 @@ class DirectParagraphStrategy(Strategy):
                     if r < 0.4 and literals:
                         state[var] = ctx.rng.choice(literals)
                     elif r < 0.7:
-                        info = ctx.var_report.variables.get(var)
-                        if info and info.classification == "flag":
-                            state[var] = ctx.rng.choice(flag_vals)
-                        elif isinstance(ds.get(var), int):
-                            state[var] = ctx.rng.choice(int_vals)
+                        dom = ctx.domains.get(var)
+                        if dom:
+                            strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
+                            state[var] = generate_value(dom, strat, ctx.rng)
                         else:
-                            state[var] = ctx.rng.choice(str_vals)
-                # Random perturbation of a few extra vars
+                            info = ctx.var_report.variables.get(var)
+                            if info and info.classification == "flag":
+                                state[var] = ctx.rng.choice(flag_vals)
+                            elif isinstance(ds.get(var), int):
+                                state[var] = ctx.rng.choice(int_vals)
+                            else:
+                                state[var] = ctx.rng.choice(str_vals)
+                # Random perturbation of a few extra vars (domain-aware)
                 for _ in range(ctx.rng.randint(1, 8)):
                     if not var_list:
                         break
                     v = ctx.rng.choice(var_list)
                     if v not in cond_vars:
-                        dv = ds.get(v)
-                        if isinstance(dv, int):
-                            state[v] = ctx.rng.choice(int_vals)
-                        elif isinstance(dv, str):
-                            state[v] = ctx.rng.choice(str_vals)
+                        dom = ctx.domains.get(v)
+                        if dom:
+                            strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
+                            state[v] = generate_value(dom, strat, ctx.rng)
+                        else:
+                            dv = ds.get(v)
+                            if isinstance(dv, int):
+                                state[v] = ctx.rng.choice(int_vals)
+                            elif isinstance(dv, str):
+                                state[v] = ctx.rng.choice(str_vals)
 
                 yield state, stubs, defaults, f"direct:{para}|p:{trial}"
                 yielded += 1
@@ -1345,12 +1357,12 @@ class DirectParagraphStrategy(Strategy):
                         break  # found chain for this branch
 
     # ------------------------------------------------------------------
-    # LLM gap round: ask LLM about uncovered branches, then perturb
+    # LLM gap round: per-branch focused prompts with feedback
     # ------------------------------------------------------------------
 
     def _llm_gap_round(self, ctx, cov, batch_size, branch_meta) -> Iterator[CaseT]:
-        """Ask LLM to suggest inputs for uncovered branches, then hill-climb
-        around each suggestion via direct paragraph invocation."""
+        """Per-branch focused LLM prompts with semantic types, covered-direction
+        context, and multi-turn execution feedback."""
         if not ctx.llm_provider:
             yield from self._param_round(ctx, cov, batch_size, branch_meta)
             return
@@ -1362,10 +1374,22 @@ class DirectParagraphStrategy(Strategy):
         if not sorted_paras:
             return
 
-        # Build gap report: uncovered branches with conditions
-        gap_lines = []
-        for para in sorted_paras[:10]:  # top 10 paragraphs by gap
-            uncov = []
+        # --- Multi-turn feedback: check results of previous LLM round ---
+        if self._llm_prev_branches:
+            for bkey, cond in self._llm_prev_branches:
+                if bkey in cov.branches_hit:
+                    self._llm_feedback.append(f"SUCCESS: {bkey} was covered")
+                else:
+                    self._llm_feedback.append(
+                        f"STILL UNCOVERED: {bkey} (condition: {cond[:80]})"
+                    )
+            self._llm_prev_branches = []
+            # Keep only recent feedback to avoid prompt bloat
+            self._llm_feedback = self._llm_feedback[-15:]
+
+        # --- Collect the hardest uncovered branches ---
+        hard_branches: list[tuple[str, str, str, dict]] = []
+        for para in sorted_paras:
             for bid, meta in branch_meta.items():
                 if meta.get("paragraph") != para:
                     continue
@@ -1374,44 +1398,117 @@ class DirectParagraphStrategy(Strategy):
                     if bk not in cov.branches_hit:
                         cond = meta.get("condition", "")
                         if cond:
-                            uncov.append(f"    {bk}: {d}=={'TRUE' if d == 'T' else 'FALSE'} for: {cond}")
-            if uncov:
-                # Show best TC for this paragraph
-                tc = self._best_tc_for_para(cov, para)
-                tc_snippet = ""
-                if tc:
-                    ivars = tc.get("input_state", {})
-                    top_vars = list(ivars.items())[:5]
-                    tc_snippet = f"  Best TC: {dict(top_vars)}"
-                gap_lines.append(f"  {para} ({len(uncov)} uncovered):")
-                gap_lines.extend(uncov[:5])
-                if tc_snippet:
-                    gap_lines.append(tc_snippet)
+                            hard_branches.append((bid, d, para, meta))
 
-        if not gap_lines:
+        if not hard_branches:
             yield from self._param_round(ctx, cov, batch_size, branch_meta)
             return
 
-        # Build compact variable context
-        cond_vars = self._collect_cond_vars(branch_meta, sorted_paras[0], ctx)
-        var_hint_lines = []
-        for var, vals in list(cond_vars.items())[:15]:
-            var_hint_lines.append(f"  {var}: known values {vals[:6]}")
+        # --- Build per-branch focused prompts (top 5 branches) ---
+        branch_prompts: list[str] = []
+        targeted_branches: list[tuple[str, str]] = []
+
+        for bid, direction, para, meta in hard_branches[:5]:
+            cond = meta.get("condition", "")
+            need = "TRUE" if direction == "T" else "FALSE"
+            bkey = f"{bid}:{direction}"
+            targeted_branches.append((bkey, cond))
+
+            lines = [f"### Branch {bkey} in {para}"]
+            lines.append(f"Condition: {cond}")
+            lines.append(f"Need condition to be: {need}")
+
+            # --- Covered-direction context (Option C) ---
+            opp_dir = "F" if direction == "T" else "T"
+            opp_key = f"{bid}:{opp_dir}"
+            opp_tc = None
+            for tc in cov.test_cases:
+                if opp_key in tc.get("branches_hit", []):
+                    opp_tc = tc
+                    break
+
+            cond_vars = self._collect_cond_vars(branch_meta, para, ctx)
+
+            if opp_tc:
+                opp_need = "TRUE" if opp_dir == "T" else "FALSE"
+                lines.append(f"The {opp_need} direction IS already covered by TC with:")
+                opp_state = opp_tc.get("input_state", {})
+                shown = 0
+                for var in cond_vars:
+                    if var in opp_state and shown < 15:
+                        lines.append(f"  {var} = {repr(opp_state[var])}")
+                        shown += 1
+                lines.append(f"To get {need}, change the relevant values.")
+
+            # --- Variable semantic types and domains ---
+            if cond_vars:
+                lines.append("Variable details:")
+                for var in list(cond_vars)[:10]:
+                    dom = ctx.domains.get(var)
+                    if dom:
+                        parts = [f"  {var}: type={dom.data_type}"]
+                        if dom.semantic_type != "generic":
+                            parts.append(f"semantic={dom.semantic_type}")
+                        if dom.max_length > 0:
+                            parts.append(f"len={dom.max_length}")
+                        if dom.precision > 0:
+                            parts.append(f"precision={dom.precision}")
+                        if dom.min_value is not None:
+                            parts.append(f"range=[{dom.min_value},{dom.max_value}]")
+                        if dom.condition_literals:
+                            parts.append(f"known={dom.condition_literals[:6]}")
+                        if dom.valid_88_values:
+                            v88 = dict(list(dom.valid_88_values.items())[:4])
+                            parts.append(f"88_vals={v88}")
+                        lines.append(", ".join(parts))
+                    else:
+                        lines.append(f"  {var}: known_values={cond_vars[var][:6]}")
+
+            # --- Best TC with all condition-relevant vars ---
+            tc = self._best_tc_for_para(cov, para)
+            if tc:
+                lines.append("Best test case (condition-relevant vars):")
+                ivars = tc.get("input_state", {})
+                shown = 0
+                for var in cond_vars:
+                    if var in ivars and shown < 20:
+                        lines.append(f"  {var} = {repr(ivars[var])}")
+                        shown += 1
+                # A few extra important vars not in cond_vars
+                extra = 0
+                for var, val in ivars.items():
+                    if var not in cond_vars and extra < 5:
+                        lines.append(f"  {var} = {repr(val)}")
+                        extra += 1
+
+            branch_prompts.append("\n".join(lines))
+
+        # --- Build feedback section ---
+        feedback_section = ""
+        if self._llm_feedback:
+            feedback_section = "\n\nFeedback from previous attempts:\n" + "\n".join(
+                f"- {fb}" for fb in self._llm_feedback[-10:]
+            )
 
         prompt = f"""\
 You are a COBOL test engineer. We have {len(cov.branches_hit)}/{cov.total_branches} branches covered.
 
-These branches are still uncovered:
-{chr(10).join(gap_lines)}
+For each uncovered branch below, suggest input values that would flip the condition \
+to the needed direction. Reason about ONE branch at a time — what must each variable \
+be set to in order to satisfy (or negate) the specific condition shown.
 
-Key variables:
-{chr(10).join(var_hint_lines)}
+COBOL notes:
+- IS NUMERIC: true when field contains only digits (and optional sign/decimal point)
+- NUMVAL(X): converts alphanumeric string X to a number (e.g. NUMVAL('123.45') = 123.45)
+- SPACES = string of blanks, ZEROS = '0' characters (not numeric zero)
+- Status codes: '00' = success, '10' = EOF, '23' = not found
+- For a condition "X IS NOT NUMERIC" to be FALSE, X must contain only valid numeric chars
+{feedback_section}
 
-Suggest 5-8 test inputs that would flip these uncovered conditions.
-Focus on variable combinations that satisfy the specific conditions shown.
+{chr(10).join(branch_prompts)}
 
-Respond in YAML:
-- target: which branch/paragraph this targets
+For each branch, suggest 1-2 test inputs. Respond in YAML:
+- target: branch_id:direction in paragraph_name
   reasoning: why these values should flip the condition
   input_values:
     VARIABLE-NAME: value
@@ -1423,8 +1520,8 @@ Respond in YAML:
                 ctx.llm_provider, prompt, ctx.llm_model,
             )
             suggestions = _parse_yaml_seeds(response_text)
-            log.info("LLM gap: %d suggestions for %d uncovered paragraphs",
-                     len(suggestions), len(sorted_paras))
+            log.info("LLM gap: %d suggestions for %d hard branches",
+                     len(suggestions), min(len(hard_branches), 5))
         except Exception as e:
             log.warning("LLM gap query failed: %s", e)
             yield from self._param_round(ctx, cov, batch_size, branch_meta)
@@ -1434,15 +1531,14 @@ Respond in YAML:
             yield from self._param_round(ctx, cov, batch_size, branch_meta)
             return
 
-        # For each suggestion: yield the seed + perturbations
+        # Store targeted branches for feedback in next round
+        self._llm_prev_branches = targeted_branches
+
+        # --- For each suggestion: yield the seed + domain-aware perturbations ---
         yielded = 0
         default_state_fn = getattr(ctx.module, "_default_state", None)
         ds = default_state_fn() if default_state_fn else {}
         var_list = list(ds.keys())
-        str_vals = ["", " ", "Y", "N", "00", "04", "05", "10",
-                    "001", "002", "013", "019", "XX", "I", "T", "R"]
-        int_vals = [0, 1, -1, 99, 100, 999, -999, 1000000]
-        flag_vals = [True, False, "Y", "N", " ", "X"]
 
         perturbations_per = max(10, (batch_size - len(suggestions)) // max(len(suggestions), 1))
 
@@ -1455,7 +1551,6 @@ Respond in YAML:
             for var, val in seed_data.get("input_values", {}).items():
                 dom = ctx.domains.get(var.upper())
                 if dom:
-                    from .variable_domain import format_value_for_cobol
                     base_state[var.upper()] = format_value_for_cobol(dom, val)
                 else:
                     base_state[var.upper()] = str(val)
@@ -1474,57 +1569,70 @@ Respond in YAML:
 
             target = seed_data.get("target", "llm_gap")[:40]
 
+            # Determine target paragraph from suggestion
+            target_para = None
+            for para in sorted_paras:
+                if para.lower() in target.lower():
+                    target_para = para
+                    break
+            if not target_para:
+                target_para = sorted_paras[0]
+
             # Yield the raw LLM suggestion
-            # Pick the paragraph with most uncovered branches for direct invocation
-            best_para = sorted_paras[0] if sorted_paras else None
-            if best_para:
-                yield (base_state, stubs, defaults,
-                       f"direct:{best_para}|gap:{target}")
-            else:
-                yield base_state, stubs, defaults, f"gap:{target}"
+            yield (base_state, stubs, defaults,
+                   f"direct:{target_para}|gap:{target}")
             yielded += 1
 
-            # Hill-climb around the suggestion
+            # Hill-climb around the suggestion using domain-aware perturbation
             cond_vars_for_para = self._collect_cond_vars(
-                branch_meta, best_para, ctx) if best_para else {}
+                branch_meta, target_para, ctx)
 
             for trial in range(perturbations_per):
                 if yielded >= batch_size:
                     break
                 state = dict(base_state)
 
-                # Perturb condition variables
+                # Perturb condition variables (domain-aware)
                 for var, literals in cond_vars_for_para.items():
                     r = ctx.rng.random()
                     if r < 0.3 and literals:
                         state[var] = ctx.rng.choice(literals)
                     elif r < 0.5:
-                        info = ctx.var_report.variables.get(var)
-                        if info and info.classification == "flag":
-                            state[var] = ctx.rng.choice(flag_vals)
-                        elif isinstance(ds.get(var), int):
-                            state[var] = ctx.rng.choice(int_vals)
+                        dom = ctx.domains.get(var)
+                        if dom:
+                            strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
+                            state[var] = generate_value(dom, strat, ctx.rng)
                         else:
-                            state[var] = ctx.rng.choice(str_vals)
+                            info = ctx.var_report.variables.get(var)
+                            if info and info.classification == "flag":
+                                state[var] = ctx.rng.choice([True, False, "Y", "N", " ", "X"])
+                            elif isinstance(ds.get(var), int):
+                                state[var] = ctx.rng.choice([0, 1, -1, 99, 100, 999, -999, 1000000])
+                            else:
+                                state[var] = ctx.rng.choice(["", " ", "Y", "N", "00", "04", "05", "10",
+                                                              "001", "002", "013", "019", "XX", "I", "T", "R"])
                     # else: keep LLM's value (higher probability to preserve)
 
-                # Light random perturbation
+                # Light random perturbation (domain-aware)
                 for _ in range(ctx.rng.randint(1, 3)):
                     if not var_list:
                         break
                     v = ctx.rng.choice(var_list)
                     if v not in cond_vars_for_para:
-                        dv = ds.get(v)
-                        if isinstance(dv, int):
-                            state[v] = ctx.rng.choice(int_vals)
-                        elif isinstance(dv, str):
-                            state[v] = ctx.rng.choice(str_vals)
+                        dom = ctx.domains.get(v)
+                        if dom:
+                            strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
+                            state[v] = generate_value(dom, strat, ctx.rng)
+                        else:
+                            dv = ds.get(v)
+                            if isinstance(dv, int):
+                                state[v] = ctx.rng.choice([0, 1, -1, 99, 100, 999, -999, 1000000])
+                            elif isinstance(dv, str):
+                                state[v] = ctx.rng.choice(["", " ", "Y", "N", "00", "04", "05", "10",
+                                                            "001", "002", "013", "019", "XX", "I", "T", "R"])
 
-                if best_para:
-                    yield (state, stubs, defaults,
-                           f"direct:{best_para}|gap-perturb:{trial}")
-                else:
-                    yield state, stubs, defaults, f"gap-perturb:{trial}"
+                yield (state, stubs, defaults,
+                       f"direct:{target_para}|gap-perturb:{trial}")
                 yielded += 1
 
     # ------------------------------------------------------------------
