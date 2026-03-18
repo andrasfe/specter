@@ -183,8 +183,72 @@ Branch metadata is stored in `_BRANCH_META`, a module-level dict mapping each ab
 - **ZeroDivisionError catch**: COMPUTE/DIVIDE expressions with zero divisors set `_abended = True`
 - **PERFORM THRU**: executes all paragraphs in program order from target through thru-target
 
+## GnuCOBOL Coverage Mode
+
+When `--cobol-coverage` is used, the engine compiles and runs real COBOL via GnuCOBOL. This adds a second execution path alongside the Python simulation.
+
+### COBOL Instrumentation Pipeline
+
+```
+COBOL source + copybooks
+  → Phase 1-5:   COPY resolution, EXEC/IO/CALL replacement with mock reads
+  → Phase 6:     Paragraph tracing (DISPLAY 'SPECTER-TRACE:<para>')
+  → Phase 6b:    Branch tracing (DISPLAY '@@B:<id>:<direction>')
+  → Phase 7-10:  Mock infrastructure, linkage conversion, file handling
+  → Phase 11:    Common stubs (DFHAID, EIB fields, DFHRESP)
+  → Phase 12:    Auto-stub undefined symbols via cobc diagnostics
+  → Phase 12b:   Restore trace probes destroyed by Phase 12
+  → Phase 13:    ASCII normalization
+  → compile with cobc -x → executable
+```
+
+### Hybrid Execution
+
+The agentic loop uses two execution modes:
+
+| Target | Execution | Speed | Use case |
+|--------|-----------|-------|----------|
+| Full program | Python pre-run → COBOL binary | ~10-50ms | Baseline, fault injection, monte carlo |
+| Direct paragraph | Python only | ~0.01ms | DirectParagraphStrategy's 6 phases |
+
+Direct paragraph invocation can't run through COBOL (no way to enter mid-program), so it uses the Python simulation. Python branch IDs are prefixed with `py:` to avoid collision with COBOL `@@B:` IDs. Only COBOL branches count toward the reported coverage percentage.
+
+### CICS Coverage Mode
+
+CICS online programs use pseudo-conversational design (RECEIVE MAP → process → SEND MAP → RETURN). Three fixes enable deep coverage:
+
+1. **No-terminate mode**: `EXEC CICS RETURN/XCTL` replaced with mock-read + `CONTINUE` instead of `GO TO SPECTER-EXIT-PARA`
+2. **EIB stub initialization**: `EIBCALEN VALUE 100` and `EIBAID VALUE X'7D'` (DFHENTER) hardcoded in VALUE clauses so programs skip first-time initialization
+3. **EIBAID injection**: `CICS RECEIVE MAP` mock adds `MOVE MOCK-ALPHA-STATUS(1:1) TO EIBAID` so EVALUATE EIBAID branches are reachable
+
+### File I/O Mocking
+
+File READ/WRITE/OPEN/CLOSE verbs are replaced with sequential reads from a mock data file. Key mechanisms:
+
+- **File status propagation**: `FILE STATUS IS <var>` is extracted from SELECT clauses; after each mock read, `MOVE MOCK-ALPHA-STATUS TO <status-var>` is inserted so 88-level conditions evaluate correctly
+- **READ loop termination**: Stub outcomes for READ operations include 5 success records followed by EOF (status `'10'`), with EOF as the default, so PERFORM UNTIL loops terminate
+- **Mock record format**: 80-byte LINE SEQUENTIAL records: op-key `PIC X(30)` + alpha-status `PIC X(20)` + num-status `PIC S9(09)` (9 bytes) + filler `PIC X(21)`
+- **Padding**: 50 extra success records appended to prevent EOF when COBOL consumes more records than the Python pre-run predicted
+
+### Trace Probe Resilience
+
+Phase 12 (`_auto_stub_undefined_with_cobc`) neutralizes paragraphs with undefined symbols by replacing their bodies with `CONTINUE`. This destroys trace probes and branch probes. Phase 12b (`_restore_paragraph_tracing`) re-inserts `DISPLAY 'SPECTER-TRACE:<para>'` for any paragraph header missing one after all compilation fixes are done.
+
+### Results
+
+Tested on 14 CardDemo programs:
+
+| Category | Programs | Paragraph Coverage |
+|----------|----------|-------------------|
+| CICS online | 11 | **100%** (all 11) |
+| IMS batch | 1 (COPAUA0C) | **100%** (43/43) |
+| Batch file I/O | 3 (CBEXPORT, CBACT04C, CBTRN02C) | 52-73% |
+
+Branch coverage ranges 26-62% across all programs.
+
 ## Coverage Ceiling
 
 Some branch directions are structurally unreachable:
 - EVALUATE WHEN FALSE: only TRUE is instrumented per WHEN clause
 - Sub-paragraph state overwrite: branches depending on variables set by called sub-paragraphs may require specific execution ordering not achievable via direct invocation
+- Neutralized paragraph bodies: Phase 12 may comment out IF/EVALUATE structures in paragraphs with undefined external symbols (MQ, DLI), eliminating their branch probes
