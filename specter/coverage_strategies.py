@@ -971,6 +971,7 @@ class DirectParagraphStrategy(Strategy):
         default_state_fn = getattr(ctx.module, "_default_state", None)
         ds = default_state_fn() if default_state_fn else {}
         var_list = list(ds.keys())
+        # Fallback pools (used when no domain exists)
         str_vals = ["", " ", "Y", "N", "00", "04", "05", "10",
                     "001", "002", "013", "019", "XX", "I", "T", "R"]
         int_vals = [0, 1, -1, 99, 100, 999, -999, 1000000]
@@ -1023,29 +1024,40 @@ class DirectParagraphStrategy(Strategy):
 
             for trial in range(trials_per):
                 state = dict(base_state)
-                # Random perturbation (same as param round)
+                # Random perturbation (domain-aware)
                 for var, literals in cond_vars.items():
                     r = ctx.rng.random()
                     if r < 0.4 and literals:
                         state[var] = ctx.rng.choice(literals)
                     elif r < 0.7:
-                        info = ctx.var_report.variables.get(var)
-                        if info and info.classification == "flag":
-                            state[var] = ctx.rng.choice(flag_vals)
-                        elif isinstance(ds.get(var), int):
-                            state[var] = ctx.rng.choice(int_vals)
+                        dom = ctx.domains.get(var)
+                        if dom:
+                            strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
+                            state[var] = generate_value(dom, strat, ctx.rng)
                         else:
-                            state[var] = ctx.rng.choice(str_vals)
+                            info = ctx.var_report.variables.get(var)
+                            if info and info.classification == "flag":
+                                state[var] = ctx.rng.choice(flag_vals)
+                            elif isinstance(ds.get(var), int):
+                                state[var] = ctx.rng.choice(int_vals)
+                            else:
+                                state[var] = ctx.rng.choice(str_vals)
+                # Extra perturbation (domain-aware)
                 for _ in range(ctx.rng.randint(1, 8)):
                     if not var_list:
                         break
                     v = ctx.rng.choice(var_list)
                     if v not in cond_vars:
-                        dv = ds.get(v)
-                        if isinstance(dv, int):
-                            state[v] = ctx.rng.choice(int_vals)
-                        elif isinstance(dv, str):
-                            state[v] = ctx.rng.choice(str_vals)
+                        dom = ctx.domains.get(v)
+                        if dom:
+                            strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
+                            state[v] = generate_value(dom, strat, ctx.rng)
+                        else:
+                            dv = ds.get(v)
+                            if isinstance(dv, int):
+                                state[v] = ctx.rng.choice(int_vals)
+                            elif isinstance(dv, str):
+                                state[v] = ctx.rng.choice(str_vals)
 
                 # Build run state with stubs
                 run_state = dict(ds)
@@ -1481,6 +1493,20 @@ class DirectParagraphStrategy(Strategy):
                         lines.append(f"  {var} = {repr(val)}")
                         extra += 1
 
+            # --- Stub context: which external ops affect this branch's vars ---
+            stub_relevant = []
+            for op_key, svars in ctx.stub_mapping.items():
+                overlap = set(svars) & set(cond_vars)
+                if overlap:
+                    stub_relevant.append((op_key, svars, overlap))
+            if stub_relevant:
+                lines.append("Stub operations affecting this branch:")
+                for op_key, svars, overlap in stub_relevant:
+                    fault_vals = self._fault_values_for_op(ctx, op_key)[:8]
+                    lines.append(f"  {op_key} -> sets {svars}")
+                    lines.append(f"    Possible values: {fault_vals}")
+                    lines.append(f"    Condition vars affected: {sorted(overlap)}")
+
             branch_prompts.append("\n".join(lines))
 
         # --- Build feedback section ---
@@ -1490,19 +1516,32 @@ class DirectParagraphStrategy(Strategy):
                 f"- {fb}" for fb in self._llm_feedback[-10:]
             )
 
+        # --- Build stub operations summary ---
+        stub_summary_lines = []
+        if ctx.stub_mapping:
+            stub_summary_lines.append("Available stub operations (external calls that can be mocked):")
+            for op_key, svars in ctx.stub_mapping.items():
+                fault_vals = self._fault_values_for_op(ctx, op_key)[:6]
+                stub_summary_lines.append(f"  {op_key}: sets {svars}, values: {fault_vals}")
+        stub_summary = "\n".join(stub_summary_lines)
+
         prompt = f"""\
 You are a COBOL test engineer. We have {len(cov.branches_hit)}/{cov.total_branches} branches covered.
 
-For each uncovered branch below, suggest input values that would flip the condition \
-to the needed direction. Reason about ONE branch at a time — what must each variable \
-be set to in order to satisfy (or negate) the specific condition shown.
+For each uncovered branch below, suggest BOTH input values AND stub_overrides that \
+would flip the condition to the needed direction. Many branches depend on the return \
+status of external operations (EXEC CICS, CALL, EXEC DLI) — use stub_overrides to \
+control what these operations return.
 
 COBOL notes:
 - IS NUMERIC: true when field contains only digits (and optional sign/decimal point)
 - NUMVAL(X): converts alphanumeric string X to a number (e.g. NUMVAL('123.45') = 123.45)
 - SPACES = string of blanks, ZEROS = '0' characters (not numeric zero)
+- DFHRESP codes: 0=NORMAL, 13=NOTFND, 12=FILENOTFOUND, 22=LENGERR, 27=PGMIDERR
 - Status codes: '00' = success, '10' = EOF, '23' = not found
-- For a condition "X IS NOT NUMERIC" to be FALSE, X must contain only valid numeric chars
+- DLI status: '  '(spaces)=OK, 'GE'=segment not found, 'GB'=end of DB, 'II'=insert OK
+
+{stub_summary}
 {feedback_section}
 
 {chr(10).join(branch_prompts)}
@@ -1513,7 +1552,7 @@ For each branch, suggest 1-2 test inputs. Respond in YAML:
   input_values:
     VARIABLE-NAME: value
   stub_overrides:
-    OPERATION-KEY: status"""
+    OPERATION-KEY: status-value"""
 
         try:
             response_text, _tokens = _query_llm_sync(

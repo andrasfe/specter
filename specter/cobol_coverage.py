@@ -680,7 +680,8 @@ def run_cobol_coverage(
     # Generate Python module for pre-runs
     log.info("Generating Python module for pre-runs ...")
     import tempfile
-    code = generate_code(program, var_report, instrument=True)
+    code = generate_code(program, var_report, instrument=True,
+                         copybook_records=copybook_records)
     tmpdir = Path(tempfile.mkdtemp(prefix="specter_cov_"))
     py_path = tmpdir / f"{program.program_id}.py"
     py_path.write_text(code)
@@ -996,7 +997,8 @@ def run_coverage(
 
     # Generate + load instrumented Python module
     import tempfile
-    code = generate_code(program, var_report, instrument=True)
+    code = generate_code(program, var_report, instrument=True,
+                         copybook_records=copybook_records)
     tmpdir = Path(tempfile.mkdtemp(prefix="specter_cov_"))
     py_path = tmpdir / f"{program.program_id}.py"
     py_path.write_text(code)

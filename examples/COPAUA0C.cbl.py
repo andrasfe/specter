@@ -781,12 +781,18 @@ def para_5100_READ_XREF_RECORD(state):
         state._enter_para('5100-READ-XREF-RECORD')
         state['XREF-CARD-NUM'] = state.get('PA-RQ-CARD-NUM', '')
         _dummy_exec('CICS', 'EXEC CICS READ DATASET   (WS-CCXREF-FILE) INTO      (CARD-XREF-RECORD) LENGTH    (LENGTH OF CARD-XREF-RECORD) RIDFLD    (XREF-CARD-NUM) KEYLENGTH (LENGTH OF XREF-CARD-NUM) RESP      (WS-RESP-CD) RESP2...', state)
+        state['WS-RESP-CD'] = state.get('EIBRESP', 0)
+        state['WS-REAS-CD'] = state.get('EIBRESP2', 0)
         _eval_subject = state.get('WS-RESP-CD', '')
+        _eval_subject = _to_num(_eval_subject)
+        _eval_taken_10 = None
         if (_eval_subject == 0):
             state.get('_branches', set()).add(11)
+            _eval_taken_10 = 11
             state['CARD-FOUND-XREF'] = True
         elif (_eval_subject == 13):
             state.get('_branches', set()).add(12)
+            _eval_taken_10 = 12
             state['CARD-NFOUND-XREF'] = True
             state['NFOUND-ACCT-IN-MSTR'] = True
             state['ERR-LOCATION'] = 'A001'
@@ -797,6 +803,7 @@ def para_5100_READ_XREF_RECORD(state):
             para_9500_LOG_ERROR(state)
         else:
             state.get('_branches', set()).add(13)
+            _eval_taken_10 = 13
             state['ERR-LOCATION'] = 'C001'
             state['ERR-CRITICAL'] = True
             state['ERR-CICS'] = True
@@ -809,6 +816,9 @@ def para_5100_READ_XREF_RECORD(state):
             state['FILE'] = state.get('FAILED', '')
             state['ERR-EVENT-KEY'] = state.get('XREF-CARD-NUM', '')
             para_9500_LOG_ERROR(state)
+        for _bid in [11, 12, 13]:
+            if _bid != _eval_taken_10:
+                state.get('_branches', set()).add(-_bid)
     finally:
         state._exit_para('5100-READ-XREF-RECORD')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
@@ -840,12 +850,18 @@ def para_5200_READ_ACCT_RECORD(state):
         state._enter_para('5200-READ-ACCT-RECORD')
         state['WS-CARD-RID-ACCT-ID'] = state.get('XREF-ACCT-ID', '')
         _dummy_exec('CICS', 'EXEC CICS READ DATASET   (WS-ACCTFILENAME) RIDFLD    (WS-CARD-RID-ACCT-ID-X) KEYLENGTH (LENGTH OF WS-CARD-RID-ACCT-ID-X) INTO      (ACCOUNT-RECORD) LENGTH    (LENGTH OF ACCOUNT-RECORD) RESP      (WS-R...', state)
+        state['WS-RESP-CD'] = state.get('EIBRESP', 0)
+        state['WS-REAS-CD'] = state.get('EIBRESP2', 0)
         _eval_subject = state.get('WS-RESP-CD', '')
+        _eval_subject = _to_num(_eval_subject)
+        _eval_taken_13 = None
         if (_eval_subject == 0):
             state.get('_branches', set()).add(14)
+            _eval_taken_13 = 14
             state['FOUND-ACCT-IN-MSTR'] = True
         elif (_eval_subject == 13):
             state.get('_branches', set()).add(15)
+            _eval_taken_13 = 15
             state['NFOUND-ACCT-IN-MSTR'] = True
             state['ERR-LOCATION'] = 'A002'
             state['ERR-WARNING'] = True
@@ -855,6 +871,7 @@ def para_5200_READ_ACCT_RECORD(state):
             para_9500_LOG_ERROR(state)
         else:
             state.get('_branches', set()).add(16)
+            _eval_taken_13 = 16
             state['ERR-LOCATION'] = 'C002'
             state['ERR-CRITICAL'] = True
             state['ERR-CICS'] = True
@@ -867,6 +884,9 @@ def para_5200_READ_ACCT_RECORD(state):
             state['FILE'] = state.get('FAILED', '')
             state['ERR-EVENT-KEY'] = state.get('WS-CARD-RID-ACCT-ID-X', '')
             para_9500_LOG_ERROR(state)
+        for _bid in [14, 15, 16]:
+            if _bid != _eval_taken_13:
+                state.get('_branches', set()).add(-_bid)
     finally:
         state._exit_para('5200-READ-ACCT-RECORD')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
@@ -898,12 +918,18 @@ def para_5300_READ_CUST_RECORD(state):
         state._enter_para('5300-READ-CUST-RECORD')
         state['WS-CARD-RID-CUST-ID'] = state.get('XREF-CUST-ID', '')
         _dummy_exec('CICS', 'EXEC CICS READ DATASET   (WS-CUSTFILENAME) RIDFLD    (WS-CARD-RID-CUST-ID-X) KEYLENGTH (LENGTH OF WS-CARD-RID-CUST-ID-X) INTO      (CUSTOMER-RECORD) LENGTH    (LENGTH OF CUSTOMER-RECORD) RESP      (WS...', state)
+        state['WS-RESP-CD'] = state.get('EIBRESP', 0)
+        state['WS-REAS-CD'] = state.get('EIBRESP2', 0)
         _eval_subject = state.get('WS-RESP-CD', '')
+        _eval_subject = _to_num(_eval_subject)
+        _eval_taken_16 = None
         if (_eval_subject == 0):
             state.get('_branches', set()).add(17)
+            _eval_taken_16 = 17
             state['FOUND-CUST-IN-MSTR'] = True
         elif (_eval_subject == 13):
             state.get('_branches', set()).add(18)
+            _eval_taken_16 = 18
             state['NFOUND-CUST-IN-MSTR'] = True
             state['ERR-LOCATION'] = 'A003'
             state['ERR-WARNING'] = True
@@ -913,6 +939,7 @@ def para_5300_READ_CUST_RECORD(state):
             para_9500_LOG_ERROR(state)
         else:
             state.get('_branches', set()).add(19)
+            _eval_taken_16 = 19
             state['ERR-LOCATION'] = 'C003'
             state['ERR-CRITICAL'] = True
             state['ERR-CICS'] = True
@@ -925,6 +952,9 @@ def para_5300_READ_CUST_RECORD(state):
             state['FILE'] = state.get('FAILED', '')
             state['ERR-EVENT-KEY'] = state.get('WS-CARD-RID-CUST-ID', '')
             para_9500_LOG_ERROR(state)
+        for _bid in [17, 18, 19]:
+            if _bid != _eval_taken_16:
+                state.get('_branches', set()).add(-_bid)
     finally:
         state._exit_para('5300-READ-CUST-RECORD')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
@@ -957,14 +987,18 @@ def para_5500_READ_AUTH_SUMMRY(state):
         state['PA-ACCT-ID'] = state.get('XREF-ACCT-ID', '')
         _dummy_exec('DLI', 'EXEC DLI GU USING PCB(PAUT-PCB-NUM) SEGMENT (PAUTSUM0) INTO (PENDING-AUTH-SUMMARY) WHERE (ACCNTID = PA-ACCT-ID) END-EXEC', state)
         state['IMS-RETURN-CODE'] = state.get('DIBSTAT', '')
+        _eval_taken_19 = None
         if (state['STATUS-OK']):
             state.get('_branches', set()).add(20)
+            _eval_taken_19 = 20
             state['FOUND-PAUT-SMRY-SEG'] = True
         elif (state['SEGMENT-NOT-FOUND']):
             state.get('_branches', set()).add(21)
+            _eval_taken_19 = 21
             state['NFOUND-PAUT-SMRY-SEG'] = True
         else:
             state.get('_branches', set()).add(22)
+            _eval_taken_19 = 22
             state['ERR-LOCATION'] = 'I002'
             state['ERR-CRITICAL'] = True
             state['ERR-IMS'] = True
@@ -972,6 +1006,9 @@ def para_5500_READ_AUTH_SUMMRY(state):
             state['ERR-MESSAGE'] = 'IMS GET SUMMARY FAILED'
             state['ERR-EVENT-KEY'] = state.get('PA-CARD-NUM', '')
             para_9500_LOG_ERROR(state)
+        for _bid in [20, 21, 22]:
+            if _bid != _eval_taken_19:
+                state.get('_branches', set()).add(-_bid)
     finally:
         state._exit_para('5500-READ-AUTH-SUMMRY')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
@@ -1070,27 +1107,38 @@ def para_6000_MAKE_DECISION(state):
         state['PA-RL-AUTH-RESP-REASON'] = '0000'
         if state['AUTH-RESP-DECLINED']:
             state.get('_branches', set()).add(28)
+            _eval_taken_28 = None
             if (state['CARD-NFOUND-XREF']) or (state['NFOUND-ACCT-IN-MSTR']) or (state['NFOUND-CUST-IN-MSTR']):
                 state.get('_branches', set()).add(29)
+                _eval_taken_28 = 29
                 state['PA-RL-AUTH-RESP-REASON'] = '3100'
             elif (state['INSUFFICIENT-FUND']):
                 state.get('_branches', set()).add(30)
+                _eval_taken_28 = 30
                 state['PA-RL-AUTH-RESP-REASON'] = '4100'
             elif (state['CARD-NOT-ACTIVE']):
                 state.get('_branches', set()).add(31)
+                _eval_taken_28 = 31
                 state['PA-RL-AUTH-RESP-REASON'] = '4200'
             elif (state['ACCOUNT-CLOSED']):
                 state.get('_branches', set()).add(32)
+                _eval_taken_28 = 32
                 state['PA-RL-AUTH-RESP-REASON'] = '4300'
             elif (state['CARD-FRAUD']):
                 state.get('_branches', set()).add(33)
+                _eval_taken_28 = 33
                 state['PA-RL-AUTH-RESP-REASON'] = '5100'
             elif (state['MERCHANT-FRAUD']):
                 state.get('_branches', set()).add(34)
+                _eval_taken_28 = 34
                 state['PA-RL-AUTH-RESP-REASON'] = '5200'
             else:
                 state.get('_branches', set()).add(35)
+                _eval_taken_28 = 35
                 state['PA-RL-AUTH-RESP-REASON'] = '9000'
+            for _bid in [29, 30, 31, 32, 33, 34, 35]:
+                if _bid != _eval_taken_28:
+                    state.get('_branches', set()).add(-_bid)
         else:
             state.get('_branches', set()).add(-28)
         state['WS-APPROVED-AMT-DIS'] = state.get('WS-APPROVED-AMT', '')

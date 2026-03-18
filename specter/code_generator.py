@@ -221,6 +221,7 @@ class _CodeBuilder:
         self._branch_counter = 0
         self.branch_meta: dict[int, dict] = {}
         self.current_para: str = ""
+        self.siblings_88: dict[str, set[str]] = {}
 
     def next_branch_id(self) -> int:
         """Return a unique branch ID for instrumentation."""
@@ -719,7 +720,15 @@ def _gen_evaluate(cb: _CodeBuilder, stmt: Statement):
         for child in stmt.children:
             if child.type == "WHEN":
                 vt, io = parse_when_value(child.text)
-                if not io and re.match(r"^[+-]?\d+\.?\d*$", vt.strip()):
+                if io:
+                    continue
+                # Check raw text for numeric literal
+                if re.match(r"^[+-]?\d+\.?\d*$", vt.strip()):
+                    _has_numeric_when = True
+                    break
+                # Check resolved value (e.g. DFHRESP(NORMAL) → "0")
+                resolved = resolve_when_value(vt, False)
+                if re.match(r"^[+-]?\d+\.?\d*$", resolved.strip()):
                     _has_numeric_when = True
                     break
         if _has_numeric_when:
@@ -745,6 +754,11 @@ def _gen_evaluate(cb: _CodeBuilder, stmt: Statement):
     if current_group:
         groups.append(current_group)
 
+    # Use a unique ID for tracking which WHEN arm was taken (supports nesting)
+    eval_uid = cb._branch_counter  # snapshot before allocating bids
+    all_bids: list[int] = []
+    cb.line(f"_eval_taken_{eval_uid} = None")
+
     first_when = True
     for group in groups:
         owner = group[-1]
@@ -768,6 +782,7 @@ def _gen_evaluate(cb: _CodeBuilder, stmt: Statement):
 
         cb.indent()
         bid = cb.next_branch_id()
+        all_bids.append(bid)
         cond_label = " OR ".join(
             parse_when_value(wc.text)[0] for wc in group
         ) if not owner_is_other else "OTHER"
@@ -778,12 +793,23 @@ def _gen_evaluate(cb: _CodeBuilder, stmt: Statement):
             "subject": subject,
         }
         cb.line(f"state.get('_branches', set()).add({bid})")
+        cb.line(f"_eval_taken_{eval_uid} = {bid}")
         when_body = [c for c in owner.children if c.type != "WHEN"]
         if not when_body:
             cb.line("pass")
         else:
             for c in when_body:
                 _gen_statement(cb, c)
+        cb.dedent()
+
+    # Emit negative branch probes for non-taken WHEN arms
+    if all_bids:
+        cb.line(f"for _bid in {all_bids}:")
+        cb.indent()
+        cb.line(f"if _bid != _eval_taken_{eval_uid}:")
+        cb.indent()
+        cb.line(f"state.get('_branches', set()).add(-_bid)")
+        cb.dedent()
         cb.dedent()
 
 
@@ -999,6 +1025,9 @@ def _gen_set(cb: _CodeBuilder, stmt: Statement):
     if m:
         varname = m.group(1).upper()
         cb.line(f"state['{varname}'] = True")
+        # Clear 88-level siblings (mutual exclusivity)
+        for sibling in sorted(cb.siblings_88.get(varname, ())):
+            cb.line(f"state['{sibling}'] = False")
         return
     m = re.search(rf"SET\s+({_VN})\s+TO\s+FALSE", stmt.text, re.IGNORECASE)
     if m:
@@ -1072,6 +1101,14 @@ def _gen_exec(cb: _CodeBuilder, stmt: Statement, kind: str):
     if len(escaped) > 200:
         escaped = escaped[:200] + "..."
     cb.line(f"_dummy_exec('{kind}', '{escaped}', state)")
+    # For EXEC CICS: RESP(var) means var receives EIBRESP value after the call
+    if kind == "CICS":
+        m = re.search(r'\bRESP\s*\(\s*([A-Z][A-Z0-9-]*)\s*\)', raw, re.IGNORECASE)
+        if m:
+            cb.line(f"state['{m.group(1).upper()}'] = state.get('EIBRESP', 0)")
+        m2 = re.search(r'\bRESP2\s*\(\s*([A-Z][A-Z0-9-]*)\s*\)', raw, re.IGNORECASE)
+        if m2:
+            cb.line(f"state['{m2.group(1).upper()}'] = state.get('EIBRESP2', 0)")
 
 
 def _gen_initialize(cb: _CodeBuilder, stmt: Statement):
@@ -1650,6 +1687,7 @@ def generate_code(
     program: Program,
     var_report: VariableReport | None = None,
     instrument: bool = False,
+    copybook_records=None,
 ) -> str:
     """Generate a standalone Python module from a COBOL Program AST.
 
@@ -1657,6 +1695,7 @@ def generate_code(
         program: Parsed COBOL program AST.
         var_report: Optional variable report (extracted if not given).
         instrument: If True, emit instrumented state tracking code.
+        copybook_records: Optional list of CopybookRecord for 88-level sibling info.
 
     Returns the complete Python source code as a string.
     """
@@ -1667,6 +1706,44 @@ def generate_code(
     _PARAGRAPH_ORDER = [p.name for p in program.paragraphs]
 
     cb = _CodeBuilder()
+
+    # Build 88-level siblings map from copybook records
+    if copybook_records:
+        for rec in copybook_records:
+            for fld in rec.fields:
+                if fld.values_88:
+                    names = {n.upper() for n in fld.values_88.keys()}
+                    for name in names:
+                        cb.siblings_88[name] = names - {name}
+
+    # Heuristic: infer 88-level siblings from FOUND/NFOUND naming convention
+    # when copybooks don't provide the info.  Collect all SET-TO-TRUE targets
+    # and pair FOUND-X with NFOUND-X (and X-FOUND-Y with X-NFOUND-Y).
+    if not cb.siblings_88:
+        set_true_vars: set[str] = set()
+        def _collect_set_true(s: Statement):
+            if s.type == "SET" and re.search(r"SET\s+\S+\s+TO\s+TRUE", s.text, re.IGNORECASE):
+                m = re.search(r"SET\s+([A-Z0-9][A-Z0-9-]*)\s+TO\s+TRUE", s.text, re.IGNORECASE)
+                if m:
+                    set_true_vars.add(m.group(1).upper())
+            for c in s.children:
+                _collect_set_true(c)
+        for para in program.paragraphs:
+            for stmt in para.statements:
+                _collect_set_true(stmt)
+
+        # Match FOUND/NFOUND pairs
+        for var in set_true_vars:
+            # Try replacing NFOUND with FOUND and vice versa
+            if "NFOUND" in var:
+                partner = var.replace("NFOUND", "FOUND", 1)
+            elif "FOUND" in var:
+                partner = var.replace("FOUND", "NFOUND", 1)
+            else:
+                continue
+            if partner in set_true_vars:
+                cb.siblings_88.setdefault(var, set()).add(partner)
+                cb.siblings_88.setdefault(partner, set()).add(var)
 
     # Module docstring
     cb.line(f'"""Generated Python from COBOL program {program.program_id}.')

@@ -434,6 +434,16 @@ def extract_stub_status_mapping(
                 op_key = "SQL"
             elif stmt.type == "EXEC_CICS":
                 op_key = "CICS"
+                # Extract RESP/RESP2 variables directly from EXEC text
+                raw_text = stmt.attributes.get("raw_text", "") or stmt.text
+                resp_vars = re.findall(
+                    r'\bRESP2?\s*\(\s*([A-Z][A-Z0-9-]*)\s*\)',
+                    raw_text, re.IGNORECASE,
+                )
+                for rv in resp_vars:
+                    upper_rv = rv.upper()
+                    if upper_rv not in mapping.get(op_key, []):
+                        mapping.setdefault(op_key, []).append(upper_rv)
             elif stmt.type == "EXEC_DLI":
                 op_key = "DLI"
             elif stmt.type == "CALL":
