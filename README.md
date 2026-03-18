@@ -31,11 +31,15 @@ See [JAVAGEN.md](JAVAGEN.md) for full details on the Java generation approach, t
 
 ## Test Synthesis
 
-The `--synthesize` flag builds a minimal set of test cases targeting maximum code coverage:
+The `--synthesize` flag runs a strategy-based coverage engine that generates test cases targeting maximum branch coverage. It uses direct paragraph invocation and rotates through six phases — parameter hill-climbing, stub fault sweeps, dataflow backpropagation, frontier expansion, rainbow-table harvest, and on-the-fly inverse function synthesis. See [ALGO.md](ALGO.md) for details.
 
 ```bash
 # Single program: generate test store
 specter program.ast --synthesize --test-store tests.jsonl
+
+# With tuning: higher batch size for more trials per round
+specter program.ast --synthesize --test-store tests.jsonl \
+  --coverage-budget 50000 --coverage-timeout 120 --coverage-batch-size 500
 
 # Then use it for Java generation
 specter program.ast --java --test-store tests.jsonl -o output/
@@ -45,8 +49,7 @@ specter --multi --java --synthesize \
   COSGN00C.cbl.ast COMEN01C.cbl.ast COACTUPC.cbl.ast \
   -o carddemo/ \
   --analysis-output carddemo/test-data \
-  --synthesis-layers 7 \
-  --synthesis-timeout 300
+  --coverage-timeout 300
 
 # Exclude sensitive values from generated test data
 specter --multi --java --synthesize \
@@ -55,7 +58,7 @@ specter --multi --java --synthesize \
 
 Multi-program synthesis generates per-program JSONL test stores, a combined `tests.catalog.md` documenting every paragraph's test coverage, and JUnit 5 parameterized test classes with the stores as test resources.
 
-Each test case is a complete execution spec: input variables + mock orchestration for all external interactions (SQL results, CICS EIBRESP codes, file status codes). The synthesis engine uses seven layers — from deterministic constraint solving to targeted mutation walks and random exploration.
+Each test case is a complete execution spec: input variables + mock orchestration for all external interactions (SQL results, CICS EIBRESP codes, file status codes).
 
 ## Analysis Modes
 
