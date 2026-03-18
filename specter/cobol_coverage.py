@@ -261,14 +261,16 @@ def _python_execute(
     except Exception as exc:
         return CobolTestResult(error=f"{type(exc).__name__}: {exc}")
 
-    # Convert integer branches to "bid:T"/"bid:F" string format
+    # Convert integer branches to "py:<bid>:T"/"py:<bid>:F" string format.
+    # The "py:" prefix prevents collision with COBOL branch IDs (@@B:)
+    # since the two numbering schemes are independent.
     raw_branches = rs.get("_branches", set())
     branches_hit: set[str] = set()
     for b in raw_branches:
         if b > 0:
-            branches_hit.add(f"{b}:T")
+            branches_hit.add(f"py:{b}:T")
         elif b < 0:
-            branches_hit.add(f"{abs(b)}:F")
+            branches_hit.add(f"py:{abs(b)}:F")
 
     trace = rs.get("_trace", [])
     paragraphs_hit = list(dict.fromkeys(trace))
@@ -462,9 +464,19 @@ def _execute_and_save(
         direct_para = target[7:].split("|", 1)[0]
 
     if ctx.context is not None:
-        # COBOL execution path: pre-run Python for stub ordering, then COBOL
-        stub_log = _python_pre_run(ctx.module, input_state, stub_outcomes, stub_defaults)
-        result = run_test_case(ctx.context, input_state, stub_log)
+        if direct_para:
+            # Direct paragraph invocation: use Python for speed, COBOL can't
+            # invoke individual paragraphs.  Python execution still gives
+            # valid branch coverage from the generated module.
+            result = _python_execute(
+                ctx.module, input_state, stub_outcomes, stub_defaults,
+                paragraph=direct_para,
+            )
+            stub_log = []
+        else:
+            # Full program: pre-run Python for stub ordering, then COBOL
+            stub_log = _python_pre_run(ctx.module, input_state, stub_outcomes, stub_defaults)
+            result = run_test_case(ctx.context, input_state, stub_log)
     else:
         # Python-only execution path
         result = _python_execute(
@@ -801,12 +813,15 @@ def _run_agentic_loop(
     elapsed = time.time() - start_time
     report.total_test_cases = tc_count
     report.paragraphs_hit = len(cov.paragraphs_hit)
-    report.branches_hit = len(cov.branches_hit)
+    # Only count COBOL-mode branches (not py:-prefixed Python branches)
+    # toward the reported coverage since total_branches is from COBOL probes.
+    cobol_branches = {b for b in cov.branches_hit if not b.startswith("py:")}
+    report.branches_hit = len(cobol_branches)
     report.elapsed_seconds = elapsed
     if cov.total_paragraphs > 0:
         report.paragraph_coverage = len(cov.paragraphs_hit) / cov.total_paragraphs
     if cov.total_branches > 0:
-        report.branch_coverage = len(cov.branches_hit) / cov.total_branches
+        report.branch_coverage = len(cobol_branches) / cov.total_branches
 
     log.info("Coverage complete: %s", report.summary())
     return report
