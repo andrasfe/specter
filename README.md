@@ -31,20 +31,54 @@ See [JAVAGEN.md](JAVAGEN.md) for full details on the Java generation approach, t
 
 ## Test Synthesis
 
-The `--synthesize` flag runs a strategy-based coverage engine that generates test cases targeting maximum branch coverage. It uses direct paragraph invocation and rotates through six phases — parameter hill-climbing, stub fault sweeps, dataflow backpropagation, frontier expansion, rainbow-table harvest, and on-the-fly inverse function synthesis. See [ALGO.md](ALGO.md) for details.
+Specter generates test cases targeting maximum branch coverage using a strategy-based engine that rotates through six phases — parameter hill-climbing, stub fault sweeps, dataflow backpropagation, frontier expansion, rainbow-table harvest, and on-the-fly inverse function synthesis. See [ALGO.md](ALGO.md) for details.
+
+There are two modes: **Python-only** (from AST alone) and **GnuCOBOL hybrid** (AST + COBOL source).
+
+### Python-only mode (`--synthesize`)
+
+Needs only the AST file. Generates a Python module internally and runs it via direct paragraph invocation (~1ms per trial):
 
 ```bash
-# Single program: generate test store
-specter program.ast --synthesize --test-store tests.jsonl
+# Basic: generate test store from AST
+specter COACTUPC.cbl.ast --synthesize --test-store tests.jsonl
 
-# With tuning: higher batch size for more trials per round
-specter program.ast --synthesize --test-store tests.jsonl \
-  --coverage-budget 50000 --coverage-timeout 120 --coverage-batch-size 500
+# With tuning: more trials per round (25x batch = more hill-climbing)
+specter COACTUPC.cbl.ast --synthesize \
+  --test-store tests.jsonl \
+  --coverage-budget 50000 \
+  --coverage-timeout 120 \
+  --coverage-batch-size 500
 
-# Then use it for Java generation
-specter program.ast --java --test-store tests.jsonl -o output/
+# LLM-assisted: use LLM to generate initial seeds and steer strategy selection
+specter COACTUPC.cbl.ast --synthesize \
+  --test-store tests.jsonl \
+  --llm-guided --llm-provider anthropic
+```
 
-# Multi-program: synthesize + generate Java project with per-program tests + catalog
+### GnuCOBOL hybrid mode (`--cobol-coverage`)
+
+Needs AST + COBOL source + copybook directories. Instruments and compiles real COBOL, then cross-validates with the Python simulation:
+
+```bash
+# Full pipeline: AST + COBOL source + copybooks
+specter COACTUPC.cbl.ast --cobol-coverage \
+  --cobol-source COACTUPC.cbl \
+  --copybook-dir ./copybooks \
+  --test-store tests.jsonl \
+  --coverage-budget 5000 \
+  --coverage-timeout 300 \
+  --coverage-batch-size 500
+```
+
+### Using test stores for Java generation
+
+```bash
+# Generate test store, then build Java project from it
+specter COACTUPC.cbl.ast --synthesize --test-store tests.jsonl
+specter COACTUPC.cbl.ast --java --test-store tests.jsonl -o output/
+
+# Multi-program: synthesize + generate Java project with per-program tests
 specter --multi --java --synthesize \
   COSGN00C.cbl.ast COMEN01C.cbl.ast COACTUPC.cbl.ast \
   -o carddemo/ \
@@ -56,9 +90,18 @@ specter --multi --java --synthesize \
   *.ast -o output/ --exclude-values excluded.txt
 ```
 
-Multi-program synthesis generates per-program JSONL test stores, a combined `tests.catalog.md` documenting every paragraph's test coverage, and JUnit 5 parameterized test classes with the stores as test resources.
+Each test case is a complete execution spec: input variables + mock orchestration for all external interactions (SQL results, CICS EIBRESP codes, file status codes). Multi-program synthesis generates per-program JSONL test stores, a combined `tests.catalog.md`, and JUnit 5 parameterized test classes.
 
-Each test case is a complete execution spec: input variables + mock orchestration for all external interactions (SQL results, CICS EIBRESP codes, file status codes).
+### Tuning parameters
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--coverage-budget N` | 5000 | Max test cases to generate |
+| `--coverage-timeout N` | 600 | Max seconds |
+| `--coverage-batch-size N` | 200 | Cases per strategy round (DirectParagraph gets 25x this) |
+| `--coverage-rounds N` | 0 (unlimited) | Max strategy rounds |
+
+Higher `--coverage-batch-size` means more hill-climbing trials per paragraph per round. Values of 200-500 work well; the engine scales automatically.
 
 ## Analysis Modes
 
