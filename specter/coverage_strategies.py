@@ -2050,12 +2050,16 @@ class LLMSelector(StrategySelector):
     """Consults LLM periodically, falls back to HeuristicSelector."""
 
     def __init__(self, llm_provider, llm_model: str | None = None,
-                 consult_interval: int = 5, default_batch_size: int = 200):
+                 consult_interval: int = 5, default_batch_size: int = 200,
+                 var_report: VariableReport | None = None):
         self.llm_provider = llm_provider
         self.llm_model = llm_model
         self.consult_interval = consult_interval
+        self.var_report = var_report
         self._heuristic = HeuristicSelector(default_batch_size)
         self._last_llm_round = -1
+        self._profiles_initialized = False
+        self._semantic_profiles: dict = {}
 
     def select(self, strategies, cov, round_num):
         if (round_num > 0
@@ -2069,7 +2073,12 @@ class LLMSelector(StrategySelector):
         return self._heuristic.select(strategies, cov, round_num)
 
     def _consult_llm(self, strategies, cov, round_num):
-        from .llm_fuzzer import SessionMemory, StrategyResult, get_strategy_decision
+        from .llm_fuzzer import (
+            SessionMemory,
+            StrategyResult,
+            get_strategy_decision,
+            infer_variable_semantics,
+        )
 
         memory = SessionMemory()
         for sname, syield in cov.strategy_yields.items():
@@ -2079,13 +2088,30 @@ class LLMSelector(StrategySelector):
                 new_branches=0, new_edges=0, errors=0,
             ))
 
+        if not self._profiles_initialized:
+            self._profiles_initialized = True
+            if self.var_report is not None and self.var_report.variables:
+                try:
+                    self._semantic_profiles = infer_variable_semantics(
+                        self.llm_provider, self.var_report, model=self.llm_model,
+                    )
+                except Exception as e:
+                    log.warning("LLM selector profile inference failed: %s", e)
+                    self._semantic_profiles = {}
+        if self._semantic_profiles:
+            memory.semantic_profiles.update(self._semantic_profiles)
+
+        var_report = self.var_report
+        if var_report is None:
+            var_report = type("VarReport", (), {"variables": {}})()
+
         frontier: set[str] = set()
         try:
             decision = get_strategy_decision(
                 self.llm_provider, memory, cov.paragraphs_hit,
                 cov.all_paragraphs, frontier, cov.total_branches,
                 len(cov.branches_hit),
-                type("VarReport", (), {"variables": {}})(),
+                var_report,
                 model=self.llm_model,
             )
         except Exception as e:

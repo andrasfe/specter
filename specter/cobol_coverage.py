@@ -76,6 +76,7 @@ class CoverageState:
     """Tracks cumulative coverage across all test cases."""
 
     paragraphs_hit: set[str] = field(default_factory=set)
+    runtime_only_paragraphs: set[str] = field(default_factory=set)
     branches_hit: set[str] = field(default_factory=set)
     total_paragraphs: int = 0
     total_branches: int = 0
@@ -99,6 +100,8 @@ class CobolCoverageReport:
     branches_hit: int = 0
     branches_total: int = 0
     elapsed_seconds: float = 0.0
+    runtime_trace_total: int = 0
+    runtime_only_paragraphs: int = 0
     layer_stats: dict[str, int] = field(default_factory=dict)
 
     def summary(self) -> str:
@@ -107,6 +110,8 @@ class CobolCoverageReport:
             f"  Test cases:  {self.total_test_cases}",
             f"  Paragraphs:  {self.paragraphs_hit}/{self.paragraphs_total} "
             f"({self.paragraph_coverage:.1%})",
+            f"  Runtime paragraph labels: {self.runtime_trace_total} "
+            f"(runtime-only: {self.runtime_only_paragraphs})",
             f"  Branches:    {self.branches_hit}/{self.branches_total} "
             f"({self.branch_coverage:.1%})",
             f"  Time:        {self.elapsed_seconds:.1f}s",
@@ -551,17 +556,29 @@ def _execute_and_save(
     if result.error:
         return False, tc_count
 
+    # Normalize paragraph coverage to AST-known labels. Keep runtime-only labels
+    # in a side channel for diagnostics/reporting.
+    result_paras = set(result.paragraphs_hit)
+    if cov.all_paragraphs:
+        result_ast_paras = result_paras & cov.all_paragraphs
+        result_runtime_only = result_paras - cov.all_paragraphs
+    else:
+        result_ast_paras = result_paras
+        result_runtime_only = set()
+
     # Check for new coverage
-    new_paras = set(result.paragraphs_hit) - cov.paragraphs_hit
+    new_paras = result_ast_paras - cov.paragraphs_hit
+    new_runtime_only = result_runtime_only - cov.runtime_only_paragraphs
     new_branches = result.branches_hit - cov.branches_hit
 
     # Always save first few test cases; after that, only if new coverage
     force_save = tc_count < 5
-    if not new_paras and not new_branches and not force_save:
+    if not new_paras and not new_branches and not new_runtime_only and not force_save:
         return False, tc_count
 
     # Update coverage
-    cov.paragraphs_hit.update(result.paragraphs_hit)
+    cov.paragraphs_hit.update(result_ast_paras)
+    cov.runtime_only_paragraphs.update(result_runtime_only)
     cov.branches_hit.update(result.branches_hit)
 
     # Save
@@ -592,6 +609,9 @@ def _execute_and_save(
         log.info("  [%s] +%d branches -> %d/%d",
                  strategy_name, len(new_branches), len(cov.branches_hit),
                  cov.total_branches)
+    if new_runtime_only:
+        log.info("  [%s] +%d runtime-only paras (not in AST)",
+                 strategy_name, len(new_runtime_only))
     return True, tc_count
 
 
@@ -709,12 +729,15 @@ def run_cobol_coverage(
     success_stubs, success_defaults = _build_success_stubs(stub_mapping, domains)
 
     all_paras = {p.name for p in program.paragraphs}
+    existing_ast_paras = existing_paras & all_paras
+    existing_runtime_only = existing_paras - all_paras
 
     # Coverage state
     cov = CoverageState(
-        paragraphs_hit=existing_paras,
+        paragraphs_hit=existing_ast_paras,
+        runtime_only_paragraphs=existing_runtime_only,
         branches_hit=existing_branches,
-        total_paragraphs=context.total_paragraphs,
+        total_paragraphs=len(all_paras),
         total_branches=context.total_branches,
         test_cases=existing_tcs,
         all_paragraphs=all_paras,
@@ -722,13 +745,16 @@ def run_cobol_coverage(
     )
     report = CobolCoverageReport(
         total_test_cases=len(existing_tcs),
-        paragraphs_total=context.total_paragraphs,
+        paragraphs_total=len(all_paras),
+        runtime_trace_total=context.total_paragraphs,
+        runtime_only_paragraphs=len(existing_runtime_only),
         branches_total=context.total_branches,
     )
 
     if existing_tcs:
-        log.info("Loaded %d existing TCs: %d paras, %d branches covered",
-                 len(existing_tcs), len(existing_paras), len(existing_branches))
+        log.info("Loaded %d existing TCs: %d AST paras, %d runtime-only paras, %d branches covered",
+                 len(existing_tcs), len(existing_ast_paras), len(existing_runtime_only),
+                 len(existing_branches))
 
     tc_count = len(existing_tcs)
 
@@ -773,7 +799,8 @@ def run_cobol_coverage(
 
     selector = (
         LLMSelector(llm_provider, llm_model,
-                     default_batch_size=batch_size)
+                     default_batch_size=batch_size,
+                     var_report=var_report)
         if llm_provider
         else HeuristicSelector(default_batch_size=batch_size)
     )
@@ -883,6 +910,7 @@ def _run_agentic_loop(
     elapsed = time.time() - start_time
     report.total_test_cases = tc_count
     report.paragraphs_hit = len(cov.paragraphs_hit)
+    report.runtime_only_paragraphs = len(cov.runtime_only_paragraphs)
     # In COBOL mode, only count COBOL branches (not py:-prefixed Python ones).
     # In Python-only mode (ctx.context is None), all branches count.
     if ctx.context is not None:
@@ -977,9 +1005,13 @@ def run_coverage(
     # Build success stubs
     success_stubs, success_defaults = _build_success_stubs(stub_mapping, domains)
 
+    existing_ast_paras = existing_paras & all_paras
+    existing_runtime_only = existing_paras - all_paras
+
     # Coverage state
     cov = CoverageState(
-        paragraphs_hit=existing_paras,
+        paragraphs_hit=existing_ast_paras,
+        runtime_only_paragraphs=existing_runtime_only,
         branches_hit=existing_branches,
         total_paragraphs=total_paragraphs,
         total_branches=total_branches,
@@ -990,12 +1022,15 @@ def run_coverage(
     report = CobolCoverageReport(
         total_test_cases=len(existing_tcs),
         paragraphs_total=total_paragraphs,
+        runtime_trace_total=total_paragraphs,
+        runtime_only_paragraphs=len(existing_runtime_only),
         branches_total=total_branches,
     )
 
     if existing_tcs:
-        log.info("Loaded %d existing TCs: %d paras, %d branches covered",
-                 len(existing_tcs), len(existing_paras), len(existing_branches))
+        log.info("Loaded %d existing TCs: %d AST paras, %d runtime-only paras, %d branches covered",
+                 len(existing_tcs), len(existing_ast_paras), len(existing_runtime_only),
+                 len(existing_branches))
 
     tc_count = len(existing_tcs)
 
@@ -1076,7 +1111,8 @@ def run_coverage(
 
     selector = (
         LLMSelector(llm_provider, llm_model,
-                     default_batch_size=batch_size)
+                     default_batch_size=batch_size,
+                     var_report=var_report)
         if llm_provider
         else HeuristicSelector(default_batch_size=batch_size)
     )
