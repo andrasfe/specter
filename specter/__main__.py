@@ -293,6 +293,16 @@ def main(argv: list[str] | None = None) -> int:
         type=int, default=600, metavar="N",
         help="Max seconds for --cobol-coverage (default: 600)",
     )
+    parser.add_argument(
+        "--coverage-rounds",
+        type=int, default=0, metavar="N",
+        help="Max strategy rounds for coverage loop (default: 0 = unlimited)",
+    )
+    parser.add_argument(
+        "--coverage-batch-size",
+        type=int, default=200, metavar="N",
+        help="Cases per strategy round (default: 200)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -402,6 +412,8 @@ def main(argv: list[str] | None = None) -> int:
                         seed=args.seed,
                         llm_provider=llm_provider_for_synth,
                         llm_model=args.llm_model,
+                        max_rounds=args.coverage_rounds,
+                        batch_size=args.coverage_batch_size,
                     )
                     print(cov_report.summary())
                     per_program_stores[program_id] = str(store_path)
@@ -570,6 +582,8 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             llm_provider=llm_provider_for_cov,
             llm_model=args.llm_model,
+            max_rounds=args.coverage_rounds,
+            batch_size=args.coverage_batch_size,
         )
         print()
         print(cov_report.summary())
@@ -774,6 +788,8 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             llm_provider=llm_provider_for_synth,
             llm_model=args.llm_model,
+            max_rounds=args.coverage_rounds,
+            batch_size=args.coverage_batch_size,
         )
         print()
         print(cov_report.summary())

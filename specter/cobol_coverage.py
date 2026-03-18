@@ -535,6 +535,8 @@ def run_cobol_coverage(
     work_dir: str | Path | None = None,
     llm_provider=None,
     llm_model: str | None = None,
+    max_rounds: int = 0,
+    batch_size: int = 200,
 ) -> CobolCoverageReport:
     """Run coverage-guided test generation against real COBOL.
 
@@ -688,14 +690,16 @@ def run_cobol_coverage(
         ])
 
     selector = (
-        LLMSelector(llm_provider, llm_model)
+        LLMSelector(llm_provider, llm_model,
+                     default_batch_size=batch_size)
         if llm_provider
-        else HeuristicSelector()
+        else HeuristicSelector(default_batch_size=batch_size)
     )
 
     return _run_agentic_loop(
         ctx, cov, report, strategies, selector,
         budget, timeout, start_time, tc_count,
+        max_rounds=max_rounds,
     )
 
 
@@ -713,6 +717,7 @@ def _run_agentic_loop(
     timeout: int | float,
     start_time: float,
     tc_count: int,
+    max_rounds: int = 0,
 ) -> CobolCoverageReport:
     """Run the strategy-based agentic coverage loop.
 
@@ -720,6 +725,9 @@ def _run_agentic_loop(
     """
     round_num = 0
     while tc_count < budget and (time.time() - start_time) < timeout:
+        if max_rounds > 0 and round_num >= max_rounds:
+            log.info("Max rounds (%d) reached", max_rounds)
+            break
         strategy, batch_size = selector.select(strategies, cov, round_num)
         round_new = 0
         round_cov_before = len(cov.paragraphs_hit) + len(cov.branches_hit)
@@ -818,6 +826,8 @@ def run_coverage(
     seed: int = 42,
     llm_provider=None,
     llm_model: str | None = None,
+    max_rounds: int = 0,
+    batch_size: int = 200,
 ) -> CobolCoverageReport:
     """Run coverage-guided test generation using Python execution only.
 
@@ -936,12 +946,14 @@ def run_coverage(
         ])
 
     selector = (
-        LLMSelector(llm_provider, llm_model)
+        LLMSelector(llm_provider, llm_model,
+                     default_batch_size=batch_size)
         if llm_provider
-        else HeuristicSelector()
+        else HeuristicSelector(default_batch_size=batch_size)
     )
 
     return _run_agentic_loop(
         ctx, cov, report, strategies, selector,
         budget, timeout, start_time, tc_count,
+        max_rounds=max_rounds,
     )
