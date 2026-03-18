@@ -881,15 +881,18 @@ def _run_agentic_loop(
     elapsed = time.time() - start_time
     report.total_test_cases = tc_count
     report.paragraphs_hit = len(cov.paragraphs_hit)
-    # Only count COBOL-mode branches (not py:-prefixed Python branches)
-    # toward the reported coverage since total_branches is from COBOL probes.
-    cobol_branches = {b for b in cov.branches_hit if not b.startswith("py:")}
-    report.branches_hit = len(cobol_branches)
+    # In COBOL mode, only count COBOL branches (not py:-prefixed Python ones).
+    # In Python-only mode (ctx.context is None), all branches count.
+    if ctx.context is not None:
+        counted_branches = {b for b in cov.branches_hit if not b.startswith("py:")}
+    else:
+        counted_branches = cov.branches_hit
+    report.branches_hit = len(counted_branches)
     report.elapsed_seconds = elapsed
     if cov.total_paragraphs > 0:
         report.paragraph_coverage = len(cov.paragraphs_hit) / cov.total_paragraphs
     if cov.total_branches > 0:
-        report.branch_coverage = len(cobol_branches) / cov.total_branches
+        report.branch_coverage = len(counted_branches) / cov.total_branches
 
     log.info("Coverage complete: %s", report.summary())
     return report
