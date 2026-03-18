@@ -621,14 +621,22 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         # Verify LLM connection before doing any work
+        import concurrent.futures
+
         from .llm_coverage import _query_llm_sync, get_llm_provider
         try:
             _synth_llm = get_llm_provider(
                 provider_name=args.llm_provider, model=args.llm_model,
             )
             print(f"  LLM provider: {type(_synth_llm).__name__}")
-            _query_llm_sync(_synth_llm, "ping", args.llm_model)
+            # Ping with 15s timeout to catch hanging connections
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(_query_llm_sync, _synth_llm, "ping", args.llm_model)
+                fut.result(timeout=15)
             print("  LLM connection: OK")
+        except concurrent.futures.TimeoutError:
+            print("Error: LLM connection timed out (15s)", file=sys.stderr)
+            return 1
         except Exception as e:
             print(f"Error: LLM connection required for --synthesize: {e}", file=sys.stderr)
             return 1
