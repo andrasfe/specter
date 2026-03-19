@@ -606,9 +606,9 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    if args.copybook_dir and not args.mock_cobol and not args.java and not args.cobol_coverage:
+    if args.copybook_dir and not args.mock_cobol and not args.java and not args.cobol_coverage and not args.synthesize:
         print(
-            "Error: --copybook-dir requires --mock-cobol, --java, or --cobol-coverage.",
+            "Error: --copybook-dir requires --mock-cobol, --java, --cobol-coverage, or --synthesize.",
             file=sys.stderr,
         )
         return 1
@@ -747,8 +747,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # Generate code
+    copybook_records = None
+    if args.copybook_dir:
+        from .variable_domain import load_copybooks
+        copybook_records = load_copybooks([Path(d) for d in args.copybook_dir])
     print(f"Generating {output_path} ...")
-    code = generate_code(program, var_report, instrument=args.analyze)
+    code = generate_code(program, var_report, instrument=args.analyze,
+                         copybook_records=copybook_records)
     output_path.write_text(code)
     print(f"  Written {len(code)} bytes")
 

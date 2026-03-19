@@ -54,6 +54,8 @@ class StrategyContext:
     cobol_source_path: Path | None = None
     llm_provider: object | None = None
     llm_model: str | None = None
+    siblings_88: dict[str, set[str]] = field(default_factory=dict)
+    flag_88_added: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -1727,6 +1729,10 @@ class FaultInjectionStrategy(Strategy):
             "status_cics": [0, 12, 13, 16, 22, 27],
         }
 
+        # Get 88-level sibling info from context (set by coverage runner)
+        flag_88_added = getattr(ctx, 'flag_88_added', None) or set()
+        siblings_88 = getattr(ctx, 'siblings_88', None) or {}
+
         for op_key, status_vars in ctx.stub_mapping.items():
             fault_values: list = []
             for var in status_vars:
@@ -1746,8 +1752,21 @@ class FaultInjectionStrategy(Strategy):
                 fault_stubs, fault_defaults = _build_fault_stubs(
                     ctx.stub_mapping, ctx.domains,
                     target_op=op_key, fault_value=fv, rng=ctx.rng,
+                    flag_88_added=flag_88_added, siblings_88=siblings_88,
                 )
                 yield base, fault_stubs, fault_defaults, f"fault:{op_key}={fv}"
+
+            # Also try 88-level flag faults: activate each sibling flag
+            for var in status_vars:
+                var_upper = var.upper()
+                if var_upper in flag_88_added:
+                    base = _build_input_state(ctx.domains, "semantic", ctx.rng)
+                    fault_stubs, fault_defaults = _build_fault_stubs(
+                        ctx.stub_mapping, ctx.domains,
+                        target_op=op_key, fault_value=var_upper, rng=ctx.rng,
+                        flag_88_added=flag_88_added, siblings_88=siblings_88,
+                    )
+                    yield base, fault_stubs, fault_defaults, f"fault-88:{op_key}={var}"
 
         self._ran = True
 

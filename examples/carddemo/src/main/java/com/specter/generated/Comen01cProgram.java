@@ -175,8 +175,38 @@ public class Comen01cProgram implements CicsProgram {
         state.put("LIT-MENUPGM", "COMEN01C");
         state.put("LIT-MENUTRANID", "COME");
         state.put("CCDA-TITLE01", "Credit Card Demo Application");
-        state.put("CCDA-TITLE02", "COMEN01C - Account Update");
+        state.put("CCDA-TITLE02", "Main Menu");
         state.put("CCDA-MSG-THANK-YOU", "Thank you for using the application");
         state.put("CCDA-MSG-INVALID-KEY", "Invalid key pressed");
+
+        // Seed menu options (in real CardDemo these come from a VSAM control file)
+        state.put("CDEMO-MENU-OPT-COUNT", 8);
+        String[][] menuOpts = {
+            {"1", "Account View",      "COACTVWC", " "},
+            {"2", "Account Update",    "COACTUPC", " "},
+            {"3", "Bill Payment",      "COBIL00C", " "},
+            {"4", "Transaction List",  "COTRN00C", " "},
+            {"5", "Transaction Add",   "COTRN01C", " "},
+            {"6", "Credit Card List",  "COCRDLIC", " "},
+            {"7", "Credit Card View",  "COCRDSLC", " "},
+            {"8", "User Admin",        "COUSR00C", "A"},
+        };
+        for (String[] opt : menuOpts) {
+            String idx = opt[0];
+            state.put("CDEMO-MENU-OPT-NUM(" + idx + ")", idx);
+            state.put("CDEMO-MENU-OPT-NAME(" + idx + ")", opt[1]);
+            state.put("CDEMO-MENU-OPT-PGMNAME(" + idx + ")", opt[2]);
+            state.put("CDEMO-MENU-OPT-USRTYPE(" + idx + ")", opt[3]);
+        }
+        // The generated code uses WS-OPTION as the subscript variable,
+        // so also seed keys with that indirection for runtime lookup
+        state.put("OPTN001O", "1. Account View");
+        state.put("OPTN002O", "2. Account Update");
+        state.put("OPTN003O", "3. Bill Payment");
+        state.put("OPTN004O", "4. Transaction List");
+        state.put("OPTN005O", "5. Transaction Add");
+        state.put("OPTN006O", "6. Credit Card List");
+        state.put("OPTN007O", "7. Credit Card View");
+        state.put("OPTN008O", "8. User Admin");
     }
 }

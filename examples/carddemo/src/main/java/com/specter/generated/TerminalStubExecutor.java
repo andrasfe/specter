@@ -21,7 +21,7 @@ public class TerminalStubExecutor extends DefaultStubExecutor {
     private static final Pattern SEND_TEXT_PAT =
             Pattern.compile("SEND\\s+TEXT", Pattern.CASE_INSENSITIVE);
     private static final Pattern XCTL_PAT =
-            Pattern.compile("XCTL\\s+PROGRAM\\s*\\(?'?([^)']+)'?\\)?",
+            Pattern.compile("XCTL\\s+PROGRAM\\s*\\(?'?([A-Z0-9-]+(?:\\([^)]*\\))?)'?\\)?",
                     Pattern.CASE_INSENSITIVE);
     private static final Pattern RETURN_TRANSID_PAT =
             Pattern.compile("RETURN\\s+TRANSID", Pattern.CASE_INSENSITIVE);

@@ -81,7 +81,62 @@ public class ProgramState extends HashMap<String, Object> {
     @Override
     public Object get(Object key) {
         Object v = super.get(key);
-        return v != null ? v : " ";
+        if (v != null) return v;
+        // Resolve subscripted or reference-modified variables
+        if (key instanceof String) {
+            String k = (String) key;
+            int lp = k.indexOf('(');
+            int rp = k.lastIndexOf(')');
+            if (lp > 0 && rp > lp) {
+                String inner = k.substring(lp + 1, rp);
+                String baseName = k.substring(0, lp);
+
+                // Reference modification: VAR(start:length) — substring
+                if (inner.contains(":")) {
+                    String[] parts = inner.split(":", 2);
+                    String startExpr = parts[0].trim();
+                    String lenExpr = parts[1].trim();
+                    Object baseVal = super.get(baseName);
+                    if (baseVal == null) baseVal = super.get(k.substring(0, lp));
+                    if (baseVal != null) {
+                        String s = String.valueOf(baseVal);
+                        int start = resolveInt(startExpr) - 1; // COBOL is 1-based
+                        int len = resolveInt(lenExpr);
+                        if (start >= 0 && start < s.length()) {
+                            int end = Math.min(start + len, s.length());
+                            return s.substring(start, end);
+                        }
+                    }
+                } else {
+                    // Subscript: VAR(SUB-VAR) → VAR(value-of-SUB-VAR)
+                    if (!inner.isEmpty() && !Character.isDigit(inner.charAt(0))) {
+                        Object subVal = super.get(inner);
+                        if (subVal != null) {
+                            String resolved = baseName + "("
+                                + String.valueOf(subVal).trim() + ")";
+                            Object rv = super.get(resolved);
+                            if (rv != null) return rv;
+                        }
+                    }
+                }
+            }
+        }
+        return " ";
+    }
+
+    /** Resolve an expression to an int — either a literal or a variable name. */
+    private int resolveInt(String expr) {
+        try {
+            return Integer.parseInt(expr);
+        } catch (NumberFormatException e) {
+            Object val = super.get(expr);
+            if (val instanceof Number) return ((Number) val).intValue();
+            if (val != null) {
+                try { return Integer.parseInt(String.valueOf(val).trim()); }
+                catch (NumberFormatException e2) { /* fall through */ }
+            }
+            return 1;
+        }
     }
 
     /**

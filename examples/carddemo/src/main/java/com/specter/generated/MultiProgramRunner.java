@@ -124,6 +124,11 @@ public class MultiProgramRunner {
                     return null;
                 }
             } catch (XctlSignal xctl) {
+                // XCTL preserves the COMMAREA — set EIBCALEN to a non-zero
+                // value so the target program knows it has a COMMAREA.
+                // Reset CDEMO-PGM-REENTER so the target sends its screen first.
+                state.put("EIBCALEN", 1);
+                state.put("CDEMO-PGM-REENTER", false);
                 return xctl.targetProgram; // Transfer to target
             } catch (GobackSignal g) {
                 return null;

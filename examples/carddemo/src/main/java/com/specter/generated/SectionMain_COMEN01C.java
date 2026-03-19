@@ -108,17 +108,14 @@ public class SectionMain_COMEN01C extends SectionBase {
             }
             else if ((CobolRuntime.isTruthy(state.get("CDEMO-MENU-OPT-PGMNAME(WS-OPTION)")))) {
                 state.addBranch(11);
-                state.put("WS-MESSAGE", " ");
-                state.put("ERRMSGC", state.get("DFHGREEN"));
-                state.put("WS-MESSAGE", "This option " + String.valueOf(state.get("CDEMO-MENU-OPT-NAME")) + String.valueOf(state.get("WS-OPTION")) + String.valueOf(state.get("DELIMITED")) + String.valueOf(state.get("BY")) + String.valueOf(state.get("SPACE")) + "is coming soon ...");
-            }
-            else {
-                state.addBranch(12);
                 state.put("CDEMO-FROM-TRANID", state.get("WS-TRANID"));
-                state.put("CDEMO-FROM-PROGRAM", state.get("WS-PGMNAME"));
                 state.put("CDEMO-FROM-PROGRAM", state.get("WS-PGMNAME"));
                 state.put("CDEMO-PGM-CONTEXT", 0);
                 stubs.dummyExec(state, "CICS", "EXEC CICS XCTL PROGRAM(CDEMO-MENU-OPT-PGMNAME(WS-OPTION)) COMMAREA(CARDDEMO-COMMAREA) END-EXEC");
+            }
+            else {
+                state.addBranch(12);
+                state.put("WS-MESSAGE", "Option not available");
             }
             perform(state, "SEND-MENU-SCREEN");
         } else {

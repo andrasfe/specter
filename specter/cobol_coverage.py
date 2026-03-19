@@ -368,27 +368,88 @@ def _build_input_state(
     return state
 
 
+def _build_siblings_88(copybook_records) -> dict[str, set[str]]:
+    """Build 88-level siblings map from copybook records."""
+    siblings: dict[str, set[str]] = {}
+    if not copybook_records:
+        return siblings
+    for rec in copybook_records:
+        for fld in rec.fields:
+            if fld.values_88:
+                names = {n.upper() for n in fld.values_88.keys()}
+                for name in names:
+                    siblings[name] = names - {name}
+    return siblings
+
+
+def _expand_stub_mapping(
+    stub_mapping: dict[str, list[str]],
+    siblings_88: dict[str, set[str]],
+) -> set[str]:
+    """Expand stub mapping to include 88-level sibling vars.
+
+    Returns the set of var names that were added (not in the original mapping).
+    """
+    added: set[str] = set()
+    for op_key in list(stub_mapping.keys()):
+        status_vars = stub_mapping[op_key]
+        original = {v.upper() for v in status_vars}
+        to_add: set[str] = set()
+        for var in status_vars:
+            to_add.update(siblings_88.get(var.upper(), set()))
+        for var in sorted(to_add - original):
+            status_vars.append(var)
+            added.add(var.upper())
+    return added
+
+
 def _build_success_stubs(
     stub_mapping: dict[str, list[str]],
     domains: dict[str, VariableDomain],
+    flag_88_added: set[str] | None = None,
+    siblings_88: dict[str, set[str]] | None = None,
 ) -> tuple[dict[str, list], dict[str, list]]:
     """Build all-success stub outcomes and defaults.
 
     For READ operations: generates multiple success records followed by EOF
     ('10'), with default set to EOF so PERFORM UNTIL loops terminate.
     For other operations: single success entry with success default.
+
+    88-level flags (identified by flag_88_added / siblings_88) are set to
+    True for success indicators (original mapping vars) and False for their
+    siblings (added vars).
     """
+    flag_88_added = flag_88_added or set()
+    siblings_88 = siblings_88 or {}
     outcomes: dict[str, list] = {}
     defaults: dict[str, list] = {}
 
     for op_key, status_vars in stub_mapping.items():
         is_read = op_key.startswith("READ:")
 
+        # Identify the primary success flag among 88-level vars.
+        # Heuristic: prefer vars with OK/SUCCESS in name, else first original.
+        _88_originals = [v for v in status_vars
+                         if v.upper() in siblings_88 and v.upper() not in flag_88_added]
+        _success_flag = None
+        for v in _88_originals:
+            if any(kw in v.upper() for kw in ("OK", "SUCCESS", "FOUND")):
+                _success_flag = v.upper()
+                break
+        if not _success_flag and _88_originals:
+            _success_flag = _88_originals[0].upper()
+
         success_entries: list = []
         eof_entries: list = []
         for var in status_vars:
             dom = domains.get(var)
-            if dom and dom.semantic_type == "status_file":
+            var_upper = var.upper()
+            is_88 = var_upper in siblings_88 or var_upper in flag_88_added
+            # 88-level: only the primary success flag is True
+            if is_88 and _success_flag:
+                success_entries.append((var, var_upper == _success_flag))
+                eof_entries.append((var, False))
+            elif dom and dom.semantic_type == "status_file":
                 success_entries.append((var, "00"))
                 eof_entries.append((var, "10"))
             elif dom and dom.semantic_type == "status_sql":
@@ -423,10 +484,18 @@ def _build_fault_stubs(
     target_op: str | None = None,
     fault_value: str | int | None = None,
     rng: random.Random | None = None,
+    flag_88_added: set[str] | None = None,
+    siblings_88: dict[str, set[str]] | None = None,
 ) -> tuple[dict[str, list], dict[str, list]]:
-    """Build stubs with one operation returning an error code."""
+    """Build stubs with one operation returning an error code.
+
+    For 88-level flags, fault_value is interpreted as the flag name to
+    activate (set to True) while all siblings are set to False.
+    """
     if rng is None:
         rng = random.Random()
+    flag_88_added = flag_88_added or set()
+    siblings_88 = siblings_88 or {}
 
     outcomes: dict[str, list] = {}
     defaults: dict[str, list] = {}
@@ -435,9 +504,31 @@ def _build_fault_stubs(
         entries: list = []
         is_target = (target_op is not None and op_key == target_op)
 
+        # Check if this op has 88-level flags
+        has_88 = any(v.upper() in siblings_88 or v.upper() in flag_88_added
+                     for v in status_vars)
+
+        # If targeting an op with 88-level flags and fault_value is a flag name,
+        # set that flag True and all others False
+        target_flag = None
+        if is_target and has_88 and isinstance(fault_value, str):
+            fv_upper = fault_value.upper()
+            if fv_upper in siblings_88 or fv_upper in flag_88_added:
+                target_flag = fv_upper
+
         for var in status_vars:
             dom = domains.get(var)
-            if is_target and fault_value is not None:
+            var_upper = var.upper()
+            is_88 = var_upper in siblings_88 or var_upper in flag_88_added
+
+            if is_target and target_flag:
+                # 88-level targeted fault: activate the target, clear others
+                entries.append((var, var_upper == target_flag))
+            elif is_target and is_88 and not target_flag:
+                # 88-level var but fault_value is a status code (e.g. "GE")
+                # Set original flags to False, added siblings to False
+                entries.append((var, False))
+            elif is_target and fault_value is not None:
                 entries.append((var, fault_value))
             elif is_target:
                 # Pick a non-success value
@@ -451,7 +542,11 @@ def _build_fault_stubs(
                     entries.append((var, "10"))
             else:
                 # Success for non-target ops
-                if dom and dom.semantic_type == "status_file":
+                if var_upper in flag_88_added:
+                    entries.append((var, False))
+                elif var_upper in siblings_88:
+                    entries.append((var, True))
+                elif dom and dom.semantic_type == "status_file":
                     entries.append((var, "00"))
                 elif dom and dom.semantic_type == "status_sql":
                     entries.append((var, 0))
@@ -742,8 +837,18 @@ def run_cobol_coverage(
     # Load existing coverage
     existing_tcs, existing_paras, existing_branches = load_existing_coverage(store_path)
 
+    # Expand stub mapping with 88-level siblings
+    siblings_88 = _build_siblings_88(copybook_records)
+    flag_88_added = _expand_stub_mapping(stub_mapping, siblings_88)
+    if flag_88_added:
+        log.info("Expanded stub mapping with %d 88-level siblings: %s",
+                 len(flag_88_added), sorted(flag_88_added))
+
     # Build success stubs
-    success_stubs, success_defaults = _build_success_stubs(stub_mapping, domains)
+    success_stubs, success_defaults = _build_success_stubs(
+        stub_mapping, domains,
+        flag_88_added=flag_88_added, siblings_88=siblings_88,
+    )
 
     all_paras = {p.name for p in program.paragraphs}
     existing_ast_paras = existing_paras & all_paras
@@ -794,6 +899,8 @@ def run_cobol_coverage(
         cobol_source_path=Path(cobol_source),
         llm_provider=llm_provider,
         llm_model=llm_model,
+        siblings_88=siblings_88,
+        flag_88_added=flag_88_added,
     )
 
     # --- REGISTER STRATEGIES ---
@@ -1020,8 +1127,18 @@ def run_coverage(
     # Load existing coverage
     existing_tcs, existing_paras, existing_branches = load_existing_coverage(store_path)
 
+    # Expand stub mapping with 88-level siblings
+    siblings_88 = _build_siblings_88(copybook_records)
+    flag_88_added = _expand_stub_mapping(stub_mapping, siblings_88)
+    if flag_88_added:
+        log.info("Expanded stub mapping with %d 88-level siblings: %s",
+                 len(flag_88_added), sorted(flag_88_added))
+
     # Build success stubs
-    success_stubs, success_defaults = _build_success_stubs(stub_mapping, domains)
+    success_stubs, success_defaults = _build_success_stubs(
+        stub_mapping, domains,
+        flag_88_added=flag_88_added, siblings_88=siblings_88,
+    )
 
     existing_ast_paras = existing_paras & all_paras
     existing_runtime_only = existing_paras - all_paras
@@ -1103,6 +1220,8 @@ def run_coverage(
         cobol_source_path=cobol_source_path,
         llm_provider=llm_provider,
         llm_model=llm_model,
+        siblings_88=siblings_88,
+        flag_88_added=flag_88_added,
     )
 
     # --- REGISTER STRATEGIES ---
