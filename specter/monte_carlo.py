@@ -233,6 +233,10 @@ class _FuzzerState:
     sample_call_events: list[list[tuple]] = field(default_factory=list)
     concolic_failed: set[int] = field(default_factory=set)
     concolic_cooldown: dict[int, int] = field(default_factory=dict)
+    # Pre-computed variable classification buckets (populated once)
+    _vars_with_literals: list[str] = field(default_factory=list)
+    _vars_non_status: list[str] = field(default_factory=list)
+    _classification_buckets_ready: bool = False
 
 
 def _should_add_to_corpus(fuzzer: _FuzzerState, coverage: frozenset, edges: frozenset,
@@ -258,18 +262,27 @@ def _add_to_corpus(fuzzer: _FuzzerState, entry: _CorpusEntry,
 
 
 def _evict_corpus(fuzzer: _FuzzerState) -> None:
-    """Remove lowest-energy entry whose coverage is redundantly covered."""
+    """Remove lowest-energy entry whose coverage is redundantly covered.
+
+    Uses a coverage reference-count approach: O(n·m) instead of O(n²·m).
+    """
+    # Build a coverage counter: how many corpus entries cover each path
+    coverage_counts: dict[str, int] = {}
+    for entry in fuzzer.corpus:
+        for path in entry.coverage:
+            coverage_counts[path] = coverage_counts.get(path, 0) + 1
+
+    # Sort by energy (lowest first) — prefer evicting low-energy entries
     candidates = sorted(range(len(fuzzer.corpus)),
                         key=lambda i: fuzzer.corpus[i].energy)
+
     for idx in candidates:
         entry = fuzzer.corpus[idx]
-        other_coverage: set[str] = set()
-        for i, e in enumerate(fuzzer.corpus):
-            if i != idx:
-                other_coverage.update(e.coverage)
-        if entry.coverage.issubset(other_coverage):
+        # Entry is redundant if every path it covers is also covered by ≥1 other entry
+        if all(coverage_counts.get(p, 0) > 1 for p in entry.coverage):
             fuzzer.corpus.pop(idx)
             return
+
     # No redundant entry — drop lowest energy
     fuzzer.corpus.pop(candidates[0])
 
@@ -820,6 +833,17 @@ def _mutate_state(parent_state: dict, var_report, rng: random.Random,
     if not var_names:
         return state, stub_out
 
+    # Lazily populate pre-computed classification buckets
+    if not fuzzer._classification_buckets_ready:
+        fuzzer._vars_with_literals = [
+            n for n in var_names if var_report.variables[n].condition_literals
+        ]
+        fuzzer._vars_non_status = [
+            n for n in var_names
+            if var_report.variables[n].classification not in ("status",)
+        ]
+        fuzzer._classification_buckets_ready = True
+
     r = rng.random()
 
     if r < 0.30:
@@ -829,7 +853,7 @@ def _mutate_state(parent_state: dict, var_report, rng: random.Random,
 
     elif r < 0.48:
         # Literal-guided
-        candidates = [n for n in var_names if var_report.variables[n].condition_literals]
+        candidates = fuzzer._vars_with_literals
         if candidates:
             name = rng.choice(candidates)
             state[name] = rng.choice(var_report.variables[name].condition_literals)
@@ -840,8 +864,7 @@ def _mutate_state(parent_state: dict, var_report, rng: random.Random,
     elif r < 0.60:
         # Gate-preserving mutation: only mutate non-status variables
         # This preserves initialization passage while exploring post-init logic
-        non_status = [n for n in var_names
-                      if var_report.variables[n].classification not in ("status",)]
+        non_status = fuzzer._vars_non_status
         if non_status:
             n_changes = rng.randint(1, min(3, len(non_status)))
             for name in rng.sample(non_status, n_changes):

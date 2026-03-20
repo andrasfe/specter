@@ -14,6 +14,191 @@ from .models import Program, Statement
 from .variable_extractor import VariableReport, extract_variables
 
 # ---------------------------------------------------------------------------
+# Pre-compiled regexes (hoisted from per-call sites for performance)
+# ---------------------------------------------------------------------------
+
+# Used by _strip_cobol_comments
+_COMMENT_KW_RE = re.compile(
+    r"\b(TO|FROM|BY|GIVING|INTO|UNTIL|REMAINDER|ROUNDED|THRU|REPLACING)\b",
+    re.IGNORECASE,
+)
+_AFTER_PERIOD_RE = re.compile(r"[A-Z0-9]")
+_COBOL_EXPR_START_RE = re.compile(r"[A-Z][A-Z0-9-]*\s*[(/+*=-]", re.IGNORECASE)
+
+# Used by _strip_comments_arithmetic
+_ARITH_CONT_RE = re.compile(r'(?:^|\s)([+\-*/])\s+([A-Z0-9])', re.IGNORECASE)
+_ARITH_PERIOD_VAR_RE = re.compile(r'\.\s+([A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?)', re.IGNORECASE)
+_ARITH_VAR_TOKENS_RE = re.compile(r'[A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?', re.IGNORECASE)
+
+# Used by _strip_comments_condition
+_COND_CONT_RE = re.compile(
+    r"\b(AND|OR)\s+(?:NOT\s+)?(?:\()?[A-Z][A-Z0-9-]",
+    re.IGNORECASE,
+)
+_COND_START_RE = re.compile(
+    r"(?:\()?\s*[A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?\s+(?:EQUAL|NOT|LESS|GREATER|IN)\b",
+    re.IGNORECASE,
+)
+_COND_PAREN_RE = re.compile(
+    r"(\([A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?\s+(?:EQUAL|NOT|LESS|GREATER))",
+    re.IGNORECASE,
+)
+
+# Used by _tokenize_cobol_vars
+_COBOL_VAR_TOKEN_RE = re.compile(
+    r"[A-Z0-9][A-Z0-9-]*(?:\s*\([^)]*\))?",
+    re.IGNORECASE,
+)
+
+# Used by _var_name
+_SUBSCRIPT_RE = re.compile(r"\s*\(.*\)")
+
+# Used by _sanitize_name
+_NON_ALNUM_RE = re.compile(r"[^A-Z0-9_]")
+_MULTI_UNDERSCORE_RE = re.compile(r"_+")
+
+# Used by _resolve_source
+_ALL_PREFIX_RE = re.compile(r"^ALL\s+", re.IGNORECASE)
+_NUMERIC_LITERAL_RE = re.compile(r"^-?\d+\.?\d*$")
+_SIGNED_NUMERIC_RE = re.compile(r"^[+-]?\d+\.?\d*$")
+_LENGTH_OF_RE = re.compile(r"LENGTH\s+OF\s+(.+)", re.IGNORECASE)
+_SUBSCRIPT_RANGE_RE = re.compile(r"([A-Z][A-Z0-9-]*)\((\d+):(\d+)\)", re.IGNORECASE)
+
+# Used by _gen_move
+_MOVE_FALLBACK_RE = re.compile(r"MOVE\s+(.+?)\s+TO\s+(.+)", re.IGNORECASE)
+_MOVE_ALL_RE = re.compile(r"MOVE\s+ALL\s+", re.IGNORECASE)
+
+# Used by _gen_compute
+_COMPUTE_RE = re.compile(
+    r"COMPUTE\s+([A-Z0-9][A-Z0-9-]*(?:\s*\([^)]*\))?)\s*(?:ROUNDED\s*)?(?:=|EQUAL)\s*(.+)",
+    re.IGNORECASE,
+)
+_COMMENT_STRIP_RE = re.compile(r"\*>.*")
+_COMMENT_STRIP_SMART_RE = re.compile(r"\*>[^*]*?(?=[A-Z0-9(])", re.IGNORECASE)
+_EXPR_TOKEN_RE = re.compile(r"[A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?|[+\-*/()]|\d+\.?\d*", re.IGNORECASE)
+_VAR_ZERO_SUB_RE = re.compile(r"[A-Z_][A-Z0-9_-]*(?:\s*\([^)]*\))?", re.IGNORECASE)
+_LENGTH_OF_EXPR_RE = re.compile(r"LENGTH\s+OF\s+([A-Z][A-Z0-9-]*)", re.IGNORECASE)
+_FUNCTION_KW_RE = re.compile(r"FUNCTION\s+", re.IGNORECASE)
+_FUNCTION_CALL_RE = re.compile(r"FUNCTION\s+([\w-]+)\s*\(", re.IGNORECASE)
+_FUNCTION_BARE_RE = re.compile(r"\bFUNCTION\b\s*", re.IGNORECASE)
+_VAR_OF_QUAL_RE = re.compile(
+    r"([A-Z][A-Z0-9-]*)\s+OF\s+[A-Z][A-Z0-9-]*", re.IGNORECASE,
+)
+_PLACEHOLDER_RE = re.compile(r"^__PH\d+__$")
+_VAR_REPLACE_RE = re.compile(r"([A-Z_][A-Z0-9_-]*)(?:\s*\([^)]*\))?", re.IGNORECASE)
+_OF_QUALIFIER_RE = re.compile(r"\s+OF\s+\S+", re.IGNORECASE)
+
+# Used by _gen_add / _gen_subtract
+_ADD_GIVING_RE = re.compile(r"ADD\s+(.+?)\s+GIVING\s+(.+)", re.IGNORECASE)
+_ADD_TO_RE = re.compile(r"ADD\s+(.+?)\s+TO\s+(.+)", re.IGNORECASE)
+_SUBTRACT_GIVING_RE = re.compile(
+    r"SUBTRACT\s+(.+?)\s+FROM\s+(.+?)\s+GIVING\s+(.+)", re.IGNORECASE,
+)
+_SUBTRACT_FROM_RE = re.compile(r"SUBTRACT\s+(.+?)\s+FROM\s+(.+)", re.IGNORECASE)
+_ROUNDED_STRIP_RE = re.compile(r"\s+ROUNDED\b.*", re.IGNORECASE)
+_ROUNDED_SUFFIX_RE = re.compile(r"\s+ROUNDED$", re.IGNORECASE)
+
+# Used by _gen_perform
+_TIMES_NUM_RE = re.compile(r"(\d+)\s+TIMES?", re.IGNORECASE)
+_TIMES_VAR_RE = re.compile(r"([A-Z][A-Z0-9-]*)\s+TIMES?", re.IGNORECASE)
+_VARYING_RE = re.compile(
+    r"VARYING\s+([A-Z][A-Z0-9-]*)\s+FROM\s+(\S+)\s+BY\s+(\S+)\s+UNTIL\s+(.+)",
+    re.IGNORECASE,
+)
+
+# Used by _gen_perform_thru
+_THRU_RE = re.compile(r"THRU\s+([A-Z][A-Z0-9-]*)", re.IGNORECASE)
+
+# Used by _gen_set
+_VN = r"[A-Z0-9][A-Z0-9-]*"
+_SET_TO_TRUE_RE = re.compile(rf"SET\s+({_VN})\s+TO\s+TRUE", re.IGNORECASE)
+_SET_TO_FALSE_RE = re.compile(rf"SET\s+({_VN})\s+TO\s+FALSE", re.IGNORECASE)
+_SET_UP_BY_RE = re.compile(rf"SET\s+({_VN})\s+UP\s+BY\s+(.+)", re.IGNORECASE)
+_SET_DOWN_BY_RE = re.compile(rf"SET\s+({_VN})\s+DOWN\s+BY\s+(.+)", re.IGNORECASE)
+_SET_TO_RE = re.compile(rf"SET\s+({_VN})\s+TO\s+(.+)", re.IGNORECASE)
+_SET_TRUE_DETECT_RE = re.compile(r"SET\s+\S+\s+TO\s+TRUE", re.IGNORECASE)
+_SET_TRUE_EXTRACT_RE = re.compile(r"SET\s+([A-Z0-9][A-Z0-9-]*)\s+TO\s+TRUE", re.IGNORECASE)
+
+# Used by _gen_display
+_DISPLAY_RE = re.compile(r"DISPLAY\s+(.*)", re.IGNORECASE)
+
+# Used by _gen_exec
+_RESP_RE = re.compile(r'\bRESP\s*\(\s*([A-Z][A-Z0-9-]*)\s*\)', re.IGNORECASE)
+_RESP2_RE = re.compile(r'\bRESP2\s*\(\s*([A-Z][A-Z0-9-]*)\s*\)', re.IGNORECASE)
+
+# Used by _gen_initialize
+_INITIALIZE_RE = re.compile(r"INITIALIZE\s+(.+)", re.IGNORECASE)
+
+# Used by _gen_string_stmt
+_INTO_RE = re.compile(r"INTO\s+([A-Z][A-Z0-9-]*)", re.IGNORECASE)
+_STRING_PREFIX_RE = re.compile(r"^STRING\s+", re.IGNORECASE)
+_STRING_TOKEN_RE = re.compile(r"'[^']*'|[A-Z][A-Z0-9-]*", re.IGNORECASE)
+
+# Used by _gen_accept
+_ACCEPT_RE = re.compile(r"ACCEPT\s+([A-Z][A-Z0-9-]*)", re.IGNORECASE)
+
+# Used by _gen_read / _gen_write / _gen_rewrite
+_READ_RE = re.compile(r"READ\s+([A-Z][A-Z0-9-]*)", re.IGNORECASE)
+_WRITE_RE = re.compile(r"WRITE\s+([A-Z][A-Z0-9-]*)", re.IGNORECASE)
+_REWRITE_RE = re.compile(r"REWRITE\s+([A-Z][A-Z0-9-]*)", re.IGNORECASE)
+
+# Used by _gen_open / _gen_close
+_OPEN_RE = re.compile(r"OPEN\s+(?:INPUT|OUTPUT|I-O|EXTEND)\s+(.+)", re.IGNORECASE)
+_CLOSE_RE = re.compile(r"CLOSE\s+(.+)", re.IGNORECASE)
+
+# Used by _gen_search
+_SEARCH_TABLE_RE = re.compile(r"SEARCH\s+([A-Z][A-Z0-9-]*)", re.IGNORECASE)
+_SEARCH_VARYING_RE = re.compile(r"VARYING\s+([A-Z][A-Z0-9-]*)", re.IGNORECASE)
+_AT_END_RE = re.compile(r"\bAT\s+END\b", re.IGNORECASE)
+_WHEN_RE = re.compile(r"\bWHEN\b", re.IGNORECASE)
+
+# Used by _gen_unstring
+_UNSTRING_SRC_RE = re.compile(r"UNSTRING\s+([A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?)", re.IGNORECASE)
+_DELIMITED_BY_RE = re.compile(r"DELIMITED\s+BY\s+(\S+)", re.IGNORECASE)
+_UNSTRING_INTO_RE = re.compile(r"\bINTO\s+(.+?)(?:\s+END-UNSTRING|\s*$)", re.IGNORECASE)
+_UNSTRING_VAR_RE = re.compile(r"[A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?", re.IGNORECASE)
+_PAREN_STRIP_RE = re.compile(r"\s*\(.*\)")
+_PAREN_STRIP_OPEN_RE = re.compile(r"\s*\(.*")
+
+# Used by _gen_inspect
+_INSPECT_TALLYING_RE = re.compile(
+    r"INSPECT\s+([A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?)\s+TALLYING\s+([A-Z][A-Z0-9-]*)\s+FOR\s+LEADING\s+(\S+)",
+    re.IGNORECASE,
+)
+_INSPECT_REPLACING_RE = re.compile(
+    r"INSPECT\s+([A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?)\s+REPLACING\s+(.+)",
+    re.IGNORECASE,
+)
+
+# Used by _gen_multiply
+_MULTIPLY_GIVING_RE = re.compile(
+    r"MULTIPLY\s+(\S+)\s+BY\s+(\S+)\s+GIVING\s+(.+)", re.IGNORECASE,
+)
+_MULTIPLY_BY_RE = re.compile(r"MULTIPLY\s+(.+?)\s+BY\s+(.+)", re.IGNORECASE)
+
+# Used by _gen_divide
+_DIVIDE_BY_GIVING_RE = re.compile(
+    r"DIVIDE\s+(.+?)\s+BY\s+(.+?)\s+GIVING\s+(\S+)(?:\s+REMAINDER\s+(\S+))?",
+    re.IGNORECASE,
+)
+_DIVIDE_INTO_GIVING_RE = re.compile(
+    r"DIVIDE\s+(.+?)\s+INTO\s+(\S+)\s+GIVING\s+(\S+)(?:\s+REMAINDER\s+(\S+))?",
+    re.IGNORECASE,
+)
+_DIVIDE_INTO_RE = re.compile(r"DIVIDE\s+(.+?)\s+INTO\s+(.+)", re.IGNORECASE)
+
+# Used by _gen_goto
+_GOTO_RE = re.compile(r"GO\s+TO\s+([A-Z][A-Z0-9-]*)", re.IGNORECASE)
+
+# Used by _gen_statement (START/DELETE)
+_START_RE = re.compile(r"START\s+([A-Z][A-Z0-9-]*)", re.IGNORECASE)
+_DELETE_RE = re.compile(r"DELETE\s+([A-Z][A-Z0-9-]*)", re.IGNORECASE)
+
+# Used by _gen_exec_body
+_EXEC_MOVE_RE = re.compile(r"MOVE\s+([A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?)\s+TO\s+(.+)", re.IGNORECASE)
+_EXEC_DISPLAY_RE = re.compile(r"DISPLAY\s+'([^']*)'", re.IGNORECASE)
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -49,23 +234,19 @@ def _strip_cobol_comments(text: str) -> str:
 
     # From each subsequent segment, try to extract real code after comment prose.
     # Comment prose typically doesn't contain COBOL keywords at word boundaries.
-    _KW = re.compile(
-        r"\b(TO|FROM|BY|GIVING|INTO|UNTIL|REMAINDER|ROUNDED|THRU|REPLACING)\b",
-        re.IGNORECASE,
-    )
     code_parts = [first]
     for seg in parts[1:]:
         seg = seg.strip()
         # If segment contains a COBOL keyword, keep from the first keyword onward
-        m = _KW.search(seg)
+        m = _COMMENT_KW_RE.search(seg)
         if m:
             code_parts.append(seg[m.start():])
         elif ". " in seg:
             # Old code ending with period, then new code starts
             after_period = seg.split(". ", 1)[1].strip()
-            if after_period and re.match(r"[A-Z0-9]", after_period):
+            if after_period and _AFTER_PERIOD_RE.match(after_period):
                 code_parts.append(after_period)
-        elif re.match(r"[A-Z][A-Z0-9-]*\s*[(/+*=-]", seg, re.IGNORECASE):
+        elif _COBOL_EXPR_START_RE.match(seg):
             # Looks like a COBOL expression (variable followed by operator/paren)
             code_parts.append(seg)
         # else: pure comment prose, discard
@@ -95,7 +276,7 @@ def _strip_comments_arithmetic(text: str) -> str:
         # an operator (+, -, *, /), opening paren, or a variable/number that
         # follows the pattern of a COBOL arithmetic token
         # Strategy: find the first arithmetic operator at word boundary
-        m = re.search(r'(?:^|\s)([+\-*/])\s+([A-Z0-9])', seg, re.IGNORECASE)
+        m = _ARITH_CONT_RE.search(seg)
         if m:
             # Found an operator — keep from there
             result += " " + seg[m.start():].strip()
@@ -112,12 +293,12 @@ def _strip_comments_arithmetic(text: str) -> str:
         if result and result.rstrip()[-1:] in '+-*/':
             # Pattern: *> OLD-CODE. NEW-CODE or *> OLD-CODE NEW-CODE
             # Look for a COBOL variable after a period-space separator
-            m2 = re.search(r'\.\s+([A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?)', seg, re.IGNORECASE)
+            m2 = _ARITH_PERIOD_VAR_RE.search(seg)
             if m2:
                 result += " " + m2.group(1)
                 continue
             # Look for last COBOL variable/number in the segment (likely the replacement)
-            tokens = re.findall(r'[A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?', seg, re.IGNORECASE)
+            tokens = _ARITH_VAR_TOKENS_RE.findall(seg)
             if tokens:
                 result += " " + tokens[-1]
                 continue
@@ -133,23 +314,20 @@ def _tokenize_cobol_vars(text: str) -> list[str]:
     text = _strip_cobol_comments(text).rstrip(".")
     tokens = []
     # Match: identifier optionally followed by (possibly space-separated) subscript in parens
-    for m in re.finditer(
-        r"[A-Z0-9][A-Z0-9-]*(?:\s*\([^)]*\))?",
-        text, re.IGNORECASE,
-    ):
+    for m in _COBOL_VAR_TOKEN_RE.finditer(text):
         tokens.append(m.group(0).strip())
     return tokens
 
 
 def _var_name(token: str) -> str:
     """Extract the base variable name from a token, stripping subscripts."""
-    return re.sub(r"\s*\(.*\)", "", token).upper().strip("'\".,;:")
+    return _SUBSCRIPT_RE.sub("", token).upper().strip("'\".,;:")
 
 
 def _sanitize_name(name: str) -> str:
     """Convert a COBOL paragraph name to a valid Python function name."""
-    cleaned = re.sub(r"[^A-Z0-9_]", "_", name.upper().replace("-", "_").replace(".", "_"))
-    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    cleaned = _NON_ALNUM_RE.sub("_", name.upper().replace("-", "_").replace(".", "_"))
+    cleaned = _MULTI_UNDERSCORE_RE.sub("_", cleaned).strip("_")
     return "para_" + cleaned
 
 
@@ -173,7 +351,7 @@ def _resolve_source(source: str) -> str:
     s = source.strip()
 
     # Strip leading ALL (MOVE ALL 'X' etc.)
-    s = re.sub(r"^ALL\s+", "", s, flags=re.IGNORECASE).strip()
+    s = _ALL_PREFIX_RE.sub("", s).strip()
 
     # Figurative constant
     upper = s.upper()
@@ -185,17 +363,17 @@ def _resolve_source(source: str) -> str:
         return s
 
     # Numeric literal — strip leading zeros
-    if re.match(r"^-?\d+\.?\d*$", s):
+    if _NUMERIC_LITERAL_RE.match(s):
         return str(int(s)) if "." not in s else str(float(s))
 
     # LENGTH OF variable
-    m = re.match(r"LENGTH\s+OF\s+(.+)", s, re.IGNORECASE)
+    m = _LENGTH_OF_RE.match(s)
     if m:
         varname = _vk(m.group(1).strip())
         return f"len(str(state.get('{varname}', '')))"
 
     # Variable with subscript like FOO(1:2)
-    m = re.match(r"([A-Z][A-Z0-9-]*)\((\d+):(\d+)\)", s, re.IGNORECASE)
+    m = _SUBSCRIPT_RANGE_RE.match(s)
     if m:
         varname = _vk(m.group(1))
         start = int(m.group(2)) - 1  # COBOL is 1-based
@@ -259,7 +437,7 @@ def _gen_move(cb: _CodeBuilder, stmt: Statement):
 
     if not source or not targets:
         # Fallback: parse from text
-        m = re.search(r"MOVE\s+(.+?)\s+TO\s+(.+)", stmt.text, re.IGNORECASE)
+        m = _MOVE_FALLBACK_RE.search(stmt.text)
         if m:
             source = m.group(1).strip()
             targets = m.group(2).strip()
@@ -268,9 +446,9 @@ def _gen_move(cb: _CodeBuilder, stmt: Statement):
             return
 
     # Detect MOVE ALL 'x' — strip ALL prefix from source if present
-    is_move_all = bool(re.search(r"MOVE\s+ALL\s+", stmt.text, re.IGNORECASE))
+    is_move_all = bool(_MOVE_ALL_RE.search(stmt.text))
     if is_move_all:
-        source = re.sub(r"^ALL\s+", "", source, flags=re.IGNORECASE).strip()
+        source = _ALL_PREFIX_RE.sub("", source).strip()
 
     resolved = _resolve_source(source)
     for target_tok in _tokenize_cobol_vars(_strip_cobol_comments(targets)):
@@ -278,11 +456,11 @@ def _gen_move(cb: _CodeBuilder, stmt: Statement):
         if target_tok:
             tname = _var_name(target_tok)
             # Handle subscript targets
-            m = re.match(r"([A-Z][A-Z0-9-]*)\((\d+):(\d+)\)", tname)
-            if m:
-                varname = m.group(1)
-                start = int(m.group(2)) - 1
-                length = int(m.group(3))
+            m_sub = _SUBSCRIPT_RANGE_RE.match(tname)
+            if m_sub:
+                varname = m_sub.group(1)
+                start = int(m_sub.group(2)) - 1
+                length = int(m_sub.group(3))
                 cb.line(f"_v = str(state.get('{varname}', ''))")
                 cb.line(f"state['{varname}'] = _v[:{start}] + str({resolved})[:{length}] + _v[{start + length}:]")
             elif is_move_all:
@@ -303,14 +481,10 @@ def _gen_compute(cb: _CodeBuilder, stmt: Statement):
     if not target or not expression:
         # Fallback: parse from text — support subscripted targets like VAR(1) or VAR (1 2)
         # Also support EQUAL as synonym for = in COMPUTE, and digit-prefixed var names
-        _compute_re = re.compile(
-            r"COMPUTE\s+([A-Z0-9][A-Z0-9-]*(?:\s*\([^)]*\))?)\s*(?:ROUNDED\s*)?(?:=|EQUAL)\s*(.+)",
-            re.IGNORECASE,
-        )
-        m = _compute_re.search(stmt.text)
+        m = _COMPUTE_RE.search(stmt.text)
         if m:
             raw_target = m.group(1).strip()
-            target = re.sub(r"\s*\(.*\)", "", raw_target).upper()
+            target = _SUBSCRIPT_RE.sub("", raw_target).upper()
             expression = m.group(2).strip().rstrip(".")
         else:
             cb.line(f"pass  # COMPUTE: {_oneline(stmt.text)}")
@@ -329,7 +503,7 @@ def _gen_compute(cb: _CodeBuilder, stmt: Statement):
             candidates.append(s1)
 
         # Strategy 2: simple truncation (strip everything after *>)
-        s2 = re.sub(r"\*>.*", "", expression)
+        s2 = _COMMENT_STRIP_RE.sub("", expression)
         s2 = " ".join(s2.split()).strip().rstrip(".")
         while s2 and s2[-1] in "+-*/":
             s2 = s2[:-1].strip()
@@ -347,18 +521,23 @@ def _gen_compute(cb: _CodeBuilder, stmt: Statement):
         # Strategy 4: for *> OLD-CODE NEW-CODE, strip *> markers then try
         # taking the last N tokens that form a valid expression (new code
         # typically mirrors old code structure)
-        bare = re.sub(r"\*>[^*]*?(?=[A-Z0-9(])", "", expression, flags=re.IGNORECASE)
+        bare = _COMMENT_STRIP_SMART_RE.sub("", expression)
         bare = " ".join(bare.split()).strip().rstrip(".")
         if bare:
             # Try the full bare expression
-            if bare not in candidates:
+            candidates_seen = set(candidates)
+            if bare not in candidates_seen:
                 candidates.append(bare)
+                candidates_seen.add(bare)
             # Try taking the second half (old code replaced by new code)
-            tokens = re.findall(r"[A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?|[+\-*/()]|\d+\.?\d*", bare, re.IGNORECASE)
-            for split_idx in range(1, len(tokens)):
+            # Cap at last 8 splits to avoid O(n²) for large expressions
+            tokens = _EXPR_TOKEN_RE.findall(bare)
+            start_idx = max(1, len(tokens) - 8)
+            for split_idx in range(start_idx, len(tokens)):
                 half = " ".join(tokens[split_idx:])
-                if half and half not in candidates:
+                if half and half not in candidates_seen:
                     candidates.append(half)
+                    candidates_seen.add(half)
 
         # Pick the first candidate that produces a valid Python expression
         expression = ""
@@ -367,7 +546,7 @@ def _gen_compute(cb: _CodeBuilder, stmt: Statement):
             open_c = cand.count("(") - cand.count(")")
             test_expr = cand + ")" * open_c if open_c > 0 else cand
             # Quick variable substitution for compile test
-            test_py = re.sub(r"[A-Z_][A-Z0-9_-]*(?:\s*\([^)]*\))?", "0", test_expr, flags=re.IGNORECASE)
+            test_py = _VAR_ZERO_SUB_RE.sub("0", test_expr)
             test_py = test_py.replace(")(", ")*(")  # fix adjacent parens
             try:
                 compile(test_py, "<test>", "eval")
@@ -399,16 +578,15 @@ def _gen_compute(cb: _CodeBuilder, stmt: Statement):
         return key
 
     # LENGTH OF <var>
-    expr = re.sub(
-        r"LENGTH\s+OF\s+([A-Z][A-Z0-9-]*)",
+    expr = _LENGTH_OF_EXPR_RE.sub(
         lambda m: _ph(f"len(str(state.get('{_vk(m.group(1))}', '')))"),
-        expr, flags=re.IGNORECASE,
+        expr,
     )
 
     # FUNCTION <name>(<balanced-parens>) — handles nested parens properly
     def _extract_function_call(text: str, start: int) -> tuple[str, str, int] | None:
         """Find FUNCTION name(...) starting at `start`. Returns (name, inner, end)."""
-        m = re.match(r"FUNCTION\s+([\w-]+)\s*\(", text[start:], re.IGNORECASE)
+        m = _FUNCTION_CALL_RE.match(text[start:])
         if not m:
             return None
         name = m.group(1)
@@ -428,7 +606,7 @@ def _gen_compute(cb: _CodeBuilder, stmt: Statement):
         """Resolve all FUNCTION calls in text, innermost first."""
         while True:
             # Find the last FUNCTION keyword (innermost call)
-            positions = [m.start() for m in re.finditer(r"FUNCTION\s+", text, re.IGNORECASE)]
+            positions = [m.start() for m in _FUNCTION_KW_RE.finditer(text)]
             if not positions:
                 break
             resolved_any = False
@@ -445,7 +623,7 @@ def _gen_compute(cb: _CodeBuilder, stmt: Statement):
                 elif "DATE-OF-INTEGER" in upper_fname:
                     replacement = _ph(_resolve_function(inner))
                 elif "NUMVAL" in upper_fname:
-                    cleaned = re.sub(r"\s+OF\s+\S+", "", inner, flags=re.IGNORECASE).strip()
+                    cleaned = _OF_QUALIFIER_RE.sub("", inner).strip()
                     varname = _vk(cleaned)
                     replacement = _ph(f"_to_num(state.get('{varname}', 0))")
                 else:
@@ -460,27 +638,24 @@ def _gen_compute(cb: _CodeBuilder, stmt: Statement):
     expr = _resolve_function(expr)
 
     # Strip remaining bare FUNCTION keyword
-    expr = re.sub(r"\bFUNCTION\b\s*", "", expr, flags=re.IGNORECASE)
+    expr = _FUNCTION_BARE_RE.sub("", expr)
 
     # VAR OF QUALIFIER → use the first identifier
-    expr = re.sub(
-        r"([A-Z][A-Z0-9-]*)\s+OF\s+[A-Z][A-Z0-9-]*",
-        r"\1", expr, flags=re.IGNORECASE,
-    )
+    expr = _VAR_OF_QUAL_RE.sub(r"\1", expr)
 
     # Convert remaining variable references to Python
     def replace_var(m):
         name = m.group(1)  # base identifier (without subscript)
         upper = name.upper()
-        if re.match(r"^__PH\d+__$", name):
+        if _PLACEHOLDER_RE.match(name):
             return name
-        if re.match(r"^-?\d+\.?\d*$", name):
+        if _NUMERIC_LITERAL_RE.match(name):
             return str(int(name)) if "." not in name else str(float(name))
         if upper in _FIGURATIVE_SOURCES:
             return str(_FIGURATIVE_SOURCES[upper])
         return f"_to_num(state.get('{upper}', 0))"
 
-    py_expr = re.sub(r"([A-Z_][A-Z0-9_-]*)(?:\s*\([^)]*\))?", replace_var, expr, flags=re.IGNORECASE)
+    py_expr = _VAR_REPLACE_RE.sub(replace_var, expr)
 
     # Restore placeholders
     for key, val in _placeholders.items():
@@ -506,15 +681,15 @@ def _gen_compute(cb: _CodeBuilder, stmt: Statement):
 
 def _gen_add(cb: _CodeBuilder, stmt: Statement):
     text = _strip_cobol_comments(stmt.text)
-    m_giving = re.search(r"ADD\s+(.+?)\s+GIVING\s+(.+)", text, re.IGNORECASE)
-    m_to = re.search(r"ADD\s+(.+?)\s+TO\s+(.+)", text, re.IGNORECASE)
+    m_giving = _ADD_GIVING_RE.search(text)
+    m_to = _ADD_TO_RE.search(text)
     if m_giving:
         addends_str = m_giving.group(1).strip()
-        target_str = re.sub(r"\s+ROUNDED\b.*", "", m_giving.group(2).strip().rstrip("."), flags=re.IGNORECASE)
+        target_str = _ROUNDED_STRIP_RE.sub("", m_giving.group(2).strip().rstrip("."))
         tname = _var_name(target_str)
         parts = []
         for tok in _tokenize_cobol_vars(addends_str):
-            if re.match(r"^[+-]?\d+\.?\d*$", tok):
+            if _SIGNED_NUMERIC_RE.match(tok):
                 parts.append(tok)
             elif tok.upper() not in ("TO", "GIVING", "ROUNDED"):
                 vname = _var_name(tok)
@@ -546,19 +721,16 @@ def _gen_add(cb: _CodeBuilder, stmt: Statement):
 
 def _gen_subtract(cb: _CodeBuilder, stmt: Statement):
     text = _strip_cobol_comments(stmt.text)
-    m_giving = re.search(
-        r"SUBTRACT\s+(.+?)\s+FROM\s+(.+?)\s+GIVING\s+(.+)",
-        text, re.IGNORECASE,
-    )
-    m = re.search(r"SUBTRACT\s+(.+?)\s+FROM\s+(.+)", text, re.IGNORECASE)
+    m_giving = _SUBTRACT_GIVING_RE.search(text)
+    m = _SUBTRACT_FROM_RE.search(text)
     if m_giving:
         subtrahend = m_giving.group(1).strip()
         minuend = m_giving.group(2).strip().rstrip(".")
-        target_str = re.sub(r"\s+ROUNDED\b.*", "", m_giving.group(3).strip().rstrip("."), flags=re.IGNORECASE)
+        target_str = _ROUNDED_STRIP_RE.sub("", m_giving.group(3).strip().rstrip("."))
         tname = _var_name(target_str)
         def _sv(v):
             v = v.strip()
-            if re.match(r"^[+-]?\d+\.?\d*$", v):
+            if _SIGNED_NUMERIC_RE.match(v):
                 return v
             return f"_to_num(state.get('{_var_name(v)}', 0))"
         cb.line(f"state['{tname}'] = {_sv(minuend)} - {_sv(subtrahend)}")
@@ -566,7 +738,7 @@ def _gen_subtract(cb: _CodeBuilder, stmt: Statement):
         subtrahend = m.group(1).strip()
         targets_str = m.group(2).strip().rstrip(".")
 
-        if re.match(r"^-?\d+\.?\d*$", subtrahend):
+        if _NUMERIC_LITERAL_RE.match(subtrahend):
             val = str(int(subtrahend)) if "." not in subtrahend else str(float(subtrahend))
         else:
             val = f"_to_num(state.get('{_var_name(subtrahend)}', 0))"
@@ -593,32 +765,25 @@ def _strip_comments_condition(text: str) -> str:
     parts = text.split("*>")
     result = parts[0].strip()
 
-    # Pattern for condition continuation: AND/OR followed by condition,
-    # or a parenthesized condition group
-    _COND_CONT = re.compile(
-        r"\b(AND|OR)\s+(?:NOT\s+)?(?:\()?[A-Z][A-Z0-9-]",
-        re.IGNORECASE,
-    )
-    # Pattern for start of condition: VAR comparison or (VAR comparison
-    _COND_START = re.compile(
-        r"(?:\()?\s*[A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?\s+(?:EQUAL|NOT|LESS|GREATER|IN)\b",
-        re.IGNORECASE,
-    )
-
     def _append(result: str, new_text: str) -> str:
         """Append new_text to result, avoiding AND AND or OR OR duplication."""
         new_text = new_text.strip()
         result_stripped = result.rstrip()
         # If result ends with AND/OR and new_text starts with same, skip the dupe
+        result_upper = result_stripped.upper()
+        new_upper = new_text[:4].upper()
         for kw in ("AND", "OR"):
-            if result_stripped.upper().endswith(kw) and re.match(rf"^{kw}\b", new_text, re.IGNORECASE):
-                new_text = new_text[len(kw):].strip()
-                break
+            if result_upper.endswith(kw) and new_upper.startswith(kw):
+                # verify word boundary
+                rest = new_text[len(kw):]
+                if not rest or not rest[0].isalpha():
+                    new_text = rest.strip()
+                    break
         # If result ends with AND but new_text starts with OR (or vice versa),
         # the AND was from the old code — replace it with the new connector
-        if result_stripped.upper().endswith("AND") and re.match(r"^OR\b", new_text, re.IGNORECASE):
+        if result_upper.endswith("AND") and new_upper.startswith("OR") and (len(new_text) <= 2 or not new_text[2:3].isalpha()):
             result = result_stripped[:-3].rstrip()
-        elif result_stripped.upper().endswith("OR") and re.match(r"^AND\b", new_text, re.IGNORECASE):
+        elif result_upper.endswith("OR") and new_upper.startswith("AND") and (len(new_text) <= 3 or not new_text[3:4].isalpha()):
             result = result_stripped[:-2].rstrip()
         return result + " " + new_text
 
@@ -628,7 +793,7 @@ def _strip_comments_condition(text: str) -> str:
             continue
 
         # Look for AND/OR continuation — most reliable indicator of new code
-        m = _COND_CONT.search(seg)
+        m = _COND_CONT_RE.search(seg)
         if m:
             result = _append(result, seg[m.start():])
             continue
@@ -636,18 +801,18 @@ def _strip_comments_condition(text: str) -> str:
         # Look for period-separated new code: *> old-code. new-code
         if ". " in seg:
             after = seg.split(". ", 1)[1].strip()
-            if after and _COND_START.match(after):
+            if after and _COND_START_RE.match(after):
                 result = _append(result, after)
                 continue
 
         # Look for a parenthesized condition start
-        m = re.search(r"(\([A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?\s+(?:EQUAL|NOT|LESS|GREATER))", seg, re.IGNORECASE)
+        m = _COND_PAREN_RE.search(seg)
         if m:
             result = _append(result, seg[m.start():])
             continue
 
         # Look for condition start: VAR EQUAL/NOT/LESS...
-        m = _COND_START.search(seg)
+        m = _COND_START_RE.search(seg)
         if m:
             result = _append(result, seg[m.start():])
             continue
@@ -723,12 +888,12 @@ def _gen_evaluate(cb: _CodeBuilder, stmt: Statement):
                 if io:
                     continue
                 # Check raw text for numeric literal
-                if re.match(r"^[+-]?\d+\.?\d*$", vt.strip()):
+                if _SIGNED_NUMERIC_RE.match(vt.strip()):
                     _has_numeric_when = True
                     break
                 # Check resolved value (e.g. DFHRESP(NORMAL) → "0")
                 resolved = resolve_when_value(vt, False)
-                if re.match(r"^[+-]?\d+\.?\d*$", resolved.strip()):
+                if _SIGNED_NUMERIC_RE.match(resolved.strip()):
                     _has_numeric_when = True
                     break
         if _has_numeric_when:
@@ -822,7 +987,7 @@ def _gen_perform(cb: _CodeBuilder, stmt: Statement):
     times_str = stmt.attributes.get("times", "")
     if times_str:
         # Extract numeric count: "3 TIMES" → 3, or variable name
-        m = re.match(r"(\d+)\s+TIMES?", times_str, re.IGNORECASE)
+        m = _TIMES_NUM_RE.match(times_str)
         if m:
             count = int(m.group(1))
             cb.line(f"for _ in range({count}):")
@@ -831,7 +996,7 @@ def _gen_perform(cb: _CodeBuilder, stmt: Statement):
             cb.dedent()
             return
         # Variable TIMES: "WS-COUNT TIMES"
-        mv = re.match(r"([A-Z][A-Z0-9-]*)\s+TIMES?", times_str, re.IGNORECASE)
+        mv = _TIMES_VAR_RE.match(times_str)
         if mv:
             vname = mv.group(1).upper()
             cb.line(f"for _ in range(int(_to_num(state.get('{vname}', 0)))):")
@@ -840,10 +1005,7 @@ def _gen_perform(cb: _CodeBuilder, stmt: Statement):
             cb.dedent()
             return
     # Check for VARYING in text when not in attributes
-    m_vary = re.search(
-        r"VARYING\s+([A-Z][A-Z0-9-]*)\s+FROM\s+(\S+)\s+BY\s+(\S+)\s+UNTIL\s+(.+)",
-        stmt.text, re.IGNORECASE,
-    )
+    m_vary = _VARYING_RE.search(stmt.text)
     if m_vary:
         loop_var = m_vary.group(1).upper()
         from_val = _resolve_source(m_vary.group(2).strip())
@@ -880,19 +1042,18 @@ def _gen_perform(cb: _CodeBuilder, stmt: Statement):
 
 
 _PARAGRAPH_ORDER: list[str] = []
+_PARAGRAPH_INDEX: dict[str, int] = {}
 
 
 def _get_thru_range(target: str, thru: str) -> list[str]:
     """Get the list of paragraph names from target through thru (inclusive)."""
     if not _PARAGRAPH_ORDER:
         return [target]
-    try:
-        start = _PARAGRAPH_ORDER.index(target)
-    except ValueError:
+    start = _PARAGRAPH_INDEX.get(target)
+    if start is None:
         return [target]
-    try:
-        end = _PARAGRAPH_ORDER.index(thru)
-    except ValueError:
+    end = _PARAGRAPH_INDEX.get(thru)
+    if end is None:
         return [target]
     if end < start:
         return [target]
@@ -904,7 +1065,7 @@ def _gen_perform_thru(cb: _CodeBuilder, stmt: Statement):
     thru = stmt.attributes.get("thru", "")
     condition = stmt.attributes.get("condition", "")
     # ProLeap sometimes gives wrong thru value; prefer parsing from text
-    m_thru = re.search(r"THRU\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+    m_thru = _THRU_RE.search(stmt.text)
     if m_thru:
         thru = m_thru.group(1).upper()
 
@@ -968,10 +1129,7 @@ def _gen_perform_inline(cb: _CodeBuilder, stmt: Statement):
         cb.line(f"while not ({py_cond}):")
     elif varying:
         # Parse VARYING <var> FROM <start> BY <step> UNTIL <cond>
-        m_vary = re.match(
-            r"VARYING\s+([A-Z][A-Z0-9-]*)\s+FROM\s+(\S+)\s+BY\s+(\S+)\s+UNTIL\s+(.+)",
-            varying, re.IGNORECASE,
-        )
+        m_vary = _VARYING_RE.match(varying)
         if m_vary:
             loop_var = m_vary.group(1).upper()
             from_val = _resolve_source(m_vary.group(2).strip())
@@ -1020,8 +1178,7 @@ def _gen_perform_inline(cb: _CodeBuilder, stmt: Statement):
 
 
 def _gen_set(cb: _CodeBuilder, stmt: Statement):
-    _VN = r"[A-Z0-9][A-Z0-9-]*"
-    m = re.search(rf"SET\s+({_VN})\s+TO\s+TRUE", stmt.text, re.IGNORECASE)
+    m = _SET_TO_TRUE_RE.search(stmt.text)
     if m:
         varname = m.group(1).upper()
         cb.line(f"state['{varname}'] = True")
@@ -1029,24 +1186,24 @@ def _gen_set(cb: _CodeBuilder, stmt: Statement):
         for sibling in sorted(cb.siblings_88.get(varname, ())):
             cb.line(f"state['{sibling}'] = False")
         return
-    m = re.search(rf"SET\s+({_VN})\s+TO\s+FALSE", stmt.text, re.IGNORECASE)
+    m = _SET_TO_FALSE_RE.search(stmt.text)
     if m:
         varname = m.group(1).upper()
         cb.line(f"state['{varname}'] = False")
         return
-    m = re.search(rf"SET\s+({_VN})\s+UP\s+BY\s+(.+)", stmt.text, re.IGNORECASE)
+    m = _SET_UP_BY_RE.search(stmt.text)
     if m:
         varname = m.group(1).upper()
         value = m.group(2).strip().rstrip(".")
         cb.line(f"state['{varname}'] = _to_num(state.get('{varname}', 0)) + {_resolve_source(value)}")
         return
-    m = re.search(rf"SET\s+({_VN})\s+DOWN\s+BY\s+(.+)", stmt.text, re.IGNORECASE)
+    m = _SET_DOWN_BY_RE.search(stmt.text)
     if m:
         varname = m.group(1).upper()
         value = m.group(2).strip().rstrip(".")
         cb.line(f"state['{varname}'] = _to_num(state.get('{varname}', 0)) - {_resolve_source(value)}")
         return
-    m = re.search(rf"SET\s+({_VN})\s+TO\s+(.+)", stmt.text, re.IGNORECASE)
+    m = _SET_TO_RE.search(stmt.text)
     if m:
         varname = m.group(1).upper()
         value = m.group(2).strip().rstrip(".")
@@ -1058,7 +1215,7 @@ def _gen_set(cb: _CodeBuilder, stmt: Statement):
 def _gen_display(cb: _CodeBuilder, stmt: Statement):
     # Parse DISPLAY text to extract parts
     text = stmt.text.strip()
-    m = re.match(r"DISPLAY\s+(.*)", text, re.IGNORECASE)
+    m = _DISPLAY_RE.match(text)
     if not m:
         cb.line(f"state['_display'].append('{_sq(_oneline(text))}')")
         return
@@ -1103,17 +1260,17 @@ def _gen_exec(cb: _CodeBuilder, stmt: Statement, kind: str):
     cb.line(f"_dummy_exec('{kind}', '{escaped}', state)")
     # For EXEC CICS: RESP(var) means var receives EIBRESP value after the call
     if kind == "CICS":
-        m = re.search(r'\bRESP\s*\(\s*([A-Z][A-Z0-9-]*)\s*\)', raw, re.IGNORECASE)
+        m = _RESP_RE.search(raw)
         if m:
             cb.line(f"state['{m.group(1).upper()}'] = state.get('EIBRESP', 0)")
-        m2 = re.search(r'\bRESP2\s*\(\s*([A-Z][A-Z0-9-]*)\s*\)', raw, re.IGNORECASE)
+        m2 = _RESP2_RE.search(raw)
         if m2:
             cb.line(f"state['{m2.group(1).upper()}'] = state.get('EIBRESP2', 0)")
 
 
 def _gen_initialize(cb: _CodeBuilder, stmt: Statement):
     text = _strip_cobol_comments(stmt.text)
-    m = re.search(r"INITIALIZE\s+(.+)", text, re.IGNORECASE)
+    m = _INITIALIZE_RE.search(text)
     if m:
         targets = m.group(1).strip().rstrip(".")
         for tok in _tokenize_cobol_vars(targets):
@@ -1127,12 +1284,12 @@ def _gen_initialize(cb: _CodeBuilder, stmt: Statement):
 
 def _gen_string_stmt(cb: _CodeBuilder, stmt: Statement):
     # Best-effort: extract INTO target and concatenate parts
-    m = re.search(r"INTO\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+    m = _INTO_RE.search(stmt.text)
     if m:
         target = m.group(1).upper()
         # Extract parts before DELIMITED
         parts_text = re.split(r"\bINTO\b", stmt.text, flags=re.IGNORECASE)[0]
-        parts_text = re.sub(r"^STRING\s+", "", parts_text, flags=re.IGNORECASE)
+        parts_text = _STRING_PREFIX_RE.sub("", parts_text)
 
         # Split on DELIMITED BY SIZE
         segments = re.split(r"\s+DELIMITED\s+BY\s+SIZE\s*", parts_text, flags=re.IGNORECASE)
@@ -1142,7 +1299,7 @@ def _gen_string_stmt(cb: _CodeBuilder, stmt: Statement):
             if not seg:
                 continue
             # Each segment could be a quoted string or variable
-            for token in re.findall(r"'[^']*'|[A-Z][A-Z0-9-]*", seg, re.IGNORECASE):
+            for token in _STRING_TOKEN_RE.findall(seg):
                 if token.startswith("'"):
                     py_parts.append(token)
                 else:
@@ -1158,7 +1315,7 @@ def _gen_string_stmt(cb: _CodeBuilder, stmt: Statement):
 
 
 def _gen_accept(cb: _CodeBuilder, stmt: Statement):
-    m = re.search(r"ACCEPT\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+    m = _ACCEPT_RE.search(stmt.text)
     if m:
         varname = m.group(1).upper()
         cb.line(f"# ACCEPT {varname} — uses preset state value")
@@ -1168,7 +1325,7 @@ def _gen_accept(cb: _CodeBuilder, stmt: Statement):
 
 def _gen_read(cb: _CodeBuilder, stmt: Statement):
     # Extract file name and set status
-    m = re.search(r"READ\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+    m = _READ_RE.search(stmt.text)
     if m:
         fname = m.group(1).upper()
         cb.line(f"state['_reads'].append('{fname}')")
@@ -1179,7 +1336,7 @@ def _gen_read(cb: _CodeBuilder, stmt: Statement):
 
 
 def _gen_write(cb: _CodeBuilder, stmt: Statement):
-    m = re.search(r"WRITE\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+    m = _WRITE_RE.search(stmt.text)
     if m:
         recname = m.group(1).upper()
         cb.line(f"state['_writes'].append('{recname}')")
@@ -1190,7 +1347,7 @@ def _gen_write(cb: _CodeBuilder, stmt: Statement):
 
 
 def _gen_rewrite(cb: _CodeBuilder, stmt: Statement):
-    m = re.search(r"REWRITE\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+    m = _REWRITE_RE.search(stmt.text)
     if m:
         recname = m.group(1).upper()
         cb.line(f"state['_writes'].append('{recname}')")
@@ -1200,7 +1357,7 @@ def _gen_rewrite(cb: _CodeBuilder, stmt: Statement):
 
 
 def _gen_open(cb: _CodeBuilder, stmt: Statement):
-    m = re.search(r"OPEN\s+(?:INPUT|OUTPUT|I-O|EXTEND)\s+(.+)", stmt.text, re.IGNORECASE)
+    m = _OPEN_RE.search(stmt.text)
     if m:
         files_str = m.group(1).strip().rstrip(".")
         for tok in re.split(r"\s+", files_str):
@@ -1211,7 +1368,7 @@ def _gen_open(cb: _CodeBuilder, stmt: Statement):
 
 
 def _gen_close(cb: _CodeBuilder, stmt: Statement):
-    m = re.search(r"CLOSE\s+(.+)", stmt.text, re.IGNORECASE)
+    m = _CLOSE_RE.search(stmt.text)
     if m:
         files_str = m.group(1).strip().rstrip(".")
         for tok in re.split(r"\s+", files_str):
@@ -1233,21 +1390,21 @@ def _gen_search(cb: _CodeBuilder, stmt: Statement):
     text = stmt.text.strip()
 
     # Extract table name
-    m_table = re.match(r"SEARCH\s+([A-Z][A-Z0-9-]*)", text, re.IGNORECASE)
+    m_table = _SEARCH_TABLE_RE.match(text)
     if not m_table:
         cb.line(f"pass  # SEARCH (unparsed): {_oneline(text)}")
         return
     table_name = m_table.group(1).upper()
 
     # Extract VARYING index
-    m_vary = re.search(r"VARYING\s+([A-Z][A-Z0-9-]*)", text, re.IGNORECASE)
+    m_vary = _SEARCH_VARYING_RE.search(text)
     index_var = m_vary.group(1).upper() if m_vary else None
 
     # Split into AT END and WHEN sections
     at_end_body = ""
     when_body = ""
-    at_end_pos = re.search(r"\bAT\s+END\b", text, re.IGNORECASE)
-    when_pos = re.search(r"\bWHEN\b", text, re.IGNORECASE)
+    at_end_pos = _AT_END_RE.search(text)
+    when_pos = _WHEN_RE.search(text)
 
     if at_end_pos and when_pos:
         at_end_body = text[at_end_pos.end():when_pos.start()].strip()
@@ -1373,16 +1530,16 @@ def _gen_unstring(cb: _CodeBuilder, stmt: Statement):
     text = " ".join(stmt.text.split())
 
     # Extract source
-    m_src = re.match(r"UNSTRING\s+([A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?)", text, re.IGNORECASE)
+    m_src = _UNSTRING_SRC_RE.match(text)
     if not m_src:
         cb.line(f"pass  # UNSTRING (unparsed): {_oneline(text)}")
         return
 
     src_raw = m_src.group(1).strip()
-    src_var = re.sub(r"\s*\(.*\)", "", src_raw).upper()
+    src_var = _SUBSCRIPT_RE.sub("", src_raw).upper()
 
     # Extract delimiter
-    m_delim = re.search(r"DELIMITED\s+BY\s+(\S+)", text, re.IGNORECASE)
+    m_delim = _DELIMITED_BY_RE.search(text)
     if m_delim:
         delim_token = m_delim.group(1).strip()
         if _vk(delim_token) == "SPACES" or _vk(delim_token) == "SPACE":
@@ -1395,7 +1552,7 @@ def _gen_unstring(cb: _CodeBuilder, stmt: Statement):
         py_delim = "None"
 
     # Extract INTO targets
-    m_into = re.search(r"\bINTO\s+(.+?)(?:\s+END-UNSTRING|\s*$)", text, re.IGNORECASE)
+    m_into = _UNSTRING_INTO_RE.search(text)
     if not m_into:
         cb.line(f"pass  # UNSTRING (no INTO): {_oneline(text)}")
         return
@@ -1403,8 +1560,8 @@ def _gen_unstring(cb: _CodeBuilder, stmt: Statement):
     targets_str = m_into.group(1).strip()
     # Split target names (filter out keywords)
     targets = []
-    for tok in re.findall(r"[A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?", targets_str, re.IGNORECASE):
-        clean = re.sub(r"\s*\(.*\)", "", tok).upper()
+    for tok in _UNSTRING_VAR_RE.findall(targets_str):
+        clean = _SUBSCRIPT_RE.sub("", tok).upper()
         if clean not in ("END-UNSTRING", "DELIMITER", "COUNT", "IN", "ALL", "OR"):
             targets.append(clean)
 
@@ -1429,12 +1586,9 @@ def _gen_inspect(cb: _CodeBuilder, stmt: Statement):
     text = stmt.text.strip()
 
     # INSPECT var TALLYING counter FOR LEADING SPACES/ZEROES
-    m = re.search(
-        r"INSPECT\s+([A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?)\s+TALLYING\s+([A-Z][A-Z0-9-]*)\s+FOR\s+LEADING\s+(\S+)",
-        text, re.IGNORECASE,
-    )
+    m = _INSPECT_TALLYING_RE.search(text)
     if m:
-        src_var = _vk(re.sub(r"\s*\(.*\)", "", m.group(1).strip()))
+        src_var = _vk(_SUBSCRIPT_RE.sub("", m.group(1).strip()))
         counter = _vk(m.group(2).strip())
         what = m.group(3).strip().upper().rstrip(".")
         if what in ("SPACES", "SPACE"):
@@ -1460,12 +1614,9 @@ def _gen_inspect(cb: _CodeBuilder, stmt: Statement):
         return
 
     # INSPECT var REPLACING LEADING/ALL/FIRST
-    m = re.search(
-        r"INSPECT\s+([A-Z][A-Z0-9-]*(?:\s*\([^)]*\))?)\s+REPLACING\s+(.+)",
-        text, re.IGNORECASE,
-    )
+    m = _INSPECT_REPLACING_RE.search(text)
     if m:
-        src_var = re.sub(r"\s*\(.*\)", "", m.group(1).strip()).upper()
+        src_var = _SUBSCRIPT_RE.sub("", m.group(1).strip()).upper()
         # Best-effort: just emit a comment — REPLACING is complex
         cb.line(f"pass  # INSPECT REPLACING: {_oneline(text)}")
         return
@@ -1483,200 +1634,204 @@ def _gen_goto(cb: _CodeBuilder, stmt: Statement):
         cb.line(f"pass  # GO TO: {_oneline(stmt.text)}")
 
 
+def _gen_multiply(cb: _CodeBuilder, stmt: Statement):
+    _text = _strip_cobol_comments(stmt.text)
+    m_giving = _MULTIPLY_GIVING_RE.search(_text)
+    m = _MULTIPLY_BY_RE.search(_text)
+    if m_giving:
+        f1 = m_giving.group(1).strip().rstrip(".")
+        f2 = m_giving.group(2).strip().rstrip(".")
+        target_str = _ROUNDED_STRIP_RE.sub("", m_giving.group(3).strip().rstrip("."))
+        tname = _var_name(target_str)
+        def _mv(v):
+            v = v.strip()
+            if _SIGNED_NUMERIC_RE.match(v):
+                return v
+            return f"_to_num(state.get('{_var_name(v)}', 0))"
+        cb.line(f"state['{tname}'] = {_mv(f1)} * {_mv(f2)}")
+    elif m:
+        factor = m.group(1).strip()
+        targets_str = m.group(2).strip().rstrip(".")
+        if _NUMERIC_LITERAL_RE.match(factor):
+            val = str(int(factor)) if "." not in factor else str(float(factor))
+        else:
+            val = f"_to_num(state.get('{_var_name(factor)}', 0))"
+        for tok in _tokenize_cobol_vars(targets_str):
+            tname = _var_name(tok)
+            if tname and tname not in ("GIVING", "ROUNDED"):
+                cb.line(f"state['{tname}'] = _to_num(state.get('{tname}', 0)) * {val}")
+    else:
+        cb.line(f"pass  # MULTIPLY: {_oneline(stmt.text)}")
+
+
+def _gen_divide(cb: _CodeBuilder, stmt: Statement):
+    def _div_val(v):
+        v = v.strip().rstrip(".")
+        v = _ROUNDED_SUFFIX_RE.sub("", v)
+        if _SIGNED_NUMERIC_RE.match(v):
+            return v
+        vn = _vk(_PAREN_STRIP_OPEN_RE.sub("", v))
+        return f"_to_num(state.get('{vn}', 0))"
+
+    m_by = _DIVIDE_BY_GIVING_RE.search(stmt.text)
+    m_into_giving = _DIVIDE_INTO_GIVING_RE.search(stmt.text)
+    m_into = _DIVIDE_INTO_RE.search(stmt.text)
+    if m_by:
+        dividend = _div_val(m_by.group(1))
+        divisor = _div_val(m_by.group(2))
+        tname = _vk(_PAREN_STRIP_OPEN_RE.sub("", m_by.group(3).strip().rstrip(".")))
+        tname = _ROUNDED_SUFFIX_RE.sub("", tname)
+        cb.line(f"state['{tname}'] = _to_num({dividend}) // ({divisor} or 1)")
+        if m_by.group(4):
+            rname = _vk(_PAREN_STRIP_OPEN_RE.sub("", m_by.group(4).strip().rstrip(".")))
+            cb.line(f"state['{rname}'] = _to_num({dividend}) % ({divisor} or 1)")
+    elif m_into_giving:
+        # DIVIDE x INTO y GIVING z [REMAINDER r]
+        # z = y / x, r = y % x, y unchanged
+        divisor = _div_val(m_into_giving.group(1))
+        dividend = _div_val(m_into_giving.group(2))
+        tname = _vk(_PAREN_STRIP_OPEN_RE.sub("", m_into_giving.group(3).strip().rstrip(".")))
+        tname = _ROUNDED_SUFFIX_RE.sub("", tname)
+        cb.line(f"state['{tname}'] = _to_num({dividend}) // ({divisor} or 1)")
+        if m_into_giving.group(4):
+            rname = _vk(_PAREN_STRIP_OPEN_RE.sub("", m_into_giving.group(4).strip().rstrip(".")))
+            cb.line(f"state['{rname}'] = _to_num({dividend}) % ({divisor} or 1)")
+    elif m_into:
+        divisor = m_into.group(1).strip()
+        targets_str = m_into.group(2).strip().rstrip(".")
+        if _NUMERIC_LITERAL_RE.match(divisor):
+            val = str(int(divisor)) if "." not in divisor else str(float(divisor))
+        else:
+            val = f"_to_num(state.get('{_var_name(divisor)}', 0))"
+        for tok in _tokenize_cobol_vars(targets_str):
+            tname = _var_name(tok)
+            if tname and tname not in ("GIVING", "REMAINDER", "ROUNDED"):
+                cb.line(f"state['{tname}'] = _to_num(state.get('{tname}', 0)) // ({val} or 1)")
+    else:
+        cb.line(f"pass  # DIVIDE: {_oneline(stmt.text)}")
+
+
+def _gen_goback(cb: _CodeBuilder, stmt: Statement):
+    cb.line("raise _GobackSignal()")
+
+
+def _gen_exit(cb: _CodeBuilder, stmt: Statement):
+    cb.line("pass  # EXIT")
+
+
+def _gen_continue(cb: _CodeBuilder, stmt: Statement):
+    cb.line("pass  # CONTINUE")
+
+
+def _gen_sort(cb: _CodeBuilder, stmt: Statement):
+    cb.line(f"pass  # SORT: {_oneline(stmt.text)}")
+
+
+def _gen_alter(cb: _CodeBuilder, stmt: Statement):
+    cb.line(f"pass  # ALTER: {_oneline(stmt.text)}")
+
+
+def _gen_start(cb: _CodeBuilder, stmt: Statement):
+    m = _START_RE.search(stmt.text)
+    if m:
+        fname = m.group(1).upper()
+        cb.line(f"_apply_stub_outcome(state, 'START:{fname}')")
+    cb.line(f"pass  # {_oneline(stmt.text, 70)}")
+
+
+def _gen_delete(cb: _CodeBuilder, stmt: Statement):
+    m = _DELETE_RE.search(stmt.text)
+    if m:
+        fname = m.group(1).upper()
+        cb.line(f"_apply_stub_outcome(state, 'DELETE:{fname}')")
+    cb.line(f"pass  # {_oneline(stmt.text, 70)}")
+
+
+def _gen_noop(cb: _CodeBuilder, stmt: Statement):
+    pass
+
+
+def _gen_exec_sql(cb, stmt):
+    _gen_exec(cb, stmt, "SQL")
+
+
+def _gen_exec_cics(cb, stmt):
+    _gen_exec(cb, stmt, "CICS")
+
+
+def _gen_exec_dli(cb, stmt):
+    _gen_exec(cb, stmt, "DLI")
+
+
+def _gen_exec_other(cb, stmt):
+    _gen_exec(cb, stmt, "OTHER")
+
+
+# Dispatch table for O(1) statement type lookup
+_STATEMENT_DISPATCH: dict[str, callable] = {
+    "MOVE": _gen_move,
+    "COMPUTE": _gen_compute,
+    "ADD": _gen_add,
+    "SUBTRACT": _gen_subtract,
+    "IF": _gen_if,
+    "ELSE": _gen_noop,
+    "EVALUATE": _gen_evaluate,
+    "WHEN": _gen_noop,
+    "PERFORM": _gen_perform,
+    "PERFORM_THRU": _gen_perform_thru,
+    "PERFORM_INLINE": _gen_perform_inline,
+    "SET": _gen_set,
+    "DISPLAY": _gen_display,
+    "CALL": _gen_call,
+    "EXEC_SQL": _gen_exec_sql,
+    "EXEC_CICS": _gen_exec_cics,
+    "EXEC_DLI": _gen_exec_dli,
+    "EXEC_OTHER": _gen_exec_other,
+    "GOBACK": _gen_goback,
+    "STOP_RUN": _gen_goback,
+    "EXIT": _gen_exit,
+    "CONTINUE": _gen_continue,
+    "CONTINUE_STMT": _gen_continue,
+    "INITIALIZE": _gen_initialize,
+    "OPEN": _gen_open,
+    "CLOSE": _gen_close,
+    "READ": _gen_read,
+    "WRITE": _gen_write,
+    "REWRITE": _gen_rewrite,
+    "ACCEPT": _gen_accept,
+    "STRING": _gen_string_stmt,
+    "UNSTRING": _gen_unstring,
+    "INSPECT": _gen_inspect,
+    "SEARCH": _gen_search,
+    "SORT": _gen_sort,
+    "GO_TO": _gen_goto,
+    "ALTER": _gen_alter,
+    "MULTIPLY": _gen_multiply,
+    "DIVIDE": _gen_divide,
+    "START": _gen_start,
+    "DELETE": _gen_delete,
+}
+
+
 def _gen_statement(cb: _CodeBuilder, stmt: Statement):
     """Generate Python code for a single statement."""
-    stype = stmt.type
-
-    if stype == "MOVE":
-        _gen_move(cb, stmt)
-    elif stype == "COMPUTE":
-        _gen_compute(cb, stmt)
-    elif stype == "ADD":
-        _gen_add(cb, stmt)
-    elif stype == "SUBTRACT":
-        _gen_subtract(cb, stmt)
-    elif stype == "IF":
-        _gen_if(cb, stmt)
-    elif stype == "ELSE":
-        # Handled inside IF
-        pass
-    elif stype == "EVALUATE":
-        _gen_evaluate(cb, stmt)
-    elif stype == "WHEN":
-        # Handled inside EVALUATE
-        pass
-    elif stype == "PERFORM":
-        _gen_perform(cb, stmt)
-    elif stype == "PERFORM_THRU":
-        _gen_perform_thru(cb, stmt)
-    elif stype == "PERFORM_INLINE":
-        _gen_perform_inline(cb, stmt)
-    elif stype == "SET":
-        _gen_set(cb, stmt)
-    elif stype == "DISPLAY":
-        _gen_display(cb, stmt)
-    elif stype == "CALL":
-        _gen_call(cb, stmt)
-    elif stype == "EXEC_SQL":
-        _gen_exec(cb, stmt, "SQL")
-    elif stype == "EXEC_CICS":
-        _gen_exec(cb, stmt, "CICS")
-    elif stype == "EXEC_DLI":
-        _gen_exec(cb, stmt, "DLI")
-    elif stype == "EXEC_OTHER":
-        _gen_exec(cb, stmt, "OTHER")
-    elif stype == "GOBACK":
-        cb.line("raise _GobackSignal()")
-    elif stype == "STOP_RUN":
-        cb.line("raise _GobackSignal()")
-    elif stype == "EXIT":
-        cb.line("pass  # EXIT")
-    elif stype in ("CONTINUE", "CONTINUE_STMT"):
-        cb.line("pass  # CONTINUE")
-    elif stype == "INITIALIZE":
-        _gen_initialize(cb, stmt)
-    elif stype == "OPEN":
-        _gen_open(cb, stmt)
-    elif stype == "CLOSE":
-        _gen_close(cb, stmt)
-    elif stype == "READ":
-        _gen_read(cb, stmt)
-    elif stype == "WRITE":
-        _gen_write(cb, stmt)
-    elif stype == "REWRITE":
-        _gen_rewrite(cb, stmt)
-    elif stype == "ACCEPT":
-        _gen_accept(cb, stmt)
-    elif stype == "STRING":
-        _gen_string_stmt(cb, stmt)
-    elif stype == "UNSTRING":
-        _gen_unstring(cb, stmt)
-    elif stype == "INSPECT":
-        _gen_inspect(cb, stmt)
-    elif stype == "SEARCH":
-        _gen_search(cb, stmt)
-    elif stype == "SORT":
-        cb.line(f"pass  # SORT: {_oneline(stmt.text)}")
-    elif stype == "GO_TO":
-        _gen_goto(cb, stmt)
-    elif stype == "ALTER":
-        cb.line(f"pass  # ALTER: {_oneline(stmt.text)}")
-    elif stype == "MULTIPLY":
-        _text = _strip_cobol_comments(stmt.text)
-        m_giving = re.search(
-            r"MULTIPLY\s+(\S+)\s+BY\s+(\S+)\s+GIVING\s+(.+)",
-            _text, re.IGNORECASE,
-        )
-        m = re.search(r"MULTIPLY\s+(.+?)\s+BY\s+(.+)", _text, re.IGNORECASE)
-        if m_giving:
-            f1 = m_giving.group(1).strip().rstrip(".")
-            f2 = m_giving.group(2).strip().rstrip(".")
-            target_str = re.sub(r"\s+ROUNDED\b.*", "", m_giving.group(3).strip().rstrip("."), flags=re.IGNORECASE)
-            tname = _var_name(target_str)
-            def _mv(v):
-                v = v.strip()
-                if re.match(r"^[+-]?\d+\.?\d*$", v):
-                    return v
-                return f"_to_num(state.get('{_var_name(v)}', 0))"
-            cb.line(f"state['{tname}'] = {_mv(f1)} * {_mv(f2)}")
-        elif m:
-            factor = m.group(1).strip()
-            targets_str = m.group(2).strip().rstrip(".")
-            if re.match(r"^-?\d+\.?\d*$", factor):
-                val = str(int(factor)) if "." not in factor else str(float(factor))
-            else:
-                val = f"_to_num(state.get('{_var_name(factor)}', 0))"
-            for tok in _tokenize_cobol_vars(targets_str):
-                tname = _var_name(tok)
-                if tname and tname not in ("GIVING", "ROUNDED"):
-                    cb.line(f"state['{tname}'] = _to_num(state.get('{tname}', 0)) * {val}")
-        else:
-            cb.line(f"pass  # MULTIPLY: {_oneline(stmt.text)}")
-    elif stype == "DIVIDE":
-        m_by = re.search(
-            r"DIVIDE\s+(.+?)\s+BY\s+(.+?)\s+GIVING\s+(\S+)"
-            r"(?:\s+REMAINDER\s+(\S+))?",
-            stmt.text, re.IGNORECASE,
-        )
-        m_into_giving = re.search(
-            r"DIVIDE\s+(.+?)\s+INTO\s+(\S+)\s+GIVING\s+(\S+)"
-            r"(?:\s+REMAINDER\s+(\S+))?",
-            stmt.text, re.IGNORECASE,
-        )
-        m_into = re.search(r"DIVIDE\s+(.+?)\s+INTO\s+(.+)", stmt.text, re.IGNORECASE)
-        if m_by:
-            def _div_val(v):
-                v = v.strip().rstrip(".")
-                v = re.sub(r"\s+ROUNDED$", "", v, flags=re.IGNORECASE)
-                if re.match(r"^[+-]?\d+\.?\d*$", v):
-                    return v
-                vn = _vk(re.sub(r"\s*\(.*", "", v))
-                return f"_to_num(state.get('{vn}', 0))"
-            dividend = _div_val(m_by.group(1))
-            divisor = _div_val(m_by.group(2))
-            tname = _vk(re.sub(r"\s*\(.*", "", m_by.group(3).strip().rstrip(".")))
-            tname = re.sub(r"\s+ROUNDED$", "", tname, flags=re.IGNORECASE)
-            cb.line(f"state['{tname}'] = _to_num({dividend}) // ({divisor} or 1)")
-            if m_by.group(4):
-                rname = _vk(re.sub(r"\s*\(.*", "", m_by.group(4).strip().rstrip(".")))
-                cb.line(f"state['{rname}'] = _to_num({dividend}) % ({divisor} or 1)")
-        elif m_into_giving:
-            # DIVIDE x INTO y GIVING z [REMAINDER r]
-            # z = y / x, r = y % x, y unchanged
-            def _div_val2(v):
-                v = v.strip().rstrip(".")
-                v = re.sub(r"\s+ROUNDED$", "", v, flags=re.IGNORECASE)
-                if re.match(r"^[+-]?\d+\.?\d*$", v):
-                    return v
-                vn = _vk(re.sub(r"\s*\(.*", "", v))
-                return f"_to_num(state.get('{vn}', 0))"
-            divisor = _div_val2(m_into_giving.group(1))
-            dividend = _div_val2(m_into_giving.group(2))
-            tname = _vk(re.sub(r"\s*\(.*", "", m_into_giving.group(3).strip().rstrip(".")))
-            tname = re.sub(r"\s+ROUNDED$", "", tname, flags=re.IGNORECASE)
-            cb.line(f"state['{tname}'] = _to_num({dividend}) // ({divisor} or 1)")
-            if m_into_giving.group(4):
-                rname = _vk(re.sub(r"\s*\(.*", "", m_into_giving.group(4).strip().rstrip(".")))
-                cb.line(f"state['{rname}'] = _to_num({dividend}) % ({divisor} or 1)")
-        elif m_into:
-            divisor = m_into.group(1).strip()
-            targets_str = m_into.group(2).strip().rstrip(".")
-            if re.match(r"^-?\d+\.?\d*$", divisor):
-                val = str(int(divisor)) if "." not in divisor else str(float(divisor))
-            else:
-                val = f"_to_num(state.get('{_var_name(divisor)}', 0))"
-            for tok in _tokenize_cobol_vars(targets_str):
-                tname = _var_name(tok)
-                if tname and tname not in ("GIVING", "REMAINDER", "ROUNDED"):
-                    cb.line(f"state['{tname}'] = _to_num(state.get('{tname}', 0)) // ({val} or 1)")
-        else:
-            cb.line(f"pass  # DIVIDE: {_oneline(stmt.text)}")
-    elif stype == "START":
-        m = re.search(r"START\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
-        if m:
-            fname = m.group(1).upper()
-            cb.line(f"_apply_stub_outcome(state, 'START:{fname}')")
-        cb.line(f"pass  # {_oneline(stmt.text, 70)}")
-    elif stype == "DELETE":
-        m = re.search(r"DELETE\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
-        if m:
-            fname = m.group(1).upper()
-            cb.line(f"_apply_stub_outcome(state, 'DELETE:{fname}')")
-        cb.line(f"pass  # {_oneline(stmt.text, 70)}")
+    handler = _STATEMENT_DISPATCH.get(stmt.type)
+    if handler is not None:
+        handler(cb, stmt)
     else:
         # Check for UNKNOWN statements that are actually START/DELETE
         text_upper = stmt.text.strip().upper()
         if text_upper.startswith("START "):
-            m = re.search(r"START\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+            m = _START_RE.search(stmt.text)
             if m:
                 fname = m.group(1).upper()
                 cb.line(f"_apply_stub_outcome(state, 'START:{fname}')")
         elif text_upper.startswith("DELETE "):
-            m = re.search(r"DELETE\s+([A-Z][A-Z0-9-]*)", stmt.text, re.IGNORECASE)
+            m = _DELETE_RE.search(stmt.text)
             if m:
                 fname = m.group(1).upper()
                 cb.line(f"_apply_stub_outcome(state, 'DELETE:{fname}')")
-        cb.line(f"pass  # {stype}: {_oneline(stmt.text)}")
+        cb.line(f"pass  # {stmt.type}: {_oneline(stmt.text)}")
 
 
 # ---------------------------------------------------------------------------
@@ -1702,8 +1857,9 @@ def generate_code(
     if var_report is None:
         var_report = extract_variables(program)
 
-    global _PARAGRAPH_ORDER
+    global _PARAGRAPH_ORDER, _PARAGRAPH_INDEX
     _PARAGRAPH_ORDER = [p.name for p in program.paragraphs]
+    _PARAGRAPH_INDEX = {name: i for i, name in enumerate(_PARAGRAPH_ORDER)}
 
     cb = _CodeBuilder()
 
@@ -1722,8 +1878,8 @@ def generate_code(
     if not cb.siblings_88:
         set_true_vars: set[str] = set()
         def _collect_set_true(s: Statement):
-            if s.type == "SET" and re.search(r"SET\s+\S+\s+TO\s+TRUE", s.text, re.IGNORECASE):
-                m = re.search(r"SET\s+([A-Z0-9][A-Z0-9-]*)\s+TO\s+TRUE", s.text, re.IGNORECASE)
+            if s.type == "SET" and _SET_TRUE_DETECT_RE.search(s.text):
+                m = _SET_TRUE_EXTRACT_RE.search(s.text)
                 if m:
                     set_true_vars.add(m.group(1).upper())
             for c in s.children:
