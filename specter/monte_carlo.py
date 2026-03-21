@@ -835,12 +835,13 @@ def _mutate_state(parent_state: dict, var_report, rng: random.Random,
 
     # Lazily populate pre-computed classification buckets
     if not fuzzer._classification_buckets_ready:
+        vars_dict = var_report.variables
         fuzzer._vars_with_literals = [
-            n for n in var_names if var_report.variables[n].condition_literals
+            n for n in var_names if vars_dict[n].condition_literals
         ]
         fuzzer._vars_non_status = [
             n for n in var_names
-            if var_report.variables[n].classification not in ("status",)
+            if vars_dict[n].classification not in ("status",)
         ]
         fuzzer._classification_buckets_ready = True
 

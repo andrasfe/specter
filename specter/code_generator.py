@@ -133,6 +133,8 @@ _INITIALIZE_RE = re.compile(r"INITIALIZE\s+(.+)", re.IGNORECASE)
 _INTO_RE = re.compile(r"INTO\s+([A-Z][A-Z0-9-]*)", re.IGNORECASE)
 _STRING_PREFIX_RE = re.compile(r"^STRING\s+", re.IGNORECASE)
 _STRING_TOKEN_RE = re.compile(r"'[^']*'|[A-Z][A-Z0-9-]*", re.IGNORECASE)
+_INTO_SPLIT_RE = re.compile(r"\bINTO\b", re.IGNORECASE)
+_DELIMITED_SPLIT_RE = re.compile(r"\s+DELIMITED\s+BY\s+SIZE\s*", re.IGNORECASE)
 
 # Used by _gen_accept
 _ACCEPT_RE = re.compile(r"ACCEPT\s+([A-Z][A-Z0-9-]*)", re.IGNORECASE)
@@ -1288,11 +1290,11 @@ def _gen_string_stmt(cb: _CodeBuilder, stmt: Statement):
     if m:
         target = m.group(1).upper()
         # Extract parts before DELIMITED
-        parts_text = re.split(r"\bINTO\b", stmt.text, flags=re.IGNORECASE)[0]
+        parts_text = _INTO_SPLIT_RE.split(stmt.text)[0]
         parts_text = _STRING_PREFIX_RE.sub("", parts_text)
 
         # Split on DELIMITED BY SIZE
-        segments = re.split(r"\s+DELIMITED\s+BY\s+SIZE\s*", parts_text, flags=re.IGNORECASE)
+        segments = _DELIMITED_SPLIT_RE.split(parts_text)
         py_parts = []
         for seg in segments:
             seg = seg.strip()
@@ -1360,7 +1362,7 @@ def _gen_open(cb: _CodeBuilder, stmt: Statement):
     m = _OPEN_RE.search(stmt.text)
     if m:
         files_str = m.group(1).strip().rstrip(".")
-        for tok in re.split(r"\s+", files_str):
+        for tok in files_str.split():
             tok = _vk(tok.strip())
             if tok and tok not in ("INPUT", "OUTPUT", "I-O", "EXTEND"):
                 cb.line(f"_apply_stub_outcome(state, 'OPEN:{tok}')")
@@ -1371,7 +1373,7 @@ def _gen_close(cb: _CodeBuilder, stmt: Statement):
     m = _CLOSE_RE.search(stmt.text)
     if m:
         files_str = m.group(1).strip().rstrip(".")
-        for tok in re.split(r"\s+", files_str):
+        for tok in files_str.split():
             tok = _vk(tok.strip())
             if tok:
                 cb.line(f"_apply_stub_outcome(state, 'CLOSE:{tok}')")
@@ -2128,8 +2130,7 @@ def generate_code(
     cb.line('"""Return default state dict with all discovered variables."""')
     cb.line("return {")
     cb.indent()
-    for name in sorted(var_report.variables.keys()):
-        info = var_report.variables[name]
+    for name, info in sorted(var_report.variables.items()):
         if info.classification == "flag":
             default = "False"
         elif info.classification == "status":

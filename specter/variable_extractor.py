@@ -68,26 +68,45 @@ class VariableReport:
     """All variables discovered in a program."""
 
     variables: dict[str, VariableInfo] = field(default_factory=dict)
+    _cache: dict = field(default_factory=dict, repr=False)
+
+    def _invalidate_cache(self):
+        self._cache.clear()
 
     @property
     def input_vars(self) -> list[str]:
-        return [n for n, v in self.variables.items() if v.classification == "input"]
+        key = "input"
+        if key not in self._cache:
+            self._cache[key] = [n for n, v in self.variables.items() if v.classification == "input"]
+        return self._cache[key]
 
     @property
     def internal_vars(self) -> list[str]:
-        return [n for n, v in self.variables.items() if v.classification == "internal"]
+        key = "internal"
+        if key not in self._cache:
+            self._cache[key] = [n for n, v in self.variables.items() if v.classification == "internal"]
+        return self._cache[key]
 
     @property
     def status_vars(self) -> list[str]:
-        return [n for n, v in self.variables.items() if v.classification == "status"]
+        key = "status"
+        if key not in self._cache:
+            self._cache[key] = [n for n, v in self.variables.items() if v.classification == "status"]
+        return self._cache[key]
 
     @property
     def flag_vars(self) -> list[str]:
-        return [n for n, v in self.variables.items() if v.classification == "flag"]
+        key = "flag"
+        if key not in self._cache:
+            self._cache[key] = [n for n, v in self.variables.items() if v.classification == "flag"]
+        return self._cache[key]
 
     @property
     def all_names(self) -> list[str]:
-        return sorted(self.variables.keys())
+        key = "all"
+        if key not in self._cache:
+            self._cache[key] = sorted(self.variables.keys())
+        return self._cache[key]
 
 
 def _clean_var_name(name: str) -> str:
@@ -259,7 +278,7 @@ def _walk_statement(report: VariableReport, stmt: Statement):
                 if not (source.startswith("'") or re.match(r"^-?\d+\.?\d*$", source.strip())):
                     _record_read(report, name)
         if targets:
-            for t in re.split(r"\s+", targets):
+            for t in targets.split():
                 t = t.strip()
                 if t and t.upper() not in _KEYWORDS:
                     _record_write(report, t)
@@ -503,9 +522,9 @@ def extract_stub_status_mapping(
                         if not found:
                             found = _find_first_var_in_condition(cond)
                         if found:
-                            mapping.setdefault(op_key, []).extend(
-                                v for v in found if v not in mapping.get(op_key, [])
-                            )
+                            existing = mapping.setdefault(op_key, [])
+                            existing_set = set(existing)
+                            existing.extend(v for v in found if v not in existing_set)
                     break
 
     # Apply fallback defaults for common operations
