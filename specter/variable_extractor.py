@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 from dataclasses import dataclass, field
 
 from .models import Program, Statement
+
+_logger = logging.getLogger(__name__)
 
 # Variable name pattern (COBOL style with hyphens)
 _VAR_RE = re.compile(r"\b([A-Z][A-Z0-9-]*(?:\([^)]*\))?)\b")
@@ -68,26 +72,45 @@ class VariableReport:
     """All variables discovered in a program."""
 
     variables: dict[str, VariableInfo] = field(default_factory=dict)
+    _cache: dict = field(default_factory=dict, repr=False)
+
+    def _invalidate_cache(self):
+        self._cache.clear()
 
     @property
     def input_vars(self) -> list[str]:
-        return [n for n, v in self.variables.items() if v.classification == "input"]
+        key = "input"
+        if key not in self._cache:
+            self._cache[key] = [n for n, v in self.variables.items() if v.classification == "input"]
+        return self._cache[key]
 
     @property
     def internal_vars(self) -> list[str]:
-        return [n for n, v in self.variables.items() if v.classification == "internal"]
+        key = "internal"
+        if key not in self._cache:
+            self._cache[key] = [n for n, v in self.variables.items() if v.classification == "internal"]
+        return self._cache[key]
 
     @property
     def status_vars(self) -> list[str]:
-        return [n for n, v in self.variables.items() if v.classification == "status"]
+        key = "status"
+        if key not in self._cache:
+            self._cache[key] = [n for n, v in self.variables.items() if v.classification == "status"]
+        return self._cache[key]
 
     @property
     def flag_vars(self) -> list[str]:
-        return [n for n, v in self.variables.items() if v.classification == "flag"]
+        key = "flag"
+        if key not in self._cache:
+            self._cache[key] = [n for n, v in self.variables.items() if v.classification == "flag"]
+        return self._cache[key]
 
     @property
     def all_names(self) -> list[str]:
-        return sorted(self.variables.keys())
+        key = "all"
+        if key not in self._cache:
+            self._cache[key] = sorted(self.variables.keys())
+        return self._cache[key]
 
 
 def _clean_var_name(name: str) -> str:
@@ -259,7 +282,7 @@ def _walk_statement(report: VariableReport, stmt: Statement):
                 if not (source.startswith("'") or re.match(r"^-?\d+\.?\d*$", source.strip())):
                     _record_read(report, name)
         if targets:
-            for t in re.split(r"\s+", targets):
+            for t in targets.split():
                 t = t.strip()
                 if t and t.upper() not in _KEYWORDS:
                     _record_write(report, t)
@@ -397,13 +420,30 @@ def _classify_variables(report: VariableReport):
 
 def extract_variables(program: Program) -> VariableReport:
     """Extract and classify all variables from a Program AST."""
+    t_start = time.monotonic()
+    n_paras = len(program.paragraphs)
+    _logger.info("extract_variables: start program=%s paragraphs=%d",
+                 program.program_id, n_paras)
+
     report = VariableReport()
 
+    t_walk = time.monotonic()
+    n_stmts = 0
     for para in program.paragraphs:
         for stmt in para.statements:
             _walk_statement(report, stmt)
+            n_stmts += 1
+    _logger.debug("extract_variables: walked %d statements in %.3fs, found %d vars",
+                  n_stmts, time.monotonic() - t_walk, len(report.variables))
 
+    t_classify = time.monotonic()
     _classify_variables(report)
+    _logger.debug("extract_variables: classification took %.3fs", time.monotonic() - t_classify)
+
+    _logger.info("extract_variables: finished in %.3fs (%d variables: %d input, %d internal, %d status, %d flag)",
+                 time.monotonic() - t_start, len(report.variables),
+                 len(report.input_vars), len(report.internal_vars),
+                 len(report.status_vars), len(report.flag_vars))
     return report
 
 
@@ -418,6 +458,8 @@ def extract_stub_status_mapping(
 
     Returns e.g. {"SQL": ["SQLCODE"], "READ:MY-FILE": ["MY-FILE-STATUS"]}.
     """
+    t_start = time.monotonic()
+    _logger.debug("extract_stub_status_mapping: start")
     mapping: dict[str, list[str]] = {}
 
     # Collect all known status variable names
@@ -503,9 +545,9 @@ def extract_stub_status_mapping(
                         if not found:
                             found = _find_first_var_in_condition(cond)
                         if found:
-                            mapping.setdefault(op_key, []).extend(
-                                v for v in found if v not in mapping.get(op_key, [])
-                            )
+                            existing = mapping.setdefault(op_key, [])
+                            existing_set = set(existing)
+                            existing.extend(v for v in found if v not in existing_set)
                     break
 
     # Apply fallback defaults for common operations
@@ -563,6 +605,8 @@ def extract_stub_status_mapping(
                         if candidate in status_vars:
                             mapping[key] = [candidate]
 
+    _logger.debug("extract_stub_status_mapping: finished in %.3fs (%d mappings)",
+                  time.monotonic() - t_start, len(mapping))
     return mapping
 
 
