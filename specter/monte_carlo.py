@@ -12,8 +12,11 @@ import random
 import re
 import sys
 from collections import Counter
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -1090,6 +1093,8 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
     uncovered paragraphs, combining static analysis with LLM reasoning
     to maximize path coverage.
     """
+    t_guided_start = time.monotonic()
+    _logger.info("_run_guided: start n_iterations=%d concolic=%s", n_iterations, concolic)
     rng = random.Random(seed)
     search_rng = random.Random(seed + 1_000_000)  # separate rng for SEARCH outcomes
     fuzzer = _FuzzerState()
@@ -1318,7 +1323,18 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
             except ImportError:
                 pass
 
+    _guided_log_interval = max(1, n_iterations // 10)
+    _t_guided_loop = time.monotonic()
+
     for i in range(n_iterations):
+        if i > 0 and i % _guided_log_interval == 0:
+            elapsed = time.monotonic() - _t_guided_loop
+            rate = i / elapsed if elapsed > 0 else 0
+            _logger.info("_run_guided: iteration %d/%d (%.0f iter/s, corpus=%d, "
+                         "coverage=%d paras, %d branches, %d edges)",
+                         i, n_iterations, rate, len(fuzzer.corpus),
+                         len(fuzzer.global_coverage), len(fuzzer.global_branches),
+                         len(fuzzer.global_edges))
         # --- LLM-guided strategy decision ---
         # Use adaptive LLM strategist when available; fall back to
         # original LLM suggestion injection otherwise.
@@ -2135,6 +2151,12 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
     except Exception:
         pass
 
+    _logger.info("_run_guided: finished %d iterations in %.3fs "
+                 "(corpus=%d, coverage=%d paras, %d branches, %d edges, %d ok, %d err)",
+                 n_iterations, time.monotonic() - t_guided_start,
+                 len(fuzzer.corpus), len(fuzzer.global_coverage),
+                 len(fuzzer.global_branches), len(fuzzer.global_edges),
+                 fuzzer.n_successful, fuzzer.n_errors)
     return _build_report_from_fuzzer(fuzzer, n_iterations, all_paragraphs,
                                     call_graph=call_graph,
                                     total_branches=total_branches)
@@ -2270,7 +2292,12 @@ def run_monte_carlo(
     Returns:
         MonteCarloReport with aggregated results.
     """
+    t_start = time.monotonic()
+    _logger.info("run_monte_carlo: start n_iterations=%d guided=%s concolic=%s seed=%d",
+                 n_iterations, guided, concolic, seed)
+
     module = _load_module(generated_module_path)
+    _logger.debug("run_monte_carlo: module loaded in %.3fs", time.monotonic() - t_start)
 
     # Raise recursion limit for deep COBOL call chains
     old_limit = sys.getrecursionlimit()
@@ -2302,8 +2329,15 @@ def run_monte_carlo(
     rng = random.Random(seed)
     report = MonteCarloReport(n_iterations=n_iterations)
     _all_branches: set[int] = set()
+    _t_loop = time.monotonic()
+    _log_interval = max(1, n_iterations // 10)  # log ~10 times
 
     for i in range(n_iterations):
+        if i > 0 and i % _log_interval == 0:
+            elapsed = time.monotonic() - _t_loop
+            rate = i / elapsed if elapsed > 0 else 0
+            _logger.info("run_monte_carlo: iteration %d/%d (%.0f iter/s, %d ok, %d err)",
+                         i, n_iterations, rate, report.n_successful, report.n_errors)
         if var_report is not None:
             initial = _generate_random_state(var_report, rng)
         else:
@@ -2408,4 +2442,7 @@ def run_monte_carlo(
 
         report.analysis_report = analysis
 
+    _logger.info("run_monte_carlo: finished %d iterations in %.3fs (%d ok, %d err, %d abend)",
+                 n_iterations, time.monotonic() - t_start,
+                 report.n_successful, report.n_errors, report.n_abended)
     return report

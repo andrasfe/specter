@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 from textwrap import indent
 
 from .condition_parser import (
@@ -12,6 +14,8 @@ from .condition_parser import (
 )
 from .models import Program, Statement
 from .variable_extractor import VariableReport, extract_variables
+
+_logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Pre-compiled regexes (hoisted from per-call sites for performance)
@@ -494,6 +498,7 @@ def _gen_compute(cb: _CodeBuilder, stmt: Statement):
     # Strip COBOL inline comments (*> ... to end)
     # Try multiple strategies and pick the first that compiles
     if "*>" in expression:
+        _t_compute = time.monotonic()
         candidates = []
 
         # Strategy 1: _strip_cobol_comments (understands old-code. new-code)
@@ -556,6 +561,11 @@ def _gen_compute(cb: _CodeBuilder, stmt: Statement):
                 break
             except SyntaxError:
                 continue
+
+        _compute_elapsed = time.monotonic() - _t_compute
+        if _compute_elapsed > 0.1:
+            _logger.debug("_gen_compute: comment-strip for target=%s took %.3fs (%d candidates)",
+                          target, _compute_elapsed, len(candidates))
 
     if not expression:
         cb.line(f"pass  # COMPUTE: empty expression after comment strip")
@@ -1856,8 +1866,17 @@ def generate_code(
 
     Returns the complete Python source code as a string.
     """
+    t_start = time.monotonic()
+    n_paras = len(program.paragraphs)
+    n_vars = len(var_report.variables) if var_report else 0
+    _logger.info("generate_code: start program=%s paragraphs=%d vars=%d instrument=%s",
+                 program.program_id, n_paras, n_vars, instrument)
+
     if var_report is None:
+        t0 = time.monotonic()
         var_report = extract_variables(program)
+        _logger.debug("generate_code: extract_variables took %.3fs (%d vars)",
+                      time.monotonic() - t0, len(var_report.variables))
 
     global _PARAGRAPH_ORDER, _PARAGRAPH_INDEX
     _PARAGRAPH_ORDER = [p.name for p in program.paragraphs]
@@ -2180,7 +2199,10 @@ def generate_code(
         cb.blank()
 
     # One function per paragraph
-    for para in program.paragraphs:
+    _para_count = len(program.paragraphs)
+    _slow_threshold = 0.5  # seconds
+    for _pi, para in enumerate(program.paragraphs):
+        _t_para = time.monotonic()
         cb.current_para = para.name
         func_name = _sanitize_name(para.name)
         cb.line(f"def {func_name}(state):")
@@ -2218,6 +2240,13 @@ def generate_code(
         cb.dedent()
         cb.blank()
         cb.blank()
+        _para_elapsed = time.monotonic() - _t_para
+        if _para_elapsed >= _slow_threshold:
+            _logger.warning("generate_code: paragraph %d/%d '%s' took %.3fs (slow)",
+                            _pi + 1, _para_count, para.name, _para_elapsed)
+        elif _pi % 20 == 0 or _pi == _para_count - 1:
+            _logger.debug("generate_code: paragraph %d/%d '%s' took %.3fs",
+                          _pi + 1, _para_count, para.name, _para_elapsed)
 
     # Branch metadata for concolic engine (maps branch ID -> condition info)
     cb.line(f"_BRANCH_META = {repr(cb.branch_meta)}")
@@ -2290,4 +2319,7 @@ def generate_code(
     cb.dedent()
     cb.blank()
 
-    return cb.build()
+    source = cb.build()
+    _logger.info("generate_code: finished program=%s in %.3fs (%d lines generated)",
+                 program.program_id, time.monotonic() - t_start, source.count('\n'))
+    return source
