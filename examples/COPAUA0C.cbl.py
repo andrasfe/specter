@@ -80,6 +80,54 @@ class _SafeDict(dict):
             return ''
 
 
+class _InstrumentedState(_SafeDict):
+    """Dict subclass that records variable reads/writes and paragraph trace."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._current_para = ''
+        self._call_stack = []
+        super().__setitem__('_trace', [])
+        super().__setitem__('_var_writes', [])
+        super().__setitem__('_var_reads', [])
+        super().__setitem__('_call_events', [])
+
+    def _enter_para(self, name):
+        if len(self['_trace']) > 50000:
+            raise _GobackSignal()
+        caller = self._call_stack[-1] if self._call_stack else None
+        self._call_stack.append(name)
+        self._current_para = name
+        super().__getitem__('_trace').append(name)
+        super().__getitem__('_call_events').append(('enter', name, len(self._call_stack), caller))
+
+    def _exit_para(self, name):
+        if self._call_stack and self._call_stack[-1] == name:
+            self._call_stack.pop()
+        self._current_para = self._call_stack[-1] if self._call_stack else ''
+        super().__getitem__('_call_events').append(('exit', name, len(self._call_stack) + 1, None))
+
+    def __setitem__(self, key, value):
+        if not key.startswith('_'):
+            super().__getitem__('_var_writes').append((key, self._current_para))
+        super().__setitem__(key, value)
+
+    def get(self, key, default=None):
+        if not key.startswith('_'):
+            super().__getitem__('_var_reads').append((key, self._current_para))
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        if not key.startswith('_'):
+            dict.__getitem__(self, '_var_reads').append((key, self._current_para))
+        return super().__getitem__(key)
+
+    def setdefault(self, key, default=None):
+        if key not in self:
+            self[key] = default
+        return super().__getitem__(key)
+
+
 def _default_state():
     """Return default state dict with all discovered variables."""
     return {
@@ -343,6 +391,7 @@ def para_MAIN_PARA(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('MAIN-PARA')
         para_1000_INITIALIZE(state)
         para_1000_EXIT(state)
         para_2000_MAIN_PROCESS(state)
@@ -351,6 +400,7 @@ def para_MAIN_PARA(state):
         para_9000_EXIT(state)
         _dummy_exec('CICS', 'EXEC CICS RETURN END-EXEC.', state)
     finally:
+        state._exit_para('MAIN-PARA')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -362,6 +412,7 @@ def para_1000_INITIALIZE(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('1000-INITIALIZE')
         _dummy_exec('CICS', 'EXEC CICS RETRIEVE INTO(MQTM) NOHANDLE END-EXEC', state)
         if state['EIBRESP'] == 0:
             state.get('_branches', set()).add(1)
@@ -375,6 +426,7 @@ def para_1000_INITIALIZE(state):
         para_3100_READ_REQUEST_MQ(state)
         para_3100_EXIT(state)
     finally:
+        state._exit_para('1000-INITIALIZE')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -386,8 +438,10 @@ def para_1000_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('1000-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('1000-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -399,6 +453,7 @@ def para_1100_OPEN_REQUEST_QUEUE(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('1100-OPEN-REQUEST-QUEUE')
         state['MQOD-OBJECTTYPE'] = state.get('MQOT-Q', '')
         state['OF'] = state.get('MQOT-Q', '')
         state['MQM-OD-REQUEST'] = state.get('MQOT-Q', '')
@@ -410,11 +465,20 @@ def para_1100_OPEN_REQUEST_QUEUE(state):
         if state['WS-COMPCODE'] == state['MQCC-OK']:
             state.get('_branches', set()).add(2)
             state['WS-REQUEST-MQ-OPEN'] = True
+            state['WS-REQUEST-MQ-CLSE'] = False
         else:
             state.get('_branches', set()).add(-2)
             state['ERR-LOCATION'] = 'M001'
             state['ERR-CRITICAL'] = True
+            state['ERR-INFO'] = False
+            state['ERR-LOG'] = False
+            state['ERR-WARNING'] = False
             state['ERR-MQ'] = True
+            state['ERR-APP'] = False
+            state['ERR-CICS'] = False
+            state['ERR-DB2'] = False
+            state['ERR-FILE'] = False
+            state['ERR-IMS'] = False
             state['WS-CODE-DISPLAY'] = state.get('WS-COMPCODE', '')
             state['ERR-CODE-1'] = state.get('WS-CODE-DISPLAY', '')
             state['WS-CODE-DISPLAY'] = state.get('WS-REASON', '')
@@ -422,6 +486,7 @@ def para_1100_OPEN_REQUEST_QUEUE(state):
             state['ERR-MESSAGE'] = 'REQ MQ OPEN ERROR'
             para_9500_LOG_ERROR(state)
     finally:
+        state._exit_para('1100-OPEN-REQUEST-QUEUE')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -433,8 +498,10 @@ def para_1100_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('1100-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('1100-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -446,6 +513,7 @@ def para_1200_SCHEDULE_PSB(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('1200-SCHEDULE-PSB')
         _dummy_exec('DLI', 'EXEC DLI SCHD PSB((PSB-NAME)) NODHABEND END-EXEC', state)
         state['IMS-RETURN-CODE'] = state.get('DIBSTAT', '')
         if state['PSB-SCHEDULED-MORE-THAN-ONCE']:
@@ -458,15 +526,25 @@ def para_1200_SCHEDULE_PSB(state):
         if state['STATUS-OK']:
             state.get('_branches', set()).add(4)
             state['IMS-PSB-SCHD'] = True
+            state['IMS-PSB-NOT-SCHD'] = False
         else:
             state.get('_branches', set()).add(-4)
             state['ERR-LOCATION'] = 'I001'
             state['ERR-CRITICAL'] = True
+            state['ERR-INFO'] = False
+            state['ERR-LOG'] = False
+            state['ERR-WARNING'] = False
             state['ERR-IMS'] = True
+            state['ERR-APP'] = False
+            state['ERR-CICS'] = False
+            state['ERR-DB2'] = False
+            state['ERR-FILE'] = False
+            state['ERR-MQ'] = False
             state['ERR-CODE-1'] = state.get('IMS-RETURN-CODE', '')
             state['ERR-MESSAGE'] = 'IMS SCHD FAILED'
             para_9500_LOG_ERROR(state)
     finally:
+        state._exit_para('1200-SCHEDULE-PSB')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -478,8 +556,10 @@ def para_1200_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('1200-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('1200-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -491,6 +571,7 @@ def para_2000_MAIN_PROCESS(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('2000-MAIN-PROCESS')
         _lc1 = 0
         while not ((state['NO-MORE-MSG-AVAILABLE']) or (state['WS-LOOP-END'])):
             state.get('_branches', set()).add(5)
@@ -501,6 +582,7 @@ def para_2000_MAIN_PROCESS(state):
             state['WS-MSG-PROCESSED'] = _to_num(state.get('WS-MSG-PROCESSED', 0)) + 1
             _dummy_exec('CICS', 'EXEC CICS SYNCPOINT END-EXEC', state)
             state['IMS-PSB-NOT-SCHD'] = True
+            state['IMS-PSB-SCHD'] = False
             if _to_num(state['WS-MSG-PROCESSED']) > _to_num(state['WS-REQSTS-PROCESS-LIMIT']):
                 state.get('_branches', set()).add(6)
                 state['WS-LOOP-END'] = True
@@ -514,6 +596,7 @@ def para_2000_MAIN_PROCESS(state):
         if _lc1 == 0:
             state.get('_branches', set()).add(-5)
     finally:
+        state._exit_para('2000-MAIN-PROCESS')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -525,8 +608,10 @@ def para_2000_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('2000-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('2000-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -538,6 +623,7 @@ def para_2100_EXTRACT_REQUEST_MSG(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('2100-EXTRACT-REQUEST-MSG')
         _us_src = str(state.get('W01-GET-BUFFER', ''))
         _us_parts = _us_src.split(',')
         state['PA-RQ-AUTH-DATE'] = _us_parts[0].strip() if 0 < len(_us_parts) else ''
@@ -561,6 +647,7 @@ def para_2100_EXTRACT_REQUEST_MSG(state):
         state['PA-RQ-TRANSACTION-AMT'] = _to_num(state.get('WS-TRANSACTION-AMT-AN', 0))
         state['WS-TRANSACTION-AMT'] = state.get('PA-RQ-TRANSACTION-AMT', '')
     finally:
+        state._exit_para('2100-EXTRACT-REQUEST-MSG')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -572,8 +659,10 @@ def para_2100_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('2100-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('2100-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -585,6 +674,7 @@ def para_3100_READ_REQUEST_MQ(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('3100-READ-REQUEST-MQ')
         state['MQGMO-OPTIONS'] = _to_num(state.get('MQGMO-NO-SYNCPOINT', 0)) + _to_num(state.get('MQGMO-WAIT', 0))
         state['MQGMO-WAITINTERVAL'] = state.get('WS-WAIT-INTERVAL', '')
         state['MQMD-MSGID'] = state.get('MQMI-NONE', '')
@@ -607,11 +697,20 @@ def para_3100_READ_REQUEST_MQ(state):
             if state['WS-REASON'] == state['MQRC-NO-MSG-AVAILABLE']:
                 state.get('_branches', set()).add(8)
                 state['NO-MORE-MSG-AVAILABLE'] = True
+                state['MORE-MSG-AVAILABLE'] = False
             else:
                 state.get('_branches', set()).add(-8)
                 state['ERR-LOCATION'] = 'M003'
                 state['ERR-CRITICAL'] = True
+                state['ERR-INFO'] = False
+                state['ERR-LOG'] = False
+                state['ERR-WARNING'] = False
                 state['ERR-CICS'] = True
+                state['ERR-APP'] = False
+                state['ERR-DB2'] = False
+                state['ERR-FILE'] = False
+                state['ERR-IMS'] = False
+                state['ERR-MQ'] = False
                 state['WS-CODE-DISPLAY'] = state.get('WS-COMPCODE', '')
                 state['ERR-CODE-1'] = state.get('WS-CODE-DISPLAY', '')
                 state['WS-CODE-DISPLAY'] = state.get('WS-REASON', '')
@@ -622,6 +721,7 @@ def para_3100_READ_REQUEST_MQ(state):
                 state['ERR-EVENT-KEY'] = state.get('PA-CARD-NUM', '')
                 para_9500_LOG_ERROR(state)
     finally:
+        state._exit_para('3100-READ-REQUEST-MQ')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -633,8 +733,10 @@ def para_3100_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('3100-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('3100-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -646,7 +748,9 @@ def para_5000_PROCESS_AUTH(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('5000-PROCESS-AUTH')
         state['APPROVE-AUTH'] = True
+        state['DECLINE-AUTH'] = False
         para_1200_SCHEDULE_PSB(state)
         para_1200_EXIT(state)
         state['CARD-FOUND-XREF'] = True
@@ -678,6 +782,7 @@ def para_5000_PROCESS_AUTH(state):
         else:
             state.get('_branches', set()).add(-10)
     finally:
+        state._exit_para('5000-PROCESS-AUTH')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -689,8 +794,10 @@ def para_5000_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('5000-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('5000-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -702,6 +809,7 @@ def para_5100_READ_XREF_RECORD(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('5100-READ-XREF-RECORD')
         state['XREF-CARD-NUM'] = state.get('PA-RQ-CARD-NUM', '')
         _dummy_exec('CICS', 'EXEC CICS READ DATASET   (WS-CCXREF-FILE) INTO      (CARD-XREF-RECORD) LENGTH    (LENGTH OF CARD-XREF-RECORD) RIDFLD    (XREF-CARD-NUM) KEYLENGTH (LENGTH OF XREF-CARD-NUM) RESP      (WS-RESP-CD) RESP2...', state)
         state['WS-RESP-CD'] = state.get('EIBRESP', 0)
@@ -723,7 +831,15 @@ def para_5100_READ_XREF_RECORD(state):
             state['FOUND-ACCT-IN-MSTR'] = False
             state['ERR-LOCATION'] = 'A001'
             state['ERR-WARNING'] = True
+            state['ERR-CRITICAL'] = False
+            state['ERR-INFO'] = False
+            state['ERR-LOG'] = False
             state['ERR-APP'] = True
+            state['ERR-CICS'] = False
+            state['ERR-DB2'] = False
+            state['ERR-FILE'] = False
+            state['ERR-IMS'] = False
+            state['ERR-MQ'] = False
             state['ERR-MESSAGE'] = 'CARD NOT FOUND IN XREF'
             state['ERR-EVENT-KEY'] = state.get('XREF-CARD-NUM', '')
             para_9500_LOG_ERROR(state)
@@ -732,7 +848,15 @@ def para_5100_READ_XREF_RECORD(state):
             _eval_taken_10 = 13
             state['ERR-LOCATION'] = 'C001'
             state['ERR-CRITICAL'] = True
+            state['ERR-INFO'] = False
+            state['ERR-LOG'] = False
+            state['ERR-WARNING'] = False
             state['ERR-CICS'] = True
+            state['ERR-APP'] = False
+            state['ERR-DB2'] = False
+            state['ERR-FILE'] = False
+            state['ERR-IMS'] = False
+            state['ERR-MQ'] = False
             state['WS-CODE-DISPLAY'] = state.get('WS-RESP-CD', '')
             state['ERR-CODE-1'] = state.get('WS-CODE-DISPLAY', '')
             state['WS-CODE-DISPLAY'] = state.get('WS-REAS-CD', '')
@@ -746,6 +870,7 @@ def para_5100_READ_XREF_RECORD(state):
             if _bid != _eval_taken_10:
                 state.get('_branches', set()).add(-_bid)
     finally:
+        state._exit_para('5100-READ-XREF-RECORD')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -757,8 +882,10 @@ def para_5100_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('5100-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('5100-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -770,6 +897,7 @@ def para_5200_READ_ACCT_RECORD(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('5200-READ-ACCT-RECORD')
         state['WS-CARD-RID-ACCT-ID'] = state.get('XREF-ACCT-ID', '')
         _dummy_exec('CICS', 'EXEC CICS READ DATASET   (WS-ACCTFILENAME) RIDFLD    (WS-CARD-RID-ACCT-ID-X) KEYLENGTH (LENGTH OF WS-CARD-RID-ACCT-ID-X) INTO      (ACCOUNT-RECORD) LENGTH    (LENGTH OF ACCOUNT-RECORD) RESP      (WS-R...', state)
         state['WS-RESP-CD'] = state.get('EIBRESP', 0)
@@ -789,7 +917,15 @@ def para_5200_READ_ACCT_RECORD(state):
             state['FOUND-ACCT-IN-MSTR'] = False
             state['ERR-LOCATION'] = 'A002'
             state['ERR-WARNING'] = True
+            state['ERR-CRITICAL'] = False
+            state['ERR-INFO'] = False
+            state['ERR-LOG'] = False
             state['ERR-APP'] = True
+            state['ERR-CICS'] = False
+            state['ERR-DB2'] = False
+            state['ERR-FILE'] = False
+            state['ERR-IMS'] = False
+            state['ERR-MQ'] = False
             state['ERR-MESSAGE'] = 'ACCT NOT FOUND IN XREF'
             state['ERR-EVENT-KEY'] = state.get('WS-CARD-RID-ACCT-ID-X', '')
             para_9500_LOG_ERROR(state)
@@ -798,7 +934,15 @@ def para_5200_READ_ACCT_RECORD(state):
             _eval_taken_13 = 16
             state['ERR-LOCATION'] = 'C002'
             state['ERR-CRITICAL'] = True
+            state['ERR-INFO'] = False
+            state['ERR-LOG'] = False
+            state['ERR-WARNING'] = False
             state['ERR-CICS'] = True
+            state['ERR-APP'] = False
+            state['ERR-DB2'] = False
+            state['ERR-FILE'] = False
+            state['ERR-IMS'] = False
+            state['ERR-MQ'] = False
             state['WS-CODE-DISPLAY'] = state.get('WS-RESP-CD', '')
             state['ERR-CODE-1'] = state.get('WS-CODE-DISPLAY', '')
             state['WS-CODE-DISPLAY'] = state.get('WS-REAS-CD', '')
@@ -812,6 +956,7 @@ def para_5200_READ_ACCT_RECORD(state):
             if _bid != _eval_taken_13:
                 state.get('_branches', set()).add(-_bid)
     finally:
+        state._exit_para('5200-READ-ACCT-RECORD')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -823,8 +968,10 @@ def para_5200_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('5200-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('5200-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -836,6 +983,7 @@ def para_5300_READ_CUST_RECORD(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('5300-READ-CUST-RECORD')
         state['WS-CARD-RID-CUST-ID'] = state.get('XREF-CUST-ID', '')
         _dummy_exec('CICS', 'EXEC CICS READ DATASET   (WS-CUSTFILENAME) RIDFLD    (WS-CARD-RID-CUST-ID-X) KEYLENGTH (LENGTH OF WS-CARD-RID-CUST-ID-X) INTO      (CUSTOMER-RECORD) LENGTH    (LENGTH OF CUSTOMER-RECORD) RESP      (WS...', state)
         state['WS-RESP-CD'] = state.get('EIBRESP', 0)
@@ -855,7 +1003,15 @@ def para_5300_READ_CUST_RECORD(state):
             state['FOUND-CUST-IN-MSTR'] = False
             state['ERR-LOCATION'] = 'A003'
             state['ERR-WARNING'] = True
+            state['ERR-CRITICAL'] = False
+            state['ERR-INFO'] = False
+            state['ERR-LOG'] = False
             state['ERR-APP'] = True
+            state['ERR-CICS'] = False
+            state['ERR-DB2'] = False
+            state['ERR-FILE'] = False
+            state['ERR-IMS'] = False
+            state['ERR-MQ'] = False
             state['ERR-MESSAGE'] = 'CUST NOT FOUND IN XREF'
             state['ERR-EVENT-KEY'] = state.get('WS-CARD-RID-CUST-ID', '')
             para_9500_LOG_ERROR(state)
@@ -864,7 +1020,15 @@ def para_5300_READ_CUST_RECORD(state):
             _eval_taken_16 = 19
             state['ERR-LOCATION'] = 'C003'
             state['ERR-CRITICAL'] = True
+            state['ERR-INFO'] = False
+            state['ERR-LOG'] = False
+            state['ERR-WARNING'] = False
             state['ERR-CICS'] = True
+            state['ERR-APP'] = False
+            state['ERR-DB2'] = False
+            state['ERR-FILE'] = False
+            state['ERR-IMS'] = False
+            state['ERR-MQ'] = False
             state['WS-CODE-DISPLAY'] = state.get('WS-RESP-CD', '')
             state['ERR-CODE-1'] = state.get('WS-CODE-DISPLAY', '')
             state['WS-CODE-DISPLAY'] = state.get('WS-REAS-CD', '')
@@ -878,6 +1042,7 @@ def para_5300_READ_CUST_RECORD(state):
             if _bid != _eval_taken_16:
                 state.get('_branches', set()).add(-_bid)
     finally:
+        state._exit_para('5300-READ-CUST-RECORD')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -889,8 +1054,10 @@ def para_5300_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('5300-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('5300-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -902,6 +1069,7 @@ def para_5500_READ_AUTH_SUMMRY(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('5500-READ-AUTH-SUMMRY')
         state['PA-ACCT-ID'] = state.get('XREF-ACCT-ID', '')
         _dummy_exec('DLI', 'EXEC DLI GU USING PCB(PAUT-PCB-NUM) SEGMENT (PAUTSUM0) INTO (PENDING-AUTH-SUMMARY) WHERE (ACCNTID = PA-ACCT-ID) END-EXEC', state)
         state['IMS-RETURN-CODE'] = state.get('DIBSTAT', '')
@@ -921,7 +1089,15 @@ def para_5500_READ_AUTH_SUMMRY(state):
             _eval_taken_19 = 22
             state['ERR-LOCATION'] = 'I002'
             state['ERR-CRITICAL'] = True
+            state['ERR-INFO'] = False
+            state['ERR-LOG'] = False
+            state['ERR-WARNING'] = False
             state['ERR-IMS'] = True
+            state['ERR-APP'] = False
+            state['ERR-CICS'] = False
+            state['ERR-DB2'] = False
+            state['ERR-FILE'] = False
+            state['ERR-MQ'] = False
             state['ERR-CODE-1'] = state.get('IMS-RETURN-CODE', '')
             state['ERR-MESSAGE'] = 'IMS GET SUMMARY FAILED'
             state['ERR-EVENT-KEY'] = state.get('PA-CARD-NUM', '')
@@ -930,6 +1106,7 @@ def para_5500_READ_AUTH_SUMMRY(state):
             if _bid != _eval_taken_19:
                 state.get('_branches', set()).add(-_bid)
     finally:
+        state._exit_para('5500-READ-AUTH-SUMMRY')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -941,8 +1118,10 @@ def para_5500_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('5500-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('5500-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -954,8 +1133,10 @@ def para_5600_READ_PROFILE_DATA(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('5600-READ-PROFILE-DATA')
         pass  # CONTINUE
     finally:
+        state._exit_para('5600-READ-PROFILE-DATA')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -967,8 +1148,10 @@ def para_5600_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('5600-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('5600-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -980,6 +1163,7 @@ def para_6000_MAKE_DECISION(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('6000-MAKE-DECISION')
         state['PA-RL-CARD-NUM'] = state.get('PA-RQ-CARD-NUM', '')
         state['PA-RL-TRANSACTION-ID'] = state.get('PA-RQ-TRANSACTION-ID', '')
         state['PA-RL-AUTH-ID-CODE'] = state.get('PA-RQ-AUTH-TIME', '')
@@ -989,7 +1173,12 @@ def para_6000_MAKE_DECISION(state):
             if _to_num(state['WS-TRANSACTION-AMT']) > _to_num(state['WS-AVAILABLE-AMT']):
                 state.get('_branches', set()).add(24)
                 state['DECLINE-AUTH'] = True
+                state['APPROVE-AUTH'] = False
                 state['INSUFFICIENT-FUND'] = True
+                state['ACCOUNT-CLOSED'] = False
+                state['CARD-FRAUD'] = False
+                state['CARD-NOT-ACTIVE'] = False
+                state['MERCHANT-FRAUD'] = False
             else:
                 state.get('_branches', set()).add(-24)
         else:
@@ -1000,20 +1189,28 @@ def para_6000_MAKE_DECISION(state):
                 if _to_num(state['WS-TRANSACTION-AMT']) > _to_num(state['WS-AVAILABLE-AMT']):
                     state.get('_branches', set()).add(26)
                     state['DECLINE-AUTH'] = True
+                    state['APPROVE-AUTH'] = False
                     state['INSUFFICIENT-FUND'] = True
+                    state['ACCOUNT-CLOSED'] = False
+                    state['CARD-FRAUD'] = False
+                    state['CARD-NOT-ACTIVE'] = False
+                    state['MERCHANT-FRAUD'] = False
                 else:
                     state.get('_branches', set()).add(-26)
             else:
                 state.get('_branches', set()).add(-25)
                 state['DECLINE-AUTH'] = True
+                state['APPROVE-AUTH'] = False
         if state['DECLINE-AUTH']:
             state.get('_branches', set()).add(27)
             state['AUTH-RESP-DECLINED'] = True
+            state['AUTH-RESP-APPROVED'] = False
             state['PA-RL-AUTH-RESP-CODE'] = '05'
             state['PA-RL-APPROVED-AMT'] = 0
         else:
             state.get('_branches', set()).add(-27)
             state['AUTH-RESP-APPROVED'] = True
+            state['AUTH-RESP-DECLINED'] = False
             state['PA-RL-AUTH-RESP-CODE'] = '00'
             state['PA-RL-APPROVED-AMT'] = state.get('PA-RQ-TRANSACTION-AMT', '')
         state['PA-RL-AUTH-RESP-REASON'] = '0000'
@@ -1056,6 +1253,7 @@ def para_6000_MAKE_DECISION(state):
         state['WS-APPROVED-AMT-DIS'] = state.get('WS-APPROVED-AMT', '')
         state['W02-PUT-BUFFER'] = str(state.get('PA-RL-CARD-NUM', '')) + ',' + str(state.get('PA-RL-TRANSACTION-ID', '')) + ',' + str(state.get('PA-RL-AUTH-ID-CODE', '')) + ',' + str(state.get('PA-RL-AUTH-RESP-CODE', '')) + ',' + str(state.get('PA-RL-AUTH-RESP-REASON', '')) + ',' + str(state.get('WS-APPROVED-AMT-DIS', '')) + ','
     finally:
+        state._exit_para('6000-MAKE-DECISION')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1067,8 +1265,10 @@ def para_6000_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('6000-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('6000-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1080,6 +1280,7 @@ def para_7100_SEND_RESPONSE(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('7100-SEND-RESPONSE')
         state['MQOD-OBJECTTYPE'] = state.get('MQOT-Q', '')
         state['OF'] = state.get('MQOT-Q', '')
         state['MQM-OD-REPLY'] = state.get('MQOT-Q', '')
@@ -1117,7 +1318,15 @@ def para_7100_SEND_RESPONSE(state):
             state.get('_branches', set()).add(36)
             state['ERR-LOCATION'] = 'M004'
             state['ERR-CRITICAL'] = True
+            state['ERR-INFO'] = False
+            state['ERR-LOG'] = False
+            state['ERR-WARNING'] = False
             state['ERR-MQ'] = True
+            state['ERR-APP'] = False
+            state['ERR-CICS'] = False
+            state['ERR-DB2'] = False
+            state['ERR-FILE'] = False
+            state['ERR-IMS'] = False
             state['WS-CODE-DISPLAY'] = state.get('WS-COMPCODE', '')
             state['ERR-CODE-1'] = state.get('WS-CODE-DISPLAY', '')
             state['WS-CODE-DISPLAY'] = state.get('WS-REASON', '')
@@ -1131,6 +1340,7 @@ def para_7100_SEND_RESPONSE(state):
         else:
             state.get('_branches', set()).add(-36)
     finally:
+        state._exit_para('7100-SEND-RESPONSE')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1142,8 +1352,10 @@ def para_7100_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('7100-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('7100-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1155,11 +1367,13 @@ def para_8000_WRITE_AUTH_TO_DB(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('8000-WRITE-AUTH-TO-DB')
         para_8400_UPDATE_SUMMARY(state)
         para_8400_EXIT(state)
         para_8500_INSERT_AUTH(state)
         para_8500_EXIT(state)
     finally:
+        state._exit_para('8000-WRITE-AUTH-TO-DB')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1171,8 +1385,10 @@ def para_8000_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('8000-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('8000-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1184,6 +1400,7 @@ def para_8400_UPDATE_SUMMARY(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('8400-UPDATE-SUMMARY')
         if state['NFOUND-PAUT-SMRY-SEG']:
             state.get('_branches', set()).add(37)
             state['PENDING-AUTH-SUMMARY'] = 0 if isinstance(state.get('PENDING-AUTH-SUMMARY', ''), (int, float)) else ''
@@ -1217,12 +1434,21 @@ def para_8400_UPDATE_SUMMARY(state):
             state.get('_branches', set()).add(-40)
             state['ERR-LOCATION'] = 'I003'
             state['ERR-CRITICAL'] = True
+            state['ERR-INFO'] = False
+            state['ERR-LOG'] = False
+            state['ERR-WARNING'] = False
             state['ERR-IMS'] = True
+            state['ERR-APP'] = False
+            state['ERR-CICS'] = False
+            state['ERR-DB2'] = False
+            state['ERR-FILE'] = False
+            state['ERR-MQ'] = False
             state['ERR-CODE-1'] = state.get('IMS-RETURN-CODE', '')
             state['ERR-MESSAGE'] = 'IMS UPDATE SUMRY FAILED'
             state['ERR-EVENT-KEY'] = state.get('PA-CARD-NUM', '')
             para_9500_LOG_ERROR(state)
     finally:
+        state._exit_para('8400-UPDATE-SUMMARY')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1234,8 +1460,10 @@ def para_8400_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('8400-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('8400-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1247,6 +1475,7 @@ def para_8500_INSERT_AUTH(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('8500-INSERT-AUTH')
         _dummy_exec('CICS', 'EXEC CICS ASKTIME NOHANDLE ABSTIME(WS-ABS-TIME) END-EXEC', state)
         _dummy_exec('CICS', 'EXEC CICS FORMATTIME ABSTIME(WS-ABS-TIME) YYDDD(WS-CUR-DATE-X6) TIME(WS-CUR-TIME-X6) MILLISECONDS(WS-CUR-TIME-MS) END-EXEC', state)
         state['WS-YYDDD'] = str(state.get('WS-CUR-DATE-X6', ''))[0:5]
@@ -1279,9 +1508,15 @@ def para_8500_INSERT_AUTH(state):
         if state['AUTH-RESP-APPROVED']:
             state.get('_branches', set()).add(41)
             state['PA-MATCH-PENDING'] = True
+            state['PA-MATCH-AUTH-DECLINED'] = False
+            state['PA-MATCH-PENDING-EXPIRED'] = False
+            state['PA-MATCHED-WITH-TRAN'] = False
         else:
             state.get('_branches', set()).add(-41)
             state['PA-MATCH-AUTH-DECLINED'] = True
+            state['PA-MATCH-PENDING'] = False
+            state['PA-MATCH-PENDING-EXPIRED'] = False
+            state['PA-MATCHED-WITH-TRAN'] = False
         state['PA-AUTH-FRAUD'] = ' '
         state['PA-ACCT-ID'] = state.get('XREF-ACCT-ID', '')
         _dummy_exec('DLI', 'EXEC DLI ISRT USING PCB(PAUT-PCB-NUM) SEGMENT (PAUTSUM0) WHERE (ACCNTID = PA-ACCT-ID) SEGMENT (PAUTDTL1) FROM (PENDING-AUTH-DETAILS) SEGLENGTH (LENGTH OF PENDING-AUTH-DETAILS) END-EXEC', state)
@@ -1293,12 +1528,21 @@ def para_8500_INSERT_AUTH(state):
             state.get('_branches', set()).add(-42)
             state['ERR-LOCATION'] = 'I004'
             state['ERR-CRITICAL'] = True
+            state['ERR-INFO'] = False
+            state['ERR-LOG'] = False
+            state['ERR-WARNING'] = False
             state['ERR-IMS'] = True
+            state['ERR-APP'] = False
+            state['ERR-CICS'] = False
+            state['ERR-DB2'] = False
+            state['ERR-FILE'] = False
+            state['ERR-MQ'] = False
             state['ERR-CODE-1'] = state.get('IMS-RETURN-CODE', '')
             state['ERR-MESSAGE'] = 'IMS INSERT DETL FAILED'
             state['ERR-EVENT-KEY'] = state.get('PA-CARD-NUM', '')
             para_9500_LOG_ERROR(state)
     finally:
+        state._exit_para('8500-INSERT-AUTH')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1310,8 +1554,10 @@ def para_8500_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('8500-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('8500-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1323,6 +1569,7 @@ def para_9000_TERMINATE(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('9000-TERMINATE')
         if state['IMS-PSB-SCHD']:
             state.get('_branches', set()).add(43)
             _dummy_exec('DLI', 'EXEC DLI TERM END-EXEC', state)
@@ -1331,6 +1578,7 @@ def para_9000_TERMINATE(state):
         para_9100_CLOSE_REQUEST_QUEUE(state)
         para_9100_EXIT(state)
     finally:
+        state._exit_para('9000-TERMINATE')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1342,8 +1590,10 @@ def para_9000_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('9000-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('9000-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1355,17 +1605,27 @@ def para_9100_CLOSE_REQUEST_QUEUE(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('9100-CLOSE-REQUEST-QUEUE')
         if state['WS-REQUEST-MQ-OPEN']:
             state.get('_branches', set()).add(44)
             _dummy_call('MQCLOSE', state)
             if state['WS-COMPCODE'] == state['MQCC-OK']:
                 state.get('_branches', set()).add(45)
                 state['WS-REQUEST-MQ-CLSE'] = True
+                state['WS-REQUEST-MQ-OPEN'] = False
             else:
                 state.get('_branches', set()).add(-45)
                 state['ERR-LOCATION'] = 'M005'
                 state['ERR-WARNING'] = True
+                state['ERR-CRITICAL'] = False
+                state['ERR-INFO'] = False
+                state['ERR-LOG'] = False
                 state['ERR-MQ'] = True
+                state['ERR-APP'] = False
+                state['ERR-CICS'] = False
+                state['ERR-DB2'] = False
+                state['ERR-FILE'] = False
+                state['ERR-IMS'] = False
                 state['WS-CODE-DISPLAY'] = state.get('WS-COMPCODE', '')
                 state['ERR-CODE-1'] = state.get('WS-CODE-DISPLAY', '')
                 state['WS-CODE-DISPLAY'] = state.get('WS-REASON', '')
@@ -1377,6 +1637,7 @@ def para_9100_CLOSE_REQUEST_QUEUE(state):
         else:
             state.get('_branches', set()).add(-44)
     finally:
+        state._exit_para('9100-CLOSE-REQUEST-QUEUE')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1388,8 +1649,10 @@ def para_9100_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('9100-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('9100-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1401,6 +1664,7 @@ def para_9500_LOG_ERROR(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('9500-LOG-ERROR')
         _dummy_exec('CICS', 'EXEC CICS ASKTIME NOHANDLE ABSTIME(WS-ABS-TIME) END-EXEC', state)
         _dummy_exec('CICS', 'EXEC CICS FORMATTIME ABSTIME(WS-ABS-TIME) YYMMDD(WS-CUR-DATE-X6) TIME(WS-CUR-TIME-X6) END-EXEC', state)
         state['ERR-APPLICATION'] = state.get('WS-CICS-TRANID', '')
@@ -1414,6 +1678,7 @@ def para_9500_LOG_ERROR(state):
         else:
             state.get('_branches', set()).add(-46)
     finally:
+        state._exit_para('9500-LOG-ERROR')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1425,8 +1690,10 @@ def para_9500_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('9500-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('9500-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1438,10 +1705,12 @@ def para_9990_END_ROUTINE(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('9990-END-ROUTINE')
         para_9000_TERMINATE(state)
         _dummy_exec('CICS', 'EXEC CICS RETURN END-EXEC', state)
         pass  # UNKNOWN: 
     finally:
+        state._exit_para('9990-END-ROUTINE')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1453,8 +1722,10 @@ def para_9990_EXIT(state):
         state['_call_depth'] = _d - 1
         return
     try:
+        state._enter_para('9990-EXIT')
         pass  # EXIT
     finally:
+        state._exit_para('9990-EXIT')
         state['_call_depth'] = state.get('_call_depth', 1) - 1
 
 
@@ -1463,7 +1734,7 @@ _BRANCH_META = {1: {'condition': 'EIBRESP = DFHRESP(NORMAL)', 'paragraph': '1000
 
 def run(initial_state=None):
     """Execute the program with optional initial state overrides."""
-    state = _SafeDict({**_default_state(), **(initial_state or {})})
+    state = _InstrumentedState({**_default_state(), **(initial_state or {})})
     state.setdefault('_display', [])
     state.setdefault('_calls', [])
     state.setdefault('_execs', [])
@@ -1472,6 +1743,7 @@ def run(initial_state=None):
     state.setdefault('_abended', False)
     state.setdefault('_branches', set())
     state.setdefault('_stub_log', [])
+    dict.__setitem__(state, '_initial_snapshot', {k: v for k, v in state.items() if not k.startswith('_')})
     try:
         para_MAIN_PARA(state)
         para_1000_INITIALIZE(state)
@@ -1520,6 +1792,12 @@ def run(initial_state=None):
         pass
     except ZeroDivisionError:
         state['_abended'] = True
+    _snap = dict.__getitem__(state, '_initial_snapshot')
+    state['_state_diffs'] = {
+        k: {'from': _snap[k], 'to': dict.__getitem__(state, k)}
+        for k in _snap
+        if _snap[k] != dict.get(state, k)
+    }
     return state
 
 

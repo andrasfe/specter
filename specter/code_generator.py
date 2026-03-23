@@ -1855,6 +1855,7 @@ def generate_code(
     var_report: VariableReport | None = None,
     instrument: bool = False,
     copybook_records=None,
+    cobol_source: str | None = None,
 ) -> str:
     """Generate a standalone Python module from a COBOL Program AST.
 
@@ -1863,6 +1864,7 @@ def generate_code(
         var_report: Optional variable report (extracted if not given).
         instrument: If True, emit instrumented state tracking code.
         copybook_records: Optional list of CopybookRecord for 88-level sibling info.
+        cobol_source: Optional path to COBOL source for inline 88-level extraction.
 
     Returns the complete Python source code as a string.
     """
@@ -1884,19 +1886,22 @@ def generate_code(
 
     cb = _CodeBuilder()
 
-    # Build 88-level siblings map from copybook records
+    # Build 88-level siblings map from copybook records and COBOL source
     if copybook_records:
         for rec in copybook_records:
             for fld in rec.fields:
                 if fld.values_88:
                     names = {n.upper() for n in fld.values_88.keys()}
                     for name in names:
-                        cb.siblings_88[name] = names - {name}
+                        cb.siblings_88.setdefault(name, set()).update(names - {name})
+    if cobol_source:
+        from .cobol_coverage import _extract_88_siblings_from_source
+        for name, sibs in _extract_88_siblings_from_source(cobol_source).items():
+            cb.siblings_88.setdefault(name, set()).update(sibs)
 
-    # Heuristic: infer 88-level siblings from FOUND/NFOUND naming convention
-    # when copybooks don't provide the info.  Collect all SET-TO-TRUE targets
-    # and pair FOUND-X with NFOUND-X (and X-FOUND-Y with X-NFOUND-Y).
-    if not cb.siblings_88:
+    # Heuristic: infer 88-level siblings from FOUND/NFOUND naming convention.
+    # Always runs — adds pairs not already covered by copybooks.
+    if True:
         set_true_vars: set[str] = set()
         def _collect_set_true(s: Statement):
             if s.type == "SET" and _SET_TRUE_DETECT_RE.search(s.text):

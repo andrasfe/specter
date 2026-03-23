@@ -752,8 +752,10 @@ def main(argv: list[str] | None = None) -> int:
         from .variable_domain import load_copybooks
         copybook_records = load_copybooks([Path(d) for d in args.copybook_dir])
     print(f"Generating {output_path} ...")
+    cobol_src = getattr(args, 'cobol_source', None)
     code = generate_code(program, var_report, instrument=args.analyze,
-                         copybook_records=copybook_records)
+                         copybook_records=copybook_records,
+                         cobol_source=cobol_src)
     output_path.write_text(code)
     print(f"  Written {len(code)} bytes")
 

@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -368,17 +369,64 @@ def _build_input_state(
     return state
 
 
-def _build_siblings_88(copybook_records) -> dict[str, set[str]]:
-    """Build 88-level siblings map from copybook records."""
+def _extract_88_siblings_from_source(cobol_source: str | Path) -> dict[str, set[str]]:
+    """Extract 88-level sibling groups by scanning COBOL source.
+
+    Reads the .cbl file line-by-line, tracking the current parent variable.
+    Consecutive 88-level items under the same parent are siblings.
+    """
     siblings: dict[str, set[str]] = {}
-    if not copybook_records:
+    current_group: list[str] = []
+    path = Path(cobol_source)
+    if not path.exists():
         return siblings
-    for rec in copybook_records:
-        for fld in rec.fields:
-            if fld.values_88:
-                names = {n.upper() for n in fld.values_88.keys()}
-                for name in names:
-                    siblings[name] = names - {name}
+
+    _88_re = re.compile(r"^\s+88\s+([A-Z0-9][A-Z0-9-]*)\s+VALUE", re.IGNORECASE)
+    _level_re = re.compile(r"^\s+(\d{1,2})\s+([A-Z0-9][A-Z0-9-]*)", re.IGNORECASE)
+
+    def _flush_group():
+        if len(current_group) > 1:
+            names = set(current_group)
+            for name in names:
+                siblings.setdefault(name, set()).update(names - {name})
+
+    for line in path.read_text(errors="replace").splitlines():
+        m88 = _88_re.match(line)
+        if m88:
+            current_group.append(m88.group(1).upper())
+            continue
+        mlevel = _level_re.match(line)
+        if mlevel and mlevel.group(1) != "88":
+            _flush_group()
+            current_group = []
+
+    _flush_group()
+    return siblings
+
+
+def _build_siblings_88(
+    copybook_records,
+    cobol_source: str | Path | None = None,
+) -> dict[str, set[str]]:
+    """Build 88-level siblings map from copybook records and COBOL source.
+
+    Combines siblings discovered from copybook field definitions with
+    those extracted directly from the COBOL source (where 88-levels are
+    often defined inline rather than in copybooks).
+    """
+    siblings: dict[str, set[str]] = {}
+    if copybook_records:
+        for rec in copybook_records:
+            for fld in rec.fields:
+                if fld.values_88:
+                    names = {n.upper() for n in fld.values_88.keys()}
+                    for name in names:
+                        siblings.setdefault(name, set()).update(names - {name})
+    # Also scan COBOL source for inline 88-level definitions
+    if cobol_source:
+        source_siblings = _extract_88_siblings_from_source(cobol_source)
+        for name, sibs in source_siblings.items():
+            siblings.setdefault(name, set()).update(sibs)
     return siblings
 
 
@@ -388,12 +436,20 @@ def _expand_stub_mapping(
 ) -> set[str]:
     """Expand stub mapping to include 88-level sibling vars.
 
+    Only expands ops where ALL original status vars are 88-level flags
+    (i.e. all appear in siblings_88).  Ops that mix 88-level flags with
+    non-88 status codes (like CICS with EIBRESP + ERR-CRITICAL) are left
+    unchanged to avoid setting numeric status vars to booleans.
+
     Returns the set of var names that were added (not in the original mapping).
     """
     added: set[str] = set()
     for op_key in list(stub_mapping.keys()):
         status_vars = stub_mapping[op_key]
         original = {v.upper() for v in status_vars}
+        # Only expand if ALL original vars are 88-level flags
+        if not all(v.upper() in siblings_88 for v in status_vars):
+            continue
         to_add: set[str] = set()
         for var in status_vars:
             to_add.update(siblings_88.get(var.upper(), set()))
@@ -776,7 +832,8 @@ def run_cobol_coverage(
     log.info("Generating Python module for pre-runs ...")
     import tempfile
     code = generate_code(program, var_report, instrument=True,
-                         copybook_records=copybook_records)
+                         copybook_records=copybook_records,
+                         cobol_source=str(cobol_source))
     tmpdir = Path(tempfile.mkdtemp(prefix="specter_cov_"))
     py_path = tmpdir / f"{program.program_id}.py"
     py_path.write_text(code)
@@ -838,7 +895,7 @@ def run_cobol_coverage(
     existing_tcs, existing_paras, existing_branches = load_existing_coverage(store_path)
 
     # Expand stub mapping with 88-level siblings
-    siblings_88 = _build_siblings_88(copybook_records)
+    siblings_88 = _build_siblings_88(copybook_records, cobol_source=cobol_source)
     flag_88_added = _expand_stub_mapping(stub_mapping, siblings_88)
     if flag_88_added:
         log.info("Expanded stub mapping with %d 88-level siblings: %s",
@@ -1105,7 +1162,8 @@ def run_coverage(
     # Generate + load instrumented Python module
     import tempfile
     code = generate_code(program, var_report, instrument=True,
-                         copybook_records=copybook_records)
+                         copybook_records=copybook_records,
+                         cobol_source=str(cobol_source) if cobol_source else None)
     tmpdir = Path(tempfile.mkdtemp(prefix="specter_cov_"))
     py_path = tmpdir / f"{program.program_id}.py"
     py_path.write_text(code)
@@ -1128,7 +1186,8 @@ def run_coverage(
     existing_tcs, existing_paras, existing_branches = load_existing_coverage(store_path)
 
     # Expand stub mapping with 88-level siblings
-    siblings_88 = _build_siblings_88(copybook_records)
+    cobol_source_path = Path(cobol_source) if cobol_source else None
+    siblings_88 = _build_siblings_88(copybook_records, cobol_source=cobol_source_path)
     flag_88_added = _expand_stub_mapping(stub_mapping, siblings_88)
     if flag_88_added:
         log.info("Expanded stub mapping with %d 88-level siblings: %s",
