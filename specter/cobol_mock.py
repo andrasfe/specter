@@ -129,6 +129,9 @@ def instrument_cobol(
     # Phase 5: Replace CALL statements
     lines, stats["call_replaced"] = _replace_call_stmts(lines)
 
+    # Phase 5b: Neutralize interactive ACCEPT statements
+    lines = _replace_accept_stmts(lines)
+
     # Phase 6: Add paragraph tracing
     if config.trace_paragraphs:
         lines, stats["paras_traced"] = _add_paragraph_tracing(lines)
@@ -873,6 +876,55 @@ def _replace_call_stmts(lines: list[str]) -> tuple[list[str], int]:
             i += 1
 
     return result, count
+
+
+def _replace_accept_stmts(lines: list[str]) -> list[str]:
+    """Replace ACCEPT statements with CONTINUE to avoid stdin blocking."""
+    result: list[str] = []
+    accept_re = re.compile(r"^(\s{6}\s+)ACCEPT\b", re.IGNORECASE)
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        content = _get_cobol_content(line)
+        m = accept_re.match(line)
+
+        if m and not content.strip().startswith("*"):
+            block = [line]
+            j = i + 1
+            while j < len(lines):
+                next_content = _get_cobol_content(lines[j]).strip()
+                if not next_content or next_content.startswith("*"):
+                    break
+                if re.match(
+                    r"^(IF|ELSE|END-IF|MOVE|PERFORM|EVALUATE|DISPLAY"
+                    r"|ADD|SUBTRACT|COMPUTE|GO|READ|WRITE|OPEN|CLOSE"
+                    r"|CALL|EXEC|SET|INITIALIZE|STRING|UNSTRING|INSPECT"
+                    r"|ACCEPT|STOP|GOBACK|EXIT|CONTINUE|SEARCH)\b",
+                    next_content,
+                    re.IGNORECASE,
+                ):
+                    break
+                block.append(lines[j])
+                if next_content.rstrip().endswith("."):
+                    j += 1
+                    break
+                j += 1
+
+            block_text = "".join(_get_cobol_content(bl) for bl in block).strip()
+            dot = "." if block_text.endswith(".") else ""
+
+            for bl in block:
+                result.append(_comment_line(bl))
+            result.append(f"{_B}CONTINUE{dot}\n")
+
+            i = j
+            continue
+
+        result.append(line)
+        i += 1
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3204,8 +3256,16 @@ def run_cobol(
             env=env,
         )
         return result.returncode, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        return -1, "", "Execution timed out"
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout or ""
+        stderr = e.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        if not stderr:
+            stderr = "Execution timed out"
+        return -1, stdout, stderr
     except Exception as e:
         return -1, "", f"Execution error: {e}"
 
@@ -3213,10 +3273,13 @@ def run_cobol(
 def parse_trace(stdout: str) -> list[str]:
     """Extract paragraph trace from COBOL program output."""
     trace = []
+    seen: set[str] = set()
     for line in stdout.splitlines():
         if line.startswith("SPECTER-TRACE:"):
             para = line[len("SPECTER-TRACE:"):].strip()
-            trace.append(para)
+            if para and para not in seen:
+                seen.add(para)
+                trace.append(para)
     return trace
 
 

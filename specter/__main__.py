@@ -294,6 +294,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Max seconds for --cobol-coverage (default: 1800)",
     )
     parser.add_argument(
+        "--coverage-execution-timeout",
+        type=int, default=900, metavar="N",
+        help="Per-test COBOL execution timeout in seconds (default: 900)",
+    )
+    parser.add_argument(
         "--coverage-rounds",
         type=int, default=0, metavar="N",
         help="Max strategy rounds for coverage loop (default: 0 = unlimited)",
@@ -409,17 +414,21 @@ def main(argv: list[str] | None = None) -> int:
 
                     store_path = analysis_dir / f"{program_id}_testset.jsonl"
 
-                    cov_report = run_coverage(
-                        ast_file=ast_path,
-                        budget=args.coverage_budget,
-                        timeout=cov_timeout,
-                        store_path=store_path,
-                        seed=args.seed,
-                        llm_provider=llm_provider_for_synth,
-                        llm_model=args.llm_model,
-                        max_rounds=args.coverage_rounds,
-                        batch_size=args.coverage_batch_size,
-                    )
+                    try:
+                        cov_report = run_coverage(
+                            ast_file=ast_path,
+                            budget=args.coverage_budget,
+                            timeout=cov_timeout,
+                            store_path=store_path,
+                            seed=args.seed,
+                            llm_provider=llm_provider_for_synth,
+                            llm_model=args.llm_model,
+                            max_rounds=args.coverage_rounds,
+                            batch_size=args.coverage_batch_size,
+                        )
+                    except RuntimeError as e:
+                        print(f"Error: {e}", file=sys.stderr)
+                        return 2
                     print(cov_report.summary())
                     per_program_stores[program_id] = str(store_path)
 
@@ -575,6 +584,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  AST:    {source_path}")
         print(f"  COBOL:  {cobol_path}")
         print(f"  Budget: {args.coverage_budget} TCs, timeout {args.coverage_timeout}s")
+        print(f"  Per-test COBOL timeout: {args.coverage_execution_timeout}s")
         print(f"  Store:  {cov_store}")
 
         try:
@@ -584,6 +594,7 @@ def main(argv: list[str] | None = None) -> int:
                 copybook_dirs=[Path(d) for d in args.copybook_dir],
                 budget=args.coverage_budget,
                 timeout=args.coverage_timeout,
+                execution_timeout=args.coverage_execution_timeout,
                 store_path=cov_store,
                 seed=args.seed,
                 llm_provider=llm_provider_for_cov,
@@ -818,19 +829,23 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"Synthesizing test set → {test_store_path} ...")
         print(f"  Budget: {budget} TCs, timeout {cov_timeout}s")
-        cov_report = run_coverage(
-            ast_file=ast_path,
-            copybook_dirs=[Path(d) for d in args.copybook_dir],
-            cobol_source=cobol_src,
-            budget=budget,
-            timeout=cov_timeout,
-            store_path=test_store_path,
-            seed=args.seed,
-            llm_provider=llm_provider_for_synth,
-            llm_model=args.llm_model,
-            max_rounds=args.coverage_rounds,
-            batch_size=args.coverage_batch_size,
-        )
+        try:
+            cov_report = run_coverage(
+                ast_file=ast_path,
+                copybook_dirs=[Path(d) for d in args.copybook_dir],
+                cobol_source=cobol_src,
+                budget=budget,
+                timeout=cov_timeout,
+                store_path=test_store_path,
+                seed=args.seed,
+                llm_provider=llm_provider_for_synth,
+                llm_model=args.llm_model,
+                max_rounds=args.coverage_rounds,
+                batch_size=args.coverage_batch_size,
+            )
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
         print()
         print(cov_report.summary())
         print(f"\nTest store: {test_store_path}")

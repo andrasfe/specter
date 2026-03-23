@@ -360,7 +360,7 @@ def generate_seeds_from_analysis(
 
     Returns list of {input_values, stub_overrides, target, reasoning} dicts.
     """
-    from .llm_coverage import _query_llm_sync
+    from .llm_coverage import LLMUnrecoverableAuthError, _query_llm_sync
 
     # Check cache
     if cache_path:
@@ -461,6 +461,8 @@ Respond in YAML format (easier to parse than JSON):
                 batch_start, batch_start + len(batch), len(seeds_batch),
             )
         except Exception as e:
+            if isinstance(e, LLMUnrecoverableAuthError):
+                raise
             log.warning("LLM seed generation failed for batch %d: %s", batch_start, e)
 
     # Cache results

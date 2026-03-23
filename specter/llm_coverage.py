@@ -13,6 +13,7 @@ conditions.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import random
@@ -23,6 +24,89 @@ from .llm_providers import Message, create_provider, get_provider_from_env
 from .llm_providers.protocol import LLMProvider
 
 logger = logging.getLogger(__name__)
+
+
+class LLMUnrecoverableAuthError(RuntimeError):
+    """Raised when HTTP 401 persists after retries and run should abort."""
+
+
+def _is_http_401_error(exc: Exception) -> bool:
+    """Best-effort HTTP 401 detection across provider/client exception types."""
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 401:
+        return True
+    response = getattr(exc, "response", None)
+    if response is not None and getattr(response, "status_code", None) == 401:
+        return True
+
+    text = str(exc).lower()
+    return "401" in text and "unauthorized" in text
+
+
+def _run_maybe_async(callable_obj) -> object | None:
+    """Run sync/async callables safely in this sync module."""
+    result = callable_obj()
+    if inspect.isawaitable(result):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                return pool.submit(asyncio.run, result).result(timeout=30)
+        return asyncio.run(result)
+    return result
+
+
+def _reconnect_provider(provider: LLMProvider) -> LLMProvider:
+    """Best-effort disconnect/reconnect for provider auth/session refresh."""
+    refreshed: LLMProvider = provider
+
+    # 1) Try explicit disconnect/close hooks first.
+    for method_name in ("disconnect", "close", "aclose"):
+        method = getattr(refreshed, method_name, None)
+        if callable(method):
+            try:
+                _run_maybe_async(method)
+            except Exception as exc:  # pragma: no cover - best-effort cleanup
+                logger.debug("Provider %s() failed during reconnect prep: %s", method_name, exc)
+
+    # 2) Try provider-native refresh/reconnect hooks.
+    for method_name in ("reconnect", "refresh", "reset", "reinitialize"):
+        method = getattr(refreshed, method_name, None)
+        if callable(method):
+            try:
+                maybe_new = _run_maybe_async(method)
+                if maybe_new is not None:
+                    refreshed = maybe_new
+                logger.info("Provider reconnect via %s()", method_name)
+                return refreshed
+            except Exception as exc:
+                logger.warning("Provider %s() failed during reconnect: %s", method_name, exc)
+
+    # 3) SafeChain-specific cache reset + re-instantiation.
+    try:
+        if hasattr(refreshed, "_models") and isinstance(getattr(refreshed, "_models"), dict):
+            getattr(refreshed, "_models").clear()
+            logger.info("Provider model cache cleared during reconnect")
+    except Exception as exc:  # pragma: no cover - best-effort cleanup
+        logger.debug("Failed to clear provider model cache: %s", exc)
+
+    try:
+        default_model = getattr(refreshed, "default_model", None)
+        config_path = getattr(refreshed, "_config_path", None)
+        refreshed = refreshed.__class__(
+            default_model=default_model,
+            config_path=config_path,
+        )
+        logger.info("Provider instance recreated during reconnect")
+    except Exception as exc:
+        logger.debug("Provider re-instantiation skipped: %s", exc)
+
+    return refreshed
 
 
 # ---------------------------------------------------------------------------
@@ -241,20 +325,52 @@ def _query_llm_sync(
     prompt: str,
     model: str | None = None,
 ) -> tuple[str, int]:
-    """Synchronous wrapper for _query_llm."""
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
+    """Synchronous wrapper for _query_llm with 401 backoff/retry."""
 
-    if loop and loop.is_running():
-        # Already in an async context — run in a new thread
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, _query_llm(provider, prompt, model))
-            return future.result(timeout=120)
-    else:
-        return asyncio.run(_query_llm(provider, prompt, model))
+    current_provider = provider
+
+    def _run_once() -> tuple[str, int]:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            # Already in an async context - run in a new thread.
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(asyncio.run, _query_llm(current_provider, prompt, model))
+                return future.result(timeout=120)
+        return asyncio.run(_query_llm(current_provider, prompt, model))
+
+    for attempt in range(1, _LLM_MAX_RETRIES + 1):
+        try:
+            return _run_once()
+        except Exception as exc:
+            if not _is_http_401_error(exc):
+                raise
+
+            if attempt >= _LLM_MAX_RETRIES:
+                raise LLMUnrecoverableAuthError(
+                    f"LLM auth failed with HTTP 401 after {_LLM_MAX_RETRIES} attempts"
+                ) from exc
+
+            try:
+                current_provider = _reconnect_provider(current_provider)
+            except Exception as reconnect_exc:  # pragma: no cover - defensive
+                logger.warning("Provider reconnect failed: %s", reconnect_exc)
+
+            sleep_seconds = _LLM_401_RETRY_SCHEDULE[attempt - 1]
+            logger.warning(
+                "LLM request returned HTTP 401 (attempt %d/%d). Reconnected provider; sleeping %ds before retry.",
+                attempt,
+                _LLM_MAX_RETRIES,
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
+
+    raise LLMUnrecoverableAuthError("LLM auth failed with HTTP 401")
 
 
 # ---------------------------------------------------------------------------
@@ -309,8 +425,8 @@ def get_llm_provider(
     return get_provider_from_env(provider_name)
 
 
-_LLM_RETRY_PAUSE = 60  # seconds between retries
-_LLM_MAX_RETRIES = 3   # default max retry attempts
+_LLM_401_RETRY_SCHEDULE = (30, 60, 90)  # seconds between 401 retries
+_LLM_MAX_RETRIES = len(_LLM_401_RETRY_SCHEDULE) + 1
 
 
 def generate_llm_suggestions(
@@ -359,13 +475,16 @@ def generate_llm_suggestions(
             llm_state.tokens_used += tokens
             break
         except Exception as e:
+            if isinstance(e, LLMUnrecoverableAuthError):
+                raise
             logger.warning(
                 "LLM query failed (attempt %d/%d): %s",
                 attempt, max_retries, e,
             )
             if attempt < max_retries:
-                logger.info("Retrying in %d seconds...", _LLM_RETRY_PAUSE)
-                time.sleep(_LLM_RETRY_PAUSE)
+                sleep_seconds = _LLM_401_RETRY_SCHEDULE[min(attempt - 1, len(_LLM_401_RETRY_SCHEDULE) - 1)]
+                logger.info("Retrying in %d seconds...", sleep_seconds)
+                time.sleep(sleep_seconds)
             else:
                 logger.error("All %d LLM retry attempts exhausted", max_retries)
                 return []

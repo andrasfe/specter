@@ -22,7 +22,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .llm_coverage import _query_llm_sync
+from .llm_coverage import LLMUnrecoverableAuthError, _query_llm_sync
 from .models import Program, Paragraph, Statement
 from .static_analysis import StaticCallGraph, GatingCondition
 from .variable_domain import VariableDomain
@@ -670,6 +670,8 @@ def generate_llm_test_states(
         response_text, tokens = _query_llm_sync(provider, prompt, model)
         log.info("LLM response: %d chars, %d tokens", len(response_text), tokens)
     except Exception as e:
+        if isinstance(e, LLMUnrecoverableAuthError):
+            raise
         log.error("LLM query failed: %s", e)
         return []
 

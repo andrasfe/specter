@@ -43,6 +43,7 @@ class CobolExecutionContext:
     total_paragraphs: int = 0
     total_branches: int = 0
     hardened_mode: bool = False
+    coverage_mode: bool = False
 
 
 @dataclass
@@ -229,6 +230,7 @@ def prepare_context(
         total_paragraphs=result.paragraphs_traced,
         total_branches=total_branches,
         hardened_mode=hardened_mode,
+        coverage_mode=coverage_mode,
     )
 
 
@@ -270,10 +272,12 @@ def run_test_case(
     # In coverage mode (RETURN/XCTL don't terminate), the COBOL program
     # consumes more mock records than the Python pre-run produces.
     # Pad with extra success records so the COBOL doesn't hit EOF early.
-    pad_record = f"{'CICS':<30}{'00':<20}{'0':>9}{' ' * 21}"[:80]
-    pad_data = "\n".join([pad_record] * 50) + "\n"
+    pad_data = ""
+    if context.coverage_mode:
+        pad_record = f"{'CICS':<30}{'00':<20}{'0':>9}{' ' * 21}"[:80]
+        pad_data = "\n".join([pad_record] * 50) + "\n"
 
-    # Concatenate: init records first, then stub records, then padding
+    # Concatenate: init records first, then stub records, then optional padding
     parts = [p for p in [init_data, stub_data, pad_data] if p]
     mock_data = "\n".join(parts) if parts else "\n"
 
@@ -293,7 +297,7 @@ def run_test_case(
 
     elapsed_ms = (time.monotonic() - start) * 1000
 
-    if rc == -1:
+    if rc == -1 and not (stdout or "").strip():
         return CobolTestResult(
             return_code=rc,
             execution_time_ms=elapsed_ms,

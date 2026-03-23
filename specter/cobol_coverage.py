@@ -35,6 +35,7 @@ from .coverage_strategies import (
     HeuristicSelector,
     IntentDrivenStrategy,
     LLMGapStrategy,
+    LLMRuntimeSteeringStrategy,
     LLMSeedStrategy,
     LLMSelector,
     MonteCarloStrategy,
@@ -85,6 +86,9 @@ class CoverageState:
     all_paragraphs: set[str] = field(default_factory=set)
     strategy_yields: dict[str, StrategyYield] = field(default_factory=dict)
     stale_rounds: int = 0
+    consecutive_timeouts: int = 0
+    repeat_signature_count: int = 0
+    last_result_signature: tuple[frozenset[str], frozenset[str]] | None = None
     # Kept for strategies that check stub_mapping availability
     _stub_mapping: dict[str, list[str]] = field(default_factory=dict)
 
@@ -657,6 +661,52 @@ def _match_stub_operation(
     return None
 
 
+def _strict_perturb_stub_log(
+    stub_log: list[tuple[str, list]],
+    strategy_name: str,
+    tc_count: int,
+) -> list[tuple[str, list]]:
+    """Apply strict-mode status perturbation to early stub records.
+
+    COBOL mock consumption is sequential and can get trapped in equivalent
+    status streams. In strict mode, perturb the first N records for non-baseline
+    strategies to force alternate external status paths.
+    """
+    if not stub_log or strategy_name == "baseline":
+        return stub_log
+
+    profiles: list[tuple[str, int]] = [
+        ("10", 10),
+        ("12", 12),
+        ("16", 16),
+        ("96", 96),
+        ("99", 99),
+    ]
+    profile_index = (tc_count + len(strategy_name)) % len(profiles)
+    alpha_code, num_code = profiles[profile_index]
+
+    limit = min(24, len(stub_log))
+    out: list[tuple[str, list]] = []
+    for idx, (op_key, entry) in enumerate(stub_log):
+        if idx >= limit or not isinstance(entry, list):
+            out.append((op_key, entry))
+            continue
+
+        new_entry = []
+        for pair in entry:
+            if isinstance(pair, (list, tuple)) and len(pair) == 2:
+                var, val = pair
+                if isinstance(val, (int, float)):
+                    new_entry.append((var, num_code))
+                else:
+                    new_entry.append((var, alpha_code))
+            else:
+                new_entry.append(pair)
+        out.append((op_key, new_entry))
+
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Standalone execute-and-save
 # ---------------------------------------------------------------------------
@@ -694,8 +744,50 @@ def _execute_and_save(
             stub_log = []
         else:
             # Full program: pre-run Python for stub ordering, then COBOL
-            stub_log = _python_pre_run(ctx.module, input_state, stub_outcomes, stub_defaults)
-            result = run_test_case(ctx.context, input_state, stub_log)
+            strict_mode = bool(getattr(ctx, "strict_branch_coverage", False))
+            strict_fast = False
+            if strict_fast and stub_outcomes:
+                # Strict-mode fast path keeps execution moving by avoiding
+                # expensive pre-run ordering when validating branch reachability.
+                stub_log = []
+                for op_key, entries in stub_outcomes.items():
+                    if not entries:
+                        continue
+                    chosen = entries[0]
+                    default_entry = None
+                    if stub_defaults and op_key in stub_defaults:
+                        default_entry = stub_defaults.get(op_key)
+                    if default_entry is not None:
+                        for candidate in entries:
+                            if candidate != default_entry:
+                                chosen = candidate
+                                break
+                    stub_log.append((op_key, chosen))
+                    if len(stub_log) >= 30:
+                        break
+            else:
+                stub_log = _python_pre_run(ctx.module, input_state, stub_outcomes, stub_defaults)
+
+            if strict_mode:
+                stub_log = _strict_perturb_stub_log(stub_log, strategy_name, tc_count)
+
+            exec_timeout = int(getattr(ctx, "execution_timeout", 120))
+            remaining_timeout = int(getattr(ctx, "_remaining_timeout", exec_timeout))
+            effective_timeout = max(1, min(exec_timeout, remaining_timeout))
+            if strict_fast:
+                effective_timeout = min(effective_timeout, 120)
+
+            result = run_test_case(ctx.context, input_state, stub_log, timeout=effective_timeout)
+            log.info(
+                "  [%s] rc=%s time=%.0fms stubops=%d paras=%d branches=%d%s",
+                strategy_name,
+                result.return_code,
+                result.execution_time_ms,
+                len(stub_log),
+                len(result.paragraphs_hit),
+                len(result.branches_hit),
+                f" error={result.error}" if result.error else "",
+            )
     else:
         # Python-only execution path
         result = _python_execute(
@@ -705,7 +797,13 @@ def _execute_and_save(
         stub_log = []
 
     if result.error:
+        if "timed out" in result.error.lower():
+            cov.consecutive_timeouts += 1
+        else:
+            cov.consecutive_timeouts = 0
         return False, tc_count
+
+    cov.consecutive_timeouts = 0
 
     # Normalize paragraph coverage to AST-known labels. Keep runtime-only labels
     # in a side channel for diagnostics/reporting.
@@ -721,6 +819,15 @@ def _execute_and_save(
     new_paras = result_ast_paras - cov.paragraphs_hit
     new_runtime_only = result_runtime_only - cov.runtime_only_paragraphs
     new_branches = result.branches_hit - cov.branches_hit
+
+    # Track repeated execution signatures (same paragraph+branch outcome)
+    # to short-circuit strict runs that are stuck in equivalent paths.
+    signature = (frozenset(result_ast_paras), frozenset(result.branches_hit))
+    if cov.last_result_signature == signature:
+        cov.repeat_signature_count += 1
+    else:
+        cov.last_result_signature = signature
+        cov.repeat_signature_count = 0
 
     # Always save first few test cases; after that, only if new coverage
     force_save = tc_count < 5
@@ -776,6 +883,7 @@ def run_cobol_coverage(
     copybook_dirs: list[str | Path] | None = None,
     budget: int = 5000,
     timeout: int = 1800,
+    execution_timeout: int = 900,
     store_path: str | Path | None = None,
     seed: int = 42,
     work_dir: str | Path | None = None,
@@ -804,7 +912,7 @@ def run_cobol_coverage(
     from .code_generator import generate_code
     from .monte_carlo import _load_module
 
-    start_time = time.time()
+    setup_start = time.time()
     rng = random.Random(seed)
     copybook_dirs = list(copybook_dirs or [])
 
@@ -854,6 +962,7 @@ def run_cobol_coverage(
 
     # Prepare COBOL context (instrument + compile)
     log.info("Instrumenting and compiling COBOL ...")
+    strict_injectable = injectable[:40] if strict_branch_coverage else []
     try:
         # Don't pass injectable_vars — the init dispatch EVALUATE that Phase 10
         # generates often gets destroyed by Phase 12, and the destruction
@@ -864,15 +973,30 @@ def run_cobol_coverage(
             cobol_source, copybook_dirs,
             enable_branch_tracing=True,
             work_dir=work_dir,
-            injectable_vars=[],
+            injectable_vars=strict_injectable,
             coverage_mode=True,
             allow_hardening_fallback=not strict_branch_coverage,
         )
     except RuntimeError as e:
-        log.error("COBOL compilation failed: %s", e)
-        if strict_branch_coverage:
-            raise
-        return CobolCoverageReport(elapsed_seconds=time.time() - start_time)
+        if strict_branch_coverage and strict_injectable:
+            log.warning(
+                "Strict compile with %d injectable vars failed, retrying without injection: %s",
+                len(strict_injectable),
+                e,
+            )
+            context = prepare_context(
+                cobol_source, copybook_dirs,
+                enable_branch_tracing=True,
+                work_dir=work_dir,
+                injectable_vars=[],
+                coverage_mode=True,
+                allow_hardening_fallback=not strict_branch_coverage,
+            )
+        else:
+            log.error("COBOL compilation failed: %s", e)
+            if strict_branch_coverage:
+                raise
+            return CobolCoverageReport(elapsed_seconds=time.time() - setup_start)
 
     if strict_branch_coverage and context.total_branches == 0:
         msg = (
@@ -959,6 +1083,8 @@ def run_cobol_coverage(
         siblings_88=siblings_88,
         flag_88_added=flag_88_added,
     )
+    setattr(ctx, "execution_timeout", max(1, int(execution_timeout)))
+    setattr(ctx, "strict_branch_coverage", bool(strict_branch_coverage))
 
     # --- REGISTER STRATEGIES ---
     strategies: list[Strategy] = [
@@ -972,23 +1098,32 @@ def run_cobol_coverage(
         MonteCarloStrategy(),
     ]
     if llm_provider:
-        strategies.extend([
-            LLMSeedStrategy(llm_provider, llm_model),
-            LLMGapStrategy(llm_provider, llm_model),
-            IntentDrivenStrategy(llm_provider, llm_model),
-        ])
+        # Keep strategy behavior generic: LLM guidance is based on runtime
+        # coverage signals, branch metadata, and discovered variable domains.
+        strategies.append(LLMRuntimeSteeringStrategy(llm_provider, llm_model))
+        if not strict_branch_coverage:
+            strategies.extend([
+                LLMSeedStrategy(llm_provider, llm_model),
+                LLMGapStrategy(llm_provider, llm_model),
+                IntentDrivenStrategy(llm_provider, llm_model),
+            ])
 
     selector = (
         LLMSelector(llm_provider, llm_model,
                      default_batch_size=batch_size,
                      var_report=var_report)
-        if llm_provider
+        if llm_provider and not strict_branch_coverage
         else HeuristicSelector(default_batch_size=batch_size)
     )
 
+    loop_start_time = time.time()
+    setup_elapsed = loop_start_time - setup_start
+    if setup_elapsed > 0.5:
+        log.info("Coverage setup complete in %.1fs; starting execution loop", setup_elapsed)
+
     return _run_agentic_loop(
         ctx, cov, report, strategies, selector,
-        budget, timeout, start_time, tc_count,
+        budget, timeout, loop_start_time, tc_count,
         max_rounds=max_rounds,
     )
 
@@ -1014,11 +1149,35 @@ def _run_agentic_loop(
     Shared between run_cobol_coverage() and run_coverage().
     """
     round_num = 0
+    strict_mode = bool(getattr(ctx, "strict_branch_coverage", False))
+    strict_case_cap = 3
+    strict_strategy_order = [
+        "baseline",
+        "fault_injection",
+        "branch_solver",
+        "constraint_solver",
+        "stub_walk",
+        "guided_mutation",
+        "llm_runtime",
+        "monte_carlo",
+    ]
     while tc_count < budget and (time.time() - start_time) < timeout:
         if max_rounds > 0 and round_num >= max_rounds:
             log.info("Max rounds (%d) reached", max_rounds)
             break
-        strategy, batch_size = selector.select(strategies, cov, round_num)
+        strategy = None
+        batch_size = 0
+        if strict_mode:
+            target_name = strict_strategy_order[round_num % len(strict_strategy_order)]
+            for candidate in strategies:
+                if candidate.name == target_name and candidate.should_run(cov, round_num):
+                    strategy = candidate
+                    break
+            if strategy is not None:
+                batch_size = min(50, int(getattr(selector, "default_batch_size", 50) or 50))
+
+        if strategy is None:
+            strategy, batch_size = selector.select(strategies, cov, round_num)
         round_new = 0
         round_cov_before = len(cov.paragraphs_hit) + len(cov.branches_hit)
 
@@ -1029,6 +1188,9 @@ def _run_agentic_loop(
             if tc_count >= budget or (time.time() - start_time) >= timeout:
                 break
 
+            remaining = max(1, int(timeout - (time.time() - start_time)))
+            setattr(ctx, "_remaining_timeout", remaining)
+
             saved, tc_count = _execute_and_save(
                 ctx, cov, input_state, stubs, defaults,
                 strategy.name, target, report, tc_count,
@@ -1037,6 +1199,36 @@ def _run_agentic_loop(
                 round_new += 1
 
             cases_tried += 1
+
+            if cov.consecutive_timeouts >= 5:
+                log.info(
+                    "Round %d: aborting %s after %d consecutive timeouts",
+                    round_num,
+                    strategy.name,
+                    cov.consecutive_timeouts,
+                )
+                break
+
+            if strict_mode and cov.repeat_signature_count >= 2:
+                log.info(
+                    "Round %d: aborting %s after repeated identical execution signatures",
+                    round_num,
+                    strategy.name,
+                )
+                break
+
+            current_cap = strict_case_cap
+            if strategy.name == "llm_runtime":
+                current_cap = 2
+
+            if strict_mode and cases_tried >= current_cap:
+                log.info(
+                    "Round %d: strict cap reached for %s (%d cases)",
+                    round_num,
+                    strategy.name,
+                    current_cap,
+                )
+                break
             if round_new >= batch_size:
                 break
 
@@ -1061,6 +1253,21 @@ def _run_agentic_loop(
             cov.stale_rounds += 1
         else:
             cov.stale_rounds = 0
+
+        if strict_mode:
+            stale_limit = 2
+            llm_runtime_available = any(s.name == "llm_runtime" for s in strategies)
+            llm_runtime_cases = cov.strategy_yields.get("llm_runtime", StrategyYield()).total_cases
+            if llm_runtime_available and llm_runtime_cases == 0:
+                # Give runtime LLM steering one chance before strict early-stop.
+                stale_limit = max(stale_limit, 7)
+
+            if cov.stale_rounds >= stale_limit:
+                log.info(
+                    "Strict plateau detected after %d stale rounds, stopping early",
+                    cov.stale_rounds,
+                )
+                break
 
         # Early termination conditions
         full_para = (cov.total_paragraphs > 0
@@ -1137,7 +1344,7 @@ def run_coverage(
     from .code_generator import generate_code
     from .monte_carlo import _load_module
 
-    start_time = time.time()
+    setup_start = time.time()
     rng = random.Random(seed)
     copybook_dirs = list(copybook_dirs or [])
 
@@ -1313,8 +1520,13 @@ def run_coverage(
         else HeuristicSelector(default_batch_size=batch_size)
     )
 
+    loop_start_time = time.time()
+    setup_elapsed = loop_start_time - setup_start
+    if setup_elapsed > 0.5:
+        log.info("Coverage setup complete in %.1fs; starting execution loop", setup_elapsed)
+
     return _run_agentic_loop(
         ctx, cov, report, strategies, selector,
-        budget, timeout, start_time, tc_count,
+        budget, timeout, loop_start_time, tc_count,
         max_rounds=max_rounds,
     )

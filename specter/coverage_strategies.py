@@ -6,8 +6,10 @@ tuples.  The agentic loop in cobol_coverage.py handles execution and saving.
 
 from __future__ import annotations
 
+import json
 import logging
 import random
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -228,6 +230,187 @@ class LLMGapStrategy(Strategy):
             yield input_state, stubs, defaults, f"llm-gap:{lts.target_description[:36]}"
 
 
+class LLMRuntimeSteeringStrategy(Strategy):
+    """Runtime LLM steering based only on generic runtime signals."""
+
+    name = "llm_runtime"
+    priority = 28
+    requires_llm = True
+
+    def __init__(
+        self,
+        llm_provider,
+        llm_model: str | None = None,
+        max_calls: int = 2,
+        min_stale_rounds: int = 1,
+    ):
+        self.llm_provider = llm_provider
+        self.llm_model = llm_model
+        self.max_calls = max_calls
+        self.min_stale_rounds = min_stale_rounds
+        self._calls = 0
+
+    def should_run(self, cov, round_num: int) -> bool:
+        if self._calls >= self.max_calls:
+            return False
+        if cov.total_branches <= 0 or len(cov.branches_hit) >= cov.total_branches:
+            return False
+        return cov.stale_rounds >= self.min_stale_rounds
+
+    def _build_prompt(self, ctx, cov) -> str:
+        uncovered: list[str] = []
+        for bid, meta in ctx.branch_meta.items():
+            for direction in ("T", "F"):
+                bkey = f"{bid}:{direction}"
+                if bkey not in cov.branches_hit:
+                    para = meta.get("paragraph", "")
+                    cond = (meta.get("condition", "") or "")[:120]
+                    uncovered.append(f"{bkey} | para={para} | cond={cond}")
+            if len(uncovered) >= 14:
+                break
+
+        recent_cases = cov.test_cases[-3:]
+        recent_lines: list[str] = []
+        for tc in recent_cases:
+            inp = tc.get("input_state", {}) or {}
+            keys = sorted(inp.keys())[:10]
+            preview = {k: inp.get(k) for k in keys}
+            recent_lines.append(
+                f"- branches={tc.get('branches_hit', [])[:10]} input={preview}"
+            )
+
+        var_lines: list[str] = []
+        for name, dom in sorted(ctx.domains.items()):
+            if dom.classification not in ("input", "status", "flag") or dom.set_by_stub:
+                continue
+            hints: list[str] = []
+            if dom.condition_literals:
+                hints.append(f"lits={dom.condition_literals[:5]!r}")
+            if dom.valid_88_values:
+                hints.append(f"88={dict(list(dom.valid_88_values.items())[:4])!r}")
+            if dom.semantic_type != "generic":
+                hints.append(f"type={dom.semantic_type}")
+            var_lines.append(f"- {name}: {', '.join(hints) if hints else 'free'}")
+            if len(var_lines) >= 35:
+                break
+
+        stub_lines: list[str] = []
+        for op_key, status_vars in sorted(ctx.stub_mapping.items()):
+            stub_lines.append(f"- {op_key}: status_vars={status_vars}")
+            if len(stub_lines) >= 24:
+                break
+
+        return (
+            "You are steering COBOL branch coverage in a generic engine.\n"
+            "Goal: propose diverse candidate test states that can flip uncovered branches.\n\n"
+            f"Covered branches: {len(cov.branches_hit)}/{cov.total_branches}\n"
+            "Uncovered branch targets (subset):\n"
+            + "\n".join(uncovered)
+            + "\n\nRecent executed cases:\n"
+            + ("\n".join(recent_lines) if recent_lines else "- (none)")
+            + "\n\nAvailable input variables (subset):\n"
+            + ("\n".join(var_lines) if var_lines else "- (none)")
+            + "\n\nStub operations (subset):\n"
+            + ("\n".join(stub_lines) if stub_lines else "- (none)")
+            + "\n\nRespond with JSON array only:\n"
+            "[\n"
+            "  {\n"
+            "    \"target_branch\": \"<id:T|F>\",\n"
+            "    \"input_values\": {\"VAR\": value},\n"
+            "    \"stub_overrides\": {\"OP:KEY\": \"status\"},\n"
+            "    \"reasoning\": \"brief\"\n"
+            "  }\n"
+            "]\n"
+            "Output 3-6 candidates. Use only listed variable names and operation keys."
+        )
+
+    def _parse_response(self, text: str) -> list[dict]:
+        payload = text.strip()
+        if "```" in payload:
+            parts = payload.split("```")
+            for part in parts[1::2]:
+                lines = part.strip().split("\n", 1)
+                if len(lines) > 1 and lines[0].strip().lower() in ("json", ""):
+                    payload = lines[1]
+                else:
+                    payload = part
+                break
+
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            m = re.search(r"\[[\s\S]*\]", payload)
+            if not m:
+                return []
+            try:
+                data = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                return []
+
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list):
+            return []
+        return [d for d in data if isinstance(d, dict)]
+
+    def generate_cases(self, ctx, cov, batch_size) -> Iterator[CaseT]:
+        from .cobol_coverage import _match_stub_operation
+        from .llm_coverage import LLMUnrecoverableAuthError, _query_llm_sync
+
+        self._calls += 1
+        prompt = self._build_prompt(ctx, cov)
+        if not prompt:
+            return
+
+        try:
+            response_text, tokens = _query_llm_sync(
+                self.llm_provider, prompt, self.llm_model,
+            )
+            log.info(
+                "LLM runtime steering response: %d chars, %d tokens",
+                len(response_text),
+                tokens,
+            )
+        except Exception as e:
+            if isinstance(e, LLMUnrecoverableAuthError):
+                raise
+            log.warning("LLM runtime steering query failed: %s", e)
+            return
+
+        items = self._parse_response(response_text)
+        if not items:
+            return
+
+        emitted = 0
+        for item in items:
+            input_state = {}
+            for var, val in (item.get("input_values") or {}).items():
+                if not isinstance(var, str):
+                    continue
+                dom = ctx.domains.get(var.upper())
+                if dom:
+                    input_state[var.upper()] = format_value_for_cobol(dom, val)
+
+            stubs = dict(ctx.success_stubs)
+            defaults = dict(ctx.success_defaults)
+            for op_key, status_val in (item.get("stub_overrides") or {}).items():
+                if not isinstance(op_key, str):
+                    continue
+                matched = _match_stub_operation(op_key, ctx.stub_mapping)
+                if not matched:
+                    continue
+                svars = ctx.stub_mapping.get(matched, [])
+                entry = [(sv, status_val) for sv in svars]
+                stubs[matched] = [entry] * 50
+                defaults[matched] = entry
+
+            target = str(item.get("target_branch") or item.get("reasoning") or "llm_runtime")
+            yield input_state, stubs, defaults, f"llm-runtime:{target[:42]}"
+            emitted += 1
+            if emitted >= max(1, min(batch_size, 6)):
+                break
+
+
 class IntentDrivenStrategy(Strategy):
     """NEW: Generate realistic business-scenario test data via LLM."""
 
@@ -263,7 +446,7 @@ class IntentDrivenStrategy(Strategy):
             yield input_state, stubs, defaults, f"intent:{scenario.target_description[:36]}"
 
     def _generate_scenarios(self, ctx: StrategyContext):
-        from .llm_coverage import _query_llm_sync
+        from .llm_coverage import LLMUnrecoverableAuthError, _query_llm_sync
         from .llm_test_states import (
             LLMTestState,
             extract_flow_summary,
@@ -293,6 +476,8 @@ class IntentDrivenStrategy(Strategy):
                      len(response_text), tokens)
             return parse_test_states(response_text)
         except Exception as e:
+            if isinstance(e, LLMUnrecoverableAuthError):
+                raise
             log.warning("Intent-driven LLM query failed: %s", e)
             return []
 
@@ -1381,7 +1566,7 @@ class DirectParagraphStrategy(Strategy):
             yield from self._param_round(ctx, cov, batch_size, branch_meta)
             return
 
-        from .llm_coverage import _query_llm_sync
+        from .llm_coverage import LLMUnrecoverableAuthError, _query_llm_sync
         from .program_analysis import _parse_yaml_seeds
 
         sorted_paras = self._paragraphs_with_gaps(branch_meta, cov)
@@ -1564,6 +1749,8 @@ For each branch, suggest 1-2 test inputs. Respond in YAML:
             log.info("LLM gap: %d suggestions for %d hard branches",
                      len(suggestions), min(len(hard_branches), 5))
         except Exception as e:
+            if isinstance(e, LLMUnrecoverableAuthError):
+                raise
             log.warning("LLM gap query failed: %s", e)
             yield from self._param_round(ctx, cov, batch_size, branch_meta)
             return
@@ -2262,6 +2449,10 @@ class LLMSelector(StrategySelector):
                         self.llm_provider, self.var_report, model=self.llm_model,
                     )
                 except Exception as e:
+                    from .llm_coverage import LLMUnrecoverableAuthError
+
+                    if isinstance(e, LLMUnrecoverableAuthError):
+                        raise
                     log.warning("LLM selector profile inference failed: %s", e)
                     self._semantic_profiles = {}
         if self._semantic_profiles:
@@ -2281,6 +2472,10 @@ class LLMSelector(StrategySelector):
                 model=self.llm_model,
             )
         except Exception as e:
+            from .llm_coverage import LLMUnrecoverableAuthError
+
+            if isinstance(e, LLMUnrecoverableAuthError):
+                raise
             log.warning("LLM selector query failed: %s", e)
             return None
 
