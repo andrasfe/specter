@@ -179,57 +179,6 @@ class BaselineStrategy(Strategy):
                     yield base, ctx.success_stubs, ctx.success_defaults, f"lit:{name}"
 
 
-class LLMGapStrategy(Strategy):
-    """Layer 0b: LLM re-query targeting coverage gaps."""
-
-    name = "llm_gap"
-    priority = 25
-    requires_llm = True
-
-    def __init__(self, llm_provider, llm_model: str | None = None):
-        self.llm_provider = llm_provider
-        self.llm_model = llm_model
-        self._ran = False
-
-    def should_run(self, cov, round_num: int) -> bool:
-        if self._ran:
-            return False
-        uncovered = cov.all_paragraphs - cov.paragraphs_hit
-        return len(uncovered) > 0
-
-    def generate_cases(self, ctx, cov, batch_size) -> Iterator[CaseT]:
-        self._ran = True
-
-        from .llm_test_states import generate_llm_test_states
-
-        if ctx.cobol_source_path is None:
-            return
-
-        llm_cache = ctx.store_path.with_name(ctx.store_path.stem + "_llm_states.json")
-        gap_states = generate_llm_test_states(
-            self.llm_provider,
-            ctx.cobol_source_path,
-            ctx.program,
-            ctx.var_report, ctx.stub_mapping, ctx.domains,
-            llm_cache,
-            call_graph=ctx.call_graph, gating_conds=ctx.gating_conds,
-            model=self.llm_model,
-            covered_paragraphs=cov.paragraphs_hit,
-            covered_branches=cov.branches_hit,
-        )
-        if not gap_states:
-            return
-
-        log.info("LLM gap: %d gap-targeted states", len(gap_states))
-        for lts in gap_states:
-            input_state = _convert_llm_state(lts, ctx)
-            stubs, defaults = _apply_llm_stub_overrides(
-                lts, ctx.success_stubs, ctx.success_defaults,
-                ctx.stub_mapping,
-            )
-            yield input_state, stubs, defaults, f"llm-gap:{lts.target_description[:36]}"
-
-
 class LLMRuntimeSteeringStrategy(Strategy):
     """Runtime LLM steering based only on generic runtime signals."""
 
@@ -241,7 +190,7 @@ class LLMRuntimeSteeringStrategy(Strategy):
         self,
         llm_provider,
         llm_model: str | None = None,
-        max_calls: int = 2,
+        max_calls: int = 5,
         min_stale_rounds: int = 1,
     ):
         self.llm_provider = llm_provider
@@ -249,16 +198,32 @@ class LLMRuntimeSteeringStrategy(Strategy):
         self.max_calls = max_calls
         self.min_stale_rounds = min_stale_rounds
         self._calls = 0
+        self._consecutive_dry: int = 0  # calls that yielded no new coverage
 
     def should_run(self, cov, round_num: int) -> bool:
         if self._calls >= self.max_calls:
+            return False
+        # Stop after 2 consecutive dry calls (LLM has nothing new to offer)
+        if self._consecutive_dry >= 2:
             return False
         if cov.total_branches <= 0 or len(cov.branches_hit) >= cov.total_branches:
             return False
         return cov.stale_rounds >= self.min_stale_rounds
 
     def _build_prompt(self, ctx, cov) -> str:
+        from .backward_slicer import backward_slice
+
+        # Load module source for code slicing
+        module_source = ""
+        module_file = getattr(ctx.module, "__file__", None)
+        if module_file:
+            try:
+                module_source = open(module_file).read()
+            except OSError:
+                pass
+
         uncovered: list[str] = []
+        code_slices: list[str] = []
         for bid, meta in ctx.branch_meta.items():
             for direction in ("T", "F"):
                 bkey = f"{bid}:{direction}"
@@ -266,6 +231,14 @@ class LLMRuntimeSteeringStrategy(Strategy):
                     para = meta.get("paragraph", "")
                     cond = (meta.get("condition", "") or "")[:120]
                     uncovered.append(f"{bkey} | para={para} | cond={cond}")
+                    # Generate code slice for this branch
+                    if module_source and len(code_slices) < 6:
+                        target = bid if direction == "T" else -bid
+                        sl = backward_slice(module_source, target, max_lines=40)
+                        if sl:
+                            code_slices.append(
+                                f"### Code slice for branch {bkey}:\n```python\n{sl}\n```"
+                            )
             if len(uncovered) >= 14:
                 break
 
@@ -300,12 +273,23 @@ class LLMRuntimeSteeringStrategy(Strategy):
             if len(stub_lines) >= 24:
                 break
 
+        code_section = ""
+        if code_slices:
+            code_section = (
+                "\n\nGenerated Python code slices (trace backward from each TARGET branch):\n"
+                + "\n\n".join(code_slices)
+                + "\n\nThe code shows the exact execution path. state['VAR'] reads/writes "
+                "the program state dict. _apply_stub_outcome(state, 'OP') applies the "
+                "stub outcome for that operation — control it via stub_overrides."
+            )
+
         return (
             "You are steering COBOL branch coverage in a generic engine.\n"
             "Goal: propose diverse candidate test states that can flip uncovered branches.\n\n"
             f"Covered branches: {len(cov.branches_hit)}/{cov.total_branches}\n"
             "Uncovered branch targets (subset):\n"
             + "\n".join(uncovered)
+            + code_section
             + "\n\nRecent executed cases:\n"
             + ("\n".join(recent_lines) if recent_lines else "- (none)")
             + "\n\nAvailable input variables (subset):\n"
@@ -622,8 +606,6 @@ class DirectParagraphStrategy(Strategy):
 
     def __init__(self):
         self._round = 0  # 0=param, 1=stub, 2=dataflow, 3=frontier
-        self._llm_feedback: list[str] = []
-        self._llm_prev_branches: list[tuple[str, str]] = []  # (bkey, condition)
 
     def _fault_values_for_op(self, ctx, op_key: str) -> list:
         """Compute interesting fault values for a stub operation.
@@ -1556,315 +1538,7 @@ class DirectParagraphStrategy(Strategy):
                         break  # found chain for this branch
 
     # ------------------------------------------------------------------
-    # LLM gap round: per-branch focused prompts with feedback
-    # ------------------------------------------------------------------
-
-    def _llm_gap_round(self, ctx, cov, batch_size, branch_meta) -> Iterator[CaseT]:
-        """Per-branch focused LLM prompts with semantic types, covered-direction
-        context, and multi-turn execution feedback."""
-        if not ctx.llm_provider:
-            yield from self._param_round(ctx, cov, batch_size, branch_meta)
-            return
-
-        from .llm_coverage import LLMUnrecoverableAuthError, _query_llm_sync
-        from .program_analysis import _parse_yaml_seeds
-
-        sorted_paras = self._paragraphs_with_gaps(branch_meta, cov)
-        if not sorted_paras:
-            return
-
-        # --- Multi-turn feedback: check results of previous LLM round ---
-        if self._llm_prev_branches:
-            for bkey, cond in self._llm_prev_branches:
-                if bkey in cov.branches_hit:
-                    self._llm_feedback.append(f"SUCCESS: {bkey} was covered")
-                else:
-                    self._llm_feedback.append(
-                        f"STILL UNCOVERED: {bkey} (condition: {cond[:80]})"
-                    )
-            self._llm_prev_branches = []
-            # Keep only recent feedback to avoid prompt bloat
-            self._llm_feedback = self._llm_feedback[-15:]
-
-        # --- Collect the hardest uncovered branches ---
-        hard_branches: list[tuple[str, str, str, dict]] = []
-        for para in sorted_paras:
-            for bid, meta in branch_meta.items():
-                if meta.get("paragraph") != para:
-                    continue
-                for d in ("T", "F"):
-                    bk = f"{bid}:{d}"
-                    if bk not in cov.branches_hit:
-                        cond = meta.get("condition", "")
-                        if cond:
-                            hard_branches.append((bid, d, para, meta))
-
-        if not hard_branches:
-            yield from self._param_round(ctx, cov, batch_size, branch_meta)
-            return
-
-        # --- Build per-branch focused prompts (top 5 branches) ---
-        branch_prompts: list[str] = []
-        targeted_branches: list[tuple[str, str]] = []
-
-        for bid, direction, para, meta in hard_branches[:5]:
-            cond = meta.get("condition", "")
-            need = "TRUE" if direction == "T" else "FALSE"
-            bkey = f"{bid}:{direction}"
-            targeted_branches.append((bkey, cond))
-
-            lines = [f"### Branch {bkey} in {para}"]
-            lines.append(f"Condition: {cond}")
-            lines.append(f"Need condition to be: {need}")
-
-            # --- Covered-direction context (Option C) ---
-            opp_dir = "F" if direction == "T" else "T"
-            opp_key = f"{bid}:{opp_dir}"
-            opp_tc = None
-            for tc in cov.test_cases:
-                if opp_key in tc.get("branches_hit", []):
-                    opp_tc = tc
-                    break
-
-            cond_vars = self._collect_cond_vars(branch_meta, para, ctx)
-
-            if opp_tc:
-                opp_need = "TRUE" if opp_dir == "T" else "FALSE"
-                lines.append(f"The {opp_need} direction IS already covered by TC with:")
-                opp_state = opp_tc.get("input_state", {})
-                shown = 0
-                for var in cond_vars:
-                    if var in opp_state and shown < 15:
-                        lines.append(f"  {var} = {repr(opp_state[var])}")
-                        shown += 1
-                lines.append(f"To get {need}, change the relevant values.")
-
-            # --- Variable semantic types and domains ---
-            if cond_vars:
-                lines.append("Variable details:")
-                for var in list(cond_vars)[:10]:
-                    dom = ctx.domains.get(var)
-                    if dom:
-                        parts = [f"  {var}: type={dom.data_type}"]
-                        if dom.semantic_type != "generic":
-                            parts.append(f"semantic={dom.semantic_type}")
-                        if dom.max_length > 0:
-                            parts.append(f"len={dom.max_length}")
-                        if dom.precision > 0:
-                            parts.append(f"precision={dom.precision}")
-                        if dom.min_value is not None:
-                            parts.append(f"range=[{dom.min_value},{dom.max_value}]")
-                        if dom.condition_literals:
-                            parts.append(f"known={dom.condition_literals[:6]}")
-                        if dom.valid_88_values:
-                            v88 = dict(list(dom.valid_88_values.items())[:4])
-                            parts.append(f"88_vals={v88}")
-                        lines.append(", ".join(parts))
-                    else:
-                        lines.append(f"  {var}: known_values={cond_vars[var][:6]}")
-
-            # --- Best TC with all condition-relevant vars ---
-            tc = self._best_tc_for_para(cov, para)
-            if tc:
-                lines.append("Best test case (condition-relevant vars):")
-                ivars = tc.get("input_state", {})
-                shown = 0
-                for var in cond_vars:
-                    if var in ivars and shown < 20:
-                        lines.append(f"  {var} = {repr(ivars[var])}")
-                        shown += 1
-                # A few extra important vars not in cond_vars
-                extra = 0
-                for var, val in ivars.items():
-                    if var not in cond_vars and extra < 5:
-                        lines.append(f"  {var} = {repr(val)}")
-                        extra += 1
-
-            # --- Stub context: which external ops affect this branch's vars ---
-            stub_relevant = []
-            for op_key, svars in ctx.stub_mapping.items():
-                overlap = set(svars) & set(cond_vars)
-                if overlap:
-                    stub_relevant.append((op_key, svars, overlap))
-            if stub_relevant:
-                lines.append("Stub operations affecting this branch:")
-                for op_key, svars, overlap in stub_relevant:
-                    fault_vals = self._fault_values_for_op(ctx, op_key)[:8]
-                    lines.append(f"  {op_key} -> sets {svars}")
-                    lines.append(f"    Possible values: {fault_vals}")
-                    lines.append(f"    Condition vars affected: {sorted(overlap)}")
-
-            branch_prompts.append("\n".join(lines))
-
-        # --- Build feedback section ---
-        feedback_section = ""
-        if self._llm_feedback:
-            feedback_section = "\n\nFeedback from previous attempts:\n" + "\n".join(
-                f"- {fb}" for fb in self._llm_feedback[-10:]
-            )
-
-        # --- Build stub operations summary ---
-        stub_summary_lines = []
-        if ctx.stub_mapping:
-            stub_summary_lines.append("Available stub operations (external calls that can be mocked):")
-            for op_key, svars in ctx.stub_mapping.items():
-                fault_vals = self._fault_values_for_op(ctx, op_key)[:6]
-                stub_summary_lines.append(f"  {op_key}: sets {svars}, values: {fault_vals}")
-        stub_summary = "\n".join(stub_summary_lines)
-
-        prompt = f"""\
-You are a COBOL test engineer. We have {len(cov.branches_hit)}/{cov.total_branches} branches covered.
-
-For each uncovered branch below, suggest BOTH input values AND stub_overrides that \
-would flip the condition to the needed direction. Many branches depend on the return \
-status of external operations (EXEC CICS, CALL, EXEC DLI) — use stub_overrides to \
-control what these operations return.
-
-COBOL notes:
-- IS NUMERIC: true when field contains only digits (and optional sign/decimal point)
-- NUMVAL(X): converts alphanumeric string X to a number (e.g. NUMVAL('123.45') = 123.45)
-- SPACES = string of blanks, ZEROS = '0' characters (not numeric zero)
-- DFHRESP codes: 0=NORMAL, 13=NOTFND, 12=FILENOTFOUND, 22=LENGERR, 27=PGMIDERR
-- Status codes: '00' = success, '10' = EOF, '23' = not found
-- DLI status: '  '(spaces)=OK, 'GE'=segment not found, 'GB'=end of DB, 'II'=insert OK
-
-{stub_summary}
-{feedback_section}
-
-{chr(10).join(branch_prompts)}
-
-For each branch, suggest 1-2 test inputs. Respond in YAML:
-- target: branch_id:direction in paragraph_name
-  reasoning: why these values should flip the condition
-  input_values:
-    VARIABLE-NAME: value
-  stub_overrides:
-    OPERATION-KEY: status-value"""
-
-        try:
-            response_text, _tokens = _query_llm_sync(
-                ctx.llm_provider, prompt, ctx.llm_model,
-            )
-            suggestions = _parse_yaml_seeds(response_text)
-            log.info("LLM gap: %d suggestions for %d hard branches",
-                     len(suggestions), min(len(hard_branches), 5))
-        except Exception as e:
-            if isinstance(e, LLMUnrecoverableAuthError):
-                raise
-            log.warning("LLM gap query failed: %s", e)
-            yield from self._param_round(ctx, cov, batch_size, branch_meta)
-            return
-
-        if not suggestions:
-            yield from self._param_round(ctx, cov, batch_size, branch_meta)
-            return
-
-        # Store targeted branches for feedback in next round
-        self._llm_prev_branches = targeted_branches
-
-        # --- For each suggestion: yield the seed + domain-aware perturbations ---
-        yielded = 0
-        default_state_fn = getattr(ctx.module, "_default_state", None)
-        ds = default_state_fn() if default_state_fn else {}
-        var_list = list(ds.keys())
-
-        perturbations_per = max(10, (batch_size - len(suggestions)) // max(len(suggestions), 1))
-
-        for seed_data in suggestions:
-            if yielded >= batch_size:
-                break
-
-            # Build input state from LLM suggestion
-            base_state = {}
-            for var, val in seed_data.get("input_values", {}).items():
-                dom = ctx.domains.get(var.upper())
-                if dom:
-                    base_state[var.upper()] = format_value_for_cobol(dom, val)
-                else:
-                    base_state[var.upper()] = str(val)
-
-            # Build stubs from overrides
-            stubs = dict(ctx.success_stubs)
-            defaults = dict(ctx.success_defaults)
-            for op_key, status_val in seed_data.get("stub_overrides", {}).items():
-                from .cobol_coverage import _match_stub_operation
-                matched = _match_stub_operation(op_key, ctx.stub_mapping)
-                if matched:
-                    svars = ctx.stub_mapping[matched]
-                    entry = [(sv, status_val) for sv in svars]
-                    stubs[matched] = [entry] * 50
-                    defaults[matched] = entry
-
-            target = seed_data.get("target", "llm_gap")[:40]
-
-            # Determine target paragraph from suggestion
-            target_para = None
-            for para in sorted_paras:
-                if para.lower() in target.lower():
-                    target_para = para
-                    break
-            if not target_para:
-                target_para = sorted_paras[0]
-
-            # Yield the raw LLM suggestion
-            yield (base_state, stubs, defaults,
-                   f"direct:{target_para}|gap:{target}")
-            yielded += 1
-
-            # Hill-climb around the suggestion using domain-aware perturbation
-            cond_vars_for_para = self._collect_cond_vars(
-                branch_meta, target_para, ctx)
-
-            for trial in range(perturbations_per):
-                if yielded >= batch_size:
-                    break
-                state = dict(base_state)
-
-                # Perturb condition variables (domain-aware)
-                for var, literals in cond_vars_for_para.items():
-                    r = ctx.rng.random()
-                    if r < 0.3 and literals:
-                        state[var] = ctx.rng.choice(literals)
-                    elif r < 0.5:
-                        dom = ctx.domains.get(var)
-                        if dom:
-                            strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
-                            state[var] = generate_value(dom, strat, ctx.rng)
-                        else:
-                            info = ctx.var_report.variables.get(var)
-                            if info and info.classification == "flag":
-                                state[var] = ctx.rng.choice([True, False, "Y", "N", " ", "X"])
-                            elif isinstance(ds.get(var), int):
-                                state[var] = ctx.rng.choice([0, 1, -1, 99, 100, 999, -999, 1000000])
-                            else:
-                                state[var] = ctx.rng.choice(["", " ", "Y", "N", "00", "04", "05", "10",
-                                                              "001", "002", "013", "019", "XX", "I", "T", "R"])
-                    # else: keep LLM's value (higher probability to preserve)
-
-                # Light random perturbation (domain-aware)
-                for _ in range(ctx.rng.randint(1, 3)):
-                    if not var_list:
-                        break
-                    v = ctx.rng.choice(var_list)
-                    if v not in cond_vars_for_para:
-                        dom = ctx.domains.get(v)
-                        if dom:
-                            strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
-                            state[v] = generate_value(dom, strat, ctx.rng)
-                        else:
-                            dv = ds.get(v)
-                            if isinstance(dv, int):
-                                state[v] = ctx.rng.choice([0, 1, -1, 99, 100, 999, -999, 1000000])
-                            elif isinstance(dv, str):
-                                state[v] = ctx.rng.choice(["", " ", "Y", "N", "00", "04", "05", "10",
-                                                            "001", "002", "013", "019", "XX", "I", "T", "R"])
-
-                yield (state, stubs, defaults,
-                       f"direct:{target_para}|gap-perturb:{trial}")
-                yielded += 1
-
-    # ------------------------------------------------------------------
-    # Main: rotate param → stub → dataflow → frontier → harvest → inverse → llm_gap
+    # Main: rotate param → stub → dataflow → frontier → harvest → inverse
     # ------------------------------------------------------------------
 
     def generate_cases(self, ctx, cov, batch_size) -> Iterator[CaseT]:
@@ -1872,7 +1546,7 @@ For each branch, suggest 1-2 test inputs. Respond in YAML:
         if not branch_meta:
             return
 
-        n_phases = 7 if ctx.llm_provider else 6
+        n_phases = 6
         phase = self._round % n_phases
         if phase == 0:
             yield from self._param_round(ctx, cov, batch_size, branch_meta)
@@ -1890,7 +1564,7 @@ For each branch, suggest 1-2 test inputs. Respond in YAML:
         elif phase == 5:
             yield from self._inverse_round(ctx, cov, batch_size, branch_meta)
         else:
-            yield from self._llm_gap_round(ctx, cov, batch_size, branch_meta)
+            yield from self._param_round(ctx, cov, batch_size, branch_meta)
 
         self._round += 1
 
@@ -2403,7 +2077,7 @@ class LLMSelector(StrategySelector):
     """Consults LLM periodically, falls back to HeuristicSelector."""
 
     def __init__(self, llm_provider, llm_model: str | None = None,
-                 consult_interval: int = 5, default_batch_size: int = 200,
+                 consult_interval: int = 3, default_batch_size: int = 200,
                  var_report: VariableReport | None = None):
         self.llm_provider = llm_provider
         self.llm_model = llm_model

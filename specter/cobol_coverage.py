@@ -34,7 +34,6 @@ from .coverage_strategies import (
     GuidedMutationStrategy,
     HeuristicSelector,
     IntentDrivenStrategy,
-    LLMGapStrategy,
     LLMRuntimeSteeringStrategy,
     LLMSeedStrategy,
     LLMSelector,
@@ -1104,7 +1103,6 @@ def run_cobol_coverage(
         if not strict_branch_coverage:
             strategies.extend([
                 LLMSeedStrategy(llm_provider, llm_model),
-                LLMGapStrategy(llm_provider, llm_model),
                 IntentDrivenStrategy(llm_provider, llm_model),
             ])
 
@@ -1247,6 +1245,13 @@ def _run_agentic_loop(
                  round_num, strategy.name, round_new, new_coverage,
                  len(cov.paragraphs_hit), cov.total_paragraphs,
                  len(cov.branches_hit), cov.total_branches)
+
+        # Update adaptive LLM strategy tracking
+        if hasattr(strategy, '_consecutive_dry'):
+            if new_coverage > 0:
+                strategy._consecutive_dry = 0
+            else:
+                strategy._consecutive_dry += 1
 
         # Staleness detection
         if new_coverage == 0:
@@ -1506,11 +1511,9 @@ def run_coverage(
     if llm_seeds:
         strategies.insert(0, _LLMSeedInjector(llm_seeds, stub_mapping))
 
-    # LLM selector for per-round strategy steering (optional)
+    # LLM runtime steering for Python-only mode (optional)
     if llm_provider:
-        strategies.extend([
-            LLMGapStrategy(llm_provider, llm_model),
-        ])
+        strategies.append(LLMRuntimeSteeringStrategy(llm_provider, llm_model))
 
     selector = (
         LLMSelector(llm_provider, llm_model,
