@@ -992,6 +992,318 @@ class TestBuildMultiFaultStubs:
         assert defaults["READ:FILE1"] == [("FS-FILE1", "00")]
 
 
+# ---------------------------------------------------------------------------
+# Branch probing engine tests
+# ---------------------------------------------------------------------------
+
+
+def _make_probe_module():
+    """Build a fake module with a paragraph that has IF branches.
+
+    Generated code pattern:
+      para_TEST_PARA(state):
+          if state.get('WS-CODE') == '00':
+              state['_branches'].add(1)   # 1:T
+          else:
+              state['_branches'].add(-1)  # 1:F
+          if state.get('WS-RESP') == 13:
+              state['_branches'].add(2)   # 2:T
+          else:
+              state['_branches'].add(-2)  # 2:F
+    """
+    import types
+    mod = types.ModuleType("_probe_test_mod")
+
+    def _default_state():
+        return {"WS-CODE": "", "WS-RESP": 0, "_branches": set()}
+
+    def para_TEST_PARA(state):
+        state.setdefault("_branches", set())
+        state.setdefault("_display", [])
+        state.setdefault("_calls", [])
+        state.setdefault("_execs", [])
+        state.setdefault("_reads", [])
+        state.setdefault("_writes", [])
+        state.setdefault("_abended", False)
+        if state.get("WS-CODE") == "00":
+            state["_branches"].add(1)
+        else:
+            state["_branches"].add(-1)
+        if state.get("WS-RESP") == 13:
+            state["_branches"].add(2)
+        else:
+            state["_branches"].add(-2)
+
+    mod._default_state = _default_state
+    mod.para_TEST_PARA = para_TEST_PARA
+    return mod
+
+
+def _make_probe_ctx(module, rng=None):
+    """Build a minimal StrategyContext for probing tests."""
+    from specter.coverage_strategies import StrategyContext
+
+    domains = {
+        "WS-CODE": VariableDomain(
+            name="WS-CODE", data_type="alpha", classification="input",
+            max_length=2, condition_literals=["00", "10", "23"],
+        ),
+        "WS-RESP": VariableDomain(
+            name="WS-RESP", data_type="numeric", classification="input",
+            max_length=5, max_value=99999, min_value=0,
+            condition_literals=[0, 13, 27],
+        ),
+    }
+    report = VariableReport(variables={
+        "WS-CODE": VariableInfo(name="WS-CODE", classification="input"),
+        "WS-RESP": VariableInfo(name="WS-RESP", classification="input"),
+    })
+    from specter.models import Program
+    from specter.static_analysis import StaticCallGraph
+
+    return StrategyContext(
+        module=module,
+        context=None,
+        domains=domains,
+        stub_mapping={},
+        call_graph=StaticCallGraph({}, {}),
+        gating_conds={},
+        var_report=report,
+        program=Program(program_id="TEST", paragraphs=[]),
+        all_paragraphs={"TEST-PARA"},
+        success_stubs={},
+        success_defaults={},
+        rng=rng or random.Random(42),
+        store_path=Path("/tmp/test_store.jsonl"),
+        branch_meta={
+            1: {"condition": "WS-CODE = '00'", "paragraph": "TEST-PARA", "type": "IF"},
+            2: {"condition": "WS-RESP = 13", "paragraph": "TEST-PARA", "type": "IF"},
+        },
+    )
+
+
+class TestBranchProbing:
+    """Tests for _probe_branches_for_paragraph and _discover_stub_branch_mapping."""
+
+    def test_probe_finds_hits(self):
+        from specter.cobol_coverage import CoverageState
+        from specter.coverage_strategies import _probe_branches_for_paragraph
+
+        mod = _make_probe_module()
+        ctx = _make_probe_ctx(mod)
+        cov = CoverageState(
+            total_paragraphs=1,
+            total_branches=4,
+            all_paragraphs={"TEST-PARA"},
+            _stub_mapping={},
+        )
+        cov.paragraphs_hit.add("TEST-PARA")
+
+        results = _probe_branches_for_paragraph(
+            ctx, cov, "TEST-PARA", ctx.branch_meta, max_probes=50,
+        )
+        assert len(results) == 4  # 1:T, 1:F, 2:T, 2:F
+        # At least some branches should be hit
+        total_hits = sum(r.hit_count for r in results)
+        assert total_hits > 0
+
+    def test_probe_skips_covered_branches(self):
+        from specter.cobol_coverage import CoverageState
+        from specter.coverage_strategies import _probe_branches_for_paragraph
+
+        mod = _make_probe_module()
+        ctx = _make_probe_ctx(mod)
+        cov = CoverageState(
+            total_paragraphs=1,
+            total_branches=4,
+            all_paragraphs={"TEST-PARA"},
+            _stub_mapping={},
+        )
+        cov.paragraphs_hit.add("TEST-PARA")
+        cov.branches_hit.update({"1:T", "1:F"})  # branch 1 already covered
+
+        results = _probe_branches_for_paragraph(
+            ctx, cov, "TEST-PARA", ctx.branch_meta, max_probes=50,
+        )
+        # Only branches for bid=2 should be probed
+        assert len(results) == 2
+        assert all(r.branch_key.startswith("2:") for r in results)
+
+    def test_probe_returns_discriminating_vars(self):
+        from specter.cobol_coverage import CoverageState
+        from specter.coverage_strategies import _probe_branches_for_paragraph
+
+        mod = _make_probe_module()
+        ctx = _make_probe_ctx(mod)
+        cov = CoverageState(
+            total_paragraphs=1,
+            total_branches=4,
+            all_paragraphs={"TEST-PARA"},
+            _stub_mapping={},
+        )
+        cov.paragraphs_hit.add("TEST-PARA")
+
+        results = _probe_branches_for_paragraph(
+            ctx, cov, "TEST-PARA", ctx.branch_meta, max_probes=100,
+        )
+        # Branch 1:T (WS-CODE='00') should have WS-CODE as discriminating var
+        b1t = next((r for r in results if r.branch_key == "1:T"), None)
+        assert b1t is not None
+        if b1t.hit_count > 0:
+            # Should have hit_inputs
+            assert len(b1t.hit_inputs) > 0
+
+    def test_probe_returns_empty_for_wrong_para(self):
+        from specter.cobol_coverage import CoverageState
+        from specter.coverage_strategies import _probe_branches_for_paragraph
+
+        mod = _make_probe_module()
+        ctx = _make_probe_ctx(mod)
+        cov = CoverageState(
+            total_paragraphs=1,
+            total_branches=4,
+            all_paragraphs={"TEST-PARA"},
+            _stub_mapping={},
+        )
+        results = _probe_branches_for_paragraph(
+            ctx, cov, "NONEXISTENT-PARA", ctx.branch_meta, max_probes=50,
+        )
+        assert results == []
+
+    def test_discover_stub_branch_mapping(self):
+        """Test stub discovery with a module that has stub-dependent branches."""
+        import types
+        from specter.cobol_coverage import CoverageState
+        from specter.coverage_strategies import _discover_stub_branch_mapping
+
+        mod = types.ModuleType("_stub_test_mod")
+
+        def _default_state():
+            return {
+                "WS-STATUS": "00",
+                "_branches": set(),
+                "_stub_outcomes": {},
+                "_stub_defaults": {},
+                "_stub_log": [],
+            }
+
+        def _apply_stub_outcome(state, op_key):
+            outcomes = state.get("_stub_outcomes", {}).get(op_key)
+            if outcomes:
+                entry = outcomes.pop(0)
+            else:
+                entry = state.get("_stub_defaults", {}).get(op_key, [])
+            for var, val in (entry if isinstance(entry, list) else []):
+                state[var] = val
+
+        def para_STUB_PARA(state):
+            state.setdefault("_branches", set())
+            state.setdefault("_display", [])
+            state.setdefault("_calls", [])
+            state.setdefault("_execs", [])
+            state.setdefault("_reads", [])
+            state.setdefault("_writes", [])
+            state.setdefault("_abended", False)
+            _apply_stub_outcome(state, "CICS:READ")
+            if state.get("WS-STATUS") == "00":
+                state["_branches"].add(1)
+            else:
+                state["_branches"].add(-1)
+
+        mod._default_state = _default_state
+        mod.para_STUB_PARA = para_STUB_PARA
+        mod._apply_stub_outcome = _apply_stub_outcome
+
+        domains = {
+            "WS-STATUS": VariableDomain(
+                name="WS-STATUS", data_type="alpha", classification="status",
+                max_length=2, condition_literals=["00", "10", "23"],
+            ),
+        }
+        report = VariableReport(variables={
+            "WS-STATUS": VariableInfo(name="WS-STATUS", classification="status"),
+        })
+        from specter.models import Program
+        from specter.static_analysis import StaticCallGraph
+        from specter.coverage_strategies import StrategyContext
+
+        ctx = StrategyContext(
+            module=mod, context=None, domains=domains,
+            stub_mapping={"CICS:READ": ["WS-STATUS"]},
+            call_graph=StaticCallGraph({}, {}), gating_conds={},
+            var_report=report,
+            program=Program(program_id="TEST", paragraphs=[]),
+            all_paragraphs={"STUB-PARA"},
+            success_stubs={"CICS:READ": [[("WS-STATUS", "00")]] * 50},
+            success_defaults={"CICS:READ": [("WS-STATUS", "00")]},
+            rng=random.Random(42),
+            store_path=Path("/tmp/test_store.jsonl"),
+            branch_meta={1: {"condition": "WS-STATUS = '00'", "paragraph": "STUB-PARA", "type": "IF"}},
+        )
+        results = _discover_stub_branch_mapping(ctx, "STUB-PARA", ctx.branch_meta)
+        assert len(results) > 0
+        sm = results[0]
+        assert sm.op_key == "CICS:READ"
+        # '00' should activate branch 1:T, non-'00' should activate 1:F
+        assert any("1:T" in brs for brs in sm.outcome_to_branches.values())
+
+    def test_format_probing_results(self):
+        from specter.coverage_strategies import (
+            BranchProbeResult,
+            StubBranchMap,
+            _format_probing_results,
+        )
+
+        probes = [
+            BranchProbeResult(
+                branch_key="17:F", paragraph="READ-PARA",
+                hit_count=3, total_probes=200,
+                hit_inputs=[{"WS-RESP": 13}],
+                discriminating_vars={"WS-RESP": {"13", "27"}},
+                discriminating_stubs={"CICS:READ": {"13"}},
+            ),
+        ]
+        stubs = [
+            StubBranchMap(
+                op_key="CICS:READ",
+                outcome_to_branches={"13": {"17:F", "18:T"}},
+            ),
+        ]
+        text = _format_probing_results(probes, stubs)
+        assert "17:F" in text
+        assert "WS-RESP" in text
+        assert "CICS:READ" in text
+        assert "Execution Probing Results" in text
+
+    def test_best_probed_state_for_para(self):
+        from specter.coverage_strategies import (
+            BranchProbeResult,
+            _best_probed_state_for_para,
+        )
+
+        mod = _make_probe_module()
+        ctx = _make_probe_ctx(mod)
+        # No cache → None
+        assert _best_probed_state_for_para(ctx, "TEST-PARA") is None
+
+        # Add to cache
+        ctx.probe_cache["TEST-PARA"] = [
+            BranchProbeResult(
+                branch_key="1:T", paragraph="TEST-PARA",
+                hit_count=5, total_probes=100,
+                hit_inputs=[{"WS-CODE": "00"}],
+            ),
+            BranchProbeResult(
+                branch_key="2:T", paragraph="TEST-PARA",
+                hit_count=2, total_probes=100,
+                hit_inputs=[{"WS-RESP": 13}],
+            ),
+        ]
+        result = _best_probed_state_for_para(ctx, "TEST-PARA")
+        assert result is not None
+        assert result["WS-CODE"] == "00"  # from the higher-hit-count result
+
+
 class TestHeuristicSelector:
     """Tests for the HeuristicSelector."""
 

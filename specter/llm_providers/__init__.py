@@ -60,8 +60,14 @@ from .protocol import (
     LLMProvider,
     Message,
 )
-from .providers.anthropic import AnthropicProvider
-from .providers.openai import OpenAIProvider
+try:
+    from .providers.anthropic import AnthropicProvider
+except ImportError:
+    AnthropicProvider = None  # type: ignore[assignment,misc]
+try:
+    from .providers.openai import OpenAIProvider
+except ImportError:
+    OpenAIProvider = None  # type: ignore[assignment,misc]
 from .providers.openrouter import OpenRouterProvider
 
 __all__ = [

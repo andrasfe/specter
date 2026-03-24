@@ -9,8 +9,16 @@ Available Providers:
     - OpenAIProvider: Direct OpenAI API
 """
 
-from .anthropic import AnthropicProvider
-from .openai import OpenAIProvider
+try:
+    from .anthropic import AnthropicProvider
+except ImportError:
+    AnthropicProvider = None  # type: ignore[assignment,misc]
+
+try:
+    from .openai import OpenAIProvider
+except ImportError:
+    OpenAIProvider = None  # type: ignore[assignment,misc]
+
 from .openrouter import OpenRouterProvider
 
 __all__ = [

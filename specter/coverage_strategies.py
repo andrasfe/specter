@@ -58,6 +58,7 @@ class StrategyContext:
     llm_model: str | None = None
     siblings_88: dict[str, set[str]] = field(default_factory=dict)
     flag_88_added: set[str] = field(default_factory=set)
+    probe_cache: dict = field(default_factory=dict)  # para → list[BranchProbeResult]
 
 
 @dataclass
@@ -68,6 +69,27 @@ class StrategyYield:
     total_new_coverage: int = 0
     rounds: int = 0
     last_yield_round: int = 0
+
+
+@dataclass
+class BranchProbeResult:
+    """Result of probing a branch via direct paragraph execution."""
+
+    branch_key: str                          # e.g. "17:F"
+    paragraph: str
+    hit_count: int
+    total_probes: int
+    hit_inputs: list = field(default_factory=list)       # up to 5 concrete inputs
+    discriminating_vars: dict = field(default_factory=dict)  # var → set of values
+    discriminating_stubs: dict = field(default_factory=dict)  # op_key → set of values
+
+
+@dataclass
+class StubBranchMap:
+    """Maps stub operation outcomes to the branches they activate."""
+
+    op_key: str
+    outcome_to_branches: dict = field(default_factory=dict)  # str(value) → set[str]
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +201,338 @@ class BaselineStrategy(Strategy):
                     yield base, ctx.success_stubs, ctx.success_defaults, f"lit:{name}"
 
 
+# ---------------------------------------------------------------------------
+# Branch probing helpers (execution-guided, no LLM cost)
+# ---------------------------------------------------------------------------
+
+
+def _probe_branches_for_paragraph(
+    ctx: StrategyContext,
+    cov,
+    para: str,
+    branch_meta: dict,
+    max_probes: int = 200,
+) -> list[BranchProbeResult]:
+    """Execute *para* with a grid of inputs to discover branch-activating states.
+
+    Returns one ``BranchProbeResult`` per uncovered branch in the paragraph.
+    """
+    from .monte_carlo import _run_paragraph_directly
+
+    # 1. Find uncovered branches in this paragraph
+    uncovered: list[tuple[int, str, str]] = []  # (bid_int, direction, bkey)
+    for bid, meta in branch_meta.items():
+        if meta.get("paragraph") != para:
+            continue
+        try:
+            bid_int = int(bid)
+        except (ValueError, TypeError):
+            continue
+        for d in ("T", "F"):
+            bkey = f"{bid}:{d}"
+            if bkey not in cov.branches_hit:
+                uncovered.append((bid_int, d, bkey))
+
+    if not uncovered:
+        return []
+
+    # 2. Build probe-value grid from condition variables
+    probe_vars: dict[str, list] = {}
+    kw = {"NOT", "AND", "OR", "EQUAL", "GREATER", "LESS", "THAN",
+          "ZERO", "ZEROS", "ZEROES", "SPACES", "SPACE", "OTHER",
+          "NUMERIC", "TRUE", "FALSE"}
+    for bid, meta in branch_meta.items():
+        if meta.get("paragraph") != para:
+            continue
+        cond = meta.get("condition", "")
+        if not cond:
+            continue
+        for var_name in set(re.findall(r"\b([A-Z][A-Z0-9_-]+)\b", cond)) - kw:
+            if var_name in probe_vars:
+                continue
+            dom = ctx.domains.get(var_name)
+            if not dom:
+                continue
+            vals: list = []
+            for lit in (dom.condition_literals or []):
+                if lit not in vals:
+                    vals.append(lit)
+            for v88 in (dom.valid_88_values or {}).values():
+                if v88 not in vals:
+                    vals.append(v88)
+            if dom.data_type == "numeric":
+                for bv in [0, 1, -1]:
+                    if bv not in vals:
+                        vals.append(bv)
+                if dom.max_value is not None and dom.max_value not in vals:
+                    vals.append(dom.max_value)
+            else:
+                for sv in ["", " ", "Y", "N"]:
+                    if sv not in vals:
+                        vals.append(sv)
+            probe_vars[var_name] = vals[:15]
+
+    # 3. Build stub fault configurations
+    default_state_fn = getattr(ctx.module, "_default_state", None)
+    ds = default_state_fn() if default_state_fn else {}
+
+    stub_configs: list[tuple[dict, dict, dict]] = [
+        (dict(ctx.success_stubs), dict(ctx.success_defaults), {}),
+    ]
+    for op_key, status_vars in ctx.stub_mapping.items():
+        fault_vals: list = []
+        for var in status_vars:
+            dom = ctx.domains.get(var)
+            if dom:
+                for lit in (dom.condition_literals or [])[:3]:
+                    if lit not in fault_vals:
+                        fault_vals.append(lit)
+                for v88 in list((dom.valid_88_values or {}).values())[:3]:
+                    if v88 not in fault_vals:
+                        fault_vals.append(v88)
+        if not fault_vals:
+            fault_vals = ["10", "23", "00"]
+        for fv in fault_vals[:4]:
+            fs = dict(ctx.success_stubs)
+            fd = dict(ctx.success_defaults)
+            entry = [(sv, fv) for sv in status_vars]
+            fs[op_key] = [entry] * 50
+            fd[op_key] = entry
+            stub_configs.append((fs, fd, {op_key: fv}))
+
+    # 4. Generate probe inputs via grid sampling
+    probe_inputs: list[dict] = []
+    var_names = list(probe_vars.keys())
+    n_per_config = max(1, max_probes // max(len(stub_configs), 1))
+    for _ in range(n_per_config):
+        state: dict = {}
+        for vn in var_names:
+            vals = probe_vars[vn]
+            if vals:
+                state[vn] = ctx.rng.choice(vals)
+        probe_inputs.append(state)
+    # Pad with domain-aware random states
+    while len(probe_inputs) < max_probes // 2:
+        state = {}
+        for vn in var_names:
+            dom = ctx.domains.get(vn)
+            if dom:
+                state[vn] = generate_value(
+                    dom,
+                    ctx.rng.choice(["boundary", "random_valid", "condition_literal"]),
+                    ctx.rng,
+                )
+        probe_inputs.append(state)
+
+    # 5. Execute probes
+    tracker: dict[str, dict] = {
+        bkey: {"hits": 0, "inputs": [], "var_hits": {}, "stub_hits": {}}
+        for _, _, bkey in uncovered
+    }
+    total_probes = 0
+
+    for probe_state in probe_inputs:
+        for stubs, defaults, stub_label in stub_configs:
+            if total_probes >= max_probes:
+                break
+            total_probes += 1
+            run_state = dict(ds)
+            run_state.update(probe_state)
+            run_state["_stub_outcomes"] = {
+                k: [list(e) if isinstance(e, list) else e for e in v]
+                for k, v in stubs.items()
+            }
+            run_state["_stub_defaults"] = dict(defaults)
+            try:
+                final = _run_paragraph_directly(ctx.module, para, run_state)
+            except Exception:
+                continue
+            if not final:
+                continue
+
+            branches = final.get("_branches", set())
+            for bid_int, direction, bkey in uncovered:
+                target = bid_int if direction == "T" else -bid_int
+                if target in branches:
+                    t = tracker[bkey]
+                    t["hits"] += 1
+                    if len(t["inputs"]) < 5:
+                        t["inputs"].append(dict(probe_state))
+                    for vn, vv in probe_state.items():
+                        if vn.startswith("_"):
+                            continue
+                        t["var_hits"].setdefault(vn, {})
+                        vv_key = str(vv)
+                        t["var_hits"][vn][vv_key] = (
+                            t["var_hits"][vn].get(vv_key, 0) + 1
+                        )
+                    for ok, fv in stub_label.items():
+                        t["stub_hits"].setdefault(ok, {})
+                        fv_str = str(fv)
+                        t["stub_hits"][ok][fv_str] = (
+                            t["stub_hits"][ok].get(fv_str, 0) + 1
+                        )
+        if total_probes >= max_probes:
+            break
+
+    # 6. Build results
+    results: list[BranchProbeResult] = []
+    for bid_int, direction, bkey in uncovered:
+        t = tracker[bkey]
+        disc_vars: dict[str, set] = {}
+        disc_stubs: dict[str, set] = {}
+        if t["hits"] > 0:
+            threshold = max(1, int(t["hits"] * 0.3))
+            for vn, vc in t["var_hits"].items():
+                top = {v for v, c in vc.items() if c >= threshold}
+                if top and len(top) <= 5:
+                    disc_vars[vn] = top
+            for ok, vc in t["stub_hits"].items():
+                top = {v for v, c in vc.items() if c >= threshold}
+                if top:
+                    disc_stubs[ok] = top
+        results.append(BranchProbeResult(
+            branch_key=bkey,
+            paragraph=para,
+            hit_count=t["hits"],
+            total_probes=total_probes,
+            hit_inputs=t["inputs"],
+            discriminating_vars=disc_vars,
+            discriminating_stubs=disc_stubs,
+        ))
+    return results
+
+
+def _discover_stub_branch_mapping(
+    ctx: StrategyContext,
+    para: str,
+    branch_meta: dict,
+) -> list[StubBranchMap]:
+    """For each stub op, discover which status values activate which branches."""
+    from .monte_carlo import _run_paragraph_directly
+
+    default_state_fn = getattr(ctx.module, "_default_state", None)
+    ds = default_state_fn() if default_state_fn else {}
+
+    para_bids: list[int] = []
+    for bid, meta in branch_meta.items():
+        if meta.get("paragraph") != para:
+            continue
+        try:
+            para_bids.append(int(bid))
+        except (ValueError, TypeError):
+            continue
+    if not para_bids:
+        return []
+
+    results: list[StubBranchMap] = []
+    for op_key, status_vars in ctx.stub_mapping.items():
+        values_to_try: set = set()
+        for var in status_vars:
+            dom = ctx.domains.get(var)
+            if dom:
+                for lit in (dom.condition_literals or []):
+                    values_to_try.add(lit)
+                for v88 in (dom.valid_88_values or {}).values():
+                    values_to_try.add(v88)
+        if not values_to_try:
+            values_to_try = {"00", "10", "23", "35", 0, 13, 27}
+
+        outcome_to_branches: dict[str, set] = {}
+        for fv in values_to_try:
+            stubs = dict(ctx.success_stubs)
+            defaults = dict(ctx.success_defaults)
+            entry = [(sv, fv) for sv in status_vars]
+            stubs[op_key] = [entry] * 50
+            defaults[op_key] = entry
+
+            run_state = dict(ds)
+            run_state["_stub_outcomes"] = {
+                k: [list(e) if isinstance(e, list) else e for e in v]
+                for k, v in stubs.items()
+            }
+            run_state["_stub_defaults"] = dict(defaults)
+            try:
+                final = _run_paragraph_directly(ctx.module, para, run_state)
+            except Exception:
+                continue
+            if not final:
+                continue
+
+            activated: set[str] = set()
+            branches = final.get("_branches", set())
+            for bid_int in para_bids:
+                if bid_int in branches:
+                    activated.add(f"{bid_int}:T")
+                if -bid_int in branches:
+                    activated.add(f"{bid_int}:F")
+            if activated:
+                outcome_to_branches[str(fv)] = activated
+
+        if outcome_to_branches:
+            results.append(StubBranchMap(
+                op_key=op_key,
+                outcome_to_branches=outcome_to_branches,
+            ))
+    return results
+
+
+def _format_probing_results(
+    probe_results: list[BranchProbeResult],
+    stub_maps: list[StubBranchMap],
+) -> str:
+    """Format probing results as a prompt section for the LLM."""
+    if not probe_results and not stub_maps:
+        return ""
+
+    lines: list[str] = ["\n\n## Execution Probing Results"]
+    for r in probe_results[:12]:
+        lines.append(f"### Branch {r.branch_key} (para={r.paragraph})")
+        lines.append(f"- Reached in {r.hit_count}/{r.total_probes} probes")
+        if r.discriminating_vars:
+            for var, vals in list(r.discriminating_vars.items())[:3]:
+                lines.append(f"- Discriminating: {var} in {vals}")
+        if r.discriminating_stubs:
+            for op, vals in r.discriminating_stubs.items():
+                lines.append(f"- Stub map: {op} → values {vals} activate this branch")
+        if r.hit_inputs:
+            preview = {
+                k: v
+                for k, v in list(r.hit_inputs[0].items())[:6]
+                if not str(k).startswith("_")
+            }
+            lines.append(f"- Example hit: {preview}")
+        if r.hit_count == 0:
+            lines.append(
+                "- NOT reached by any probe — may need specific stub+input combo"
+            )
+
+    if stub_maps:
+        lines.append("\n### Stub-to-Branch Mapping")
+        for sm in stub_maps[:8]:
+            for val, brs in list(sm.outcome_to_branches.items())[:5]:
+                lines.append(f"- {sm.op_key}={val} activates {brs}")
+
+    return "\n".join(lines)
+
+
+def _best_probed_state_for_para(
+    ctx: StrategyContext, para: str,
+) -> dict | None:
+    """Return the best probing-discovered input state for a paragraph, or None."""
+    cached = ctx.probe_cache.get(para)
+    if not cached:
+        return None
+    # Pick the hit_input from the result with highest hit_count
+    best = None
+    best_hits = -1
+    for r in cached:
+        if r.hit_inputs and r.hit_count > best_hits:
+            best = r.hit_inputs[0]
+            best_hits = r.hit_count
+    return dict(best) if best else None
+
+
 class LLMRuntimeSteeringStrategy(Strategy):
     """Runtime LLM steering based only on generic runtime signals."""
 
@@ -206,11 +560,17 @@ class LLMRuntimeSteeringStrategy(Strategy):
         # Stop after 2 consecutive dry calls (LLM has nothing new to offer)
         if self._consecutive_dry >= 2:
             return False
-        if cov.total_branches <= 0 or len(cov.branches_hit) >= cov.total_branches:
+        # Only count COBOL-validated branches (exclude py: prefixed)
+        cobol_hits = sum(1 for b in cov.branches_hit if not b.startswith("py:"))
+        if cov.total_branches <= 0 or cobol_hits >= cov.total_branches:
             return False
         return cov.stale_rounds >= self.min_stale_rounds
 
-    def _build_prompt(self, ctx, cov) -> str:
+    def _build_prompt(
+        self, ctx, cov,
+        probing_section: str = "",
+        anchors: list | None = None,
+    ) -> str:
         from .backward_slicer import backward_slice
 
         # Load module source for code slicing
@@ -233,7 +593,10 @@ class LLMRuntimeSteeringStrategy(Strategy):
                     uncovered.append(f"{bkey} | para={para} | cond={cond}")
                     # Generate code slice for this branch
                     if module_source and len(code_slices) < 6:
-                        target = bid if direction == "T" else -bid
+                        try:
+                            target = int(bid) if direction == "T" else -int(bid)
+                        except (ValueError, TypeError):
+                            target = bid
                         sl = backward_slice(module_source, target, max_lines=40)
                         if sl:
                             code_slices.append(
@@ -283,6 +646,21 @@ class LLMRuntimeSteeringStrategy(Strategy):
                 "stub outcome for that operation — control it via stub_overrides."
             )
 
+        # Anchor section — known working states from probing
+        anchor_section = ""
+        if anchors:
+            anchor_lines = ["\n\n## Known Working States (Anchors)"]
+            for a in anchors[:6]:
+                preview = {
+                    k: v
+                    for k, v in list(a["state"].items())[:6]
+                    if not str(k).startswith("_")
+                }
+                anchor_lines.append(
+                    f"- Branch {a['bkey']}: {preview}"
+                )
+            anchor_section = "\n".join(anchor_lines)
+
         return (
             "You are steering COBOL branch coverage in a generic engine.\n"
             "Goal: propose diverse candidate test states that can flip uncovered branches.\n\n"
@@ -290,6 +668,8 @@ class LLMRuntimeSteeringStrategy(Strategy):
             "Uncovered branch targets (subset):\n"
             + "\n".join(uncovered)
             + code_section
+            + probing_section
+            + anchor_section
             + "\n\nRecent executed cases:\n"
             + ("\n".join(recent_lines) if recent_lines else "- (none)")
             + "\n\nAvailable input variables (subset):\n"
@@ -337,12 +717,209 @@ class LLMRuntimeSteeringStrategy(Strategy):
             return []
         return [d for d in data if isinstance(d, dict)]
 
+    def _apply_item(self, item: dict, ctx) -> tuple[dict, dict, dict, str]:
+        """Convert a parsed LLM response item into (input_state, stubs, defaults, target)."""
+        from .cobol_coverage import _match_stub_operation
+
+        input_state: dict = {}
+        for var, val in (item.get("input_values") or {}).items():
+            if not isinstance(var, str):
+                continue
+            dom = ctx.domains.get(var.upper())
+            if dom:
+                input_state[var.upper()] = format_value_for_cobol(dom, val)
+
+        stubs = dict(ctx.success_stubs)
+        defaults = dict(ctx.success_defaults)
+        for op_key, status_val in (item.get("stub_overrides") or {}).items():
+            if not isinstance(op_key, str):
+                continue
+            matched = _match_stub_operation(op_key, ctx.stub_mapping)
+            if not matched:
+                continue
+            svars = ctx.stub_mapping.get(matched, [])
+            entry = [(sv, status_val) for sv in svars]
+            stubs[matched] = [entry] * 50
+            defaults[matched] = entry
+
+        target = str(
+            item.get("target_branch") or item.get("reasoning") or "llm_runtime"
+        )
+        return input_state, stubs, defaults, target
+
+    def _validate_direct(
+        self, ctx, input_state: dict, stubs: dict, defaults: dict,
+        target_branch: str, branch_meta: dict,
+    ) -> tuple[bool, set, dict | None]:
+        """Run *input_state* through direct paragraph execution and check
+        whether *target_branch* was hit.
+
+        Returns ``(hit, actual_branch_keys, final_state)``.
+        """
+        from .monte_carlo import _run_paragraph_directly
+
+        # Find the paragraph for target_branch
+        target_para = None
+        parts = target_branch.rsplit(":", 1)
+        if len(parts) == 2:
+            for bid, meta in branch_meta.items():
+                if str(bid) == parts[0]:
+                    target_para = meta.get("paragraph")
+                    break
+        if not target_para:
+            return False, set(), None
+
+        default_state_fn = getattr(ctx.module, "_default_state", None)
+        ds = default_state_fn() if default_state_fn else {}
+        run_state = dict(ds)
+        run_state.update(input_state)
+        run_state["_stub_outcomes"] = {
+            k: [list(e) if isinstance(e, list) else e for e in v]
+            for k, v in stubs.items()
+        }
+        run_state["_stub_defaults"] = dict(defaults)
+
+        try:
+            final = _run_paragraph_directly(ctx.module, target_para, run_state)
+        except Exception:
+            return False, set(), None
+        if not final:
+            return False, set(), None
+
+        branches = final.get("_branches", set())
+        actual_keys: set[str] = set()
+        for b in branches:
+            if isinstance(b, int):
+                if b > 0:
+                    actual_keys.add(f"{b}:T")
+                else:
+                    actual_keys.add(f"{abs(b)}:F")
+        return target_branch in actual_keys, actual_keys, final
+
     def generate_cases(self, ctx, cov, batch_size) -> Iterator[CaseT]:
         from .cobol_coverage import _match_stub_operation
         from .llm_coverage import LLMUnrecoverableAuthError, _query_llm_sync
+        from .monte_carlo import _run_paragraph_directly
 
         self._calls += 1
-        prompt = self._build_prompt(ctx, cov)
+        branch_meta = ctx.branch_meta
+        if not branch_meta:
+            return
+
+        default_state_fn = getattr(ctx.module, "_default_state", None)
+        ds = default_state_fn() if default_state_fn else {}
+        emitted = 0
+
+        # ---- Step 1: Probe branches (no LLM cost) ----
+        all_probe_results: list[BranchProbeResult] = []
+        all_stub_maps: list[StubBranchMap] = []
+        anchors: list[dict] = []  # {state, stubs, defaults, bkey, para}
+
+        para_gaps: dict[str, int] = {}
+        for bid, meta in branch_meta.items():
+            p = meta.get("paragraph", "")
+            if not p:
+                continue
+            for d in ("T", "F"):
+                if f"{bid}:{d}" not in cov.branches_hit:
+                    para_gaps[p] = para_gaps.get(p, 0) + 1
+        sorted_paras = sorted(para_gaps, key=lambda p: para_gaps[p], reverse=True)
+
+        for para in sorted_paras[:6]:
+            probe_results = _probe_branches_for_paragraph(
+                ctx, cov, para, branch_meta,
+            )
+            all_probe_results.extend(probe_results)
+            # Cache for DirectParagraphStrategy
+            ctx.probe_cache[para] = probe_results
+
+            stub_maps = _discover_stub_branch_mapping(ctx, para, branch_meta)
+            all_stub_maps.extend(stub_maps)
+
+            # Yield probing-solved cases (1 per unique branch key)
+            yielded_bkeys: set[str] = set()
+            for r in probe_results:
+                if not r.hit_inputs or r.branch_key in cov.branches_hit:
+                    continue
+                if r.branch_key in yielded_bkeys:
+                    continue
+                inp = r.hit_inputs[0]
+                stubs = dict(ctx.success_stubs)
+                defaults = dict(ctx.success_defaults)
+                for ok, vals in r.discriminating_stubs.items():
+                    sv_val = next(iter(vals))
+                    svars = ctx.stub_mapping.get(ok, [])
+                    entry = [(sv, sv_val) for sv in svars]
+                    stubs[ok] = [entry] * 50
+                    defaults[ok] = entry
+                anchors.append({
+                    "state": dict(inp), "stubs": stubs,
+                    "defaults": defaults, "bkey": r.branch_key,
+                    "para": r.paragraph,
+                })
+                yielded_bkeys.add(r.branch_key)
+                yield dict(inp), stubs, defaults, f"probe:{r.branch_key}"
+                emitted += 1
+
+        probing_solved = emitted
+        if probing_solved:
+            log.info("Probing solved %d branches directly", probing_solved)
+
+        # ---- Step 2: Hill-climb from anchors (cap at 20 yields) ----
+        climb_yields = 0
+        max_climb = min(20, max(1, batch_size // 4))
+        for anchor in anchors[:10]:
+            if emitted >= batch_size or climb_yields >= max_climb:
+                break
+            var_list = [k for k in anchor["state"] if not k.startswith("_")]
+            if not var_list:
+                continue
+            for _ in range(20):
+                if emitted >= batch_size or climb_yields >= max_climb:
+                    break
+                state = dict(anchor["state"])
+                n_perturb = min(ctx.rng.randint(1, 2), len(var_list))
+                for v in ctx.rng.sample(var_list, n_perturb):
+                    dom = ctx.domains.get(v)
+                    if dom:
+                        state[v] = generate_value(
+                            dom, ctx.rng.choice(["boundary", "random_valid"]),
+                            ctx.rng,
+                        )
+                # Quick check via direct execution
+                run_state = dict(ds)
+                run_state.update(state)
+                run_state["_stub_outcomes"] = {
+                    k: [list(e) if isinstance(e, list) else e for e in v]
+                    for k, v in anchor["stubs"].items()
+                }
+                run_state["_stub_defaults"] = dict(anchor["defaults"])
+                try:
+                    final = _run_paragraph_directly(
+                        ctx.module, anchor["para"], run_state,
+                    )
+                except Exception:
+                    continue
+                if not final:
+                    continue
+                branches = final.get("_branches", set())
+                for b in branches:
+                    if isinstance(b, int):
+                        bk = f"{b}:T" if b > 0 else f"{abs(b)}:F"
+                        if bk not in cov.branches_hit and bk not in yielded_bkeys:
+                            yielded_bkeys.add(bk)
+                            yield (state, anchor["stubs"], anchor["defaults"],
+                                   f"climb:{bk}")
+                            emitted += 1
+                            climb_yields += 1
+                            break
+
+        # ---- Step 3+4: Build enriched prompt and query LLM ----
+
+        probing_section = _format_probing_results(all_probe_results, all_stub_maps)
+        prompt = self._build_prompt(
+            ctx, cov, probing_section=probing_section, anchors=anchors,
+        )
         if not prompt:
             return
 
@@ -352,8 +929,7 @@ class LLMRuntimeSteeringStrategy(Strategy):
             )
             log.info(
                 "LLM runtime steering response: %d chars, %d tokens",
-                len(response_text),
-                tokens,
+                len(response_text), tokens,
             )
         except Exception as e:
             if isinstance(e, LLMUnrecoverableAuthError):
@@ -365,34 +941,75 @@ class LLMRuntimeSteeringStrategy(Strategy):
         if not items:
             return
 
-        emitted = 0
+        # ---- Step 5+6: Validate-refine micro-loop ----
+        refinement_budget = 2  # max refinement LLM calls per generate_cases
         for item in items:
-            input_state = {}
-            for var, val in (item.get("input_values") or {}).items():
-                if not isinstance(var, str):
-                    continue
-                dom = ctx.domains.get(var.upper())
-                if dom:
-                    input_state[var.upper()] = format_value_for_cobol(dom, val)
-
-            stubs = dict(ctx.success_stubs)
-            defaults = dict(ctx.success_defaults)
-            for op_key, status_val in (item.get("stub_overrides") or {}).items():
-                if not isinstance(op_key, str):
-                    continue
-                matched = _match_stub_operation(op_key, ctx.stub_mapping)
-                if not matched:
-                    continue
-                svars = ctx.stub_mapping.get(matched, [])
-                entry = [(sv, status_val) for sv in svars]
-                stubs[matched] = [entry] * 50
-                defaults[matched] = entry
-
-            target = str(item.get("target_branch") or item.get("reasoning") or "llm_runtime")
-            yield input_state, stubs, defaults, f"llm-runtime:{target[:42]}"
-            emitted += 1
             if emitted >= max(1, min(batch_size, 6)):
                 break
+
+            input_state, stubs, defaults, target = self._apply_item(item, ctx)
+
+            # Try to validate via direct execution
+            hit, actual_keys, final = self._validate_direct(
+                ctx, input_state, stubs, defaults, target, branch_meta,
+            )
+            if hit:
+                yield input_state, stubs, defaults, f"llm-validated:{target[:42]}"
+                emitted += 1
+                continue
+
+            # Refinement loop
+            if final is not None and refinement_budget > 0:
+                for _refine in range(min(2, refinement_budget)):
+                    refinement_budget -= 1
+                    # Build feedback
+                    state_preview = {
+                        k: v
+                        for k, v in list(final.items())[:8]
+                        if not str(k).startswith("_")
+                    }
+                    feedback = (
+                        f"Your suggestion for branch {target} missed.\n"
+                        f"Actual branches hit: {sorted(actual_keys)[:10]}\n"
+                        f"Key state values: {state_preview}\n"
+                        f"Adjust input_values/stub_overrides to reach {target}.\n"
+                        f"Respond with single JSON object: "
+                        f'{{"input_values": {{...}}, "stub_overrides": {{...}}}}'
+                    )
+                    try:
+                        ref_text, _ = _query_llm_sync(
+                            self.llm_provider, feedback, self.llm_model,
+                        )
+                    except Exception:
+                        break
+                    ref_items = self._parse_response(ref_text)
+                    if not ref_items:
+                        break
+                    ri = ref_items[0]
+                    ri["target_branch"] = target
+                    input_state, stubs, defaults, _ = self._apply_item(ri, ctx)
+                    hit, actual_keys, final = self._validate_direct(
+                        ctx, input_state, stubs, defaults, target, branch_meta,
+                    )
+                    if hit:
+                        log.info(
+                            "LLM refinement hit target %s on round %d",
+                            target, _refine + 1,
+                        )
+                        yield (input_state, stubs, defaults,
+                               f"llm-refined:{target[:42]}")
+                        emitted += 1
+                        break
+                    if final is None:
+                        break
+                else:
+                    # Exhausted refinements — yield unvalidated
+                    yield input_state, stubs, defaults, f"llm-runtime:{target[:42]}"
+                    emitted += 1
+            else:
+                # No validation possible or no budget — yield as-is
+                yield input_state, stubs, defaults, f"llm-runtime:{target[:42]}"
+                emitted += 1
 
 
 class IntentDrivenStrategy(Strategy):
@@ -524,7 +1141,8 @@ class BranchSolverStrategy(Strategy):
                 self._exhausted = False
             else:
                 return False
-        return cov.total_branches > 0 and len(cov.branches_hit) < cov.total_branches
+        cobol_hits = sum(1 for b in cov.branches_hit if not b.startswith("py:"))
+        return cov.total_branches > 0 and cobol_hits < cov.total_branches
 
     def generate_cases(self, ctx, cov, batch_size) -> Iterator[CaseT]:
         from .cobol_coverage import _build_input_state
@@ -598,6 +1216,10 @@ class DirectParagraphStrategy(Strategy):
     name = "direct_paragraph"
     priority = 35
 
+    def should_run(self, cov, round_num: int) -> bool:
+        cobol_hits = sum(1 for b in cov.branches_hit if not b.startswith("py:"))
+        return cov.total_branches > 0 and cobol_hits < cov.total_branches
+
     _FAULT_TABLES = {
         "status_file": ["10", "23", "35", "39", "46", "47"],
         "status_sql": [0, 100, -803, -805, -904],
@@ -652,9 +1274,6 @@ class DirectParagraphStrategy(Strategy):
             values = ["10", "23", "35", "00", " "]
 
         return values
-
-    def should_run(self, cov, round_num: int) -> bool:
-        return cov.total_branches > 0 and len(cov.branches_hit) < cov.total_branches
 
     # ------------------------------------------------------------------
     # Helpers
@@ -761,8 +1380,12 @@ class DirectParagraphStrategy(Strategy):
         for para in sorted_paras:
             if yielded >= batch_size:
                 break
+            # Prefer probing-discovered state as base (empirically better)
+            probed = _best_probed_state_for_para(ctx, para)
             tc = self._best_tc_for_para(cov, para)
-            base_state = dict(tc.get("input_state", {})) if tc else {}
+            base_state = probed if probed else (
+                dict(tc.get("input_state", {})) if tc else {}
+            )
             # Freeze stubs from best TC (or success)
             stubs = dict(ctx.success_stubs)
             defaults = dict(ctx.success_defaults)

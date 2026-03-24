@@ -27,6 +27,8 @@ Example:
 
 from __future__ import annotations
 
+from __future__ import annotations
+
 import logging
 import os
 from importlib.metadata import entry_points
@@ -59,14 +61,19 @@ def _register_builtins() -> None:
 
     _BUILTINS_REGISTERED = True
 
-    # Import here to avoid circular imports
-    from .providers.anthropic import AnthropicProvider
-    from .providers.openai import OpenAIProvider
+    # Import here to avoid circular imports; guard optional SDKs
     from .providers.openrouter import OpenRouterProvider
-
     _PROVIDERS["openrouter"] = OpenRouterProvider
-    _PROVIDERS["anthropic"] = AnthropicProvider
-    _PROVIDERS["openai"] = OpenAIProvider
+    try:
+        from .providers.anthropic import AnthropicProvider
+        _PROVIDERS["anthropic"] = AnthropicProvider
+    except ImportError:
+        pass
+    try:
+        from .providers.openai import OpenAIProvider
+        _PROVIDERS["openai"] = OpenAIProvider
+    except ImportError:
+        pass
 
 
 def _discover_plugins() -> None:

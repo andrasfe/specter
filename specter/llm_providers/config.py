@@ -19,6 +19,8 @@ Example:
     config = OpenRouterConfig()  # Reads LLM_PROVIDERS_API_KEY, etc.
 """
 
+from typing import Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -92,11 +94,11 @@ class OpenRouterConfig(ProviderConfig):
         default="https://openrouter.ai/api/v1",
         description="OpenRouter API base URL",
     )
-    site_url: str | None = Field(
+    site_url: Optional[str] = Field(
         default=None,
         description="Site URL for OpenRouter rankings",
     )
-    site_name: str | None = Field(
+    site_name: Optional[str] = Field(
         default=None,
         description="Site name for OpenRouter rankings",
     )
@@ -132,7 +134,7 @@ class AnthropicConfig(ProviderConfig):
         ...,
         description="Anthropic API key",
     )
-    base_url: str | None = Field(
+    base_url: Optional[str] = Field(
         default=None,
         description="Custom API base URL (optional)",
     )
@@ -172,11 +174,11 @@ class OpenAIConfig(ProviderConfig):
         ...,
         description="OpenAI API key",
     )
-    base_url: str | None = Field(
+    base_url: Optional[str] = Field(
         default=None,
         description="Custom API base URL (optional, for Azure or proxies)",
     )
-    organization: str | None = Field(
+    organization: Optional[str] = Field(
         default=None,
         description="OpenAI organization ID",
     )

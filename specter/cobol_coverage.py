@@ -741,6 +741,22 @@ def _execute_and_save(
                 paragraph=direct_para,
             )
             stub_log = []
+
+            # Replay through COBOL if Python found new py: branches.
+            # This lets COBOL discover the same branches from MAIN-PARA.
+            py_new = {b for b in result.branches_hit if b.startswith("py:")} - cov.branches_hit
+            if py_new and len(py_new) >= 2:
+                cobol_stub_log = _python_pre_run(ctx.module, input_state, stub_outcomes, stub_defaults)
+                exec_timeout = int(getattr(ctx, "execution_timeout", 120))
+                cobol_result = run_test_case(ctx.context, input_state, cobol_stub_log, timeout=exec_timeout)
+                if not cobol_result.error:
+                    cobol_new = cobol_result.branches_hit - cov.branches_hit
+                    if cobol_new:
+                        # Merge COBOL results into the Python result
+                        result.branches_hit.update(cobol_result.branches_hit)
+                        result.paragraphs_hit = list(dict.fromkeys(
+                            result.paragraphs_hit + cobol_result.paragraphs_hit
+                        ))
         else:
             # Full program: pre-run Python for stub ordering, then COBOL
             strict_mode = bool(getattr(ctx, "strict_branch_coverage", False))
@@ -1277,15 +1293,19 @@ def _run_agentic_loop(
         # Early termination conditions
         full_para = (cov.total_paragraphs > 0
                      and len(cov.paragraphs_hit) >= cov.total_paragraphs)
+        # Only count COBOL-validated branches (exclude py: prefixed)
+        cobol_branches_hit = sum(
+            1 for b in cov.branches_hit if not b.startswith("py:")
+        )
         full_branch = (cov.total_branches > 0
-                       and len(cov.branches_hit) >= cov.total_branches)
+                       and cobol_branches_hit >= cov.total_branches)
         if full_para and full_branch:
             log.info("Full coverage achieved!")
             break
 
         if cov.stale_rounds >= 10 and cov.total_paragraphs > 0:
             para_pct = len(cov.paragraphs_hit) / cov.total_paragraphs
-            branch_pct = (len(cov.branches_hit) / cov.total_branches
+            branch_pct = (cobol_branches_hit / cov.total_branches
                           if cov.total_branches > 0 else 1.0)
             if para_pct > 0.9 and branch_pct > 0.8:
                 log.info("Plateau detected at %.1f%% para / %.1f%% branch, stopping",
