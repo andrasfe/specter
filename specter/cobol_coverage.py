@@ -938,6 +938,24 @@ def _execute_and_save(
     cov.runtime_only_paragraphs.update(result_runtime_only)
     cov.branches_hit.update(result.branches_hit)
 
+    # Harvest successful values into domain condition_literals so that
+    # subsequent strategies reuse values that produced new coverage.
+    if new_branches and ctx.domains:
+        for var, val in input_state.items():
+            if isinstance(var, str) and not var.startswith("_"):
+                dom = ctx.domains.get(var)
+                if dom and val not in dom.condition_literals:
+                    dom.condition_literals.append(val)
+        # Also harvest stub outcome values that produced new branches
+        if stub_outcomes:
+            for op_key, entries in stub_outcomes.items():
+                for entry in entries[:1]:  # first entry is what actually executed
+                    if isinstance(entry, list):
+                        for var, val in entry:
+                            dom = ctx.domains.get(var)
+                            if dom and val not in dom.condition_literals:
+                                dom.condition_literals.append(val)
+
     # Save
     tc_id = _compute_tc_id(input_state, stub_log)
     _save_test_case(
