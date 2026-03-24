@@ -1709,6 +1709,10 @@ def run_coverage(
             use_cache=seed_cfg.cache,
             on_batch_ready=_execute_seed_batch,
         )
+        # If seeds came from cache (on_batch_ready never fired), execute them now
+        if llm_seeds and len(cov.branches_hit) == len(existing_branches):
+            log.info("Executing %d cached seeds ...", len(llm_seeds))
+            _execute_seed_batch(llm_seeds)
         _seeds_executed_live = True
         log.info("LLM seeds: %d total, %d/%d paras, %d/%d branches after seed execution",
                  len(llm_seeds), len(cov.paragraphs_hit), cov.total_paragraphs,
