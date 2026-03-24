@@ -991,6 +991,7 @@ def run_cobol_coverage(
     max_rounds: int = 0,
     batch_size: int = 200,
     strict_branch_coverage: bool = False,
+    coverage_config=None,
 ) -> CobolCoverageReport:
     """Run coverage-guided test generation against real COBOL.
 
@@ -1187,33 +1188,42 @@ def run_cobol_coverage(
     setattr(ctx, "strict_branch_coverage", bool(strict_branch_coverage))
 
     # --- REGISTER STRATEGIES ---
-    strategies: list[Strategy] = [
-        BaselineStrategy(),
-        ConstraintSolverStrategy(),
-        DirectParagraphStrategy(),
-        BranchSolverStrategy(),
-        FaultInjectionStrategy(),
-        StubWalkStrategy(),
-        GuidedMutationStrategy(),
-        MonteCarloStrategy(),
-    ]
-    if llm_provider:
-        # Keep strategy behavior generic: LLM guidance is based on runtime
-        # coverage signals, branch metadata, and discovered variable domains.
-        strategies.append(LLMRuntimeSteeringStrategy(llm_provider, llm_model))
-        if not strict_branch_coverage:
-            strategies.extend([
-                LLMSeedStrategy(llm_provider, llm_model),
-                IntentDrivenStrategy(llm_provider, llm_model),
-            ])
+    from .coverage_config import CoverageConfig, build_selector, build_strategies
 
-    selector = (
-        LLMSelector(llm_provider, llm_model,
-                     default_batch_size=batch_size,
-                     var_report=var_report)
-        if llm_provider and not strict_branch_coverage
-        else HeuristicSelector(default_batch_size=batch_size)
-    )
+    if coverage_config is None:
+        coverage_config = CoverageConfig(default_batch_size=batch_size)
+
+    if coverage_config.strategies or coverage_config.rounds:
+        strategies = build_strategies(coverage_config, llm_provider, llm_model)
+    else:
+        strategies: list[Strategy] = [
+            BaselineStrategy(),
+            ConstraintSolverStrategy(),
+            DirectParagraphStrategy(),
+            BranchSolverStrategy(),
+            FaultInjectionStrategy(),
+            StubWalkStrategy(),
+            GuidedMutationStrategy(),
+            MonteCarloStrategy(),
+        ]
+        if llm_provider:
+            strategies.append(LLMRuntimeSteeringStrategy(llm_provider, llm_model))
+            if not strict_branch_coverage:
+                strategies.extend([
+                    LLMSeedStrategy(llm_provider, llm_model),
+                    IntentDrivenStrategy(llm_provider, llm_model),
+                ])
+
+    if coverage_config.selector != "heuristic" or coverage_config.rounds:
+        selector = build_selector(coverage_config, llm_provider, llm_model, var_report)
+    else:
+        selector = (
+            LLMSelector(llm_provider, llm_model,
+                         default_batch_size=batch_size,
+                         var_report=var_report)
+            if llm_provider and not strict_branch_coverage
+            else HeuristicSelector(default_batch_size=batch_size)
+        )
 
     loop_start_time = time.time()
     setup_elapsed = loop_start_time - setup_start
@@ -1224,6 +1234,7 @@ def run_cobol_coverage(
         ctx, cov, report, strategies, selector,
         budget, timeout, loop_start_time, tc_count,
         max_rounds=max_rounds,
+        config=coverage_config,
     )
 
 
@@ -1242,11 +1253,23 @@ def _run_agentic_loop(
     start_time: float,
     tc_count: int,
     max_rounds: int = 0,
+    config=None,
 ) -> CobolCoverageReport:
     """Run the strategy-based agentic coverage loop.
 
     Shared between run_cobol_coverage() and run_coverage().
+    If *config* is a CoverageConfig with explicit rounds, those drive
+    strategy selection instead of the selector.
     """
+    from .coverage_config import CoverageConfig, TerminationConfig
+    if config is None:
+        config = CoverageConfig()
+    term = config.termination if config.termination else TerminationConfig()
+
+    # Build name→strategy index for explicit round mode
+    strategies_by_name: dict[str, Strategy] = {s.name: s for s in strategies}
+    explicit_rounds = config.rounds
+    explicit_idx = 0
     round_num = 0
     strict_mode = bool(getattr(ctx, "strict_branch_coverage", False))
     strict_case_cap = 3
@@ -1266,7 +1289,20 @@ def _run_agentic_loop(
             break
         strategy = None
         batch_size = 0
-        if strict_mode:
+
+        # Mode 1: Explicit rounds from config
+        if explicit_rounds:
+            if explicit_idx >= len(explicit_rounds):
+                explicit_idx = config.loop_from
+            rc = explicit_rounds[explicit_idx]
+            candidate = strategies_by_name.get(rc.strategy)
+            if candidate is not None and candidate.should_run(cov, round_num):
+                strategy = candidate
+                batch_size = rc.batch_size or config.default_batch_size
+            explicit_idx += 1
+
+        # Mode 2: Strict mode round-robin
+        if strategy is None and strict_mode:
             target_name = strict_strategy_order[round_num % len(strict_strategy_order)]
             for candidate in strategies:
                 if candidate.name == target_name and candidate.should_run(cov, round_num):
@@ -1275,6 +1311,7 @@ def _run_agentic_loop(
             if strategy is not None:
                 batch_size = min(50, int(getattr(selector, "default_batch_size", 50) or 50))
 
+        # Mode 3: Selector-driven (default)
         if strategy is None:
             strategy, batch_size = selector.select(strategies, cov, round_num)
         round_new = 0
@@ -1388,16 +1425,16 @@ def _run_agentic_loop(
             log.info("Full coverage achieved!")
             break
 
-        if cov.stale_rounds >= 10 and cov.total_paragraphs > 0:
+        if cov.stale_rounds >= term.max_stale_rounds and cov.total_paragraphs > 0:
             para_pct = len(cov.paragraphs_hit) / cov.total_paragraphs
             branch_pct = (cobol_branches_hit / cov.total_branches
                           if cov.total_branches > 0 else 1.0)
-            if para_pct > 0.9 and branch_pct > 0.8:
+            if para_pct > term.plateau_para_pct and branch_pct > term.plateau_branch_pct:
                 log.info("Plateau detected at %.1f%% para / %.1f%% branch, stopping",
                          para_pct * 100, branch_pct * 100)
                 break
             # Extended patience when branch coverage is still low
-            if cov.stale_rounds >= 30:
+            if cov.stale_rounds >= term.extended_stale_limit:
                 log.info("Extended plateau at %.1f%% para / %.1f%% branch, stopping",
                          para_pct * 100, branch_pct * 100)
                 break
@@ -1443,6 +1480,7 @@ def run_coverage(
     llm_model: str | None = None,
     max_rounds: int = 0,
     batch_size: int = 200,
+    coverage_config=None,
 ) -> CobolCoverageReport:
     """Run coverage-guided test generation using Python execution only.
 
@@ -1602,32 +1640,41 @@ def run_coverage(
     )
 
     # --- REGISTER STRATEGIES ---
-    strategies: list[Strategy] = [
-        BaselineStrategy(),
-        ConstraintSolverStrategy(),
-        DirectParagraphStrategy(),
-        BranchSolverStrategy(),
-        FaultInjectionStrategy(),
-        StubWalkStrategy(),
-        GuidedMutationStrategy(),
-        MonteCarloStrategy(),
-    ]
+    from .coverage_config import CoverageConfig, build_selector, build_strategies
+
+    if coverage_config is None:
+        coverage_config = CoverageConfig(default_batch_size=batch_size)
+
+    if coverage_config.strategies or coverage_config.rounds:
+        strategies = build_strategies(coverage_config, llm_provider, llm_model)
+    else:
+        strategies: list[Strategy] = [
+            BaselineStrategy(),
+            ConstraintSolverStrategy(),
+            DirectParagraphStrategy(),
+            BranchSolverStrategy(),
+            FaultInjectionStrategy(),
+            StubWalkStrategy(),
+            GuidedMutationStrategy(),
+            MonteCarloStrategy(),
+        ]
+        if llm_provider:
+            strategies.append(LLMRuntimeSteeringStrategy(llm_provider, llm_model))
 
     # Inject LLM seeds as a one-shot strategy (no per-round LLM calls)
     if llm_seeds:
         strategies.insert(0, _LLMSeedInjector(llm_seeds, stub_mapping))
 
-    # LLM runtime steering for Python-only mode (optional)
-    if llm_provider:
-        strategies.append(LLMRuntimeSteeringStrategy(llm_provider, llm_model))
-
-    selector = (
-        LLMSelector(llm_provider, llm_model,
-                     default_batch_size=batch_size,
-                     var_report=var_report)
-        if llm_provider
-        else HeuristicSelector(default_batch_size=batch_size)
-    )
+    if coverage_config.selector != "heuristic" or coverage_config.rounds:
+        selector = build_selector(coverage_config, llm_provider, llm_model, var_report)
+    else:
+        selector = (
+            LLMSelector(llm_provider, llm_model,
+                         default_batch_size=batch_size,
+                         var_report=var_report)
+            if llm_provider
+            else HeuristicSelector(default_batch_size=batch_size)
+        )
 
     loop_start_time = time.time()
     setup_elapsed = loop_start_time - setup_start
@@ -1638,4 +1685,5 @@ def run_coverage(
         ctx, cov, report, strategies, selector,
         budget, timeout, loop_start_time, tc_count,
         max_rounds=max_rounds,
+        config=coverage_config,
     )

@@ -313,6 +313,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Fail fast for --cobol-coverage when no branch probes are generated",
     )
+    parser.add_argument(
+        "--coverage-config",
+        metavar="PATH",
+        help="YAML config file for strategy pipeline (strategy order, batch sizes, termination)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -580,6 +585,13 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as e:
                 print(f"  Warning: LLM init failed: {e}", file=sys.stderr)
 
+        # Load coverage config if provided
+        cov_config = None
+        if args.coverage_config:
+            from .coverage_config import load_config
+            cov_config = load_config(args.coverage_config)
+            print(f"  Config:  {args.coverage_config}")
+
         print(f"Running COBOL coverage-guided test generation ...")
         print(f"  AST:    {source_path}")
         print(f"  COBOL:  {cobol_path}")
@@ -602,6 +614,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_rounds=args.coverage_rounds,
                 batch_size=args.coverage_batch_size,
                 strict_branch_coverage=args.strict_branch_coverage,
+                coverage_config=cov_config,
             )
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
