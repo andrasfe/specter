@@ -407,8 +407,13 @@ def generate_seeds_from_analysis(
     stub_summary = "\n".join(stub_lines) or "  (none)"
 
     # Process in batches
+    total_batches = (len(sorted_paras) + batch_size - 1) // batch_size
     for batch_start in range(0, len(sorted_paras), batch_size):
         batch = sorted_paras[batch_start:batch_start + batch_size]
+        batch_num = batch_start // batch_size + 1
+        log.info("Seed generation: batch %d/%d (paragraphs %d-%d, %d seeds so far)",
+                 batch_num, total_batches,
+                 batch_start, batch_start + len(batch), len(all_seeds))
 
         para_block = []
         for pa in batch:
