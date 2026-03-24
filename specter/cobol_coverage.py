@@ -1579,35 +1579,6 @@ def run_coverage(
         flag_88_added=flag_88_added, siblings_88=siblings_88,
     )
 
-    existing_ast_paras = existing_paras & all_paras
-    existing_runtime_only = existing_paras - all_paras
-
-    # Coverage state
-    cov = CoverageState(
-        paragraphs_hit=existing_ast_paras,
-        runtime_only_paragraphs=existing_runtime_only,
-        branches_hit=existing_branches,
-        total_paragraphs=total_paragraphs,
-        total_branches=total_branches,
-        test_cases=existing_tcs,
-        all_paragraphs=all_paras,
-        _stub_mapping=stub_mapping,
-    )
-    report = CobolCoverageReport(
-        total_test_cases=len(existing_tcs),
-        paragraphs_total=total_paragraphs,
-        runtime_trace_total=total_paragraphs,
-        runtime_only_paragraphs=len(existing_runtime_only),
-        branches_total=total_branches,
-    )
-
-    if existing_tcs:
-        log.info("Loaded %d existing TCs: %d AST paras, %d runtime-only paras, %d branches covered",
-                 len(existing_tcs), len(existing_ast_paras), len(existing_runtime_only),
-                 len(existing_branches))
-
-    tc_count = len(existing_tcs)
-
     # --- UPFRONT ANALYSIS (static, no LLM) ---
     from .program_analysis import (
         generate_seeds_from_analysis,
@@ -1636,7 +1607,98 @@ def run_coverage(
         coverage_config = CoverageConfig(default_batch_size=batch_size)
     seed_cfg = coverage_config.seed_generation or SeedConfig()
 
+    # Build coverage state + report early so we can execute seeds as they arrive
+    existing_ast_paras = existing_paras & all_paras
+    existing_runtime_only = existing_paras - all_paras
+
+    cov = CoverageState(
+        paragraphs_hit=existing_ast_paras,
+        runtime_only_paragraphs=existing_runtime_only,
+        branches_hit=existing_branches,
+        total_paragraphs=total_paragraphs,
+        total_branches=total_branches,
+        test_cases=existing_tcs,
+        all_paragraphs=all_paras,
+        _stub_mapping=stub_mapping,
+    )
+    report = CobolCoverageReport(
+        total_test_cases=len(existing_tcs),
+        paragraphs_total=total_paragraphs,
+        runtime_trace_total=total_paragraphs,
+        runtime_only_paragraphs=len(existing_runtime_only),
+        branches_total=total_branches,
+    )
+    tc_count = len(existing_tcs)
+
+    # Callback: execute each seed batch immediately and report coverage
+    def _execute_seed_batch(seeds_batch: list[dict]) -> None:
+        nonlocal tc_count
+        for seed_data in seeds_batch:
+            input_state = {}
+            for var, val in seed_data.get("input_values", {}).items():
+                dom = domains.get(var.upper())
+                if dom:
+                    input_state[var.upper()] = format_value_for_cobol(dom, val)
+                else:
+                    input_state[var.upper()] = str(val)
+
+            stubs = dict(success_stubs)
+            defaults = dict(success_defaults)
+            for op_key, status_val in seed_data.get("stub_overrides", {}).items():
+                matched = _match_stub_operation(op_key, stub_mapping)
+                if matched:
+                    svars = stub_mapping[matched]
+                    entry = [(sv, status_val) for sv in svars]
+                    stubs[matched] = [entry] * 50
+                    defaults[matched] = entry
+
+            result = _python_execute(module, input_state, stubs, defaults)
+            if result.error:
+                continue
+
+            result_paras = set(result.paragraphs_hit)
+            result_ast_paras = result_paras & all_paras if all_paras else result_paras
+            new_paras = result_ast_paras - cov.paragraphs_hit
+            new_branches = result.branches_hit - cov.branches_hit
+
+            if not new_paras and not new_branches and tc_count >= 5:
+                continue
+
+            cov.paragraphs_hit.update(result_ast_paras)
+            cov.branches_hit.update(result.branches_hit)
+
+            # Harvest successful values
+            if new_branches and domains:
+                for var, val in input_state.items():
+                    if isinstance(var, str) and not var.startswith("_"):
+                        d = domains.get(var)
+                        if d and val not in d.condition_literals:
+                            d.condition_literals.append(val)
+
+            tc_id = _compute_tc_id(input_state, [])
+            _save_test_case(
+                store_path, tc_id, input_state, [], result,
+                "llm_seeds", seed_data.get("target", "seed")[:50],
+            )
+            tc_count += 1
+            report.layer_stats["llm_seeds"] = report.layer_stats.get("llm_seeds", 0) + 1
+
+            cov.test_cases.append({
+                "id": tc_id,
+                "input_state": {k: v for k, v in input_state.items() if not str(k).startswith("_")},
+                "stub_outcomes": [],
+                "paragraphs_hit": result.paragraphs_hit,
+                "branches_hit": sorted(result.branches_hit),
+                "layer": "llm_seeds",
+                "target": seed_data.get("target", "seed")[:50],
+            })
+
+            if new_branches:
+                log.info("  [llm_seeds] +%d branches -> %d/%d",
+                         len(new_branches), len(cov.branches_hit), cov.total_branches)
+
     llm_seeds: list[dict] = []
+    _seeds_executed_live = False
     if llm_provider:
         seed_cache = store_path.with_name(store_path.stem + "_seeds.json")
         llm_seeds = generate_seeds_from_analysis(
@@ -1645,8 +1707,12 @@ def run_coverage(
             seeds_per_batch=seed_cfg.seeds_per_batch,
             cache_path=seed_cache,
             use_cache=seed_cfg.cache,
+            on_batch_ready=_execute_seed_batch,
         )
-        log.info("LLM seeds: %d initial test states", len(llm_seeds))
+        _seeds_executed_live = True
+        log.info("LLM seeds: %d total, %d/%d paras, %d/%d branches after seed execution",
+                 len(llm_seeds), len(cov.paragraphs_hit), cov.total_paragraphs,
+                 len(cov.branches_hit), cov.total_branches)
 
     # --- BUILD STRATEGY CONTEXT ---
     ctx = StrategyContext(
@@ -1693,8 +1759,8 @@ def run_coverage(
         if llm_provider:
             strategies.append(LLMRuntimeSteeringStrategy(llm_provider, llm_model))
 
-    # Inject LLM seeds as a one-shot strategy (no per-round LLM calls)
-    if llm_seeds:
+    # Skip _LLMSeedInjector if seeds were already executed live via callback
+    if llm_seeds and not _seeds_executed_live:
         strategies.insert(0, _LLMSeedInjector(llm_seeds, stub_mapping))
 
     if coverage_config.selector != "heuristic" or coverage_config.rounds:

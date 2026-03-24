@@ -352,6 +352,7 @@ def generate_seeds_from_analysis(
     seeds_per_batch: int = 8,
     cache_path: str | Path | None = None,
     use_cache: bool = True,
+    on_batch_ready=None,
 ) -> list[dict]:
     """Query LLM to generate initial seed test states from the analysis JSON.
 
@@ -468,6 +469,9 @@ Respond in YAML format (easier to parse than JSON):
                 batch_start, batch_start + len(batch), len(seeds_batch),
                 len(all_seeds),
             )
+            # Execute seeds immediately if callback is provided
+            if on_batch_ready and seeds_batch:
+                on_batch_ready(seeds_batch)
         except Exception as e:
             if isinstance(e, LLMUnrecoverableAuthError):
                 raise
