@@ -419,6 +419,12 @@ def main(argv: list[str] | None = None) -> int:
 
                     store_path = analysis_dir / f"{program_id}_testset.jsonl"
 
+                    # Load coverage config if provided
+                    multi_cov_config = None
+                    if args.coverage_config:
+                        from .coverage_config import load_config as _load_cov_config
+                        multi_cov_config = _load_cov_config(args.coverage_config)
+
                     try:
                         cov_report = run_coverage(
                             ast_file=ast_path,
@@ -430,6 +436,7 @@ def main(argv: list[str] | None = None) -> int:
                             llm_model=args.llm_model,
                             max_rounds=args.coverage_rounds,
                             batch_size=args.coverage_batch_size,
+                            coverage_config=multi_cov_config,
                         )
                     except RuntimeError as e:
                         print(f"Error: {e}", file=sys.stderr)
@@ -842,6 +849,12 @@ def main(argv: list[str] | None = None) -> int:
 
         print(f"Synthesizing test set → {test_store_path} ...")
         print(f"  Budget: {budget} TCs, timeout {cov_timeout}s")
+        # Load coverage config if provided
+        synth_cov_config = None
+        if args.coverage_config:
+            from .coverage_config import load_config
+            synth_cov_config = load_config(args.coverage_config)
+
         try:
             cov_report = run_coverage(
                 ast_file=ast_path,
@@ -855,6 +868,7 @@ def main(argv: list[str] | None = None) -> int:
                 llm_model=args.llm_model,
                 max_rounds=args.coverage_rounds,
                 batch_size=args.coverage_batch_size,
+                coverage_config=synth_cov_config,
             )
         except RuntimeError as e:
             print(f"Error: {e}", file=sys.stderr)
