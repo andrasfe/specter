@@ -44,6 +44,15 @@ termination:
 #   - guided_mutation
 #   - monte_carlo
 
+# LLM seed generation settings:
+seed_generation:
+  paragraphs_per_batch: 10   # paragraphs sent per LLM call (lower = more focused seeds)
+  seeds_per_batch: 8         # test scenarios requested per LLM call
+  cache: true                # cache seeds to _seeds.json (set false to regenerate)
+  # For large programs (1000+ paragraphs), consider:
+  #   paragraphs_per_batch: 5   (more focused batches)
+  #   seeds_per_batch: 12       (more seeds per batch)
+
 # Per-strategy parameter overrides:
 strategy_params:
   llm_runtime:

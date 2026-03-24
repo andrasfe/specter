@@ -135,7 +135,18 @@ strategies:
   - guided_mutation
 ```
 
-Available strategies: `baseline`, `constraint_solver`, `direct_paragraph`, `branch_solver`, `fault_injection`, `stub_walk`, `guided_mutation`, `monte_carlo`, `llm_seed`, `llm_runtime`, `intent_driven`. See `examples/coverage-config.yaml` for a fully commented example.
+Available strategies: `baseline`, `constraint_solver`, `direct_paragraph`, `branch_solver`, `fault_injection`, `stub_walk`, `guided_mutation`, `monte_carlo`, `llm_seed`, `llm_runtime`, `intent_driven`.
+
+**Seed generation** — control how LLM initial seeds are generated:
+
+```yaml
+seed_generation:
+  paragraphs_per_batch: 5    # fewer paragraphs = more focused seeds (default: 10)
+  seeds_per_batch: 12        # more seeds per LLM call (default: 8)
+  cache: false               # regenerate seeds instead of using cache
+```
+
+For large programs (1000+ paragraphs), smaller `paragraphs_per_batch` with higher `seeds_per_batch` produces better coverage. See `examples/coverage-config.yaml` for a fully commented example.
 
 ### Tuning parameters
 

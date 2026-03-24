@@ -1607,12 +1607,20 @@ def run_coverage(
     log.info("Analysis saved: %s", analysis_path)
 
     # --- LLM SEED GENERATION (one-time, from analysis JSON) ---
+    from .coverage_config import CoverageConfig, SeedConfig
+    if coverage_config is None:
+        coverage_config = CoverageConfig(default_batch_size=batch_size)
+    seed_cfg = coverage_config.seed_generation or SeedConfig()
+
     llm_seeds: list[dict] = []
     if llm_provider:
         seed_cache = store_path.with_name(store_path.stem + "_seeds.json")
         llm_seeds = generate_seeds_from_analysis(
             analysis, llm_provider, llm_model,
+            batch_size=seed_cfg.paragraphs_per_batch,
+            seeds_per_batch=seed_cfg.seeds_per_batch,
             cache_path=seed_cache,
+            use_cache=seed_cfg.cache,
         )
         log.info("LLM seeds: %d initial test states", len(llm_seeds))
 

@@ -349,7 +349,9 @@ def generate_seeds_from_analysis(
     llm_provider,
     llm_model: str | None = None,
     batch_size: int = 10,
+    seeds_per_batch: int = 8,
     cache_path: str | Path | None = None,
+    use_cache: bool = True,
 ) -> list[dict]:
     """Query LLM to generate initial seed test states from the analysis JSON.
 
@@ -363,7 +365,7 @@ def generate_seeds_from_analysis(
     from .llm_coverage import LLMUnrecoverableAuthError, _query_llm_sync
 
     # Check cache
-    if cache_path:
+    if cache_path and use_cache:
         cache_path = Path(cache_path)
         if cache_path.exists():
             try:
@@ -427,7 +429,7 @@ def generate_seeds_from_analysis(
             para_block.append("\n".join(lines))
 
         prompt = f"""\
-You are a COBOL test engineer. Generate 5-8 test scenarios for program {analysis.program_id}.
+You are a COBOL test engineer. Generate {seeds_per_batch} test scenarios for program {analysis.program_id}.
 
 === PARAGRAPHS (this batch) ===
 {"".join(para_block)}
@@ -466,9 +468,10 @@ Respond in YAML format (easier to parse than JSON):
             log.warning("LLM seed generation failed for batch %d: %s", batch_start, e)
 
     # Cache results
-    if cache_path and all_seeds:
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        cache_path.write_text(json.dumps(all_seeds, indent=2, default=str))
-        log.info("Cached %d seeds to %s", len(all_seeds), cache_path)
+    if cache_path and use_cache and all_seeds:
+        cache_p = Path(cache_path)
+        cache_p.parent.mkdir(parents=True, exist_ok=True)
+        cache_p.write_text(json.dumps(all_seeds, indent=2, default=str))
+        log.info("Cached %d seeds to %s", len(all_seeds), cache_p)
 
     return all_seeds

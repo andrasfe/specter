@@ -65,12 +65,22 @@ class TerminationConfig:
 
 
 @dataclass
+class SeedConfig:
+    """Configuration for LLM seed generation."""
+
+    paragraphs_per_batch: int = 10
+    seeds_per_batch: int = 8
+    cache: bool = True
+
+
+@dataclass
 class CoverageConfig:
     """Top-level coverage configuration."""
 
     selector: str = "heuristic"
     default_batch_size: int = 200
     termination: TerminationConfig = field(default_factory=TerminationConfig)
+    seed_generation: SeedConfig = field(default_factory=SeedConfig)
     strategies: list[str] | None = None
     rounds: list[RoundConfig] | None = None
     loop_from: int = 0
@@ -130,6 +140,13 @@ def _build_config(data: dict) -> CoverageConfig:
         extended_stale_limit=int(term_data.get("extended_stale_limit", 30)),
     )
 
+    seed_data = data.get("seed_generation", {})
+    seed_generation = SeedConfig(
+        paragraphs_per_batch=int(seed_data.get("paragraphs_per_batch", 10)),
+        seeds_per_batch=int(seed_data.get("seeds_per_batch", 8)),
+        cache=bool(seed_data.get("cache", True)),
+    )
+
     rounds = None
     raw_rounds = data.get("rounds")
     if isinstance(raw_rounds, list):
@@ -151,6 +168,7 @@ def _build_config(data: dict) -> CoverageConfig:
         selector=str(data.get("selector", "heuristic")),
         default_batch_size=int(data.get("default_batch_size", 200)),
         termination=termination,
+        seed_generation=seed_generation,
         strategies=strategies,
         rounds=rounds,
         loop_from=int(data.get("loop_from", 0)),
