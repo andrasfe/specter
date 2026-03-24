@@ -1354,6 +1354,12 @@ def _run_agentic_loop(
 
             cases_tried += 1
 
+            if cases_tried % 200 == 0:
+                log.info("  %s progress: %d cases tried, %d/%d paras, %d/%d branches",
+                         strategy.name, cases_tried,
+                         len(cov.paragraphs_hit), cov.total_paragraphs,
+                         len(cov.branches_hit), cov.total_branches)
+
             if cov.consecutive_timeouts >= 5:
                 log.info(
                     "Round %d: aborting %s after %d consecutive timeouts",
