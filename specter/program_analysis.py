@@ -459,8 +459,9 @@ Respond in YAML format (easier to parse than JSON):
             seeds_batch = _parse_yaml_seeds(response_text)
             all_seeds.extend(seeds_batch)
             log.info(
-                "LLM seeds batch %d-%d: %d states",
+                "LLM seeds batch %d-%d: %d states (total: %d seeds)",
                 batch_start, batch_start + len(batch), len(seeds_batch),
+                len(all_seeds),
             )
         except Exception as e:
             if isinstance(e, LLMUnrecoverableAuthError):
