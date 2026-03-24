@@ -94,6 +94,49 @@ specter --multi --java --synthesize \
 
 Each test case is a complete execution spec: input variables + mock orchestration for all external interactions (SQL results, CICS EIBRESP codes, file status codes). Multi-program synthesis generates per-program JSONL test stores, a combined `tests.catalog.md`, and JUnit 5 parameterized test classes.
 
+### Strategy configuration
+
+The coverage engine supports 11 pluggable strategies. By default, a heuristic selector picks strategies based on yield history. You can override this with a YAML config file:
+
+```bash
+specter COPAUA0C.cbl.ast --cobol-coverage \
+  --cobol-source COPAUA0C.cbl --copybook-dir ./cpy \
+  --coverage-config pipeline.yaml
+```
+
+**Explicit rounds** — define the exact strategy sequence:
+
+```yaml
+rounds:
+  - strategy: baseline
+    batch_size: 500
+  - strategy: direct_paragraph
+    batch_size: 5000
+  - strategy: fault_injection
+    batch_size: 500
+  - strategy: llm_runtime
+    batch_size: 100
+  - strategy: monte_carlo
+    batch_size: 2000
+loop_from: 1
+termination:
+  max_stale_rounds: 10
+  plateau_branch_pct: 0.8
+```
+
+**Selector-driven** — list which strategies are available, let the selector pick:
+
+```yaml
+selector: heuristic
+strategies:
+  - baseline
+  - direct_paragraph
+  - fault_injection
+  - guided_mutation
+```
+
+Available strategies: `baseline`, `constraint_solver`, `direct_paragraph`, `branch_solver`, `fault_injection`, `stub_walk`, `guided_mutation`, `monte_carlo`, `llm_seed`, `llm_runtime`, `intent_driven`. See `examples/coverage-config.yaml` for a fully commented example.
+
 ### Tuning parameters
 
 | Flag | Default | Effect |
@@ -102,6 +145,8 @@ Each test case is a complete execution spec: input variables + mock orchestratio
 | `--coverage-timeout N` | 600 | Max seconds |
 | `--coverage-batch-size N` | 200 | Cases per strategy round (DirectParagraph gets 25x this) |
 | `--coverage-rounds N` | 0 (unlimited) | Max strategy rounds |
+| `--coverage-config PATH` | — | YAML config for strategy pipeline |
+| `--coverage-execution-timeout N` | 900 | Per-test COBOL execution timeout (seconds) |
 
 Higher `--coverage-batch-size` means more hill-climbing trials per paragraph per round. Values of 200-500 work well; the engine scales automatically.
 
@@ -126,10 +171,21 @@ cobc -x -o program.mock program.mock.cbl
 
 Replaces all EXEC CICS/SQL/DLI blocks, file I/O, and CALL statements with reads from a sequential mock data file. Adds paragraph-level tracing via DISPLAY.
 
+## Branch Coverage Features
+
+Specter includes several codegen and coverage engine features that maximize branch reachability:
+
+- **EVALUATE :F probes** — Each WHEN clause gets both a True (matched) and False (not matched) branch ID, making EVALUATE coverage work like IF coverage.
+- **88-level mutual exclusivity** — `SET X TO TRUE` clears sibling 88-level flags. Siblings are discovered from copybook records, inline COBOL source scanning, and a FOUND/NFOUND naming heuristic.
+- **MQ-aware stubs** — IBM MQ constants (MQCC-OK=0, MQCC-FAILED=2, etc.) are injected into the execution state so comparisons like `WS-COMPCODE = MQCC-OK` work correctly with integer types.
+- **Backward slicer** — For LLM-guided strategies, a backward slicer extracts the minimal code path from paragraph entry to each uncovered branch. The LLM sees the actual Python execution path instead of just condition text.
+- **Boolean condition hints** — Variables appearing in `EVALUATE WHEN TRUE` as standalone conditions (e.g., `ACCOUNT-CLOSED`) automatically get `True`/`False` added to their domain, enabling the engine to try setting them.
+
 ## Requirements
 
 - Python 3.10+
 - No external dependencies for core functionality
+- Optional: `PyYAML` for `--coverage-config` YAML support (JSON fallback works without it)
 - Optional: `z3-solver` for `--concolic` mode
 - Optional: Java 17+ and Maven 3.9+ for `--java` mode
 - Optional: GnuCOBOL for `--mock-cobol` mode
