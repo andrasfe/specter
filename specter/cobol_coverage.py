@@ -67,6 +67,53 @@ from .variable_extractor import VariableReport, extract_stub_status_mapping, ext
 
 log = logging.getLogger(__name__)
 
+# Well-known IBM MQ constants (from CMQV copybook).
+# These are defined in external copybooks that are typically not shipped
+# with application source, so we hardcode the standard values.
+_MQ_CONSTANTS: dict[str, int] = {
+    "MQCC-OK": 0,
+    "MQCC-WARNING": 1,
+    "MQCC-FAILED": 2,
+    "MQRC-NONE": 0,
+    "MQRC-NO-MSG-AVAILABLE": 2033,
+    "MQRC-NOT-AUTHORIZED": 2035,
+    "MQRC-Q-FULL": 2053,
+    "MQRC-TRUNCATED-MSG-ACCEPTED": 2079,
+    "MQOO-INPUT-AS-Q-DEF": 1,
+    "MQOO-OUTPUT": 16,
+    "MQOO-INQUIRE": 32,
+}
+
+
+def _enrich_domains_with_boolean_hints(
+    domains: dict[str, VariableDomain],
+    program: Program,
+) -> None:
+    """Add True/False as condition_literals for vars used as standalone boolean
+    conditions in EVALUATE WHEN TRUE or IF statements.
+
+    Variables like ACCOUNT-CLOSED, CARD-FRAUD etc. appear in EVALUATE WHEN
+    as boolean checks but have no condition_literals in the domain model,
+    so the coverage engine never tries setting them to True.
+    """
+    def _scan(stmt):
+        if stmt.type == "EVALUATE" and stmt.attributes.get("subject", "").upper() == "TRUE":
+            for child in stmt.children:
+                if child.type == "WHEN":
+                    cond = child.text.replace("WHEN", "", 1).strip().upper()
+                    # Single variable name (not a compound condition)
+                    if re.match(r"^[A-Z][A-Z0-9-]*$", cond):
+                        dom = domains.get(cond)
+                        if dom and True not in dom.condition_literals:
+                            dom.condition_literals.append(True)
+                            dom.condition_literals.append(False)
+        for child in stmt.children:
+            _scan(child)
+
+    for para in program.paragraphs:
+        for stmt in para.statements:
+            _scan(stmt)
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -257,6 +304,13 @@ def _python_pre_run(
     default_state_fn = getattr(module, "_default_state", None)
     if default_state_fn:
         state = default_state_fn()
+
+    # Inject MQ constants
+    var_names = {k.upper() for k in state}
+    for name, value in _MQ_CONSTANTS.items():
+        if name.upper() in var_names:
+            state[name.upper()] = value
+
     state.update(input_state)
 
     if stub_outcomes:
@@ -293,6 +347,14 @@ def _python_execute(
 
     default_state_fn = getattr(module, "_default_state", None)
     state = default_state_fn() if default_state_fn else {}
+
+    # Inject well-known MQ constants so comparisons like
+    # WS-COMPCODE = MQCC-OK work (MQCC-OK must be integer 0, not '').
+    var_names = {k.upper() for k in state}
+    for name, value in _MQ_CONSTANTS.items():
+        if name.upper() in var_names:
+            state[name.upper()] = value
+
     state.update(input_state)
 
     if stub_outcomes:
@@ -340,11 +402,22 @@ def _python_execute(
 # Value builders
 # ---------------------------------------------------------------------------
 
+def _compute_mq_overrides(var_report: VariableReport) -> dict[str, int]:
+    """Compute MQ constant overrides for variables in the var_report."""
+    overrides: dict[str, int] = {}
+    var_names = {v.upper() for v in var_report.variables}
+    for name, value in _MQ_CONSTANTS.items():
+        if name.upper() in var_names:
+            overrides[name.upper()] = value
+    return overrides
+
+
 def _build_input_state(
     domains: dict[str, VariableDomain],
     strategy: str,
     rng: random.Random,
     overrides: dict | None = None,
+    mq_overrides: dict | None = None,
 ) -> dict[str, object]:
     """Build an input state dict using the domain model."""
     state: dict[str, object] = {}
@@ -366,6 +439,10 @@ def _build_input_state(
         # Common AID keys: ENTER, PF3 (return), PF7/PF8 (scroll)
         aids = ["ENTER", "DFHENTER", "DFHPF3", "DFHPF7", "DFHPF8", "DFHCLEAR"]
         state[upper_names["EIBAID"]] = rng.choice(aids)
+
+    # MQ constants: ensure well-known IBM MQ constants have correct values
+    if mq_overrides:
+        state.update(mq_overrides)
 
     if overrides:
         state.update(overrides)
@@ -520,6 +597,9 @@ def _build_success_stubs(
             elif op_key.startswith("DLI") or "PCB" in var.upper():
                 success_entries.append((var, "  "))
                 eof_entries.append((var, "GB"))
+            elif op_key.startswith("CALL:MQ"):
+                success_entries.append((var, 0))      # MQCC-OK = 0 (integer)
+                eof_entries.append((var, 2))           # MQCC-FAILED = 2
             else:
                 success_entries.append((var, "00"))
                 eof_entries.append((var, "10"))
@@ -597,6 +677,8 @@ def _build_fault_stubs(
                     entries.append((var, rng.choice([100, -803, -805])))
                 elif "PCB" in var.upper() or op_key.startswith("DLI"):
                     entries.append((var, rng.choice(["GE", "GB", "II"])))
+                elif op_key.startswith("CALL:MQ"):
+                    entries.append((var, rng.choice([2, 1])))  # MQCC-FAILED, WARNING
                 else:
                     entries.append((var, "10"))
             else:
@@ -611,6 +693,8 @@ def _build_fault_stubs(
                     entries.append((var, 0))
                 elif "PCB" in var.upper() or op_key.startswith("DLI"):
                     entries.append((var, "  "))
+                elif op_key.startswith("CALL:MQ"):
+                    entries.append((var, 0))  # MQCC-OK
                 else:
                     entries.append((var, "00"))
 
@@ -948,6 +1032,7 @@ def run_cobol_coverage(
     log.info("Building variable domain model ...")
     copybook_records = load_copybooks(copybook_dirs) if copybook_dirs else []
     domains = build_variable_domains(var_report, copybook_records, stub_mapping)
+    _enrich_domains_with_boolean_hints(domains, program)
     log.info("Domain model: %d variables (%d from copybooks)",
              len(domains), sum(1 for d in domains.values() if d.data_type != "unknown"))
 
@@ -1389,6 +1474,7 @@ def run_coverage(
     # Build domain model
     copybook_records = load_copybooks(copybook_dirs) if copybook_dirs else []
     domains = build_variable_domains(var_report, copybook_records, stub_mapping)
+    _enrich_domains_with_boolean_hints(domains, program)
     log.info("Domain model: %d variables", len(domains))
 
     # Generate + load instrumented Python module

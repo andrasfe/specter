@@ -2228,6 +2228,9 @@ class FaultInjectionStrategy(Strategy):
             if op_key.startswith("DLI") or any("PCB" in v.upper() for v in status_vars):
                 fault_values.extend(["GE", "GB", "II", "AI"])
 
+            if op_key.startswith("CALL:MQ"):
+                fault_values.extend([0, 1, 2])  # MQCC-OK, WARNING, FAILED (int)
+
             if not fault_values:
                 fault_values = ["10", "23", "35"]
 
