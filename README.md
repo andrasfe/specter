@@ -40,30 +40,33 @@ Specter generates test cases targeting maximum branch coverage using four strate
 
 **Results on CardDemo COPAUA0C**: 91/92 Python branches (98.9%), 20/20 test cases validated against GnuCOBOL (100% pass rate, 17/27 COBOL branches confirmed).
 
-There are two modes: **Python-only** (from AST alone) and **GnuCOBOL hybrid** (AST + COBOL source).
-
-### Python-only mode (`--synthesize`)
-
-Requires the AST file, the COBOL source (for LLM comment extraction), and an LLM provider (for business-scenario seed generation):
+### Quick start
 
 ```bash
-# Full synthesis: AST + COBOL source + copybooks + LLM
-specter COACTUPC.cbl.ast --synthesize \
-  --cobol-source COACTUPC.cbl \
-  --copybook-dir ./copybooks \
+# Recommended — LLM seeds provide initial diversity, strategies do the rest
+specter program.ast --synthesize \
+  --cobol-source program.cbl --copybook-dir ./cpy \
   --test-store tests.jsonl \
-  --llm-guided --llm-provider anthropic
+  --llm-provider openrouter --llm-model gemini-3-flash
 
-# With tuning: more trials per round (25x batch = more hill-climbing)
-specter COACTUPC.cbl.ast --synthesize \
-  --cobol-source COACTUPC.cbl \
-  --copybook-dir ./copybooks \
+# For large programs (1000+ paragraphs)
+specter program.ast --synthesize \
+  --cobol-source program.cbl --copybook-dir ./cpy \
   --test-store tests.jsonl \
-  --coverage-budget 50000 \
-  --coverage-timeout 120 \
-  --coverage-batch-size 500 \
-  --llm-provider anthropic
+  --llm-provider openrouter --llm-model gemini-3-flash \
+  --coverage-budget 50000 --coverage-timeout 3600 --coverage-batch-size 500
+
+# Without LLM (algorithmic-only — still effective on smaller programs)
+specter program.ast --synthesize \
+  --cobol-source program.cbl --copybook-dir ./cpy \
+  --test-store tests.jsonl
+
+# Validate against real COBOL (requires GnuCOBOL)
+specter program.ast --cobol-validate-store tests.jsonl \
+  --cobol-source program.cbl --copybook-dir ./cpy
 ```
+
+The LLM generates initial seed test states from program analysis — these provide the starting diversity that corpus fuzzing and direct paragraph strategies then amplify through mutation and hill-climbing. On large programs, LLM seeds are critical for breaking past the entry-path bottleneck. Seeds are cached and support incremental resume after interruption.
 
 ### Portable coverage bundle (`--export-bundle` / `--run-bundle`)
 

@@ -1,12 +1,11 @@
-# Example coverage strategy configuration for Specter.
+# Specter coverage strategy configuration.
 #
 # Two modes:
 #   1. Explicit rounds: define a sequence of (strategy, batch_size) pairs.
-#   2. Selector-driven: list strategies and let the heuristic/LLM selector pick.
+#   2. Selector-driven (default): heuristic selector picks based on yield.
 #
-# If neither "rounds" nor "strategies" is set, the default strategy set is used.
+# If neither "rounds" nor "strategies" is set, all 4 strategies run.
 
-selector: heuristic
 default_batch_size: 200
 
 termination:
@@ -21,59 +20,32 @@ termination:
 #     batch_size: 500
 #   - strategy: direct_paragraph
 #     batch_size: 5000
-#   - strategy: direct_paragraph
-#     batch_size: 5000
+#   - strategy: corpus_fuzz
+#     batch_size: 2000
 #   - strategy: fault_injection
 #     batch_size: 500
-#   - strategy: branch_solver
-#     batch_size: 500
-#   - strategy: llm_runtime
-#     batch_size: 100
-#   - strategy: guided_mutation
-#     batch_size: 500
-#   - strategy: monte_carlo
-#     batch_size: 2000
 # loop_from: 1
 
 # Selector-driven with custom strategy list — uncomment to use:
 # strategies:
 #   - baseline
 #   - direct_paragraph
+#   - corpus_fuzz
 #   - fault_injection
-#   - branch_solver
-#   - guided_mutation
-#   - monte_carlo
 
-# LLM seed generation settings:
+# LLM seed generation (optional — only runs with --llm-provider):
 seed_generation:
-  paragraphs_per_batch: 10   # paragraphs sent per LLM call (lower = more focused seeds)
-  seeds_per_batch: 8         # test scenarios requested per LLM call
-  cache: true                # cache seeds to _seeds.json (set false to regenerate)
-  # For large programs (1000+ paragraphs), consider:
-  #   paragraphs_per_batch: 5   (more focused batches)
-  #   seeds_per_batch: 12       (more seeds per batch)
+  paragraphs_per_batch: 10   # paragraphs per LLM call (lower = more focused)
+  seeds_per_batch: 8         # scenarios requested per LLM call
+  cache: true                # cache to _seeds.json (false to regenerate)
 
-# COBOL validation pass — run after Python synthesis to confirm coverage
-# against the real COBOL binary. Requires --cobol-source and --copybook-dir.
+# COBOL validation — auto-validate after synthesis:
 # validation:
 #   enabled: true
-#   timeout_per_case: 30    # seconds per COBOL test execution
-
-# Per-strategy parameter overrides:
-strategy_params:
-  llm_runtime:
-    max_calls: 5
-    min_stale_rounds: 1
+#   timeout_per_case: 30
 
 # Available strategies:
 #   baseline           - 5 base cases per value strategy (one-shot)
-#   constraint_solver  - Gating condition satisfaction
-#   direct_paragraph   - 6-phase rotation: param, stub, dataflow, frontier, harvest, inverse
-#   branch_solver      - Condition-variable satisfaction per branch
-#   fault_injection    - Sweep all stub ops x fault values (one-shot)
-#   stub_walk          - Frozen inputs + pairwise fault combos (one-shot)
-#   guided_mutation    - Random walks from high-coverage test cases
-#   monte_carlo        - Random exploration with domain-aware inputs
-#   llm_seed           - LLM-generated initial seeds (one-shot, needs LLM)
-#   llm_runtime        - LLM runtime steering with code slices (needs LLM)
-#   intent_driven      - LLM business-scenario generation (one-shot, needs LLM)
+#   direct_paragraph   - 7-phase rotation with chain constraint solver
+#   corpus_fuzz        - AFL-inspired coverage-guided fuzzing with power schedule
+#   fault_injection    - Sweep stub ops x fault values (one-shot)
