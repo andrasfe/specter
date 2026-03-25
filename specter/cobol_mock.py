@@ -294,6 +294,23 @@ def _resolve_copies(
         if found:
             result.append(f"      * SPECTER: COPY {copyname} inlined from {found.name}\n")
             copy_lines = found.read_text(errors="replace").splitlines(keepends=True)
+            # Pre-process: uncomment continuation lines inside VALUE clauses.
+            # Some mainframe copybooks have '*' in column 7 on continuation
+            # lines of multi-value 88-level clauses, which breaks GnuCOBOL.
+            in_value = False
+            for ci in range(len(copy_lines)):
+                cl_raw = copy_lines[ci]
+                cl_content = cl_raw[7:72].strip() if len(cl_raw) > 7 else cl_raw.strip()
+                cl_upper = cl_content.upper()
+                if "VALUE" in cl_upper and not cl_upper.startswith("*"):
+                    in_value = not cl_content.rstrip().endswith(".")
+                elif in_value:
+                    if len(cl_raw) > 6 and cl_raw[6] in ("*", "/"):
+                        # Uncomment: replace indicator with space
+                        copy_lines[ci] = cl_raw[:6] + " " + cl_raw[7:]
+                    if cl_content.rstrip().endswith("."):
+                        in_value = False
+
             for cl in copy_lines:
                 # Truncate to 72 columns — cols 73-80 are sequence numbers
                 # that GnuCOBOL would ignore but can corrupt when concatenated
