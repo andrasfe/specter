@@ -728,197 +728,6 @@ class TestStrategies:
         targets = [c[3] for c in cases]
         assert any("fault:" in t for t in targets)
 
-    def test_monte_carlo_respects_batch_size(self):
-        from specter.coverage_strategies import MonteCarloStrategy
-
-        s = MonteCarloStrategy()
-        ctx = self._make_mock_ctx()
-        cov = self._make_mock_cov()
-
-        cases = list(s.generate_cases(ctx, cov, 10))
-        assert len(cases) == 10
-
-    def test_guided_mutation_needs_test_cases(self):
-        from specter.coverage_strategies import GuidedMutationStrategy
-
-        s = GuidedMutationStrategy()
-        cov_empty = self._make_mock_cov(test_cases=[])
-        assert s.should_run(cov_empty, 0) is False
-
-        cov_with_tcs = self._make_mock_cov(test_cases=[
-            {"input_state": {"WS-CODE": "00"}, "paragraphs_hit": ["MAIN-PARA"]},
-        ])
-        assert s.should_run(cov_with_tcs, 0) is True
-
-    def test_constraint_solver_skips_when_all_covered(self):
-        from specter.coverage_strategies import ConstraintSolverStrategy
-
-        s = ConstraintSolverStrategy()
-        cov = self._make_mock_cov(paras_hit={"MAIN-PARA", "PROCESS", "EXIT-PARA"})
-        assert s.should_run(cov, 0) is False
-
-
-class TestStubWalkStrategy:
-    """Tests for StubWalkStrategy."""
-
-    def _make_mock_ctx(self, rng=None, stub_mapping=None):
-        from specter.coverage_strategies import StrategyContext
-
-        if rng is None:
-            rng = random.Random(42)
-        if stub_mapping is None:
-            stub_mapping = {
-                "READ:FILE1": ["FS-FILE1"],
-                "WRITE:FILE2": ["FS-FILE2"],
-            }
-
-        module = type("MockModule", (), {
-            "_default_state": staticmethod(lambda: {}),
-            "run": staticmethod(lambda s: s),
-        })()
-        context = type("MockContext", (), {
-            "branch_meta": {},
-            "total_paragraphs": 5,
-            "total_branches": 10,
-        })()
-        var_report = VariableReport(variables={
-            "WS-INPUT": VariableInfo(name="WS-INPUT", classification="input"),
-            "FS-FILE1": VariableInfo(name="FS-FILE1", classification="status"),
-            "FS-FILE2": VariableInfo(name="FS-FILE2", classification="status"),
-        })
-        domains = {
-            "WS-INPUT": VariableDomain(
-                name="WS-INPUT", data_type="alpha", max_length=5,
-                classification="input",
-            ),
-            "FS-FILE1": VariableDomain(
-                name="FS-FILE1", data_type="alpha", max_length=2,
-                classification="status", semantic_type="status_file",
-                set_by_stub="READ:FILE1",
-            ),
-            "FS-FILE2": VariableDomain(
-                name="FS-FILE2", data_type="alpha", max_length=2,
-                classification="status", semantic_type="status_file",
-                set_by_stub="WRITE:FILE2",
-            ),
-        }
-        program = type("MockProgram", (), {
-            "program_id": "TEST",
-            "paragraphs": [],
-        })()
-        call_graph = type("MockCallGraph", (), {
-            "edges": {}, "reverse_edges": {}, "entry": "MAIN-PARA",
-            "all_paragraphs": {"MAIN-PARA", "PROCESS", "EXIT-PARA"},
-        })()
-
-        return StrategyContext(
-            module=module, context=context, domains=domains,
-            stub_mapping=stub_mapping, call_graph=call_graph,
-            gating_conds={}, var_report=var_report, program=program,
-            all_paragraphs={"MAIN-PARA", "PROCESS", "EXIT-PARA"},
-            success_stubs={k: [[("FS-FILE1", "00")]] for k in stub_mapping},
-            success_defaults={k: [("FS-FILE1", "00")] for k in stub_mapping},
-            rng=rng, store_path=Path("/tmp/test_store.jsonl"),
-        )
-
-    def _make_mock_cov(self, test_cases=None, stub_mapping=None):
-        from specter.cobol_coverage import CoverageState
-        if stub_mapping is None:
-            stub_mapping = {"READ:FILE1": ["FS-FILE1"], "WRITE:FILE2": ["FS-FILE2"]}
-        return CoverageState(
-            paragraphs_hit={"MAIN-PARA"},
-            branches_hit=set(),
-            total_paragraphs=5, total_branches=10,
-            test_cases=test_cases or [],
-            all_paragraphs={"MAIN-PARA", "PROCESS", "EXIT-PARA"},
-            _stub_mapping=stub_mapping,
-        )
-
-    def test_should_run_requires_stubs_and_test_cases(self):
-        from specter.coverage_strategies import StubWalkStrategy
-
-        s = StubWalkStrategy()
-        # No test cases → should not run
-        cov_no_tc = self._make_mock_cov(test_cases=[])
-        assert s.should_run(cov_no_tc, 0) is False
-
-        # No stubs → should not run
-        cov_no_stubs = self._make_mock_cov(
-            test_cases=[{"input_state": {"WS-INPUT": "A"}, "paragraphs_hit": ["MAIN-PARA"]}],
-            stub_mapping={},
-        )
-        cov_no_stubs._stub_mapping = {}
-        assert s.should_run(cov_no_stubs, 0) is False
-
-        # Both present → should run
-        cov_ok = self._make_mock_cov(
-            test_cases=[{"input_state": {"WS-INPUT": "A"}, "paragraphs_hit": ["MAIN-PARA"]}],
-        )
-        assert s.should_run(cov_ok, 0) is True
-
-    def test_generates_single_faults_with_frozen_inputs(self):
-        from specter.coverage_strategies import StubWalkStrategy
-
-        s = StubWalkStrategy()
-        base_input = {"WS-INPUT": "HELLO"}
-        tc = {"input_state": base_input, "paragraphs_hit": ["MAIN-PARA", "PROCESS"]}
-        ctx = self._make_mock_ctx()
-        cov = self._make_mock_cov(test_cases=[tc])
-
-        cases = list(s.generate_cases(ctx, cov, 500))
-        assert len(cases) > 0
-
-        # All single-fault cases should use the frozen input
-        single_fault_cases = [c for c in cases if c[3].startswith("stubwalk:")]
-        assert len(single_fault_cases) > 0
-        for input_state, stubs, defaults, target in single_fault_cases:
-            assert input_state is base_input or input_state == base_input
-
-    def test_generates_pairwise_faults(self):
-        from specter.coverage_strategies import StubWalkStrategy
-
-        s = StubWalkStrategy()
-        tc = {"input_state": {"WS-INPUT": "X"}, "paragraphs_hit": ["MAIN-PARA"]}
-        ctx = self._make_mock_ctx()
-        cov = self._make_mock_cov(test_cases=[tc])
-
-        cases = list(s.generate_cases(ctx, cov, 500))
-        pair_cases = [c for c in cases if c[3].startswith("stubwalk-pair:")]
-        # 2 ops → C(2,2) = 1 combination per base → 1 pair case
-        assert len(pair_cases) == 1
-        # The pair target should mention both ops
-        assert "READ:FILE1" in pair_cases[0][3]
-        assert "WRITE:FILE2" in pair_cases[0][3]
-
-    def test_pairwise_stubs_have_two_faults(self):
-        from specter.coverage_strategies import StubWalkStrategy
-
-        s = StubWalkStrategy()
-        tc = {"input_state": {"WS-INPUT": "X"}, "paragraphs_hit": ["MAIN-PARA"]}
-        ctx = self._make_mock_ctx()
-        cov = self._make_mock_cov(test_cases=[tc])
-
-        cases = list(s.generate_cases(ctx, cov, 500))
-        pair_cases = [c for c in cases if c[3].startswith("stubwalk-pair:")]
-        assert len(pair_cases) >= 1
-
-        # Check that the stubs dict has non-success values for both ops
-        _, stubs, defaults, _ = pair_cases[0]
-        # Both ops should have entries in defaults
-        assert "READ:FILE1" in defaults
-        assert "WRITE:FILE2" in defaults
-        # At least one entry per faulted op should be non-success
-        for op_key in ("READ:FILE1", "WRITE:FILE2"):
-            entries = defaults[op_key]
-            values = [v for _, v in entries]
-            # Success for status_file is "00"; faulted should differ
-            assert any(v != "00" for v in values)
-
-    def test_priority_is_55(self):
-        from specter.coverage_strategies import StubWalkStrategy
-        assert StubWalkStrategy.priority == 55
-
-
 class TestExecuteAndSaveAppends:
     """Test that _execute_and_save appends to cov.test_cases."""
 
@@ -938,58 +747,6 @@ class TestExecuteAndSaveAppends:
         from specter.cobol_coverage import _execute_and_save
         source = inspect.getsource(_execute_and_save)
         assert "cov.test_cases.append" in source
-
-
-class TestBuildMultiFaultStubs:
-    """Tests for _build_multi_fault_stubs helper."""
-
-    def test_two_faults(self):
-        from specter.coverage_strategies import _build_multi_fault_stubs
-
-        stub_mapping = {
-            "READ:FILE1": ["FS-FILE1"],
-            "WRITE:FILE2": ["FS-FILE2"],
-            "READ:FILE3": ["FS-FILE3"],
-        }
-        domains = {
-            "FS-FILE1": VariableDomain(
-                name="FS-FILE1", data_type="alpha", max_length=2,
-                semantic_type="status_file",
-            ),
-            "FS-FILE2": VariableDomain(
-                name="FS-FILE2", data_type="alpha", max_length=2,
-                semantic_type="status_file",
-            ),
-            "FS-FILE3": VariableDomain(
-                name="FS-FILE3", data_type="alpha", max_length=2,
-                semantic_type="status_file",
-            ),
-        }
-        faults = {"READ:FILE1": "23", "WRITE:FILE2": "47"}
-        rng = random.Random(42)
-
-        outcomes, defaults = _build_multi_fault_stubs(stub_mapping, domains, faults, rng)
-
-        # Faulted ops should have fault values
-        assert defaults["READ:FILE1"] == [("FS-FILE1", "23")]
-        assert defaults["WRITE:FILE2"] == [("FS-FILE2", "47")]
-        # Non-faulted op should have success
-        assert defaults["READ:FILE3"] == [("FS-FILE3", "00")]
-
-    def test_empty_faults_all_success(self):
-        from specter.coverage_strategies import _build_multi_fault_stubs
-
-        stub_mapping = {"READ:FILE1": ["FS-FILE1"]}
-        domains = {
-            "FS-FILE1": VariableDomain(
-                name="FS-FILE1", data_type="alpha", max_length=2,
-                semantic_type="status_file",
-            ),
-        }
-        outcomes, defaults = _build_multi_fault_stubs(
-            stub_mapping, domains, {}, random.Random(1),
-        )
-        assert defaults["READ:FILE1"] == [("FS-FILE1", "00")]
 
 
 # ---------------------------------------------------------------------------
@@ -1312,12 +1069,12 @@ class TestHeuristicSelector:
         from specter.coverage_strategies import HeuristicSelector
         from specter.coverage_strategies import (
             BaselineStrategy,
-            MonteCarloStrategy,
+            FaultInjectionStrategy,
             StrategyYield,
         )
 
         selector = HeuristicSelector()
-        strategies = [MonteCarloStrategy(), BaselineStrategy()]
+        strategies = [FaultInjectionStrategy(), BaselineStrategy()]
 
         cov = CoverageState(
             total_paragraphs=10,
@@ -1326,7 +1083,7 @@ class TestHeuristicSelector:
             _stub_mapping={},
         )
 
-        # BaselineStrategy has priority 20, MonteCarloStrategy has 70
+        # BaselineStrategy has priority 20, FaultInjectionStrategy has 50
         strategy, batch = selector.select(strategies, cov, 0)
         assert strategy.name == "baseline"
 
@@ -1335,26 +1092,26 @@ class TestHeuristicSelector:
         from specter.coverage_strategies import HeuristicSelector
         from specter.coverage_strategies import (
             BaselineStrategy,
-            MonteCarloStrategy,
+            FaultInjectionStrategy,
             StrategyYield,
         )
 
         selector = HeuristicSelector()
         baseline = BaselineStrategy()
         baseline._ran = True  # Already ran, should_run returns False
-        mc = MonteCarloStrategy()
-        strategies = [mc, baseline]
+        fi = FaultInjectionStrategy()
+        strategies = [fi, baseline]
 
         cov = CoverageState(
             total_paragraphs=10,
             total_branches=20,
             all_paragraphs=set(),
-            _stub_mapping={},
+            _stub_mapping={"OP:KEY": ["VAR"]},
         )
 
-        # Since baseline already ran, monte_carlo should be picked
+        # Since baseline already ran, fault_injection should be picked
         strategy, batch = selector.select(strategies, cov, 1)
-        assert strategy.name == "monte_carlo"
+        assert strategy.name == "fault_injection"
 
 
 # ---------------------------------------------------------------------------

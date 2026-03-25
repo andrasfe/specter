@@ -102,14 +102,13 @@ class TestBuildStrategies:
         names = [s.name for s in strategies]
         assert "baseline" in names
         assert "direct_paragraph" in names
-        assert "monte_carlo" in names
-        assert "llm_runtime" not in names
+        assert "fault_injection" in names
 
     def test_explicit_strategies_list(self):
-        cfg = CoverageConfig(strategies=["baseline", "monte_carlo"])
+        cfg = CoverageConfig(strategies=["baseline", "fault_injection"])
         strategies = build_strategies(cfg)
         names = [s.name for s in strategies]
-        assert names == ["baseline", "monte_carlo"]
+        assert names == ["baseline", "fault_injection"]
 
     def test_from_rounds(self):
         cfg = CoverageConfig(rounds=[
@@ -125,19 +124,17 @@ class TestBuildStrategies:
         assert len(names) == 2
 
     def test_unknown_strategy_skipped(self):
-        cfg = CoverageConfig(strategies=["baseline", "nonexistent", "monte_carlo"])
+        cfg = CoverageConfig(strategies=["baseline", "nonexistent", "fault_injection"])
         strategies = build_strategies(cfg)
         names = [s.name for s in strategies]
         assert "baseline" in names
-        assert "monte_carlo" in names
+        assert "fault_injection" in names
         assert len(names) == 2
 
-    def test_llm_strategy_skipped_without_provider(self):
-        cfg = CoverageConfig(strategies=["baseline", "llm_runtime"])
+    def test_unknown_strategy_all_skipped(self):
+        cfg = CoverageConfig(strategies=["nonexistent", "also_missing"])
         strategies = build_strategies(cfg)
-        names = [s.name for s in strategies]
-        assert "baseline" in names
-        assert "llm_runtime" not in names
+        assert len(strategies) == 0
 
 
 class TestTerminationConfig:

@@ -203,38 +203,16 @@ def _get_strategy_registry() -> dict[str, Any]:
     """
     from .coverage_strategies import (
         BaselineStrategy,
-        BranchSolverStrategy,
-        ConstraintSolverStrategy,
+        CorpusFuzzStrategy,
         DirectParagraphStrategy,
         FaultInjectionStrategy,
-        GuidedMutationStrategy,
-        IntentDrivenStrategy,
-        LLMRuntimeSteeringStrategy,
-        LLMSeedStrategy,
-        MonteCarloStrategy,
-        StubWalkStrategy,
     )
 
     return {
         "baseline": lambda **kw: BaselineStrategy(),
-        "constraint_solver": lambda **kw: ConstraintSolverStrategy(),
         "direct_paragraph": lambda **kw: DirectParagraphStrategy(),
-        "branch_solver": lambda **kw: BranchSolverStrategy(),
+        "corpus_fuzz": lambda **kw: CorpusFuzzStrategy(),
         "fault_injection": lambda **kw: FaultInjectionStrategy(),
-        "stub_walk": lambda **kw: StubWalkStrategy(),
-        "guided_mutation": lambda **kw: GuidedMutationStrategy(),
-        "monte_carlo": lambda **kw: MonteCarloStrategy(),
-        "llm_seed": lambda **kw: LLMSeedStrategy(
-            kw["llm_provider"], kw.get("llm_model"),
-        ),
-        "llm_runtime": lambda **kw: LLMRuntimeSteeringStrategy(
-            kw["llm_provider"], kw.get("llm_model"),
-            max_calls=int(kw.get("max_calls", 5)),
-            min_stale_rounds=int(kw.get("min_stale_rounds", 3)),
-        ),
-        "intent_driven": lambda **kw: IntentDrivenStrategy(
-            kw["llm_provider"], kw.get("llm_model"),
-        ),
     }
 
 
@@ -260,12 +238,8 @@ def build_strategies(
     else:
         # Default set
         names = [
-            "baseline", "constraint_solver", "direct_paragraph",
-            "branch_solver", "fault_injection", "stub_walk",
-            "guided_mutation", "monte_carlo",
+            "baseline", "direct_paragraph", "corpus_fuzz", "fault_injection",
         ]
-        if llm_provider:
-            names.extend(["llm_runtime", "llm_seed", "intent_driven"])
 
     strategies = []
     for name in names:
@@ -279,12 +253,6 @@ def build_strategies(
         # Add LLM context
         params["llm_provider"] = llm_provider
         params["llm_model"] = llm_model
-
-        # Check if strategy needs LLM
-        needs_llm = name in ("llm_seed", "llm_runtime", "intent_driven")
-        if needs_llm and llm_provider is None:
-            log.info("Skipping LLM strategy '%s' (no provider)", name)
-            continue
 
         try:
             strategy = factory(**params)
@@ -302,12 +270,6 @@ def build_selector(
     var_report=None,
 ):
     """Instantiate the appropriate StrategySelector from config."""
-    from .coverage_strategies import HeuristicSelector, LLMSelector
+    from .coverage_strategies import HeuristicSelector
 
-    if config.selector == "llm" and llm_provider:
-        return LLMSelector(
-            llm_provider, llm_model,
-            default_batch_size=config.default_batch_size,
-            var_report=var_report,
-        )
     return HeuristicSelector(default_batch_size=config.default_batch_size)

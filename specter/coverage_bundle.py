@@ -984,9 +984,7 @@ def run_bundle(
     if coverage_config is None:
         coverage_config = CoverageConfig(
             strategies=[
-                "baseline", "fault_injection", "branch_solver",
-                "stub_walk", "guided_mutation",
-                "monte_carlo",
+                "baseline", "corpus_fuzz", "fault_injection",
             ],
         )
 

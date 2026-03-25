@@ -27,21 +27,13 @@ from .cobol_executor import (
 from .cobol_mock import generate_mock_data_ordered
 from .coverage_strategies import (
     BaselineStrategy,
-    BranchSolverStrategy,
-    ConstraintSolverStrategy,
+    CorpusFuzzStrategy,
     DirectParagraphStrategy,
     FaultInjectionStrategy,
-    GuidedMutationStrategy,
     HeuristicSelector,
-    IntentDrivenStrategy,
-    LLMRuntimeSteeringStrategy,
-    LLMSeedStrategy,
-    LLMSelector,
-    MonteCarloStrategy,
     Strategy,
     StrategyContext,
     StrategyYield,
-    StubWalkStrategy,
 )
 from .models import Program
 from .static_analysis import (
@@ -1216,32 +1208,15 @@ def run_cobol_coverage(
     else:
         strategies: list[Strategy] = [
             BaselineStrategy(),
-            ConstraintSolverStrategy(),
             DirectParagraphStrategy(),
-            BranchSolverStrategy(),
+            CorpusFuzzStrategy(),
             FaultInjectionStrategy(),
-            StubWalkStrategy(),
-            GuidedMutationStrategy(),
-            MonteCarloStrategy(),
         ]
-        if llm_provider:
-            strategies.append(LLMRuntimeSteeringStrategy(llm_provider, llm_model))
-            if not strict_branch_coverage:
-                strategies.extend([
-                    LLMSeedStrategy(llm_provider, llm_model),
-                    IntentDrivenStrategy(llm_provider, llm_model),
-                ])
 
     if coverage_config.selector != "heuristic" or coverage_config.rounds:
         selector = build_selector(coverage_config, llm_provider, llm_model, var_report)
     else:
-        selector = (
-            LLMSelector(llm_provider, llm_model,
-                         default_batch_size=batch_size,
-                         var_report=var_report)
-            if llm_provider and not strict_branch_coverage
-            else HeuristicSelector(default_batch_size=batch_size)
-        )
+        selector = HeuristicSelector(default_batch_size=batch_size)
 
     loop_start_time = time.time()
     setup_elapsed = loop_start_time - setup_start
@@ -1767,16 +1742,10 @@ def run_coverage(
     else:
         strategies: list[Strategy] = [
             BaselineStrategy(),
-            ConstraintSolverStrategy(),
             DirectParagraphStrategy(),
-            BranchSolverStrategy(),
+            CorpusFuzzStrategy(),
             FaultInjectionStrategy(),
-            StubWalkStrategy(),
-            GuidedMutationStrategy(),
-            MonteCarloStrategy(),
         ]
-        if llm_provider:
-            strategies.append(LLMRuntimeSteeringStrategy(llm_provider, llm_model))
 
     # Skip _LLMSeedInjector if seeds were already executed live via callback
     if llm_seeds and not _seeds_executed_live:
@@ -1785,13 +1754,7 @@ def run_coverage(
     if coverage_config.selector != "heuristic" or coverage_config.rounds:
         selector = build_selector(coverage_config, llm_provider, llm_model, var_report)
     else:
-        selector = (
-            LLMSelector(llm_provider, llm_model,
-                         default_batch_size=batch_size,
-                         var_report=var_report)
-            if llm_provider
-            else HeuristicSelector(default_batch_size=batch_size)
-        )
+        selector = HeuristicSelector(default_batch_size=batch_size)
 
     loop_start_time = time.time()
     setup_elapsed = loop_start_time - setup_start
