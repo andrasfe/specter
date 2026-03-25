@@ -209,6 +209,15 @@ def prepare_context(
                 if missing:
                     from .cobol_mock import _inject_fallback_paragraphs
 
+                    # Filter out symbols already defined as paragraphs
+                    existing = set()
+                    for ln in source_text.splitlines():
+                        stripped = ln[7:72].strip() if len(ln) > 7 else ln.strip()
+                        m = re.match(r"^([A-Z0-9][A-Z0-9-]*)\s*\.", stripped, re.IGNORECASE)
+                        if m:
+                            existing.add(m.group(1).upper())
+                    missing = missing - existing
+
                     lines = source_text.splitlines(keepends=True)
                     lines = _inject_fallback_paragraphs(lines, sorted(missing))
                     source_text = "".join(lines)
