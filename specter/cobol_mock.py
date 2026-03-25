@@ -294,30 +294,43 @@ def _resolve_copies(
         if found:
             result.append(f"      * SPECTER: COPY {copyname} inlined from {found.name}\n")
             copy_lines = found.read_text(errors="replace").splitlines(keepends=True)
-            # Pre-process: uncomment continuation lines inside VALUE clauses.
-            # Some mainframe copybooks have '*' in column 7 on continuation
-            # lines of multi-value 88-level clauses, which breaks GnuCOBOL.
-            # Only uncomment if the content looks like value data (numbers, THRU).
+            # Pre-process: fix VALUE clause continuation issues.
+            # Mainframe copybooks have comments interspersed in multi-line
+            # VALUE clauses (88-levels). GnuCOBOL breaks on these because
+            # comments inside a VALUE clause terminate parsing. We either:
+            # - Remove separator comments (like *PIC---* or *---*)
+            # - Uncomment continuation lines that contain value data
             _value_cont_re = re.compile(
                 r"^\s*\d[\d\s]*(?:THRU\s+\d+)?[\s.]*$", re.IGNORECASE,
+            )
+            _separator_comment_re = re.compile(
+                r"^\s*[-*=_.A-Z]+\s*$", re.IGNORECASE,
             )
             in_value = False
             for ci in range(len(copy_lines)):
                 cl_raw = copy_lines[ci]
                 cl_content = cl_raw[7:72].strip() if len(cl_raw) > 7 else cl_raw.strip()
                 cl_upper = cl_content.upper()
-                if "VALUE" in cl_upper and not cl_upper.startswith("*"):
+                is_comment = len(cl_raw) > 6 and cl_raw[6] in ("*", "/")
+
+                if not is_comment and "VALUE" in cl_upper:
                     in_value = not cl_content.rstrip().endswith(".")
                 elif in_value:
-                    if len(cl_raw) > 6 and cl_raw[6] in ("*", "/"):
-                        # Only uncomment if content looks like value data
-                        if _value_cont_re.match(cl_content):
+                    if is_comment:
+                        # Check if this is a separator comment inside a VALUE clause
+                        # like *PIC---* or *----* or *M.A.V.---*
+                        # These break GnuCOBOL's VALUE parsing — blank them out
+                        if _separator_comment_re.match(cl_content):
+                            copy_lines[ci] = cl_raw[:6] + "*\n"
+                        elif _value_cont_re.match(cl_content):
+                            # Uncomment: this is actual value data
                             copy_lines[ci] = cl_raw[:6] + " " + cl_raw[7:]
-                        else:
-                            # Prose comment — end the VALUE tracking
+                        # Don't end in_value for comments — skip them
+                    elif not cl_content:
+                        pass  # blank line, skip
+                    else:
+                        if cl_content.rstrip().endswith("."):
                             in_value = False
-                    if cl_content.rstrip().endswith("."):
-                        in_value = False
 
             for cl in copy_lines:
                 # Truncate to 72 columns — cols 73-80 are sequence numbers
