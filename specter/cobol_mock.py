@@ -192,6 +192,9 @@ def instrument_cobol(
     # not choke on legacy encoded literals in transformed sources.
     lines = _sanitize_source_ascii(lines)
 
+    # Phase 14: Fix OCCURS DEPENDING ON without TO clause for GnuCOBOL compat.
+    lines = _fix_occurs_depending_on(lines)
+
     result_source = "".join(lines)
 
     return InstrumentResult(
@@ -2918,6 +2921,58 @@ def _sanitize_source_ascii(lines: list[str]) -> list[str]:
         sanitized = "".join(sanitized_chars)
         out.append(sanitized + ("\n" if has_nl else ""))
     return out
+
+
+def _fix_occurs_depending_on(lines: list[str]) -> list[str]:
+    """Fix OCCURS n DEPENDING ON without TO clause for GnuCOBOL.
+
+    Mainframe COBOL allows ``OCCURS n DEPENDING ON var`` without a TO phrase,
+    but GnuCOBOL requires ``OCCURS 1 TO n DEPENDING ON var``.  Also handles
+    ``OCCURS DEPENDING ON`` (no count at all) by inserting a default max.
+    """
+    result: list[str] = []
+    # Match: OCCURS <number> DEPENDING ON (without TO)
+    _occurs_n_dep = re.compile(
+        r"(OCCURS\s+)(\d+)(\s+DEPENDING\s+ON\b)",
+        re.IGNORECASE,
+    )
+    # Match: OCCURS DEPENDING ON (no number)
+    _occurs_dep_only = re.compile(
+        r"(OCCURS\s+)(DEPENDING\s+ON\b)",
+        re.IGNORECASE,
+    )
+    # Already has TO — skip
+    _occurs_to = re.compile(r"OCCURS\s+\d+\s+TO\s+\d+", re.IGNORECASE)
+
+    for line in lines:
+        content = line
+        if _occurs_to.search(content):
+            # Already has TO clause — leave alone
+            result.append(line)
+            continue
+
+        m = _occurs_n_dep.search(content)
+        if m:
+            # OCCURS 100 DEPENDING ON → OCCURS 1 TO 100 DEPENDING ON
+            n = m.group(2)
+            content = _occurs_n_dep.sub(
+                rf"\g<1>1 TO {n}\g<3>", content,
+            )
+            result.append(content)
+            continue
+
+        m2 = _occurs_dep_only.search(content)
+        if m2 and "OCCURS" in content.upper():
+            # OCCURS DEPENDING ON → OCCURS 1 TO 9999 DEPENDING ON
+            content = _occurs_dep_only.sub(
+                r"\g<1>1 TO 9999 \g<2>", content,
+            )
+            result.append(content)
+            continue
+
+        result.append(line)
+
+    return result
 
 
 def _normalize_paragraph_ellipsis(lines: list[str]) -> list[str]:
