@@ -297,6 +297,10 @@ def _resolve_copies(
             # Pre-process: uncomment continuation lines inside VALUE clauses.
             # Some mainframe copybooks have '*' in column 7 on continuation
             # lines of multi-value 88-level clauses, which breaks GnuCOBOL.
+            # Only uncomment if the content looks like value data (numbers, THRU).
+            _value_cont_re = re.compile(
+                r"^\s*\d[\d\s]*(?:THRU\s+\d+)?[\s.]*$", re.IGNORECASE,
+            )
             in_value = False
             for ci in range(len(copy_lines)):
                 cl_raw = copy_lines[ci]
@@ -306,8 +310,12 @@ def _resolve_copies(
                     in_value = not cl_content.rstrip().endswith(".")
                 elif in_value:
                     if len(cl_raw) > 6 and cl_raw[6] in ("*", "/"):
-                        # Uncomment: replace indicator with space
-                        copy_lines[ci] = cl_raw[:6] + " " + cl_raw[7:]
+                        # Only uncomment if content looks like value data
+                        if _value_cont_re.match(cl_content):
+                            copy_lines[ci] = cl_raw[:6] + " " + cl_raw[7:]
+                        else:
+                            # Prose comment — end the VALUE tracking
+                            in_value = False
                     if cl_content.rstrip().endswith("."):
                         in_value = False
 
@@ -317,6 +325,8 @@ def _resolve_copies(
                 # with code-area content during processing.
                 if len(cl.rstrip("\n\r")) > 72:
                     cl = cl[:72] + "\n"
+                # Fix non-standard abbreviations
+                cl = re.sub(r"\bP\.I\.C\.", "PIC", cl)
                 cooked = cl
                 for old, new in replacing_pairs:
                     cooked = cooked.replace(old, new)
