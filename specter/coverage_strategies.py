@@ -545,7 +545,7 @@ class LLMRuntimeSteeringStrategy(Strategy):
         llm_provider,
         llm_model: str | None = None,
         max_calls: int = 5,
-        min_stale_rounds: int = 1,
+        min_stale_rounds: int = 3,
     ):
         self.llm_provider = llm_provider
         self.llm_model = llm_model

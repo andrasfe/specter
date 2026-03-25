@@ -214,7 +214,7 @@ def _get_strategy_registry() -> dict[str, Any]:
         "llm_runtime": lambda **kw: LLMRuntimeSteeringStrategy(
             kw["llm_provider"], kw.get("llm_model"),
             max_calls=int(kw.get("max_calls", 5)),
-            min_stale_rounds=int(kw.get("min_stale_rounds", 1)),
+            min_stale_rounds=int(kw.get("min_stale_rounds", 3)),
         ),
         "intent_driven": lambda **kw: IntentDrivenStrategy(
             kw["llm_provider"], kw.get("llm_model"),
