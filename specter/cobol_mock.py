@@ -303,9 +303,10 @@ def _resolve_copies(
             _value_cont_re = re.compile(
                 r"^\s*\d[\d\s]*(?:THRU\s+\d+)?[\s.]*$", re.IGNORECASE,
             )
-            _separator_comment_re = re.compile(
-                r"^\s*[-*=_.A-Z]+\s*$", re.IGNORECASE,
-            )
+            # Separator comments: lines with 5+ consecutive dashes or equals
+            # (like *PIC---*, *---*, *M.A.V.---*, *TCS---2036---*).
+            # Must NOT match prose like **** GRCC START ****
+            _separator_comment_re = re.compile(r"-{5,}|={5,}")
             in_value = False
             for ci in range(len(copy_lines)):
                 cl_raw = copy_lines[ci]
@@ -317,15 +318,13 @@ def _resolve_copies(
                     in_value = not cl_content.rstrip().endswith(".")
                 elif in_value:
                     if is_comment:
-                        # Check if this is a separator comment inside a VALUE clause
-                        # like *PIC---* or *----* or *M.A.V.---*
-                        # These break GnuCOBOL's VALUE parsing — blank them out
-                        if _separator_comment_re.match(cl_content):
-                            copy_lines[ci] = cl_raw[:6] + "*\n"
-                        elif _value_cont_re.match(cl_content):
+                        if _value_cont_re.match(cl_content):
                             # Uncomment: this is actual value data
                             copy_lines[ci] = cl_raw[:6] + " " + cl_raw[7:]
-                        # Don't end in_value for comments — skip them
+                        elif _separator_comment_re.search(cl_content):
+                            # Separator comment (*---*, *PIC---*) — blank it
+                            copy_lines[ci] = cl_raw[:6] + "*\n"
+                        # else: prose comment — just skip, don't end in_value
                     elif not cl_content:
                         pass  # blank line, skip
                     else:
