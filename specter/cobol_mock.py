@@ -1291,22 +1291,26 @@ def _add_mock_infrastructure(
             result.insert(insert_at, entry)
 
     # --- Add FILE-CONTROL ---
-    fc_entry = (
-        f"{_B}SELECT MOCK-FILE ASSIGN TO\n"
-        f"{_CONT}'{config.mock_dd_name}'\n"
-        f"{_CONT}ORGANIZATION IS LINE SEQUENTIAL\n"
-        f"{_CONT}FILE STATUS IS MOCK-FILE-STATUS.\n"
-    )
+    # Each line must be a separate entry in result[] — multi-line strings
+    # get mangled by _sanitize_source_ascii which replaces \n with spaces.
+    fc_lines = [
+        f"{_B}SELECT MOCK-FILE ASSIGN TO\n",
+        f"{_CONT}'{config.mock_dd_name}'\n",
+        f"{_CONT}ORGANIZATION IS LINE SEQUENTIAL\n",
+        f"{_CONT}FILE STATUS IS MOCK-FILE-STATUS.\n",
+    ]
 
     fc_idx = divisions.get("file-control")
     if fc_idx is not None:
-        result.insert(fc_idx + 1, fc_entry)
+        for j, fl in enumerate(fc_lines):
+            result.insert(fc_idx + 1 + j, fl)
     else:
         io_idx = divisions.get("input-output")
         if io_idx is not None:
             # INPUT-OUTPUT SECTION exists but no FILE-CONTROL — add it
             result.insert(io_idx + 1, f"{_A}FILE-CONTROL.\n")
-            result.insert(io_idx + 2, fc_entry)
+            for j, fl in enumerate(fc_lines):
+                result.insert(io_idx + 2 + j, fl)
         else:
             # Need to add INPUT-OUTPUT SECTION + FILE-CONTROL
             env_idx = divisions.get("environment")
@@ -1319,8 +1323,7 @@ def _add_mock_infrastructure(
                 io_block = [
                     f"{_A}INPUT-OUTPUT SECTION.\n",
                     f"{_A}FILE-CONTROL.\n",
-                    fc_entry,
-                ]
+                ] + fc_lines
                 for entry in reversed(io_block):
                     result.insert(insert_at, entry)
 
@@ -1959,7 +1962,7 @@ def _add_fallback_symbols(lines: list[str]) -> list[str]:
                 out.insert(insert_at, d)
 
     if missing_paras:
-        stub_lines: list[str] = [f"\n{_CMT} SPECTER PATCH: auto paragraph stubs\n"]
+        stub_lines: list[str] = ["\n", f"{_CMT} SPECTER PATCH: auto paragraph stubs.\n"]
         for p in missing_paras:
             stub_lines.append(f"{_A}{p}.\n")
             stub_lines.append(f"{_B}EXIT.\n")
@@ -2355,7 +2358,7 @@ def _inject_fallback_paragraphs(lines: list[str], names: list[str]) -> list[str]
     if insert_at is None:
         insert_at = len(out)
 
-    stubs = [f"\n{_CMT} SPECTER PATCH: cobc-undefined paragraph stubs\n"]
+    stubs = ["\n", f"{_CMT} SPECTER PATCH: cobc-undefined paragraph stubs.\n"]
     for p in to_add:
         stubs.append(f"{_A}{p}.\n")
         stubs.append(f"{_B}EXIT.\n")

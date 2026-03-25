@@ -95,6 +95,10 @@ No dependencies beyond Python 3.9+ stdlib for core functionality. Optional: `z3-
 - In COBOL hybrid mode, direct paragraph strategies run through Python (fast), full-program strategies run through COBOL binary. Python branch IDs prefixed with `py:` to avoid collision with COBOL `@@B:` IDs.
 - End-to-end tests in `test_end_to_end.py` depend on external AST files (not in repo) and are auto-skipped when unavailable. Unit tests are self-contained.
 
+### Important: Fixing Bugs
+
+When bugs are found in generated output (Python, COBOL mock, Java), **always fix the generator**, never the generated code directly. The generated code is a product of the pipeline — fixing it directly will be overwritten on the next run and doesn't fix the root cause for other programs.
+
 ### Ralph Loops
 
 The `ralph-loops/` directory contains structured iteration workflows (`.md` files) for improving coverage on specific programs. Each loop defines: target program, goal metrics, diagnostic steps, and fix strategies. Used with the Ralph Loop plugin for automated iteration.
