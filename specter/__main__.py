@@ -110,8 +110,8 @@ def main(argv: list[str] | None = None) -> int:
         description="COBOL AST to executable Python code generator",
     )
     parser.add_argument(
-        "ast_file", nargs="+",
-        help="Path to JSON AST file(s) (.ast). Multiple files with --multi.",
+        "ast_file", nargs="*",
+        help="Path to JSON AST file(s) (.ast). Multiple files with --multi. Not needed with --run-bundle.",
     )
     parser.add_argument(
         "--output", "-o",
@@ -323,12 +323,68 @@ def main(argv: list[str] | None = None) -> int:
         metavar="PATH",
         help="YAML config file for strategy pipeline (strategy order, batch sizes, termination)",
     )
+    parser.add_argument(
+        "--export-bundle",
+        metavar="DIR",
+        help="Export portable coverage bundle (binary + spec) to directory",
+    )
+    parser.add_argument(
+        "--run-bundle",
+        metavar="DIR",
+        help="Run coverage from an exported bundle (no AST/source/copybooks needed)",
+    )
 
     args = parser.parse_args(argv)
 
     # --extract-tests: standalone operation, no AST needed
     if args.extract_tests:
         return _extract_tests(args.extract_tests, args.extract_format)
+
+    # --run-bundle: standalone operation, no AST needed
+    if args.run_bundle:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)-7s %(message)s",
+            datefmt="%H:%M:%S",
+            stream=sys.stderr,
+            force=True,
+        )
+
+        cov_config = None
+        if args.coverage_config:
+            from .coverage_config import load_config
+            cov_config = load_config(args.coverage_config)
+
+        llm_prov = None
+        if args.llm_provider:
+            from .llm_coverage import get_llm_provider
+            try:
+                llm_prov = get_llm_provider(
+                    provider_name=args.llm_provider, model=args.llm_model,
+                )
+            except Exception:
+                pass
+
+        from .coverage_bundle import run_bundle
+        store = Path(args.test_store) if args.test_store else None
+        print(f"Running coverage from bundle: {args.run_bundle}/")
+        try:
+            cov_report = run_bundle(
+                bundle_dir=args.run_bundle,
+                store_path=store,
+                budget=args.coverage_budget,
+                timeout=args.coverage_timeout,
+                seed=args.seed,
+                coverage_config=cov_config,
+                llm_provider=llm_prov,
+                llm_model=args.llm_model,
+            )
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
+        print()
+        print(cov_report.summary())
+        return 0
 
     # --extract-docs: needs generated .py (ast_file used as .py path) + JSONL
     if args.extract_docs:
@@ -492,7 +548,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Project: {project_path}")
         return 0
 
-    source_path = Path(args.ast_file[0])
+    if not args.ast_file:
+        if not args.run_bundle:
+            print("Error: AST file required (unless using --run-bundle)", file=sys.stderr)
+            return 1
+        # --run-bundle doesn't need AST — handled above, but check ordering
+        pass
+    source_path = Path(args.ast_file[0]) if args.ast_file else Path(".")
     cobol_suffixes = {".cbl", ".cob", ".cobol"}
 
     # Convenience auto-detect: treat .cbl/.cob input as mock mode when related
@@ -555,6 +617,48 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"    - {w}")
             if len(result.warnings) > 20:
                 print(f"    - ... and {len(result.warnings) - 20} more")
+        return 0
+
+    # --export-bundle: export portable coverage bundle
+    if args.export_bundle:
+        if not args.cobol_source:
+            print("Error: --export-bundle requires --cobol-source PATH", file=sys.stderr)
+            return 1
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)-7s %(message)s",
+            datefmt="%H:%M:%S",
+            stream=sys.stderr,
+            force=True,
+        )
+
+        llm_prov = None
+        if args.llm_provider:
+            from .llm_coverage import get_llm_provider
+            try:
+                llm_prov = get_llm_provider(
+                    provider_name=args.llm_provider, model=args.llm_model,
+                )
+                print(f"  LLM provider: {type(llm_prov).__name__}")
+            except Exception as e:
+                print(f"  Warning: LLM init failed: {e}", file=sys.stderr)
+
+        from .coverage_bundle import export_bundle
+        print(f"Exporting coverage bundle → {args.export_bundle}/")
+        try:
+            bundle_dir = export_bundle(
+                ast_file=source_path,
+                cobol_source=Path(args.cobol_source),
+                copybook_dirs=[Path(d) for d in args.copybook_dir],
+                output_dir=args.export_bundle,
+                llm_provider=llm_prov,
+                llm_model=args.llm_model,
+            )
+            print(f"Bundle exported: {bundle_dir}")
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 2
         return 0
 
     # --cobol-validate-store: validate a Python-generated test store against COBOL
