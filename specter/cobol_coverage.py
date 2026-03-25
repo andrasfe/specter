@@ -1708,7 +1708,13 @@ def run_coverage(
 
     llm_seeds: list[dict] = []
     _seeds_executed_live = False
-    if llm_provider:
+    # Only generate seeds if llm_seed strategy is in the config (or default)
+    _want_seeds = True
+    if coverage_config and coverage_config.strategies:
+        _want_seeds = "llm_seed" in coverage_config.strategies
+    if coverage_config and coverage_config.rounds:
+        _want_seeds = any(r.strategy == "llm_seed" for r in coverage_config.rounds)
+    if llm_provider and _want_seeds:
         seed_cache = store_path.with_name(store_path.stem + "_seeds.json")
         llm_seeds = generate_seeds_from_analysis(
             analysis, llm_provider, llm_model,
