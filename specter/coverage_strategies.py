@@ -2161,7 +2161,190 @@ class DirectParagraphStrategy(Strategy):
                         break  # found chain for this branch
 
     # ------------------------------------------------------------------
-    # Main: rotate param → stub → dataflow → frontier → harvest → inverse
+    # ------------------------------------------------------------------
+    # Chain constraint round: solve EVALUATE/if-elif chains
+    # ------------------------------------------------------------------
+
+    def _chain_constraint_round(self, ctx, cov, batch_size, branch_meta) -> Iterator[CaseT]:
+        """For uncovered branches inside if/elif chains, compute the compound
+        state needed by negating all prior conditions in the chain.
+
+        This handles cases like EVALUATE TRUE with multiple WHEN clauses
+        where reaching the Nth clause requires all N-1 prior clauses to be false.
+        """
+        if ctx.module is None:
+            return
+
+        from .monte_carlo import _run_paragraph_directly
+
+        default_state_fn = getattr(ctx.module, "_default_state", None)
+        ds = default_state_fn() if default_state_fn else {}
+        source = ""
+        module_file = getattr(ctx.module, "__file__", None)
+        if module_file:
+            try:
+                source = open(module_file).read()
+            except OSError:
+                return
+
+        yielded = 0
+        # Find EVALUATE-type branches that are uncovered
+        eval_groups: dict[str, list[tuple[int, str, dict]]] = {}
+        for bid, meta in branch_meta.items():
+            if meta.get("type") != "EVALUATE":
+                continue
+            para = meta.get("paragraph", "")
+            eval_groups.setdefault(para, []).append((bid, "T", meta))
+
+        for para, branches in eval_groups.items():
+            # Find uncovered T-direction branches in this EVALUATE
+            uncovered_bids = []
+            covered_bids = []
+            for bid, direction, meta in branches:
+                bkey = f"{bid}:{direction}"
+                if bkey not in cov.branches_hit:
+                    uncovered_bids.append((bid, meta))
+                else:
+                    covered_bids.append((bid, meta))
+
+            if not uncovered_bids:
+                continue
+
+            # For each uncovered WHEN, build state where:
+            # - All prior WHEN conditions are False
+            # - The target WHEN condition is True
+            # - Any gating conditions above the EVALUATE are satisfied
+            for target_bid, target_meta in uncovered_bids:
+                if yielded >= batch_size:
+                    return
+
+                cond = target_meta.get("condition", "")
+                state = dict(ds)
+
+                # Set the target condition variable to True
+                cond_var = cond.strip().upper()
+                if cond_var and cond_var != "OTHER":
+                    state[cond_var] = True
+
+                # Negate all prior WHEN conditions (lower bid = earlier in chain)
+                for prior_bid, _, prior_meta in branches:
+                    if prior_bid >= target_bid:
+                        continue
+                    prior_cond = prior_meta.get("condition", "").strip().upper()
+                    if prior_cond and prior_cond != "OTHER":
+                        # Handle compound OR conditions
+                        for part in prior_cond.split(" OR "):
+                            part = part.strip()
+                            if part:
+                                state[part] = False
+
+                # Set up gating: the EVALUATE is inside an IF block
+                # that checks AUTH-RESP-DECLINED, DECLINE-AUTH, etc.
+                # Use branch_meta to find the enclosing IF conditions
+                for gating_bid, gating_meta in branch_meta.items():
+                    if (gating_meta.get("paragraph") == para
+                            and gating_meta.get("type") == "IF"):
+                        gating_cond = gating_meta.get("condition", "").strip().upper()
+                        if gating_cond:
+                            # If this gating branch is covered in T direction,
+                            # the condition must be true to reach the EVALUATE
+                            gating_bkey = f"{gating_bid}:T"
+                            if gating_bkey in cov.branches_hit:
+                                state[gating_cond] = True
+
+                # Inject MQ constants
+                from .cobol_coverage import _MQ_CONSTANTS
+                for name, value in _MQ_CONSTANTS.items():
+                    if name.upper() in ds:
+                        state[name.upper()] = value
+
+                # Ensure stub outcomes are available
+                stubs = dict(ctx.success_stubs)
+                defaults = dict(ctx.success_defaults)
+
+                yield (state, stubs, defaults,
+                       f"direct:{para}|chain:{target_bid}")
+                yielded += 1
+
+                # Also try with perturbations
+                for trial in range(min(5, batch_size - yielded)):
+                    perturbed = dict(state)
+                    # Randomly flip a few non-critical variables
+                    for var in list(ds.keys())[:20]:
+                        if var not in state and ctx.rng.random() < 0.2:
+                            dom = ctx.domains.get(var)
+                            if dom and dom.condition_literals:
+                                perturbed[var] = ctx.rng.choice(dom.condition_literals)
+                    yield (perturbed, stubs, defaults,
+                           f"direct:{para}|chain-perturb:{target_bid}:{trial}")
+                    yielded += 1
+
+        # Also handle IF branches with compound state requirements
+        # (e.g., loop counters, pre-loaded flags)
+        for bid, meta in branch_meta.items():
+            if yielded >= batch_size:
+                return
+            if meta.get("type") != "IF":
+                continue
+            para = meta.get("paragraph", "")
+            for direction in ("T", "F"):
+                bkey = f"{bid}:{direction}"
+                if bkey in cov.branches_hit:
+                    continue
+                cond = meta.get("condition", "").strip()
+                if not cond:
+                    continue
+
+                state = dict(ds)
+                # Parse comparison: VAR > VAR2 or VAR = LITERAL
+                import re
+                m = re.match(r"([A-Z0-9-]+)\s*(>|<|=|NOT\s*=|>=|<=)\s*(.+)", cond, re.I)
+                if m:
+                    lhs = m.group(1).strip().upper()
+                    op = m.group(2).strip().upper()
+                    rhs = m.group(3).strip().upper()
+
+                    if direction == "T":
+                        # Make the condition true
+                        if ">" in op and "=" not in op:
+                            state[lhs] = 999999
+                            if rhs in ds:
+                                state[rhs] = 0
+                        elif "NOT" in op:
+                            state[lhs] = "MISMATCH"
+                        elif "=" in op:
+                            if rhs in ds:
+                                state[lhs] = state.get(rhs, 0)
+                            else:
+                                try:
+                                    state[lhs] = int(rhs)
+                                except ValueError:
+                                    state[lhs] = rhs
+                    else:
+                        # Make the condition false
+                        if ">" in op and "=" not in op:
+                            state[lhs] = 0
+                            if rhs in ds:
+                                state[rhs] = 999999
+                        elif "NOT" in op:
+                            if rhs in ds:
+                                state[lhs] = state.get(rhs, 0)
+                        elif "=" in op:
+                            state[lhs] = "MISMATCH_VALUE"
+
+                # Inject MQ constants
+                for name, value in _MQ_CONSTANTS.items():
+                    if name.upper() in ds:
+                        state[name.upper()] = value
+
+                stubs = dict(ctx.success_stubs)
+                defaults = dict(ctx.success_defaults)
+                yield (state, stubs, defaults,
+                       f"direct:{para}|chain-if:{bid}:{direction}")
+                yielded += 1
+
+    # ------------------------------------------------------------------
+    # Main: rotate param → stub → dataflow → frontier → harvest → inverse → chain
     # ------------------------------------------------------------------
 
     def generate_cases(self, ctx, cov, batch_size) -> Iterator[CaseT]:
@@ -2169,9 +2352,13 @@ class DirectParagraphStrategy(Strategy):
         if not branch_meta:
             return
 
-        n_phases = 6
+        n_phases = 7
         phase = self._round % n_phases
-        if phase == 0:
+        # Run chain constraint solver on first round (phase 0) to hit
+        # compound-state branches early, then rotate normally
+        if self._round == 0:
+            yield from self._chain_constraint_round(ctx, cov, batch_size, branch_meta)
+        elif phase == 0:
             yield from self._param_round(ctx, cov, batch_size, branch_meta)
         elif phase == 1:
             if ctx.stub_mapping:
@@ -2186,6 +2373,8 @@ class DirectParagraphStrategy(Strategy):
             yield from self._harvest_round(ctx, cov, batch_size, branch_meta)
         elif phase == 5:
             yield from self._inverse_round(ctx, cov, batch_size, branch_meta)
+        elif phase == 6:
+            yield from self._chain_constraint_round(ctx, cov, batch_size, branch_meta)
         else:
             yield from self._param_round(ctx, cov, batch_size, branch_meta)
 
