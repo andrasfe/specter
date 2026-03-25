@@ -2344,9 +2344,14 @@ def _inject_fallback_paragraphs(lines: list[str], names: list[str]) -> list[str]
     para_defs: set[str] = set()
     for line in lines:
         c = _get_cobol_content(line).upper().strip()
-        m = re.match(r"^([A-Z0-9][A-Z0-9-]*)\.$", c)
+        # Match paragraph labels: NAME. or NAME followed by whitespace
+        m = re.match(r"^([A-Z0-9][A-Z0-9-]*)\s*\.", c)
         if m:
             para_defs.add(m.group(1))
+        # Also catch DISPLAY 'SPECTER-TRACE:NAME' as proof of existing stub
+        m2 = re.search(r"SPECTER-TRACE:([A-Z0-9][A-Z0-9-]*)", c)
+        if m2:
+            para_defs.add(m2.group(1))
 
     seen: set[str] = set()
     to_add: list[str] = []
