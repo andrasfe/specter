@@ -365,19 +365,33 @@ def generate_seeds_from_analysis(
     """
     from .llm_coverage import LLMUnrecoverableAuthError, _query_llm_sync
 
-    # Check cache
-    if cache_path and use_cache:
-        cache_path = Path(cache_path)
-        if cache_path.exists():
-            try:
-                cached = json.loads(cache_path.read_text())
-                if cached:
-                    log.info("Loaded %d seeds from cache: %s", len(cached), cache_path)
-                    return cached
-            except (json.JSONDecodeError, KeyError):
-                pass
+    # Check cache — supports both complete cache (list) and incremental
+    # progress cache (dict with batch_index + seeds).
+    cache_p = Path(cache_path) if cache_path else None
+    resume_from_batch = 0
 
-    all_seeds: list[dict] = []
+    if cache_p and use_cache and cache_p.exists():
+        try:
+            cached = json.loads(cache_p.read_text())
+            if isinstance(cached, list) and cached:
+                # Complete cache from a finished run
+                log.info("Loaded %d seeds from cache: %s", len(cached), cache_p)
+                return cached
+            if isinstance(cached, dict) and "seeds" in cached:
+                # Incremental progress — resume from next batch
+                resume_from_batch = cached.get("batch_index", 0) + 1
+                all_seeds_so_far = cached.get("seeds", [])
+                log.info("Resuming seed generation from batch %d (%d seeds so far): %s",
+                         resume_from_batch, len(all_seeds_so_far), cache_p)
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    all_seeds: list[dict] = all_seeds_so_far if resume_from_batch > 0 else []
+
+    # Execute previously cached seeds if resuming and callback is available
+    if resume_from_batch > 0 and all_seeds and on_batch_ready:
+        log.info("Executing %d previously cached seeds ...", len(all_seeds))
+        on_batch_ready(all_seeds)
 
     # Sort paragraphs by branch count (most complex first)
     sorted_paras = sorted(
@@ -410,10 +424,13 @@ def generate_seeds_from_analysis(
     # Process in batches
     total_batches = (len(sorted_paras) + batch_size - 1) // batch_size
     for batch_start in range(0, len(sorted_paras), batch_size):
+        batch_num = batch_start // batch_size
+        if batch_num < resume_from_batch:
+            continue  # skip already-completed batches
+
         batch = sorted_paras[batch_start:batch_start + batch_size]
-        batch_num = batch_start // batch_size + 1
         log.info("Seed generation: batch %d/%d (paragraphs %d-%d, %d seeds so far)",
-                 batch_num, total_batches,
+                 batch_num + 1, total_batches,
                  batch_start, batch_start + len(batch), len(all_seeds))
 
         para_block = []
@@ -472,14 +489,21 @@ Respond in YAML format (easier to parse than JSON):
             # Execute seeds immediately if callback is provided
             if on_batch_ready and seeds_batch:
                 on_batch_ready(seeds_batch)
+            # Save incremental progress so we can resume after interruption
+            if cache_p:
+                cache_p.parent.mkdir(parents=True, exist_ok=True)
+                cache_p.write_text(json.dumps(
+                    {"batch_index": batch_num, "seeds": all_seeds},
+                    default=str,
+                ))
         except Exception as e:
             if isinstance(e, LLMUnrecoverableAuthError):
                 raise
             log.warning("LLM seed generation failed for batch %d: %s", batch_start, e)
 
-    # Cache results
-    if cache_path and use_cache and all_seeds:
-        cache_p = Path(cache_path)
+    # Finalize cache — write complete list (not incremental dict) so next
+    # run treats it as a finished cache and skips generation entirely.
+    if cache_p and all_seeds:
         cache_p.parent.mkdir(parents=True, exist_ok=True)
         cache_p.write_text(json.dumps(all_seeds, indent=2, default=str))
         log.info("Cached %d seeds to %s", len(all_seeds), cache_p)
