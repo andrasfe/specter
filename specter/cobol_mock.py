@@ -2348,7 +2348,15 @@ def _inject_fallback_paragraphs(lines: list[str], names: list[str]) -> list[str]
         if m:
             para_defs.add(m.group(1))
 
-    to_add = [n for n in names if n not in para_defs and re.match(r"^[A-Z0-9-]+$", n)]
+    seen: set[str] = set()
+    to_add: list[str] = []
+    for n in names:
+        if (n not in para_defs
+                and n not in seen
+                and re.match(r"^[A-Z0-9][A-Z0-9-]*[A-Z0-9]$", n)  # no trailing -
+                and len(n) <= 30):  # COBOL paragraph name length limit
+            to_add.append(n)
+            seen.add(n)
     if not to_add:
         return lines
 
@@ -2765,10 +2773,19 @@ def _hard_comment_procedure(lines: list[str]) -> list[str]:
     insert_at = proc_idx + 1
     stub = [f"{_A}PROCEDURE DIVISION.\n", f"{_A}SPECTER-HARDENED-ENTRY.\n"]
     if para_names:
+        # Filter out invalid paragraph names (trailing -, too long, duplicates)
+        valid_names: list[str] = []
+        seen_names: set[str] = set()
         for name in para_names:
+            if (re.match(r"^[A-Z0-9][A-Z0-9-]*[A-Z0-9]$", name, re.IGNORECASE)
+                    and len(name) <= 30
+                    and name.upper() not in seen_names):
+                valid_names.append(name)
+                seen_names.add(name.upper())
+        for name in valid_names:
             stub.append(f"{_B}PERFORM {name}.\n")
         stub.append(f"{_B}GOBACK.\n")
-        for name in para_names:
+        for name in valid_names:
             stub.extend([
                 f"{_A}{name}.\n",
                 f"{_B}DISPLAY 'SPECTER-TRACE:{name}'.\n",
@@ -3267,7 +3284,7 @@ def compile_cobol(
     if output_path is None:
         output_path = source_path.with_suffix("")
 
-    cmd = ["cobc", "-x", "-o", str(output_path), str(source_path)]
+    cmd = ["cobc", "-x", "-Wno-dialect", "-o", str(output_path), str(source_path)]
 
     if copybook_dirs:
         for d in copybook_dirs:
