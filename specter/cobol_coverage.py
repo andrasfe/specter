@@ -1631,9 +1631,12 @@ def run_coverage(
     tc_count = len(existing_tcs)
 
     # Callback: execute each seed batch immediately and report coverage
+    _seed_exec_count = 0
+
     def _execute_seed_batch(seeds_batch: list[dict]) -> None:
-        nonlocal tc_count
+        nonlocal tc_count, _seed_exec_count
         for seed_data in seeds_batch:
+            _seed_exec_count += 1
             input_state = {}
             for var, val in seed_data.get("input_values", {}).items():
                 dom = domains.get(var.upper())
@@ -1696,6 +1699,12 @@ def run_coverage(
             if new_branches:
                 log.info("  [llm_seeds] +%d branches -> %d/%d",
                          len(new_branches), len(cov.branches_hit), cov.total_branches)
+
+        # Always log batch summary so user sees progress
+        log.info("  [llm_seeds] executed %d seeds: %d/%d paras, %d/%d branches",
+                 _seed_exec_count,
+                 len(cov.paragraphs_hit), cov.total_paragraphs,
+                 len(cov.branches_hit), cov.total_branches)
 
     llm_seeds: list[dict] = []
     _seeds_executed_live = False
