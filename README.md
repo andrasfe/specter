@@ -31,7 +31,14 @@ See [JAVAGEN.md](JAVAGEN.md) for full details on the Java generation approach, t
 
 ## Test Synthesis
 
-Specter generates test cases targeting maximum branch coverage using a strategy-based engine that rotates through six phases — parameter hill-climbing, stub fault sweeps, dataflow backpropagation, frontier expansion, rainbow-table harvest, and on-the-fly inverse function synthesis. See [ALGO.md](ALGO.md) for details.
+Specter generates test cases targeting maximum branch coverage using four strategies:
+
+- **DirectParagraphStrategy** — The main workhorse (~71% of test cases). Invokes each COBOL paragraph directly via the generated Python module, rotating through 7 phases: parameter hill-climbing, stub fault sweeps, dataflow backpropagation, frontier expansion, rainbow-table harvest, inverse function synthesis, and chain constraint solving for EVALUATE chains.
+- **CorpusFuzzStrategy** — AFL-inspired coverage-guided fuzzing with energy-based corpus scheduling. Maintains a deduplicated corpus of test cases selected for branch-coverage uniqueness, mutates seeds via a power schedule that favours rare-branch coverage.
+- **BaselineStrategy** — One-shot: generates 5 base cases across value strategies (condition_literal, semantic, boundary, random_valid, 88_value).
+- **FaultInjectionStrategy** — One-shot: sweeps stub operations with domain-aware fault values (DLI status codes, MQ completion codes, file status codes).
+
+**Results on CardDemo COPAUA0C**: 91/92 Python branches (98.9%), 20/20 test cases validated against GnuCOBOL (100% pass rate, 17/27 COBOL branches confirmed).
 
 There are two modes: **Python-only** (from AST alone) and **GnuCOBOL hybrid** (AST + COBOL source).
 
@@ -114,7 +121,7 @@ Each test case is a complete execution spec: input variables + mock orchestratio
 
 ### Strategy configuration
 
-The coverage engine supports 11 pluggable strategies. By default, a heuristic selector picks strategies based on yield history. You can override this with a YAML config file:
+The coverage engine supports 4 pluggable strategies. By default, a heuristic selector picks strategies based on yield history. You can override this with a YAML config file:
 
 ```bash
 specter COPAUA0C.cbl.ast --cobol-coverage \
@@ -130,12 +137,10 @@ rounds:
     batch_size: 500
   - strategy: direct_paragraph
     batch_size: 5000
+  - strategy: corpus_fuzz
+    batch_size: 2000
   - strategy: fault_injection
     batch_size: 500
-  - strategy: llm_runtime
-    batch_size: 100
-  - strategy: monte_carlo
-    batch_size: 2000
 loop_from: 1
 termination:
   max_stale_rounds: 10
@@ -149,11 +154,11 @@ selector: heuristic
 strategies:
   - baseline
   - direct_paragraph
+  - corpus_fuzz
   - fault_injection
-  - guided_mutation
 ```
 
-Available strategies: `baseline`, `constraint_solver`, `direct_paragraph`, `branch_solver`, `fault_injection`, `stub_walk`, `guided_mutation`, `monte_carlo`, `llm_seed`, `llm_runtime`, `intent_driven`.
+Available strategies: `baseline`, `direct_paragraph`, `corpus_fuzz`, `fault_injection`.
 
 **Seed generation** — control how LLM initial seeds are generated:
 
@@ -225,10 +230,14 @@ Replaces all EXEC CICS/SQL/DLI blocks, file I/O, and CALL statements with reads 
 Specter includes several codegen and coverage engine features that maximize branch reachability:
 
 - **EVALUATE :F probes** — Each WHEN clause gets both a True (matched) and False (not matched) branch ID, making EVALUATE coverage work like IF coverage.
+- **Chain constraint solver** — For EVALUATE chains where reaching the Nth clause requires all prior clauses to be false, automatically computes the compound state (e.g., `DECLINE-AUTH=True + INSUFFICIENT-FUND=False + ACCOUNT-CLOSED=True`).
 - **88-level mutual exclusivity** — `SET X TO TRUE` clears sibling 88-level flags. Siblings are discovered from copybook records, inline COBOL source scanning, and a FOUND/NFOUND naming heuristic.
 - **MQ-aware stubs** — IBM MQ constants (MQCC-OK=0, MQCC-FAILED=2, etc.) are injected into the execution state so comparisons like `WS-COMPCODE = MQCC-OK` work correctly with integer types.
-- **Backward slicer** — For LLM-guided strategies, a backward slicer extracts the minimal code path from paragraph entry to each uncovered branch. The LLM sees the actual Python execution path instead of just condition text.
-- **Boolean condition hints** — Variables appearing in `EVALUATE WHEN TRUE` as standalone conditions (e.g., `ACCOUNT-CLOSED`) automatically get `True`/`False` added to their domain, enabling the engine to try setting them.
+- **AFL-inspired corpus fuzzing** — Maintains a deduplicated corpus of branch-coverage-unique test cases, mutates seeds via a power schedule favouring rare-branch coverage, with 60% targeted mutations on uncovered branch conditions.
+- **Value harvesting** — Successful test case values are automatically propagated across all strategies via `dom.condition_literals`, so values discovered by one strategy benefit all others.
+- **Backward slicer** — Extracts the minimal code path from paragraph entry to each uncovered branch for LLM prompt context.
+- **Boolean condition hints** — Variables appearing in `EVALUATE WHEN TRUE` as standalone conditions automatically get `True`/`False` added to their domain.
+- **COBOL validation** — Two-pass workflow: fast Python synthesis followed by COBOL binary validation. 100% of generated test cases validated on CardDemo COPAUA0C.
 
 ## Requirements
 
