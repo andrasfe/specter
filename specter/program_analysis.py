@@ -370,15 +370,15 @@ def generate_seeds_from_analysis(
     cache_p = Path(cache_path) if cache_path else None
     resume_from_batch = 0
 
-    if cache_p and use_cache and cache_p.exists():
+    if cache_p and cache_p.exists():
         try:
             cached = json.loads(cache_p.read_text())
-            if isinstance(cached, list) and cached:
-                # Complete cache from a finished run
+            if isinstance(cached, list) and cached and use_cache:
+                # Complete cache from a finished run — only use if caching enabled
                 log.info("Loaded %d seeds from cache: %s", len(cached), cache_p)
                 return cached
             if isinstance(cached, dict) and "seeds" in cached:
-                # Incremental progress — resume from next batch
+                # Incremental progress — always resume (even with cache: false)
                 resume_from_batch = cached.get("batch_index", 0) + 1
                 all_seeds_so_far = cached.get("seeds", [])
                 log.info("Resuming seed generation from batch %d (%d seeds so far): %s",
