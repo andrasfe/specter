@@ -3353,6 +3353,7 @@ def compile_cobol(
         "-Wno-dialect",            # suppress dialect warnings
         "-frelax-syntax-checks",   # allow syntax variations
         "-frelax-level-hierarchy", # allow non-matching level numbers
+        "-fmax-errors=0",          # show all errors (don't stop at 128)
         "-o", str(output_path), str(source_path),
     ]
 
