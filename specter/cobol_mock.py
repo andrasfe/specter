@@ -295,6 +295,11 @@ def _resolve_copies(
             result.append(f"      * SPECTER: COPY {copyname} inlined from {found.name}\n")
             copy_lines = found.read_text(errors="replace").splitlines(keepends=True)
             for cl in copy_lines:
+                # Truncate to 72 columns — cols 73-80 are sequence numbers
+                # that GnuCOBOL would ignore but can corrupt when concatenated
+                # with code-area content during processing.
+                if len(cl.rstrip("\n\r")) > 72:
+                    cl = cl[:72] + "\n"
                 cooked = cl
                 for old, new in replacing_pairs:
                     cooked = cooked.replace(old, new)
