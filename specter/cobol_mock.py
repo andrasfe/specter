@@ -2813,6 +2813,23 @@ def _hard_comment_procedure(lines: list[str]) -> list[str]:
         ])
     for s in reversed(stub):
         out.insert(insert_at, s)
+
+    # Final pass: comment out any duplicate paragraph definitions that
+    # survived commenting (e.g., from COPY-expanded sections after proc_idx).
+    defined: set[str] = set()
+    _para_label_re = re.compile(r"^(\s{0,6}\s?)([A-Z0-9][A-Z0-9-]*)\s*\.\s*$", re.IGNORECASE)
+    for i, line in enumerate(out):
+        if len(line) > 6 and line[6] == "*":
+            continue  # already commented
+        c = _get_cobol_content(line).strip()
+        m = _para_label_re.match(c)
+        if m:
+            name = m.group(2).upper()
+            if name in defined:
+                out[i] = _comment_line(line)
+            else:
+                defined.add(name)
+
     return out
 
 
