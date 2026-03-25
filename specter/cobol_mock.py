@@ -1880,10 +1880,19 @@ def _add_fallback_symbols(lines: list[str]) -> list[str]:
             declared.add(m_fd.group(1))
 
     para_re = re.compile(r"^\s*([A-Z0-9][A-Z0-9-]*)\s*\.\s*$", re.IGNORECASE)
+    # Also match paragraphs with trailing content: NAME. DISPLAY ...
+    para_re2 = re.compile(r"^\s*([A-Z0-9][A-Z0-9-]*)\s*\.", re.IGNORECASE)
     para_defs: set[str] = set()
-    for line in proc_lines:
+    # Scan ALL lines (not just proc_lines) to catch paragraphs in all sections
+    for line in lines:
         c = _get_cobol_content(line).upper().strip()
-        m = para_re.match(c)
+        m = para_re.match(c) or para_re2.match(c)
+        if m:
+            para_defs.add(m.group(1))
+    # Also detect SPECTER-TRACE markers from prior stub insertions
+    for line in lines:
+        c = _get_cobol_content(line).upper()
+        m = re.search(r"SPECTER-TRACE:([A-Z0-9][A-Z0-9-]*)", c)
         if m:
             para_defs.add(m.group(1))
 
