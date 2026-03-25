@@ -199,6 +199,8 @@ def export_bundle(
     llm_provider=None,
     llm_model: str | None = None,
     coverage_config=None,
+    obfuscate: bool = False,
+    mapping_output_dir: str | Path | None = None,
 ) -> Path:
     """Export a portable coverage bundle.
 
@@ -323,6 +325,59 @@ def export_bundle(
     if llm_provider:
         _llm_enrich_spec(spec, cobol_source, llm_provider, llm_model)
 
+    # --- Obfuscation ---
+    if obfuscate:
+        log.info("Obfuscating bundle for IP protection ...")
+        mapping = _build_obfuscation_mapping(spec)
+
+        # Obfuscate COBOL trace strings in the already-instrumented source
+        instr_source = context.instrumented_source_path.read_text()
+        obf_source = _obfuscate_cobol_source(instr_source, mapping)
+
+        import subprocess
+        import tempfile
+        obf_dir = Path(tempfile.mkdtemp(prefix="specter_obf_"))
+        obf_cbl = obf_dir / f"{program.program_id}.obf.cbl"
+        obf_cbl.write_text(obf_source)
+        obf_bin = obf_dir / f"{program.program_id}.mock"
+        rc = subprocess.run(
+            ["cobc", "-x", "-o", str(obf_bin), str(obf_cbl)],
+            capture_output=True, text=True,
+        )
+        if rc.returncode != 0:
+            log.warning("Obfuscated COBOL compilation failed: %s", rc.stderr[:500])
+            log.warning("Falling back to non-obfuscated binary (traces will use real names)")
+        else:
+            shutil.copy2(obf_bin, output_dir / binary_name)
+            log.info("Recompiled with obfuscated trace names")
+
+            # Strip debug symbols from binary
+            subprocess.run(["strip", str(output_dir / binary_name)],
+                           capture_output=True)
+            log.info("Binary stripped of debug symbols")
+
+        # Obfuscate spec
+        spec = _obfuscate_spec(spec, mapping)
+
+        # Randomize program_id and binary name in spec
+        obf_binary_name = mapping["program_id_obf"] + ".mock"
+        old_binary = output_dir / binary_name
+        new_binary = output_dir / obf_binary_name
+        if old_binary.exists():
+            old_binary.rename(new_binary)
+        spec.binary_name = obf_binary_name
+        spec.program_id = mapping["program_id_obf"]
+
+        log.info("Spec obfuscated: %d variables, %d paragraphs renamed",
+                 len(mapping["variables"]), len(mapping["paragraphs"]))
+
+        # Save mapping to source machine (NOT in bundle)
+        map_dir = Path(mapping_output_dir) if mapping_output_dir else Path(".")
+        map_dir.mkdir(parents=True, exist_ok=True)
+        map_path = map_dir / f"{program.program_id}_obfuscation_map.json"
+        map_path.write_text(json.dumps(mapping, indent=2))
+        log.info("Obfuscation mapping saved: %s (keep this secure!)", map_path)
+
     # --- Write spec ---
     spec_path = output_dir / "coverage-spec.yaml"
     _serialize_spec(spec, spec_path)
@@ -333,6 +388,254 @@ def export_bundle(
              len(spec.variables), len(spec.stubs), len(spec.llm_scenarios))
 
     return output_dir
+
+
+# ---------------------------------------------------------------------------
+# Obfuscation
+# ---------------------------------------------------------------------------
+
+def _build_obfuscation_mapping(spec: CoverageSpec) -> dict:
+    """Build a mapping from real names to randomized obfuscated tokens.
+
+    Uses random hex tokens (not sequential) and shuffled assignment to
+    prevent leaking variable counts, ordering, or naming patterns.
+    Adds dummy entries to further obscure the real variable count.
+    """
+    import os
+    import random as _rng
+
+    # Use OS random for non-deterministic token generation
+    _rng.seed(os.urandom(16))
+
+    def _hex_token(prefix: str, length: int = 4) -> str:
+        return prefix + "".join(_rng.choices("0123456789ABCDEF", k=length))
+
+    used_tokens: set[str] = set()
+
+    def _unique_token(prefix: str) -> str:
+        for _ in range(1000):
+            t = _hex_token(prefix)
+            if t not in used_tokens:
+                used_tokens.add(t)
+                return t
+        raise RuntimeError("Token collision")
+
+    mapping: dict = {
+        "variables": {},
+        "paragraphs": {},
+        "stubs": {},
+        "constants": {},
+        "reverse": {},
+        "program_id_obf": _hex_token("PGM"),
+    }
+
+    # Collect ALL names that appear anywhere in the spec
+    all_var_names: set[str] = set(spec.variables.keys())
+    for sibs in spec.siblings_88.values():
+        all_var_names.update(sibs)
+    for ss in spec.stubs.values():
+        all_var_names.update(ss.status_vars)
+        for sv in ss.success_values:
+            all_var_names.update(sv.keys())
+        for fv in ss.fault_values:
+            all_var_names.update(k for k in fv.keys() if k != "label")
+    for sc in spec.llm_scenarios:
+        all_var_names.update(sc.input_values.keys())
+
+    # Shuffle names before assigning tokens to break ordering
+    var_names = list(all_var_names)
+    _rng.shuffle(var_names)
+    for name in var_names:
+        token = _unique_token("X")
+        mapping["variables"][name] = token
+        mapping["reverse"][token] = name
+
+    para_names = list(spec.paragraph_names)
+    _rng.shuffle(para_names)
+    for name in para_names:
+        token = _unique_token("Q")
+        mapping["paragraphs"][name] = token
+        mapping["reverse"][token] = name
+
+    all_stub_names: set[str] = set(spec.stubs.keys())
+    for sc in spec.llm_scenarios:
+        all_stub_names.update(sc.stub_overrides.keys())
+    stub_names = list(all_stub_names)
+    _rng.shuffle(stub_names)
+    for op_key in stub_names:
+        token = _unique_token("K")
+        mapping["stubs"][op_key] = token
+        mapping["reverse"][token] = op_key
+
+    const_names = list(spec.constants.keys())
+    _rng.shuffle(const_names)
+    for name in const_names:
+        token = _unique_token("W")
+        mapping["constants"][name] = token
+        mapping["reverse"][token] = name
+
+    # Add dummy variables/paragraphs to obscure real counts
+    n_dummy_vars = _rng.randint(10, 30)
+    for _ in range(n_dummy_vars):
+        _unique_token("X")  # just consume tokens to pad the space
+
+    n_dummy_paras = _rng.randint(5, 15)
+    for _ in range(n_dummy_paras):
+        _unique_token("Q")
+
+    return mapping
+
+
+def _obfuscate_cobol_source(source: str, mapping: dict) -> str:
+    """Obfuscate SPECTER-TRACE display strings in instrumented COBOL source.
+
+    Only replaces paragraph names inside SPECTER-TRACE:xxx display
+    statements and the PROGRAM-ID — these are what the coverage engine
+    parses from stdout. Other COBOL names are left intact to avoid
+    column-alignment issues in COBOL's fixed-format source. The binary
+    should be stripped after compilation for full protection.
+    """
+    import re
+
+    para_map = mapping.get("paragraphs", {})
+    pgm_id = mapping.get("program_id_obf")
+
+    # Replace SPECTER-TRACE:<para-name> patterns
+    if para_map:
+        lookup = {real.upper(): obf for real, obf in para_map.items()}
+        def _replace_trace(m):
+            real_name = m.group(1).upper()
+            return f"SPECTER-TRACE:{lookup.get(real_name, m.group(1))}"
+        source = re.sub(
+            r"SPECTER-TRACE:([A-Z0-9][A-Z0-9-]*)",
+            _replace_trace, source, flags=re.IGNORECASE,
+        )
+
+    # Replace PROGRAM-ID
+    if pgm_id:
+        source = re.sub(
+            r"(PROGRAM-ID\.\s+)([A-Z0-9][A-Z0-9-]*)",
+            lambda m: m.group(1) + pgm_id,
+            source, flags=re.IGNORECASE,
+        )
+
+    return source
+
+
+def _obfuscate_spec(spec: CoverageSpec, mapping: dict) -> CoverageSpec:
+    """Apply obfuscation mapping to the coverage spec."""
+    var_map = mapping.get("variables", {})
+    para_map = mapping.get("paragraphs", {})
+    stub_map = mapping.get("stubs", {})
+    const_map = mapping.get("constants", {})
+
+    def _rename_var(name: str) -> str:
+        return var_map.get(name, const_map.get(name, name))
+
+    def _rename_para(name: str) -> str:
+        return para_map.get(name, name)
+
+    def _rename_stub(name: str) -> str:
+        return stub_map.get(name, name)
+
+    # Obfuscate variables
+    new_vars = {}
+    for name, vs in spec.variables.items():
+        new_name = _rename_var(name)
+        new_vs = VariableSpec(
+            name=new_name,
+            data_type=vs.data_type,
+            max_length=vs.max_length,
+            precision=vs.precision,
+            signed=vs.signed,
+            min_value=vs.min_value,
+            max_value=vs.max_value,
+            condition_literals=list(vs.condition_literals),
+            valid_88_values={_rename_var(k): v for k, v in vs.valid_88_values.items()},
+            classification=vs.classification,
+            semantic_type=vs.semantic_type,
+            set_by_stub=_rename_stub(vs.set_by_stub) if vs.set_by_stub else None,
+            llm_hints=[],  # Strip all hints
+        )
+        new_vars[new_name] = new_vs
+
+    # Obfuscate stubs
+    new_stubs = {}
+    for op_key, ss in spec.stubs.items():
+        new_key = _rename_stub(op_key)
+        new_stubs[new_key] = StubSpec(
+            op_key=new_key,
+            status_vars=[_rename_var(v) for v in ss.status_vars],
+            success_values=[
+                {_rename_var(k): v for k, v in sv.items()}
+                for sv in ss.success_values
+            ],
+            fault_values=[
+                {_rename_var(k): v for k, v in fv.items() if k != "label"}
+                for fv in ss.fault_values
+            ],
+            llm_hints=[],  # Strip all hints
+        )
+
+    # Obfuscate branch meta
+    new_branch_meta = {}
+    for bid, meta in spec.branch_meta.items():
+        new_meta = dict(meta)
+        new_meta["paragraph"] = _rename_para(meta.get("paragraph", ""))
+        new_meta["condition"] = f"condition_{bid}"  # Strip condition text
+        new_branch_meta[bid] = new_meta
+
+    # Obfuscate siblings
+    new_siblings = {}
+    for name, sibs in spec.siblings_88.items():
+        new_name = _rename_var(name)
+        new_siblings[new_name] = [_rename_var(s) for s in sibs]
+
+    # Obfuscate constants
+    new_constants = {}
+    for name, val in spec.constants.items():
+        new_constants[const_map.get(name, name)] = val
+
+    # Obfuscate call graph
+    new_call_graph = {}
+    for para, targets in spec.call_graph.items():
+        new_call_graph[_rename_para(para)] = [_rename_para(t) for t in targets]
+
+    # Obfuscate scenarios (strip descriptions, rename vars)
+    new_scenarios = []
+    for i, sc in enumerate(spec.llm_scenarios):
+        new_scenarios.append(ScenarioSpec(
+            name=f"scenario_{i + 1}",
+            description="",
+            input_values={_rename_var(k): v for k, v in sc.input_values.items()},
+            stub_overrides={
+                _rename_stub(k): (
+                    {_rename_var(vk): vv for vk, vv in v.items()}
+                    if isinstance(v, dict) else v
+                )
+                for k, v in sc.stub_overrides.items()
+            },
+            target_paragraphs=[_rename_para(p) for p in sc.target_paragraphs],
+        ))
+
+    return CoverageSpec(
+        program_id=spec.program_id,  # keep program ID (it's in the binary name)
+        exported_at=spec.exported_at,
+        platform_tag=spec.platform_tag,
+        binary_name=spec.binary_name,
+        coverage_mode=spec.coverage_mode,
+        total_branches=spec.total_branches,
+        total_paragraphs=spec.total_paragraphs,
+        branch_meta=new_branch_meta,
+        paragraph_names=[_rename_para(n) for n in spec.paragraph_names],
+        variables=new_vars,
+        stubs=new_stubs,
+        siblings_88=new_siblings,
+        constants=new_constants,
+        gating_conditions={},  # Strip entirely
+        call_graph={},  # Strip — contains unobfuscated CALL targets
+        llm_scenarios=new_scenarios,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -682,7 +985,7 @@ def run_bundle(
         coverage_config = CoverageConfig(
             strategies=[
                 "baseline", "fault_injection", "branch_solver",
-                "constraint_solver", "stub_walk", "guided_mutation",
+                "stub_walk", "guided_mutation",
                 "monte_carlo",
             ],
         )

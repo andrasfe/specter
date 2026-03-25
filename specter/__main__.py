@@ -333,6 +333,11 @@ def main(argv: list[str] | None = None) -> int:
         metavar="DIR",
         help="Run coverage from an exported bundle (no AST/source/copybooks needed)",
     )
+    parser.add_argument(
+        "--obfuscate",
+        action="store_true",
+        help="Obfuscate all names in exported bundle for IP protection (with --export-bundle)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -647,6 +652,7 @@ def main(argv: list[str] | None = None) -> int:
         from .coverage_bundle import export_bundle
         print(f"Exporting coverage bundle → {args.export_bundle}/")
         try:
+            analysis_dir = Path(args.analysis_output) if args.analysis_output else Path(".")
             bundle_dir = export_bundle(
                 ast_file=source_path,
                 cobol_source=Path(args.cobol_source),
@@ -654,6 +660,8 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir=args.export_bundle,
                 llm_provider=llm_prov,
                 llm_model=args.llm_model,
+                obfuscate=args.obfuscate,
+                mapping_output_dir=analysis_dir,
             )
             print(f"Bundle exported: {bundle_dir}")
         except RuntimeError as e:
