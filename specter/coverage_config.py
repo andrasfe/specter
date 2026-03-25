@@ -74,6 +74,14 @@ class SeedConfig:
 
 
 @dataclass
+class ValidationConfig:
+    """Configuration for COBOL validation pass."""
+
+    enabled: bool = False
+    timeout_per_case: int = 30
+
+
+@dataclass
 class CoverageConfig:
     """Top-level coverage configuration."""
 
@@ -81,6 +89,7 @@ class CoverageConfig:
     default_batch_size: int = 200
     termination: TerminationConfig = field(default_factory=TerminationConfig)
     seed_generation: SeedConfig = field(default_factory=SeedConfig)
+    validation: ValidationConfig = field(default_factory=ValidationConfig)
     strategies: list[str] | None = None
     rounds: list[RoundConfig] | None = None
     loop_from: int = 0
@@ -147,6 +156,12 @@ def _build_config(data: dict) -> CoverageConfig:
         cache=bool(seed_data.get("cache", True)),
     )
 
+    val_data = data.get("validation", {})
+    validation = ValidationConfig(
+        enabled=bool(val_data.get("enabled", False)),
+        timeout_per_case=int(val_data.get("timeout_per_case", 30)),
+    )
+
     rounds = None
     raw_rounds = data.get("rounds")
     if isinstance(raw_rounds, list):
@@ -169,6 +184,7 @@ def _build_config(data: dict) -> CoverageConfig:
         default_batch_size=int(data.get("default_batch_size", 200)),
         termination=termination,
         seed_generation=seed_generation,
+        validation=validation,
         strategies=strategies,
         rounds=rounds,
         loop_from=int(data.get("loop_from", 0)),

@@ -53,6 +53,12 @@ seed_generation:
   #   paragraphs_per_batch: 5   (more focused batches)
   #   seeds_per_batch: 12       (more seeds per batch)
 
+# COBOL validation pass — run after Python synthesis to confirm coverage
+# against the real COBOL binary. Requires --cobol-source and --copybook-dir.
+# validation:
+#   enabled: true
+#   timeout_per_case: 30    # seconds per COBOL test execution
+
 # Per-strategy parameter overrides:
 strategy_params:
   llm_runtime:

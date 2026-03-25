@@ -1798,9 +1798,29 @@ def run_coverage(
     if setup_elapsed > 0.5:
         log.info("Coverage setup complete in %.1fs; starting execution loop", setup_elapsed)
 
-    return _run_agentic_loop(
+    cov_report = _run_agentic_loop(
         ctx, cov, report, strategies, selector,
         budget, timeout, loop_start_time, tc_count,
         max_rounds=max_rounds,
         config=coverage_config,
     )
+
+    # Auto-validate against COBOL if configured
+    val_cfg = getattr(coverage_config, "validation", None)
+    if (val_cfg and val_cfg.enabled
+            and cobol_source and store_path
+            and copybook_dirs):
+        log.info("Running COBOL validation pass ...")
+        from .cobol_validate import validate_store
+        validated_path = Path(store_path).with_suffix(".validated.jsonl")
+        val_report = validate_store(
+            ast_file=ast_file,
+            cobol_source=cobol_source,
+            copybook_dirs=copybook_dirs,
+            store_path=store_path,
+            output_path=validated_path,
+            timeout_per_case=val_cfg.timeout_per_case,
+        )
+        log.info("Validation complete:\n%s", val_report)
+
+    return cov_report

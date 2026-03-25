@@ -314,6 +314,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Fail fast for --cobol-coverage when no branch probes are generated",
     )
     parser.add_argument(
+        "--cobol-validate-store",
+        metavar="JSONL",
+        help="Validate a test store against compiled COBOL (requires --cobol-source, --copybook-dir)",
+    )
+    parser.add_argument(
         "--coverage-config",
         metavar="PATH",
         help="YAML config file for strategy pipeline (strategy order, batch sizes, termination)",
@@ -550,6 +555,42 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"    - {w}")
             if len(result.warnings) > 20:
                 print(f"    - ... and {len(result.warnings) - 20} more")
+        return 0
+
+    # --cobol-validate-store: validate a Python-generated test store against COBOL
+    if args.cobol_validate_store:
+        if not args.cobol_source:
+            print("Error: --cobol-validate-store requires --cobol-source PATH", file=sys.stderr)
+            return 1
+        cobol_path = Path(args.cobol_source)
+        if not cobol_path.exists():
+            print(f"Error: COBOL source not found: {cobol_path}", file=sys.stderr)
+            return 1
+        store_path = Path(args.cobol_validate_store)
+        if not store_path.exists():
+            print(f"Error: test store not found: {store_path}", file=sys.stderr)
+            return 1
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)-7s %(message)s",
+            datefmt="%H:%M:%S",
+            stream=sys.stderr,
+            force=True,
+        )
+
+        from .cobol_validate import validate_store
+        validated_path = store_path.with_suffix(".validated.jsonl")
+        report = validate_store(
+            ast_file=source_path,
+            cobol_source=cobol_path,
+            copybook_dirs=[Path(d) for d in args.copybook_dir],
+            store_path=store_path,
+            output_path=validated_path,
+        )
+        print()
+        print(report)
+        print(f"\nValidated store: {validated_path}")
         return 0
 
     # --cobol-coverage: coverage-guided test generation against real COBOL

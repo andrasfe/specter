@@ -146,7 +146,24 @@ seed_generation:
   cache: false               # regenerate seeds instead of using cache
 ```
 
-For large programs (1000+ paragraphs), smaller `paragraphs_per_batch` with higher `seeds_per_batch` produces better coverage. See `examples/coverage-config.yaml` for a fully commented example.
+For large programs (1000+ paragraphs), smaller `paragraphs_per_batch` with higher `seeds_per_batch` produces better coverage.
+
+**COBOL validation** — automatically validate Python-discovered test cases against the real COBOL binary after synthesis:
+
+```yaml
+validation:
+  enabled: true
+  timeout_per_case: 30
+```
+
+This compiles the COBOL once, runs each test case through the binary, and outputs a `*.validated.jsonl` with only confirmed coverage. Can also be run standalone:
+
+```bash
+specter program.ast --cobol-validate-store tests.jsonl \
+  --cobol-source program.cbl --copybook-dir ./cpy
+```
+
+See `examples/coverage-config.yaml` for a fully commented example.
 
 ### Tuning parameters
 
