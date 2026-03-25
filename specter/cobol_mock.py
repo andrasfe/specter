@@ -3315,7 +3315,14 @@ def compile_cobol(
     if output_path is None:
         output_path = source_path.with_suffix("")
 
-    cmd = ["cobc", "-x", "-Wno-dialect", "-o", str(output_path), str(source_path)]
+    cmd = [
+        "cobc", "-x",
+        "-std=ibm",                # IBM mainframe dialect
+        "-Wno-dialect",            # suppress dialect warnings
+        "-frelax-syntax-checks",   # allow syntax variations
+        "-frelax-level-hierarchy", # allow non-matching level numbers
+        "-o", str(output_path), str(source_path),
+    ]
 
     if copybook_dirs:
         for d in copybook_dirs:
