@@ -1813,14 +1813,17 @@ def run_coverage(
         log.info("Running COBOL validation pass ...")
         from .cobol_validate import validate_store
         validated_path = Path(store_path).with_suffix(".validated.jsonl")
-        val_report = validate_store(
-            ast_file=ast_file,
-            cobol_source=cobol_source,
-            copybook_dirs=copybook_dirs,
-            store_path=store_path,
-            output_path=validated_path,
-            timeout_per_case=val_cfg.timeout_per_case,
-        )
-        log.info("Validation complete:\n%s", val_report)
+        try:
+            val_report = validate_store(
+                ast_file=ast_file,
+                cobol_source=cobol_source,
+                copybook_dirs=copybook_dirs,
+                store_path=store_path,
+                output_path=validated_path,
+                timeout_per_case=val_cfg.timeout_per_case,
+            )
+            log.info("Validation complete:\n%s", val_report)
+        except Exception as e:
+            log.warning("COBOL validation failed: %s", e)
 
     return cov_report
