@@ -58,6 +58,24 @@ specter COACTUPC.cbl.ast --synthesize \
   --llm-provider anthropic
 ```
 
+### Portable coverage bundle (`--export-bundle` / `--run-bundle`)
+
+Two-phase workflow for cross-machine coverage. Export on a machine with source + LLM, run on any same-platform machine with just the bundle:
+
+```bash
+# Phase 1: Export (source machine — needs AST, COBOL, copybooks, optionally LLM)
+specter program.ast --export-bundle ./bundle/ \
+  --cobol-source program.cbl --copybook-dir ./cpy \
+  --llm-provider openrouter
+
+# Phase 2: Run (any machine — only needs GnuCOBOL runtime + the bundle)
+specter --run-bundle ./bundle/ \
+  --test-store results.jsonl \
+  --coverage-budget 10000 --coverage-timeout 3600
+```
+
+The bundle contains the compiled COBOL binary and a `coverage-spec.yaml` with all variable domains, stub operations, 88-level siblings, MQ constants, and LLM-generated business scenarios. During export, the LLM analyzes the COBOL source to produce per-variable hints and 10-15 test scenarios that are baked into the spec — the run phase benefits from LLM intelligence without needing an LLM connection.
+
 ### GnuCOBOL hybrid mode (`--cobol-coverage`)
 
 Needs AST + COBOL source + copybook directories. Instruments and compiles real COBOL, then cross-validates with the Python simulation:
@@ -175,6 +193,9 @@ See `examples/coverage-config.yaml` for a fully commented example.
 | `--coverage-rounds N` | 0 (unlimited) | Max strategy rounds |
 | `--coverage-config PATH` | — | YAML config for strategy pipeline |
 | `--coverage-execution-timeout N` | 900 | Per-test COBOL execution timeout (seconds) |
+| `--export-bundle DIR` | — | Export portable bundle (binary + spec) |
+| `--run-bundle DIR` | — | Run coverage from exported bundle |
+| `--cobol-validate-store JSONL` | — | Validate test store against compiled COBOL |
 
 Higher `--coverage-batch-size` means more hill-climbing trials per paragraph per round. Values of 200-500 work well; the engine scales automatically.
 

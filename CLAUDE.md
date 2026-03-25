@@ -68,7 +68,13 @@ No dependencies beyond Python 3.9+ stdlib for core functionality. Optional: `z3-
 
 - **`backward_slicer.py`** — Extracts minimal code slices from generated Python paragraphs leading to specific branch probes. Used by `LLMRuntimeSteeringStrategy` to give the LLM focused code context for uncovered branches (variable dependencies, stub calls, conditions).
 
-- **`program_analysis.py`** — Upfront static analysis producing structured JSON per paragraph (comments, calls, stub ops, gating conditions, branch count). No LLM calls. Used as input for LLM seed generation.
+- **`program_analysis.py`** — Upfront static analysis producing structured JSON per paragraph (comments, calls, stub ops, gating conditions, branch count). No LLM calls. Used as input for LLM seed generation. Supports incremental caching for resume after interruption.
+
+- **`coverage_bundle.py`** — Portable coverage bundle export/import. `export_bundle()` compiles COBOL, extracts all metadata, queries LLM for per-variable hints and business scenarios, packages as binary + `coverage-spec.yaml`. `run_bundle()` loads spec + binary and runs coverage without AST/source/copybooks. Spec format is YAML, human-editable.
+
+- **`coverage_config.py`** — Pluggable strategy configuration. `CoverageConfig` supports explicit round sequences or selector-driven mode. `SeedConfig` for LLM seed generation parameters. `ValidationConfig` for auto-validation against COBOL. `load_config()` reads YAML (or JSON fallback).
+
+- **`cobol_validate.py`** — Two-pass COBOL validation. `validate_store()` compiles COBOL once, runs each test case from a `.jsonl` store through the binary, outputs a `.validated.jsonl` with only confirmed coverage.
 
 ### GnuCOBOL Mock Framework
 
@@ -94,6 +100,8 @@ No dependencies beyond Python 3.9+ stdlib for core functionality. Optional: `z3-
 - Mock record format: 80-byte LINE SEQUENTIAL: op-key `PIC X(30)` + alpha-status `PIC X(20)` + num-status `PIC S9(09)` (9 bytes) + filler `PIC X(21)`.
 - In COBOL hybrid mode, direct paragraph strategies run through Python (fast), full-program strategies run through COBOL binary. Python branch IDs prefixed with `py:` to avoid collision with COBOL `@@B:` IDs.
 - End-to-end tests in `test_end_to_end.py` depend on external AST files (not in repo) and are auto-skipped when unavailable. Unit tests are self-contained.
+- Coverage strategy pipeline is configurable via `--coverage-config` YAML. Two modes: explicit round sequences (strategy + batch_size per round) or selector-driven (list of strategies, heuristic picks). See `examples/coverage-config.yaml`.
+- Portable bundles (`--export-bundle` / `--run-bundle`) decouple source analysis from coverage execution. Export bakes LLM intelligence into a `coverage-spec.yaml` that travels with the compiled binary.
 
 ### Important: Fixing Bugs
 
