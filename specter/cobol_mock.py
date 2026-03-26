@@ -3646,14 +3646,41 @@ def compile_cobol(
             total_llm = 0
             total_rule = 0
             total_skipped = 0
-            n_errors = len(current_errors)
+            total_cascade_skipped = 0
 
-            log.info("=== Fix pass %d: %d errors to process ===",
-                     attempt + 1, n_errors)
+            # Deduplicate: group cascading errors (same message on
+            # consecutive lines) and only process the FIRST in each run.
+            # The rest are cascading symptoms that resolve when the root
+            # cause is fixed on recompile.
+            deduped_errors: list[tuple[int, str]] = []
+            failed_msgs: set[str] = set()  # LLM already failed on this msg
+            prev_msg = ""
+            cascade_count = 0
+            for lineno, error_msg in current_errors:
+                if error_msg == prev_msg:
+                    cascade_count += 1
+                else:
+                    cascade_count = 0
+                prev_msg = error_msg
+                if cascade_count < 3:  # allow up to 3 of same msg
+                    deduped_errors.append((lineno, error_msg))
+                else:
+                    total_cascade_skipped += 1
 
-            for err_idx, (lineno, error_msg) in enumerate(current_errors):
+            n_errors = len(deduped_errors)
+            log.info("=== Fix pass %d: %d unique errors (%d cascade-skipped) ===",
+                     attempt + 1, n_errors, total_cascade_skipped)
+
+            for err_idx, (lineno, error_msg) in enumerate(deduped_errors):
                 idx = lineno - 1
                 if idx < 0 or idx >= len(src_lines):
+                    continue
+
+                # Skip if LLM already failed on this exact error message
+                # in this pass (same structural problem, won't fix on retry)
+                if error_msg in failed_msgs and not cache.lookup(error_msg,
+                        list(src_lines[max(0, idx - 10):min(len(src_lines), idx + 11)])):
+                    total_skipped += 1
                     continue
 
                 window_start = max(0, idx - 10)
@@ -3698,7 +3725,8 @@ def compile_cobol(
                         log.info("  [%d/%d] ✓ LLM fixed %d lines at line %d",
                                  err_idx + 1, n_errors, len(llm_fixes), lineno)
                     else:
-                        log.info("  [%d/%d] ✗ LLM returned no fix for line %d",
+                        failed_msgs.add(error_msg)
+                        log.info("  [%d/%d] ✗ LLM no fix for line %d (will skip same error)",
                                  err_idx + 1, n_errors, lineno)
 
                 # Phase 3: Rule-based fallback
