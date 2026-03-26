@@ -194,10 +194,41 @@ def prepare_context(
     copybook_paths = [Path(d) for d in (copybook_dirs or [])]
 
     if work_dir is None:
-        work_dir = Path(tempfile.mkdtemp(prefix="specter_cobol_"))
-    else:
-        work_dir = Path(work_dir)
-        work_dir.mkdir(parents=True, exist_ok=True)
+        # Use a stable directory next to the source so compiled binaries persist
+        work_dir = cobol_source.parent / f".specter_build_{cobol_source.stem}"
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check if a compiled binary already exists from a prior run.
+    # Skip the entire instrument+compile pipeline if so.
+    executable_path = work_dir / cobol_source.stem
+    instrumented_path = work_dir / (cobol_source.stem + ".mock.cbl")
+    if executable_path.exists() and instrumented_path.exists():
+        # Verify the binary is newer than the source
+        if executable_path.stat().st_mtime >= cobol_source.stat().st_mtime:
+            log.info("Using cached compiled COBOL: %s", executable_path)
+            # Read branch metadata from the instrumented source
+            source_text = instrumented_path.read_text()
+            hardened_mode = "SPECTER-HARDENED-ENTRY" in source_text
+            branch_meta: dict = {}
+            total_branches = 0
+            total_paragraphs = 0
+            if enable_branch_tracing:
+                from .cobol_mock import _add_branch_tracing, _ensure_sentence_break_before_paragraphs
+                lines = source_text.splitlines(keepends=True)
+                _, branch_meta, total_branches = _add_branch_tracing(lines)
+            # Count paragraph traces
+            total_paragraphs = source_text.count("SPECTER-TRACE:")
+            return CobolExecutionContext(
+                executable_path=executable_path,
+                instrumented_source_path=instrumented_path,
+                branch_meta=branch_meta,
+                injectable_vars=[],
+                total_paragraphs=total_paragraphs,
+                total_branches=total_branches,
+                hardened_mode=hardened_mode,
+                coverage_mode=coverage_mode,
+            )
 
     # Pre-clean copybooks AND source for GnuCOBOL compatibility.
     # Pass work_dir so cached LLM fixes from prior runs can be applied.
