@@ -3340,6 +3340,21 @@ def clean_cobol_source(source_path: Path, fix_cache_dir: Path | None = None) -> 
             if new_line != line:
                 line = new_line
                 fixes += 1
+            # VALUES ARE → VALUE (IBM plural syntax not supported by GnuCOBOL)
+            new_line = re.sub(r"\bVALUES\s+ARE\b", "VALUE", line, flags=re.IGNORECASE)
+            if new_line != line:
+                line = new_line
+                fixes += 1
+            # VALUES IS → VALUE
+            new_line = re.sub(r"\bVALUES\s+IS\b", "VALUE", line, flags=re.IGNORECASE)
+            if new_line != line:
+                line = new_line
+                fixes += 1
+            # Bare VALUES (without ARE/IS) → VALUE
+            new_line = re.sub(r"\bVALUES\b(?!\s+(?:ARE|IS)\b)", "VALUE", line, flags=re.IGNORECASE)
+            if new_line != line:
+                line = new_line
+                fixes += 1
 
         if len(line) > 6 and line[6] in ("*", "/"):
             content = line[7:72].strip() if len(line) > 7 else line.strip()
@@ -3447,6 +3462,21 @@ def clean_copybooks(copybook_dirs: list[Path]) -> list[Path]:
                     if new_line != line:
                         line = new_line
                         fixes += 1
+                    # VALUES ARE → VALUE (IBM plural syntax)
+                    new_line = re.sub(r"\bVALUES\s+ARE\b", "VALUE", line, flags=re.IGNORECASE)
+                    if new_line != line:
+                        line = new_line
+                        fixes += 1
+                    # VALUES IS → VALUE
+                    new_line = re.sub(r"\bVALUES\s+IS\b", "VALUE", line, flags=re.IGNORECASE)
+                    if new_line != line:
+                        line = new_line
+                        fixes += 1
+                    # Bare VALUES → VALUE
+                    new_line = re.sub(r"\bVALUES\b(?!\s+(?:ARE|IS)\b)", "VALUE", line, flags=re.IGNORECASE)
+                    if new_line != line:
+                        line = new_line
+                        fixes += 1
 
                 # 3. Process comment lines
                 if len(line) > 6 and line[6] in ("*", "/"):
@@ -3477,6 +3507,29 @@ def clean_copybooks(copybook_dirs: list[Path]) -> list[Path]:
         log.info("Copybooks clean (%d files checked)", total_files)
 
     return [clean_dir]
+
+
+def _apply_source_fixups(source_path: Path) -> None:
+    """Apply IBM→GnuCOBOL syntax fixups directly on the source file.
+
+    Catches patterns that survive pre-clean (e.g. from inlined copybooks).
+    """
+    text = source_path.read_text(errors="replace")
+    original = text
+    fixed_lines: list[str] = []
+    for line in text.splitlines(keepends=True):
+        if len(line) > 6 and line[6] not in ("*", "/"):
+            line = re.sub(r"\bVALUES\s+ARE\b", "VALUE", line, flags=re.IGNORECASE)
+            line = re.sub(r"\bVALUES\s+IS\b", "VALUE", line, flags=re.IGNORECASE)
+            line = re.sub(r"\bVALUES\b(?!\s+(?:ARE|IS)\b)", "VALUE", line, flags=re.IGNORECASE)
+            line = re.sub(r"\bP\.I\.C\.", "PIC", line)
+        fixed_lines.append(line)
+    text = "".join(fixed_lines)
+    if text != original:
+        source_path.write_text(text)
+        count = original.count("VALUES") - text.count("VALUES")
+        log.info("Pre-compile fixups: %d VALUES→VALUE replacements in %s",
+                 count, source_path.name)
 
 
 def compile_cobol(
@@ -3525,8 +3578,9 @@ def compile_cobol(
     cache_path = source_path.parent / "cobol_fix_cache.json"
     cache = CobolFixCache(cache_path)
     session_fixes: list[str] = []
-    llm_passes_used = 0
-    max_llm_passes = 3
+
+    # Pre-compile source-level fixups (IBM → GnuCOBOL syntax)
+    _apply_source_fixups(source_path)
 
     # Track pending fix: (error_msg, original_window, fixed_window)
     # Only promoted to cache when the error disappears on recompile.
@@ -3590,7 +3644,7 @@ def compile_cobol(
                          attempt + 1, lineno, error_msg[:50])
 
             # Phase 2: Try LLM (one error at a time)
-            elif llm_provider:
+            if not fixed_count and llm_provider:
                 llm_fixes = llm_fix_errors(
                     llm_provider, llm_model,
                     [(lineno, error_msg)], src_lines, session_fixes,
@@ -3617,8 +3671,8 @@ def compile_cobol(
                     log.warning("Fix pass %d: LLM returned no fix for line %d '%s'",
                                 attempt + 1, lineno, error_msg[:50])
 
-            # Phase 3: Rule-based fallback (no LLM)
-            else:
+            # Phase 3: Rule-based fallback (comment out non-definition lines)
+            if not fixed_count:
                 _num_only = re.compile(
                     r"^\s*\d[\d\s]*(?:THRU\s+\d+[\d\s]*)*[\s.]*$", re.IGNORECASE,
                 )

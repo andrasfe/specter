@@ -29,6 +29,33 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# IBM → GnuCOBOL source-level fixups
+# ---------------------------------------------------------------------------
+
+def _gnucobol_source_fixups(source_text: str) -> str:
+    """Apply IBM-to-GnuCOBOL syntax fixups on the full instrumented source.
+
+    This runs on the final source text (after COPY resolution and
+    instrumentation) to catch patterns from inlined copybooks that
+    bypass the pre-clean phase.
+    """
+    fixed_lines: list[str] = []
+    for line in source_text.splitlines(keepends=True):
+        # Only touch code lines, not comments
+        if len(line) > 6 and line[6] not in ("*", "/"):
+            # VALUES ARE → VALUE  (IBM plural syntax)
+            line = re.sub(r"\bVALUES\s+ARE\b", "VALUE", line, flags=re.IGNORECASE)
+            # VALUES IS → VALUE
+            line = re.sub(r"\bVALUES\s+IS\b", "VALUE", line, flags=re.IGNORECASE)
+            # Bare VALUES → VALUE
+            line = re.sub(r"\bVALUES\b(?!\s+(?:ARE|IS)\b)", "VALUE", line, flags=re.IGNORECASE)
+            # P.I.C. → PIC
+            line = re.sub(r"\bP\.I\.C\.", "PIC", line)
+        fixed_lines.append(line)
+    return "".join(fixed_lines)
+
+
+# ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 
@@ -182,6 +209,10 @@ def prepare_context(
                 "coverage will report 0/0 until compilation succeeds without full "
                 "procedure hardening."
             )
+
+    # Apply IBM→GnuCOBOL source-level fixes on the final instrumented text.
+    # This catches patterns from inlined copybooks that bypass pre-clean.
+    source_text = _gnucobol_source_fixups(source_text)
 
     # Write instrumented source
     instrumented_path = work_dir / (cobol_source.stem + ".mock.cbl")
