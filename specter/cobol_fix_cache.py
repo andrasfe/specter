@@ -293,8 +293,10 @@ def llm_fix_errors(
             "Common fixes: VALUES ARE → VALUE, remove separator comments inside VALUE clauses,\n"
             "fix premature periods, uncomment continuation lines, P.I.C. → PIC,\n"
             "remove duplicate definitions, fix level-number hierarchy issues.\n\n"
-            "Output ONLY the corrected lines with their line numbers, same format as above.\n"
-            "Do not add explanations. Only output lines that changed."
+            "Output ONLY the corrected lines as a flat JSON object mapping line number to fixed content.\n"
+            "Example: {\"5417\": \"       10  EXT-K1-WS  PIC 99.\", \"5418\": \"       10  EXT-K2-WS  PIC 99.\"}\n"
+            "Do NOT wrap in outer keys like 'changed_lines'. Do NOT add explanations.\n"
+            "Only include lines that changed. Preserve COBOL column formatting (cols 7-72)."
         )
 
         try:
@@ -362,8 +364,8 @@ def llm_fix_cascade_root(
         f"Look at the 100 lines BEFORE the error to find the root cause:\n"
         f"```cobol\n{numbered}\n```\n\n"
         "Find the ONE line that broke the parser context and fix it.\n"
-        "Output ONLY the corrected line(s) with line numbers, format: '12345: fixed content'.\n"
-        "Do not add explanations."
+        "Output ONLY the corrected line(s) as a flat JSON object: {\"12345\": \"       fixed content\"}\n"
+        "Do NOT wrap in outer keys. Do NOT add explanations. Preserve COBOL column formatting."
     )
 
     try:
@@ -397,15 +399,19 @@ def _parse_llm_fix_response(
     if cleaned.strip().startswith("{"):
         try:
             data = json.loads(cleaned)
+            # Unwrap nested structures like {"changed_lines": {...}}
+            # or {"fixes": {...}} — find the inner dict with line numbers
+            if len(data) == 1:
+                inner = next(iter(data.values()))
+                if isinstance(inner, dict):
+                    data = inner
             for key, value in data.items():
-                # Key might be line number as string
                 m_key = re.match(r"(\d+)", str(key))
                 if not m_key:
                     continue
                 lineno = int(m_key.group(1))
                 if not (min_line < lineno <= max_line):
                     continue
-                # Value might be "12345: content" or just "content"
                 content = str(value)
                 m_val = re.match(r"\s*\d+\s*:\s?(.*)", content)
                 if m_val:
