@@ -305,6 +305,11 @@ def llm_fix_errors(
                     fixes[lineno] = fixed_line
                 log.info("LLM fix: %d lines corrected for errors at %s",
                          len(parsed), [ln for ln, _ in batch])
+            else:
+                # Log first 200 chars of response so we can debug why parsing failed
+                snippet = response[:200].replace("\n", "\\n") if response else "(empty)"
+                log.info("LLM response not parsed (lines %d-%d): %s",
+                          min_line + 1, max_line, snippet)
         except Exception as e:
             log.warning("LLM fix query failed: %s", e)
 
