@@ -3513,23 +3513,43 @@ def _apply_source_fixups(source_path: Path) -> None:
     """Apply IBM→GnuCOBOL syntax fixups directly on the source file.
 
     Catches patterns that survive pre-clean (e.g. from inlined copybooks).
+    Mirrors _gnucobol_source_fixups in cobol_executor.py.
     """
     text = source_path.read_text(errors="replace")
     original = text
     fixed_lines: list[str] = []
+    in_procedure = False
     for line in text.splitlines(keepends=True):
+        code_area = line[6:72] if len(line) > 6 else line
+        if "PROCEDURE DIVISION" in code_area.upper() and (len(line) <= 6 or line[6] not in ("*", "/")):
+            in_procedure = True
+
         if len(line) > 6 and line[6] not in ("*", "/"):
+            # VALUE clause fixes
             line = re.sub(r"\bVALUES\s+ARE\b", "VALUE", line, flags=re.IGNORECASE)
             line = re.sub(r"\bVALUES\s+IS\b", "VALUE", line, flags=re.IGNORECASE)
-            line = re.sub(r"\bVALUES\b(?!\s+(?:ARE|IS)\b)", "VALUE", line, flags=re.IGNORECASE)
+            if not in_procedure:
+                line = re.sub(r"\bVALUES\b(?!\s+(?:ARE|IS)\b)", "VALUE", line, flags=re.IGNORECASE)
+            # PIC fixes
             line = re.sub(r"\bP\.I\.C\.", "PIC", line)
+            # IBM compiler directives → comment out
+            stripped = code_area.strip().upper()
+            if stripped in ("EJECT", "EJECT.", "SKIP1", "SKIP1.",
+                            "SKIP2", "SKIP2.", "SKIP3", "SKIP3."):
+                line = line[:6] + "*" + line[7:]
+            elif stripped.startswith("SERVICE RELOAD") or stripped.startswith("SERVICE LABEL"):
+                line = line[:6] + "*" + line[7:]
+            elif stripped.startswith("READY TRACE") or stripped.startswith("RESET TRACE"):
+                line = line[:6] + "*" + line[7:]
+            # Truncate columns 73-80
+            raw = line.rstrip("\n\r")
+            if len(raw) > 72:
+                line = raw[:72] + "\n"
         fixed_lines.append(line)
     text = "".join(fixed_lines)
     if text != original:
         source_path.write_text(text)
-        count = original.count("VALUES") - text.count("VALUES")
-        log.info("Pre-compile fixups: %d VALUES→VALUE replacements in %s",
-                 count, source_path.name)
+        log.info("Pre-compile fixups applied to %s", source_path.name)
 
 
 def compile_cobol(

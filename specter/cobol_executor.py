@@ -38,20 +38,62 @@ def _gnucobol_source_fixups(source_text: str) -> str:
     This runs on the final source text (after COPY resolution and
     instrumentation) to catch patterns from inlined copybooks that
     bypass the pre-clean phase.
+
+    Every rule here replaces an LLM call. If the LLM fix cache shows
+    a pattern being fixed repeatedly, add it here as a regex rule.
     """
     fixed_lines: list[str] = []
+    fixes = 0
+    in_procedure = False
     for line in source_text.splitlines(keepends=True):
+        # Track which division we're in
+        code_area = line[6:72] if len(line) > 6 else line
+        if "PROCEDURE DIVISION" in code_area.upper() and (len(line) <= 6 or line[6] not in ("*", "/")):
+            in_procedure = True
+
         # Only touch code lines, not comments
         if len(line) > 6 and line[6] not in ("*", "/"):
+            orig = line
+
+            # --- VALUE clause fixes ---
             # VALUES ARE → VALUE  (IBM plural syntax)
             line = re.sub(r"\bVALUES\s+ARE\b", "VALUE", line, flags=re.IGNORECASE)
             # VALUES IS → VALUE
             line = re.sub(r"\bVALUES\s+IS\b", "VALUE", line, flags=re.IGNORECASE)
-            # Bare VALUES → VALUE
-            line = re.sub(r"\bVALUES\b(?!\s+(?:ARE|IS)\b)", "VALUE", line, flags=re.IGNORECASE)
+            # Bare VALUES → VALUE (but not in PROCEDURE DIVISION where
+            # it could be part of HIGH-VALUES/LOW-VALUES/SPACES usage)
+            if not in_procedure:
+                line = re.sub(r"\bVALUES\b(?!\s+(?:ARE|IS)\b)", "VALUE", line, flags=re.IGNORECASE)
+
+            # --- PIC clause fixes ---
             # P.I.C. → PIC
             line = re.sub(r"\bP\.I\.C\.", "PIC", line)
+
+            # --- IBM compiler directives (not supported by GnuCOBOL) ---
+            stripped = code_area.strip().upper()
+            # EJECT / SKIP1 / SKIP2 / SKIP3 — IBM page formatting
+            if stripped in ("EJECT", "EJECT.", "SKIP1", "SKIP1.",
+                            "SKIP2", "SKIP2.", "SKIP3", "SKIP3."):
+                line = line[:6] + "*" + line[7:]
+            # SERVICE RELOAD — IBM only
+            elif stripped.startswith("SERVICE RELOAD") or stripped.startswith("SERVICE LABEL"):
+                line = line[:6] + "*" + line[7:]
+            # READY TRACE / RESET TRACE — IBM debug
+            elif stripped.startswith("READY TRACE") or stripped.startswith("RESET TRACE"):
+                line = line[:6] + "*" + line[7:]
+
+            # --- Truncate to 72 columns (sequence numbers in 73-80) ---
+            raw = line.rstrip("\n\r")
+            if len(raw) > 72:
+                line = raw[:72] + "\n"
+
+            if line != orig:
+                fixes += 1
+
         fixed_lines.append(line)
+
+    if fixes:
+        log.info("GnuCOBOL source fixups: %d lines fixed", fixes)
     return "".join(fixed_lines)
 
 
