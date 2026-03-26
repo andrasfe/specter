@@ -303,6 +303,10 @@ def _resolve_copies(
             _value_cont_re = re.compile(
                 r"^\s*\d[\d\s]*(?:THRU\s+\d+)?[\s.]*$", re.IGNORECASE,
             )
+            # Matches value data at end of line (after comment prose)
+            _value_tail_re = re.compile(
+                r"\d{2,}[\d\s]*(?:THRU\s+\d+)?[\s.]*$", re.IGNORECASE,
+            )
             # Separator comments: lines with 5+ consecutive dashes or equals
             # (like *PIC---*, *---*, *M.A.V.---*, *TCS---2036---*).
             # Must NOT match prose like **** GRCC START ****
@@ -319,11 +323,22 @@ def _resolve_copies(
                 elif in_value:
                     if is_comment:
                         if _value_cont_re.match(cl_content):
-                            # Uncomment: this is actual value data
+                            # Pure value data line — uncomment it
                             copy_lines[ci] = cl_raw[:6] + " " + cl_raw[7:]
                         elif _separator_comment_re.search(cl_content):
                             # Separator comment (*---*, *PIC---*) — blank it
                             copy_lines[ci] = cl_raw[:6] + "*\n"
+                        elif _value_tail_re.search(cl_content):
+                            # Comment with value data at the end
+                            # (e.g., **** GRCC START ****  992 994.)
+                            # Extract just the value portion
+                            m_tail = _value_tail_re.search(cl_content)
+                            if m_tail:
+                                val_part = m_tail.group(0).strip()
+                                pad = " " * max(0, 40 - len(val_part))
+                                copy_lines[ci] = (
+                                    cl_raw[:6] + " " + pad + val_part + "\n"
+                                )
                         # else: prose comment — just skip, don't end in_value
                     elif not cl_content:
                         pass  # blank line, skip
