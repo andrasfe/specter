@@ -733,17 +733,18 @@ def main(argv: list[str] | None = None) -> int:
         else:
             cov_store = analysis_dir / f"{source_path.stem}_cobol_testset.jsonl"
 
-        # Create LLM provider if requested
-        llm_provider_for_cov = None
-        if args.llm_guided or args.llm_provider:
-            from .llm_coverage import get_llm_provider
-            try:
-                llm_provider_for_cov = get_llm_provider(
-                    provider_name=args.llm_provider, model=args.llm_model,
-                )
-                print(f"  LLM provider: {type(llm_provider_for_cov).__name__}")
-            except Exception as e:
-                print(f"  Warning: LLM init failed: {e}", file=sys.stderr)
+        # LLM provider is mandatory for --cobol-coverage (used for compilation
+        # fixes, seed generation, and runtime strategies). Reads from .env.
+        from .llm_coverage import get_llm_provider
+        try:
+            llm_provider_for_cov = get_llm_provider(
+                provider_name=args.llm_provider, model=args.llm_model,
+            )
+            print(f"  LLM provider: {type(llm_provider_for_cov).__name__}")
+        except Exception as e:
+            print(f"Error: LLM provider required for --cobol-coverage: {e}", file=sys.stderr)
+            print("  Configure LLM_PROVIDER in .env or pass --llm-provider", file=sys.stderr)
+            return 1
 
         # Load coverage config if provided
         cov_config = None
