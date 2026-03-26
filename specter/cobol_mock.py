@@ -3305,6 +3305,62 @@ def generate_mock_data_ordered(stub_log: list[tuple[str, list]]) -> str:
 # Compile and run
 # ---------------------------------------------------------------------------
 
+def clean_cobol_source(source_path: Path) -> Path:
+    """Pre-clean a COBOL source file for GnuCOBOL compatibility.
+
+    Same fixes as clean_copybooks but for the main .cbl file.
+    Returns path to the cleaned copy.
+    """
+    clean_dir = Path(tempfile.mkdtemp(prefix="specter_src_clean_"))
+    clean_path = clean_dir / source_path.name
+
+    _value_cont_re = re.compile(
+        r"^\s*\d[\d\s]*(?:THRU\s+\d+)?[\s.]*$", re.IGNORECASE,
+    )
+    _separator_re = re.compile(r"-{5,}|={5,}")
+    _value_tail_re = re.compile(
+        r"\d{1,3}\s+\d{1,3}[\d\s]*[\s.]*$"
+        r"|\d{1,3}\s+THRU\s+\d{1,3}[\s.]*$",
+        re.IGNORECASE,
+    )
+
+    lines = source_path.read_text(errors="replace").splitlines(keepends=True)
+    fixes = 0
+    cleaned: list[str] = []
+
+    for line in lines:
+        raw = line.rstrip("\n\r")
+        if len(raw) > 72:
+            line = raw[:72] + "\n"
+            fixes += 1
+
+        if len(line) > 6 and line[6] not in ("*", "/"):
+            new_line = re.sub(r"\bP\.I\.C\.", "PIC", line)
+            if new_line != line:
+                line = new_line
+                fixes += 1
+
+        if len(line) > 6 and line[6] in ("*", "/"):
+            content = line[7:72].strip() if len(line) > 7 else line.strip()
+            if _value_cont_re.match(content):
+                line = line[:6] + " " + line[7:]
+                fixes += 1
+            elif _separator_re.search(content):
+                line = line[:6] + "*\n"
+                fixes += 1
+            elif _value_tail_re.search(content):
+                line = line[:6] + "*\n"
+                fixes += 1
+
+        cleaned.append(line)
+
+    clean_path.write_text("".join(cleaned))
+    if fixes > 0:
+        log.info("Cleaned source %s (%d fixes) → %s",
+                 source_path.name, fixes, clean_path)
+    return clean_path
+
+
 def clean_copybooks(copybook_dirs: list[Path]) -> list[Path]:
     """Pre-clean copybooks for GnuCOBOL compatibility.
 
