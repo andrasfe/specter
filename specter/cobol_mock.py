@@ -21,6 +21,7 @@ in execution order, matching _apply_stub_outcome's FIFO semantics.
 from __future__ import annotations
 
 import os
+import logging
 import re
 import subprocess
 import tempfile
@@ -28,6 +29,8 @@ import time
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # Fixed-format COBOL column constants
 _SEQ = "      "        # Cols 1-6: sequence area
