@@ -3647,7 +3647,16 @@ def compile_cobol(
             if result.returncode == 0:
                 cache.save()
                 fixed = f" (after {attempt} fix passes)" if attempt > 0 else ""
-                return True, f"Compiled: {output_path}{fixed}"
+                lr_path = source_path.parent / "last_resort.log"
+                lr_note = ""
+                if lr_path.exists():
+                    lr_count = sum(1 for l in lr_path.read_text().splitlines()
+                                   if l.startswith("Line "))
+                    if lr_count:
+                        lr_note = f" ({lr_count} last-resort fixes need human review → {lr_path})"
+                        log.warning("Compiled OK but %d lines need human review: %s",
+                                    lr_count, lr_path)
+                return True, f"Compiled: {output_path}{fixed}{lr_note}"
 
             if attempt >= auto_fix_retries or not current_errors:
                 cache.save()
@@ -3674,6 +3683,7 @@ def compile_cobol(
             # cause is fixed on recompile.
             deduped_errors: list[tuple[int, str]] = []
             failed_msgs: set[str] = set()  # LLM already failed on this msg
+            last_resort_items: list[str] = []  # tracked for human review
             prev_msg = ""
             cascade_count = 0
             for lineno, error_msg in current_errors:
@@ -3796,10 +3806,15 @@ def compile_cobol(
 
                     # 3d: LAST RESORT — comment out even data definitions.
                     # Losing a field definition is better than failing to compile.
+                    # Tracked in .last_resort.log for human review.
                     if fixed_count == 0 and len(ln) > 6 and ln[6] != "*":
                         src_lines[idx] = ln[:6] + "*" + ln[7:]
                         fixed_count = 1
-                        log.warning("  [%d/%d] last resort: commented out data def at line %d",
+                        last_resort_items.append(
+                            f"Line {lineno}: {error_msg}\n"
+                            f"  Commented out: {ln_content}"
+                        )
+                        log.warning("  [%d/%d] LAST RESORT: commented out line %d (needs human review)",
                                     err_idx + 1, n_errors, lineno)
 
                     if fixed_count:
@@ -3819,6 +3834,16 @@ def compile_cobol(
 
             log.info("=== Fix pass %d summary: %d fixed (%d cached, %d LLM, %d rule-based), %d skipped, recompiling... ===",
                      attempt + 1, total_fixed, total_cached, total_llm, total_rule, total_skipped)
+
+            # Persist last-resort items for human review
+            if last_resort_items:
+                lr_path = source_path.parent / "last_resort.log"
+                with open(lr_path, "a") as f:
+                    f.write(f"\n--- Pass {attempt + 1} ---\n")
+                    f.write("\n".join(last_resort_items) + "\n")
+                log.warning("  %d last-resort fixes logged to %s",
+                            len(last_resort_items), lr_path.name)
+
             fixed_source = "".join(src_lines)
             source_path.write_text(fixed_source)
 
