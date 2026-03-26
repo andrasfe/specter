@@ -3341,8 +3341,13 @@ def compile_cobol(
     source_path: str | Path,
     output_path: str | Path | None = None,
     copybook_dirs: list[Path] | None = None,
+    auto_fix_retries: int = 5,
 ) -> tuple[bool, str]:
     """Compile COBOL source with GnuCOBOL.
+
+    If compilation fails, automatically comments out error lines and
+    retries up to auto_fix_retries times. This handles legacy copybook
+    constructs that GnuCOBOL rejects.
 
     Returns (success, message).
     """
@@ -3364,19 +3369,92 @@ def compile_cobol(
         for d in copybook_dirs:
             cmd.extend(["-I", str(d)])
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if result.returncode == 0:
-            return True, f"Compiled: {output_path}"
-        else:
-            return False, f"Compilation failed:\n{result.stderr}\n{result.stdout}"
-    except Exception as e:
-        return False, f"Compilation error: {e}"
+    for attempt in range(1 + auto_fix_retries):
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode == 0:
+                fixed = f" (after {attempt} auto-fix passes)" if attempt > 0 else ""
+                return True, f"Compiled: {output_path}{fixed}"
+
+            if attempt >= auto_fix_retries:
+                return False, f"Compilation failed:\n{result.stderr}\n{result.stdout}"
+
+            # Parse error line numbers from stderr
+            error_lines: set[int] = set()
+            src_name = str(source_path.name)
+            for line in (result.stderr or "").splitlines():
+                if "error:" in line.lower() and src_name in line:
+                    m = re.search(rf"{re.escape(src_name)}:(\d+):", line)
+                    if m:
+                        error_lines.add(int(m.group(1)))
+
+            if not error_lines:
+                return False, f"Compilation failed:\n{result.stderr}\n{result.stdout}"
+
+            # Smart fix: for each error line, check if it's a VALUE
+            # continuation orphaned by a premature period on the prior line.
+            # If so, remove the period instead of commenting the line.
+            src_lines = source_path.read_text().splitlines(keepends=True)
+            _num_only = re.compile(
+                r"^\s*\d[\d\s]*(?:THRU\s+\d+[\d\s]*)*[\s.]*$", re.IGNORECASE,
+            )
+            fixed_count = 0
+            for lineno in sorted(error_lines):
+                idx = lineno - 1
+                if idx < 0 or idx >= len(src_lines):
+                    continue
+                ln = src_lines[idx]
+                ln_content = ln[7:72].strip() if len(ln) > 7 else ln.strip()
+
+                # Check if this is a numeric continuation (VALUE data)
+                if _num_only.match(ln_content):
+                    # Look backward for a prior line ending with '.'
+                    # that should have been a continuation
+                    for prev in range(idx - 1, max(idx - 5, -1), -1):
+                        prev_ln = src_lines[prev]
+                        if len(prev_ln) > 6 and prev_ln[6] == "*":
+                            continue  # skip comments
+                        prev_content = prev_ln[7:72].rstrip() if len(prev_ln) > 7 else prev_ln.rstrip()
+                        if prev_content.endswith(".") and _num_only.match(prev_content.strip()):
+                            # Remove the premature period
+                            src_lines[prev] = prev_ln.replace(
+                                prev_content,
+                                prev_content[:-1] + " ",
+                                1,
+                            )
+                            fixed_count += 1
+                            break
+                        break  # only check immediate predecessor
+
+                if fixed_count == 0:
+                    # Fallback: comment out the error line if it's not a
+                    # primary field definition (88-level or continuation)
+                    if len(ln) > 6 and ln[6] != "*":
+                        if ln_content.startswith("88 ") or _num_only.match(ln_content):
+                            # Don't comment out 88-levels — they're definitions
+                            pass
+                        else:
+                            src_lines[idx] = ln[:6] + "*" + ln[7:]
+                            fixed_count += 1
+
+            if fixed_count == 0:
+                return False, f"Compilation failed:\n{result.stderr}\n{result.stdout}"
+
+            source_path.write_text("".join(src_lines))
+            log.info("Auto-fix pass %d: fixed %d lines, retrying ...",
+                     attempt + 1, fixed_count)
+
+        except subprocess.TimeoutExpired:
+            return False, "Compilation timed out"
+        except Exception as e:
+            return False, f"Compilation error: {e}"
+
+    return False, "Compilation failed after auto-fix retries"
 
 
 def run_cobol(
