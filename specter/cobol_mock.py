@@ -3575,6 +3575,9 @@ def compile_cobol(
                     uncached_errors.append((lineno, error_msg))
 
             # Phase 2: Try LLM for uncached errors
+            log.info("Compile fix: %d uncached errors, llm=%s, passes=%d/%d",
+                     len(uncached_errors), bool(llm_provider),
+                     llm_passes_used, max_llm_passes)
             if uncached_errors and llm_provider and llm_passes_used < max_llm_passes:
                 llm_passes_used += 1
                 llm_fixes = llm_fix_errors(
