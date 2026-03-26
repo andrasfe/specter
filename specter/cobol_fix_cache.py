@@ -381,9 +381,45 @@ def llm_fix_cascade_root(
 def _parse_llm_fix_response(
     response: str, min_line: int, max_line: int,
 ) -> dict[int, str]:
-    """Parse LLM response into {lineno: fixed_line} dict."""
+    """Parse LLM response into {lineno: fixed_line} dict.
+
+    Handles multiple formats:
+    - Plain text: "12345: fixed content"
+    - JSON: {"12345": "12345: fixed content"} or {"12345": "fixed content"}
+    - Markdown code blocks: ```cobol ... ```
+    """
     fixes: dict[int, str] = {}
-    for line in response.splitlines():
+
+    # Strip markdown code blocks if present
+    cleaned = re.sub(r"```\w*\n?", "", response)
+
+    # Try JSON parse first (GPT models often return JSON)
+    if cleaned.strip().startswith("{"):
+        try:
+            data = json.loads(cleaned)
+            for key, value in data.items():
+                # Key might be line number as string
+                m_key = re.match(r"(\d+)", str(key))
+                if not m_key:
+                    continue
+                lineno = int(m_key.group(1))
+                if not (min_line < lineno <= max_line):
+                    continue
+                # Value might be "12345: content" or just "content"
+                content = str(value)
+                m_val = re.match(r"\s*\d+\s*:\s?(.*)", content)
+                if m_val:
+                    content = m_val.group(1)
+                if not content.startswith(" " * 6):
+                    content = " " * 6 + " " + content.lstrip()
+                fixes[lineno] = content + "\n"
+            if fixes:
+                return fixes
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass  # Fall through to line-by-line parsing
+
+    # Line-by-line parsing
+    for line in cleaned.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -393,7 +429,6 @@ def _parse_llm_fix_response(
             lineno = int(m.group(1))
             content = m.group(2)
             if min_line < lineno <= max_line:
-                # Ensure proper COBOL formatting (pad to at least 7 chars)
                 if not content.startswith(" " * 6):
                     content = " " * 6 + " " + content.lstrip()
                 fixes[lineno] = content + "\n"
