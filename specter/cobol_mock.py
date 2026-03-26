@@ -3765,6 +3765,25 @@ def compile_cobol(
                             log.info("  LLM found cascade root cause: %d lines fixed upstream",
                                      len(llm_cascade_fixes))
 
+            # Remove ALL cascade errors from the deduped list — don't let
+            # the individual LLM waste calls on symptoms.
+            if first_section_err:
+                cascade_removed = 0
+                non_cascade: list[tuple[int, str]] = []
+                for ln, msg in deduped_errors:
+                    if "expecting SECTION or" in msg:
+                        eidx = ln - 1
+                        if 0 <= eidx < len(src_lines):
+                            content = src_lines[eidx][7:72].strip() if len(src_lines[eidx]) > 7 else src_lines[eidx].strip()
+                            if _data_def_re.match(content):
+                                cascade_removed += 1
+                                continue
+                    non_cascade.append((ln, msg))
+                if cascade_removed:
+                    log.info("  Skipping %d cascade symptom errors (will resolve when root cause is fixed)",
+                             cascade_removed)
+                    deduped_errors = non_cascade
+
             if cascade_root_fixes:
                 total_fixed += cascade_root_fixes
                 log.info("  Fixed %d cascade root causes, will recompile to check", cascade_root_fixes)
