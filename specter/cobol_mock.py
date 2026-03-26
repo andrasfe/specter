@@ -3508,7 +3508,7 @@ def compile_cobol(
         "-Wno-dialect",            # suppress dialect warnings
         "-frelax-syntax-checks",   # allow syntax variations
         "-frelax-level-hierarchy", # allow non-matching level numbers
-        "-fmax-errors=0",          # show all errors (don't stop at 128)
+        "-fmax-errors=10000",      # show all errors (don't stop early)
         "-o", str(output_path), str(source_path),
     ]
 
@@ -3613,7 +3613,22 @@ def compile_cobol(
                     if ln not in llm_fixes
                 ]
 
-            # Phase 3: Fallback — rule-based fixes for remaining errors
+            # Phase 3: Fallback — rule-based fixes ONLY if LLM is exhausted
+            # When LLM is available, don't comment out lines — let the LLM
+            # handle them on the next pass with better context.
+            if llm_provider and llm_passes_used < max_llm_passes:
+                # Skip rule-based, let LLM try again next pass
+                if fixed_count == 0:
+                    # Nothing fixed this pass — force at least one
+                    # rule-based fix to avoid infinite loop
+                    pass
+                else:
+                    # LLM fixed something, retry compilation
+                    source_path.write_text("".join(src_lines))
+                    log.info("Auto-fix pass %d: fixed %d lines (LLM), retrying ...",
+                             attempt + 1, fixed_count)
+                    continue
+
             _num_only = re.compile(
                 r"^\s*\d[\d\s]*(?:THRU\s+\d+[\d\s]*)*[\s.]*$", re.IGNORECASE,
             )
