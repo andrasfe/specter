@@ -3455,7 +3455,7 @@ def compile_cobol(
     source_path: str | Path,
     output_path: str | Path | None = None,
     copybook_dirs: list[Path] | None = None,
-    auto_fix_retries: int = 5,
+    auto_fix_retries: int = 20,
 ) -> tuple[bool, str]:
     """Compile COBOL source with GnuCOBOL.
 
@@ -3545,12 +3545,12 @@ def compile_cobol(
                             break
                         break  # only check immediate predecessor
 
-                if fixed_count == 0:
-                    # Fallback: comment out the error line if it's not a
-                    # primary field definition (88-level or continuation)
+                else:
+                    # Not a numeric continuation — try commenting out
+                    # if it's not a primary field definition
                     if len(ln) > 6 and ln[6] != "*":
-                        if ln_content.startswith("88 ") or _num_only.match(ln_content):
-                            # Don't comment out 88-levels — they're definitions
+                        if ln_content.startswith("88 "):
+                            # Don't comment out 88-levels
                             pass
                         else:
                             src_lines[idx] = ln[:6] + "*" + ln[7:]
