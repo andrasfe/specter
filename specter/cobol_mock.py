@@ -334,14 +334,11 @@ def _resolve_copies(
                         elif _value_tail_re.search(cl_content):
                             # Comment with value data at the end
                             # (e.g., **** GRCC START ****  992 994.)
-                            # Extract just the value portion
-                            m_tail = _value_tail_re.search(cl_content)
-                            if m_tail:
-                                val_part = m_tail.group(0).strip()
-                                pad = " " * max(0, 40 - len(val_part))
-                                copy_lines[ci] = (
-                                    cl_raw[:6] + " " + pad + val_part + "\n"
-                                )
+                            # Blank the comment line — the value data on
+                            # this line is a duplicate from the original
+                            # commented-out version; the active version
+                            # follows on the next non-comment line.
+                            copy_lines[ci] = cl_raw[:6] + "*\n"
                         # else: prose comment — just skip, don't end in_value
                     elif not cl_content:
                         pass  # blank line, skip
