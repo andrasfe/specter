@@ -303,9 +303,12 @@ def _resolve_copies(
             _value_cont_re = re.compile(
                 r"^\s*\d[\d\s]*(?:THRU\s+\d+)?[\s.]*$", re.IGNORECASE,
             )
-            # Matches value data at end of line (after comment prose)
+            # Matches value data at end of line: need 2+ space-separated
+            # numbers or THRU to distinguish from dates like 12/12/2001.
             _value_tail_re = re.compile(
-                r"\d{2,}[\d\s]*(?:THRU\s+\d+)?[\s.]*$", re.IGNORECASE,
+                r"\d{1,3}\s+\d{1,3}[\d\s]*[\s.]*$"
+                r"|\d{1,3}\s+THRU\s+\d{1,3}[\s.]*$",
+                re.IGNORECASE,
             )
             # Separator comments: lines with 5+ consecutive dashes or equals
             # (like *PIC---*, *---*, *M.A.V.---*, *TCS---2036---*).
