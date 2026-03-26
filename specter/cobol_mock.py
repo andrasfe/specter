@@ -297,42 +297,7 @@ def _resolve_copies(
         if found:
             result.append(f"      * SPECTER: COPY {copyname} inlined from {found.name}\n")
             copy_lines = found.read_text(errors="replace").splitlines(keepends=True)
-            # Pre-process: fix copybook comment issues for GnuCOBOL.
-            # Mainframe copybooks have comments interspersed in 88-level
-            # VALUE clauses that break GnuCOBOL parsing. Process ALL
-            # comment lines unconditionally (no VALUE state tracking):
-            _value_cont_re = re.compile(
-                r'^\s*\d[\d\s]*(?:THRU\s+\d+)?[\s.]*$', re.IGNORECASE,
-            )
-            _separator_re = re.compile(r'-{5,}|={5,}')
-            _value_tail_re = re.compile(
-                r'\d{1,3}\s+\d{1,3}[\d\s]*[\s.]*$'
-                r'|\d{1,3}\s+THRU\s+\d{1,3}[\s.]*$',
-                re.IGNORECASE,
-            )
-            for ci in range(len(copy_lines)):
-                cl_raw = copy_lines[ci]
-                if len(cl_raw) <= 6 or cl_raw[6] not in ('*', '/'):
-                    continue  # not a comment line
-                cl_content = cl_raw[7:72].strip() if len(cl_raw) > 7 else cl_raw.strip()
-                if _value_cont_re.match(cl_content):
-                    # Pure value data (e.g., *  140 142.) — uncomment
-                    copy_lines[ci] = cl_raw[:6] + ' ' + cl_raw[7:]
-                elif _separator_re.search(cl_content):
-                    # Separator (*---*, *PIC---*) — blank it
-                    copy_lines[ci] = cl_raw[:6] + "*\n"
-                elif _value_tail_re.search(cl_content):
-                    # Prose + value data (*GRCC*  992 994.) — blank it
-                    copy_lines[ci] = cl_raw[:6] + "*\n"
-
             for cl in copy_lines:
-                # Truncate to 72 columns — cols 73-80 are sequence numbers
-                # that GnuCOBOL would ignore but can corrupt when concatenated
-                # with code-area content during processing.
-                if len(cl.rstrip("\n\r")) > 72:
-                    cl = cl[:72] + "\n"
-                # Fix non-standard abbreviations
-                cl = re.sub(r"\bP\.I\.C\.", "PIC", cl)
                 cooked = cl
                 for old, new in replacing_pairs:
                     cooked = cooked.replace(old, new)
@@ -3339,6 +3304,96 @@ def generate_mock_data_ordered(stub_log: list[tuple[str, list]]) -> str:
 # ---------------------------------------------------------------------------
 # Compile and run
 # ---------------------------------------------------------------------------
+
+def clean_copybooks(copybook_dirs: list[Path]) -> list[Path]:
+    """Pre-clean copybooks for GnuCOBOL compatibility.
+
+    Creates a temp directory with cleaned copies of all .cpy/.CPY files.
+    Fixes:
+    - Truncate to 72 columns (strip sequence numbers)
+    - P.I.C. → PIC
+    - Remove separator comments inside VALUE clauses (*---*, *PIC---*)
+    - Remove comments with trailing value data (*GRCC*  992 994.)
+    - Uncomment pure numeric continuation lines (*  140 142.)
+
+    Returns list with one cleaned copybook directory.
+    """
+    import shutil
+
+    clean_dir = Path(tempfile.mkdtemp(prefix="specter_cpy_clean_"))
+
+    _value_cont_re = re.compile(
+        r"^\s*\d[\d\s]*(?:THRU\s+\d+)?[\s.]*$", re.IGNORECASE,
+    )
+    _separator_re = re.compile(r"-{5,}|={5,}")
+    _value_tail_re = re.compile(
+        r"\d{1,3}\s+\d{1,3}[\d\s]*[\s.]*$"
+        r"|\d{1,3}\s+THRU\s+\d{1,3}[\s.]*$",
+        re.IGNORECASE,
+    )
+
+    total_files = 0
+    total_fixes = 0
+
+    for src_dir in copybook_dirs:
+        if not src_dir.is_dir():
+            continue
+        for cpy_file in src_dir.iterdir():
+            if cpy_file.suffix.upper() not in (".CPY", ".CBL", ".COB", ".COBOL"):
+                # Copy non-COBOL files as-is
+                if cpy_file.is_file():
+                    shutil.copy2(cpy_file, clean_dir / cpy_file.name)
+                continue
+
+            total_files += 1
+            lines = cpy_file.read_text(errors="replace").splitlines(keepends=True)
+            fixes = 0
+
+            cleaned: list[str] = []
+            for line in lines:
+                # 1. Truncate to 72 columns
+                raw = line.rstrip("\n\r")
+                if len(raw) > 72:
+                    line = raw[:72] + "\n"
+                    fixes += 1
+
+                # 2. P.I.C. → PIC (in code area only, not comments)
+                if len(line) > 6 and line[6] not in ("*", "/"):
+                    new_line = re.sub(r"\bP\.I\.C\.", "PIC", line)
+                    if new_line != line:
+                        line = new_line
+                        fixes += 1
+
+                # 3. Process comment lines
+                if len(line) > 6 and line[6] in ("*", "/"):
+                    content = line[7:72].strip() if len(line) > 7 else line.strip()
+                    if _value_cont_re.match(content):
+                        # Pure numeric — uncomment
+                        line = line[:6] + " " + line[7:]
+                        fixes += 1
+                    elif _separator_re.search(content):
+                        # Separator comment — blank it
+                        line = line[:6] + "*\n"
+                        fixes += 1
+                    elif _value_tail_re.search(content):
+                        # Prose + trailing value data — blank it
+                        line = line[:6] + "*\n"
+                        fixes += 1
+
+                cleaned.append(line)
+
+            # Write cleaned copy
+            (clean_dir / cpy_file.name).write_text("".join(cleaned))
+            total_fixes += fixes
+
+    if total_fixes > 0:
+        log.info("Cleaned %d copybook files (%d fixes) → %s",
+                 total_files, total_fixes, clean_dir)
+    else:
+        log.info("Copybooks clean (%d files checked)", total_files)
+
+    return [clean_dir]
+
 
 def compile_cobol(
     source_path: str | Path,

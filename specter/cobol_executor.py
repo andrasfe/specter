@@ -113,6 +113,11 @@ def prepare_context(
     cobol_source = Path(cobol_source)
     copybook_paths = [Path(d) for d in (copybook_dirs or [])]
 
+    # Pre-clean copybooks for GnuCOBOL compatibility
+    if copybook_paths:
+        from .cobol_mock import clean_copybooks
+        copybook_paths = clean_copybooks(copybook_paths)
+
     if work_dir is None:
         work_dir = Path(tempfile.mkdtemp(prefix="specter_cobol_"))
     else:
