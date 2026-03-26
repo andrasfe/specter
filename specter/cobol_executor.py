@@ -115,17 +115,18 @@ def prepare_context(
     cobol_source = Path(cobol_source)
     copybook_paths = [Path(d) for d in (copybook_dirs or [])]
 
-    # Pre-clean copybooks AND source for GnuCOBOL compatibility
-    if copybook_paths:
-        from .cobol_mock import clean_copybooks, clean_cobol_source
-        copybook_paths = clean_copybooks(copybook_paths)
-        cobol_source = clean_cobol_source(cobol_source)
-
     if work_dir is None:
         work_dir = Path(tempfile.mkdtemp(prefix="specter_cobol_"))
     else:
         work_dir = Path(work_dir)
         work_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pre-clean copybooks AND source for GnuCOBOL compatibility.
+    # Pass work_dir so cached LLM fixes from prior runs can be applied.
+    if copybook_paths:
+        from .cobol_mock import clean_copybooks, clean_cobol_source
+        copybook_paths = clean_copybooks(copybook_paths)
+        cobol_source = clean_cobol_source(cobol_source, fix_cache_dir=work_dir)
 
     # Build initial_values dict for instrumentation — placeholder values
     # just to register the variable names for the EVALUATE dispatch.

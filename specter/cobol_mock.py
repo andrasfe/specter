@@ -3305,10 +3305,11 @@ def generate_mock_data_ordered(stub_log: list[tuple[str, list]]) -> str:
 # Compile and run
 # ---------------------------------------------------------------------------
 
-def clean_cobol_source(source_path: Path) -> Path:
+def clean_cobol_source(source_path: Path, fix_cache_dir: Path | None = None) -> Path:
     """Pre-clean a COBOL source file for GnuCOBOL compatibility.
 
     Same fixes as clean_copybooks but for the main .cbl file.
+    Also applies any cached LLM fixes from prior compilation runs.
     Returns path to the cleaned copy.
     """
     clean_dir = Path(tempfile.mkdtemp(prefix="specter_src_clean_"))
@@ -3354,10 +3355,37 @@ def clean_cobol_source(source_path: Path) -> Path:
 
         cleaned.append(line)
 
+    # Apply cached LLM fixes from prior runs
+    cache_fixes = 0
+    if fix_cache_dir:
+        cache_path = fix_cache_dir / "cobol_fix_cache.json"
+        if cache_path.exists():
+            from .cobol_fix_cache import CobolFixCache
+            cache = CobolFixCache(cache_path)
+            if len(cache) > 0:
+                # Try to apply each cached fix by scanning for matching patterns
+                for i, line in enumerate(cleaned):
+                    content = line[7:72].strip() if len(line) > 7 else line.strip()
+                    if not content:
+                        continue
+                    # Check common error patterns against cache
+                    for error_type in [
+                        "syntax error, unexpected Identifier",
+                        "unknown statement '88'",
+                        "syntax error, unexpected .",
+                    ]:
+                        window = cleaned[max(0, i - 5):min(len(cleaned), i + 6)]
+                        cached_fix = cache.lookup(error_type, window)
+                        if cached_fix and len(cached_fix) == len(window):
+                            cleaned[max(0, i - 5):min(len(cleaned), i + 6)] = cached_fix
+                            cache_fixes += 1
+                            break
+
     clean_path.write_text("".join(cleaned))
-    if fixes > 0:
-        log.info("Cleaned source %s (%d fixes) → %s",
-                 source_path.name, fixes, clean_path)
+    total = fixes + cache_fixes
+    if total > 0:
+        log.info("Cleaned source %s (%d regex fixes, %d cached fixes) → %s",
+                 source_path.name, fixes, cache_fixes, clean_path)
     return clean_path
 
 
@@ -3608,9 +3636,14 @@ def compile_cobol(
                             break
                         break
                 else:
-                    # Comment out non-definition lines
+                    # Only comment out lines that are NOT data definitions.
+                    # Data definitions start with level numbers (01-49, 66, 77, 88)
+                    # followed by a name and PIC/VALUE/REDEFINES.
                     if len(ln) > 6 and ln[6] != "*":
-                        if not ln_content.startswith("88 "):
+                        is_data_def = bool(re.match(
+                            r"^\s*(?:\d{2})\s+[A-Z]", ln_content, re.IGNORECASE,
+                        ))
+                        if not is_data_def:
                             src_lines[idx] = ln[:6] + "*" + ln[7:]
                             fixed_count += 1
 
