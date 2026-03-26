@@ -3582,11 +3582,6 @@ def compile_cobol(
     # Pre-compile source-level fixups (IBM → GnuCOBOL syntax)
     _apply_source_fixups(source_path)
 
-    # Track pending fix: (error_msg, original_window, fixed_window)
-    # Only promoted to cache when the error disappears on recompile.
-    pending_fix: tuple[str, list[str], list[str]] | None = None
-    prev_error_line: int | None = None
-
     for attempt in range(1 + auto_fix_retries):
         try:
             result = subprocess.run(
@@ -3601,17 +3596,6 @@ def compile_cobol(
             current_errors = parse_compilation_errors(
                 result.stderr or "", src_name,
             ) if result.returncode != 0 else []
-            current_error_lines = {ln for ln, _ in current_errors}
-
-            # Check if previous fix worked (error disappeared)
-            if pending_fix and prev_error_line not in current_error_lines:
-                err_msg, orig, fixed = pending_fix
-                cache.record(err_msg, orig, fixed,
-                             source="llm", model=llm_model or "")
-                log.info("Fix confirmed: line %d error resolved, cached",
-                         prev_error_line)
-                pending_fix = None
-
             if result.returncode == 0:
                 cache.save()
                 fixed = f" (after {attempt} fix passes)" if attempt > 0 else ""
@@ -3623,76 +3607,64 @@ def compile_cobol(
 
             src_lines = source_path.read_text().splitlines(keepends=True)
 
-            # Take the FIRST error — fix it, recompile, repeat.
-            lineno, error_msg = current_errors[0]
-            idx = lineno - 1
-            if idx < 0 or idx >= len(src_lines):
-                cache.save()
-                return False, f"Compilation failed:\n{result.stderr}\n{result.stdout}"
+            # Walk ALL errors one by one. For each: try cache → LLM
+            # (one error) → rule-based. Apply all fixes, then recompile
+            # once. Give up only when a full pass makes zero progress.
+            _num_only = re.compile(
+                r"^\s*\d[\d\s]*(?:THRU\s+\d+[\d\s]*)*[\s.]*$", re.IGNORECASE,
+            )
+            total_fixed = 0
 
-            window_start = max(0, idx - 10)
-            window_end = min(len(src_lines), idx + 11)
-            window = list(src_lines[window_start:window_end])
-            fixed_count = 0
+            for lineno, error_msg in current_errors:
+                idx = lineno - 1
+                if idx < 0 or idx >= len(src_lines):
+                    continue
 
-            # Phase 1: Try proven cached fix
-            cached = cache.lookup(error_msg, window)
-            if cached and len(cached) == len(window):
-                src_lines[window_start:window_end] = cached
-                fixed_count = 1
-                log.info("Fix pass %d: proven cached fix for line %d '%s'",
-                         attempt + 1, lineno, error_msg[:50])
+                window_start = max(0, idx - 10)
+                window_end = min(len(src_lines), idx + 11)
+                window = list(src_lines[window_start:window_end])
+                fixed_count = 0
 
-            # Phase 2: Try LLM (one error at a time)
-            if not fixed_count and llm_provider:
-                llm_fixes = llm_fix_errors(
-                    llm_provider, llm_model,
-                    [(lineno, error_msg)], src_lines, session_fixes,
-                )
-                if llm_fixes:
-                    original_lines = []
-                    fixed_lines = []
-                    for fix_lineno, fixed_line in llm_fixes.items():
-                        fix_idx = fix_lineno - 1
-                        if 0 <= fix_idx < len(src_lines):
-                            original_lines.append(src_lines[fix_idx])
-                            fixed_lines.append(fixed_line)
-                            src_lines[fix_idx] = fixed_line
-                            fixed_count += 1
-                    # Don't cache yet — wait for recompile to confirm
-                    pending_fix = (error_msg, original_lines, fixed_lines)
-                    prev_error_line = lineno
-                    session_fixes.append(
-                        f"Line {lineno}: LLM fix for '{error_msg[:40]}'"
+                # Phase 1: Try proven cached fix
+                cached = cache.lookup(error_msg, window)
+                if cached and len(cached) == len(window):
+                    src_lines[window_start:window_end] = cached
+                    fixed_count = 1
+
+                # Phase 2: Try LLM (one error at a time — clean context)
+                if not fixed_count and llm_provider:
+                    llm_fixes = llm_fix_errors(
+                        llm_provider, llm_model,
+                        [(lineno, error_msg)], src_lines, session_fixes,
                     )
-                    log.info("Fix pass %d: LLM suggested %d line changes for line %d '%s' (pending verification)",
-                             attempt + 1, len(llm_fixes), lineno, error_msg[:50])
-                else:
-                    log.warning("Fix pass %d: LLM returned no fix for line %d '%s'",
-                                attempt + 1, lineno, error_msg[:50])
+                    if llm_fixes:
+                        for fix_lineno, fixed_line in llm_fixes.items():
+                            fix_idx = fix_lineno - 1
+                            if 0 <= fix_idx < len(src_lines):
+                                src_lines[fix_idx] = fixed_line
+                                fixed_count += 1
+                        session_fixes.append(
+                            f"Line {lineno}: LLM fix for '{error_msg[:40]}'"
+                        )
 
-            # Phase 3: Rule-based fallback (comment out non-definition lines)
-            if not fixed_count:
-                _num_only = re.compile(
-                    r"^\s*\d[\d\s]*(?:THRU\s+\d+[\d\s]*)*[\s.]*$", re.IGNORECASE,
-                )
-                ln = src_lines[idx]
-                ln_content = ln[7:72].strip() if len(ln) > 7 else ln.strip()
-                if _num_only.match(ln_content):
-                    for prev in range(idx - 1, max(idx - 5, -1), -1):
-                        prev_ln = src_lines[prev]
-                        if len(prev_ln) > 6 and prev_ln[6] == "*":
-                            continue
-                        prev_content = prev_ln[7:72].rstrip() if len(prev_ln) > 7 else prev_ln.rstrip()
-                        if prev_content.endswith(".") and _num_only.match(prev_content.strip()):
-                            src_lines[prev] = prev_ln.replace(
-                                prev_content, prev_content[:-1] + " ", 1,
-                            )
-                            fixed_count += 1
+                # Phase 3: Rule-based fallback
+                if not fixed_count:
+                    ln = src_lines[idx]
+                    ln_content = ln[7:72].strip() if len(ln) > 7 else ln.strip()
+                    if _num_only.match(ln_content):
+                        for prev in range(idx - 1, max(idx - 5, -1), -1):
+                            prev_ln = src_lines[prev]
+                            if len(prev_ln) > 6 and prev_ln[6] == "*":
+                                continue
+                            prev_content = prev_ln[7:72].rstrip() if len(prev_ln) > 7 else prev_ln.rstrip()
+                            if prev_content.endswith(".") and _num_only.match(prev_content.strip()):
+                                src_lines[prev] = prev_ln.replace(
+                                    prev_content, prev_content[:-1] + " ", 1,
+                                )
+                                fixed_count += 1
+                                break
                             break
-                        break
-                if fixed_count == 0:
-                    if len(ln) > 6 and ln[6] != "*":
+                    if fixed_count == 0 and len(ln) > 6 and ln[6] != "*":
                         is_data_def = bool(re.match(
                             r"^\s*(?:\d{2})\s+[A-Z]", ln_content, re.IGNORECASE,
                         ))
@@ -3700,13 +3672,17 @@ def compile_cobol(
                             src_lines[idx] = ln[:6] + "*" + ln[7:]
                             fixed_count = 1
 
-            if fixed_count == 0:
+                total_fixed += fixed_count
+
+            if total_fixed == 0:
                 cache.save()
                 return False, (
-                    f"Compilation failed (no fix for line {lineno}: "
-                    f"{error_msg}):\n{result.stderr}\n{result.stdout}"
+                    f"Compilation failed ({len(current_errors)} errors, "
+                    f"no fixes applied):\n{result.stderr}\n{result.stdout}"
                 )
 
+            log.info("Fix pass %d: applied %d fixes across %d errors, recompiling...",
+                     attempt + 1, total_fixed, len(current_errors))
             source_path.write_text("".join(src_lines))
 
         except subprocess.TimeoutExpired:
