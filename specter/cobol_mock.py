@@ -3582,6 +3582,11 @@ def compile_cobol(
     # Pre-compile source-level fixups (IBM → GnuCOBOL syntax)
     _apply_source_fixups(source_path)
 
+    # pending_fixes: maps error_line → (error_msg, original_window, fixed_window)
+    # Promoted to cache only when the error disappears on next recompile.
+    pending_fixes: dict[int, tuple[str, list[str], list[str]]] = {}
+    prev_error_lines: set[int] = set()
+
     for attempt in range(1 + auto_fix_retries):
         try:
             result = subprocess.run(
@@ -3596,6 +3601,15 @@ def compile_cobol(
             current_errors = parse_compilation_errors(
                 result.stderr or "", src_name,
             ) if result.returncode != 0 else []
+            current_error_lines = {ln for ln, _ in current_errors}
+
+            # Promote pending fixes whose errors disappeared (proven)
+            for pline, (perr, porig, pfixed) in list(pending_fixes.items()):
+                if pline not in current_error_lines:
+                    cache.promote(perr, porig)
+                    log.info("Fix verified: line %d error gone, promoted in cache", pline)
+            pending_fixes.clear()
+
             if result.returncode == 0:
                 cache.save()
                 fixed = f" (after {attempt} fix passes)" if attempt > 0 else ""
@@ -3633,6 +3647,9 @@ def compile_cobol(
 
                 # Phase 2: Try LLM (one error at a time — clean context)
                 if not fixed_count and llm_provider:
+                    # Save original window for verification-based caching
+                    orig_window = list(src_lines[window_start:window_end])
+
                     llm_fixes = llm_fix_errors(
                         llm_provider, llm_model,
                         [(lineno, error_msg)], src_lines, session_fixes,
@@ -3646,6 +3663,13 @@ def compile_cobol(
                         session_fixes.append(
                             f"Line {lineno}: LLM fix for '{error_msg[:40]}'"
                         )
+                        # Save to cache immediately as pending (survives crashes).
+                        # Will be promoted to verified if error disappears.
+                        fixed_window = list(src_lines[window_start:window_end])
+                        cache.record(error_msg, orig_window, fixed_window,
+                                     source="llm", model=llm_model or "",
+                                     verified=False)
+                        pending_fixes[lineno] = (error_msg, orig_window, fixed_window)
 
                 # Phase 3: Rule-based fallback
                 if not fixed_count:

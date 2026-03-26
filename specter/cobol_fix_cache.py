@@ -44,6 +44,7 @@ class FixEntry:
     source: str = "llm"  # "llm" or "rule"
     llm_model: str = ""
     timestamp: str = ""
+    verified: bool = False  # True once error disappeared on recompile
 
 
 class CobolFixCache:
@@ -96,14 +97,24 @@ class CobolFixCache:
         fixed_lines: list[str],
         source: str = "llm",
         model: str = "",
+        verified: bool = False,
     ):
-        """Record a fix for future reuse."""
+        """Record a fix and persist immediately.
+
+        Fixes are saved as pending (verified=False) until the error
+        disappears on recompile, then promoted via promote().
+        Pending fixes are still usable on cache load — they survive
+        crashes so LLM work is never lost.
+        """
         pattern = normalize_context(context_lines)
         h = _hash_pattern(error_type, pattern)
         # Don't duplicate
         for fix in self._fixes:
             if fix.context_hash == h:
                 fix.fixed_lines = fixed_lines
+                if verified:
+                    fix.verified = True
+                self.save()
                 return
         self._fixes.append(FixEntry(
             error_type=error_type,
@@ -114,7 +125,19 @@ class CobolFixCache:
             source=source,
             llm_model=model,
             timestamp=datetime.now(timezone.utc).isoformat(),
+            verified=verified,
         ))
+        self.save()
+
+    def promote(self, error_type: str, context_lines: list[str]):
+        """Mark a pending fix as verified (error disappeared on recompile)."""
+        pattern = normalize_context(context_lines)
+        h = _hash_pattern(error_type, pattern)
+        for fix in self._fixes:
+            if fix.context_hash == h and not fix.verified:
+                fix.verified = True
+                self.save()
+                return
 
     def __len__(self):
         return len(self._fixes)
