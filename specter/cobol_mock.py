@@ -3602,6 +3602,11 @@ def compile_cobol(
     # Pre-compile source-level fixups (IBM → GnuCOBOL syntax)
     _apply_source_fixups(source_path)
 
+    # Clear last-resort log — fresh per run, no duplicates
+    lr_path = Path.cwd() / "last_resort.log"
+    if lr_path.exists():
+        lr_path.unlink()
+
     # Checkpoint: save a hash of the original source so we can detect
     # if a prior fixed version is still valid on the next run.
     import hashlib as _hl

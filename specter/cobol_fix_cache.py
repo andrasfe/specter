@@ -246,9 +246,9 @@ def llm_fix_errors(
     fixes: dict[int, list[str]] = {}
 
     for batch in batches[:10]:  # max 10 LLM calls per pass
-        # Extract window around the batch
-        min_line = max(0, batch[0][0] - 11)
-        max_line = min(len(src_lines), batch[-1][0] + 10)
+        # Extract window around the batch — 50 lines context minimum
+        min_line = max(0, batch[0][0] - 51)
+        max_line = min(len(src_lines), batch[-1][0] + 20)
         window = src_lines[min_line:max_line]
 
         error_desc = "\n".join(
