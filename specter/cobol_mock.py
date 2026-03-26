@@ -3456,12 +3456,17 @@ def compile_cobol(
     output_path: str | Path | None = None,
     copybook_dirs: list[Path] | None = None,
     auto_fix_retries: int = 20,
+    llm_provider=None,
+    llm_model: str | None = None,
 ) -> tuple[bool, str]:
     """Compile COBOL source with GnuCOBOL.
 
-    If compilation fails, automatically comments out error lines and
-    retries up to auto_fix_retries times. This handles legacy copybook
-    constructs that GnuCOBOL rejects.
+    If compilation fails:
+    1. Check fix cache for matching error patterns
+    2. If LLM available, ask it to fix uncached errors (up to 3 LLM passes)
+    3. Fallback: comment out non-definition error lines
+
+    Retries up to auto_fix_retries times. Fixes are cached for reuse.
 
     Returns (success, message).
     """
@@ -3483,6 +3488,18 @@ def compile_cobol(
         for d in copybook_dirs:
             cmd.extend(["-I", str(d)])
 
+    # Initialize fix cache
+    from .cobol_fix_cache import (
+        CobolFixCache,
+        llm_fix_errors,
+        parse_compilation_errors,
+    )
+    cache_path = source_path.parent / "cobol_fix_cache.json"
+    cache = CobolFixCache(cache_path)
+    session_fixes: list[str] = []
+    llm_passes_used = 0
+    max_llm_passes = 3
+
     for attempt in range(1 + auto_fix_retries):
         try:
             result = subprocess.run(
@@ -3492,82 +3509,129 @@ def compile_cobol(
                 timeout=1800,  # 30 min per attempt for large programs
             )
             if result.returncode == 0:
+                cache.save()
                 fixed = f" (after {attempt} auto-fix passes)" if attempt > 0 else ""
                 return True, f"Compiled: {output_path}{fixed}"
 
             if attempt >= auto_fix_retries:
+                cache.save()
                 return False, f"Compilation failed:\n{result.stderr}\n{result.stdout}"
 
-            # Parse error line numbers from stderr
-            error_lines: set[int] = set()
+            # Parse errors
             src_name = str(source_path.name)
-            for line in (result.stderr or "").splitlines():
-                if "error:" in line.lower() and src_name in line:
-                    m = re.search(rf"{re.escape(src_name)}:(\d+):", line)
-                    if m:
-                        error_lines.add(int(m.group(1)))
-
-            if not error_lines:
+            errors = parse_compilation_errors(result.stderr or "", src_name)
+            if not errors:
+                cache.save()
                 return False, f"Compilation failed:\n{result.stderr}\n{result.stdout}"
 
-            # Smart fix: for each error line, check if it's a VALUE
-            # continuation orphaned by a premature period on the prior line.
-            # If so, remove the period instead of commenting the line.
             src_lines = source_path.read_text().splitlines(keepends=True)
+            fixed_count = 0
+
+            # Phase 1: Try cached fixes
+            uncached_errors: list[tuple[int, str]] = []
+            for lineno, error_msg in errors:
+                idx = lineno - 1
+                if idx < 0 or idx >= len(src_lines):
+                    continue
+                window_start = max(0, idx - 10)
+                window_end = min(len(src_lines), idx + 11)
+                window = src_lines[window_start:window_end]
+                cached = cache.lookup(error_msg, window)
+                if cached and len(cached) == len(window):
+                    src_lines[window_start:window_end] = cached
+                    fixed_count += 1
+                    session_fixes.append(
+                        f"Line {lineno}: cached fix for '{error_msg[:40]}'"
+                    )
+                else:
+                    uncached_errors.append((lineno, error_msg))
+
+            # Phase 2: Try LLM for uncached errors
+            if uncached_errors and llm_provider and llm_passes_used < max_llm_passes:
+                llm_passes_used += 1
+                llm_fixes = llm_fix_errors(
+                    llm_provider, llm_model,
+                    uncached_errors, src_lines, session_fixes,
+                )
+                for lineno, fixed_line in llm_fixes.items():
+                    idx = lineno - 1
+                    if 0 <= idx < len(src_lines):
+                        old_line = src_lines[idx]
+                        src_lines[idx] = fixed_line
+                        fixed_count += 1
+                        # Cache the fix
+                        window_start = max(0, idx - 10)
+                        window_end = min(len(src_lines), idx + 11)
+                        error_msg = next(
+                            (m for ln, m in uncached_errors if ln == lineno),
+                            "unknown",
+                        )
+                        cache.record(
+                            error_msg,
+                            [old_line],
+                            [fixed_line],
+                            source="llm",
+                            model=llm_model or "",
+                        )
+                        session_fixes.append(
+                            f"Line {lineno}: LLM fix for '{error_msg[:40]}'"
+                        )
+                # Remove LLM-fixed errors from uncached list
+                uncached_errors = [
+                    (ln, msg) for ln, msg in uncached_errors
+                    if ln not in llm_fixes
+                ]
+
+            # Phase 3: Fallback — rule-based fixes for remaining errors
             _num_only = re.compile(
                 r"^\s*\d[\d\s]*(?:THRU\s+\d+[\d\s]*)*[\s.]*$", re.IGNORECASE,
             )
-            fixed_count = 0
-            for lineno in sorted(error_lines):
+            for lineno, error_msg in uncached_errors:
                 idx = lineno - 1
                 if idx < 0 or idx >= len(src_lines):
                     continue
                 ln = src_lines[idx]
                 ln_content = ln[7:72].strip() if len(ln) > 7 else ln.strip()
 
-                # Check if this is a numeric continuation (VALUE data)
+                # Try removing premature period
                 if _num_only.match(ln_content):
-                    # Look backward for a prior line ending with '.'
-                    # that should have been a continuation
                     for prev in range(idx - 1, max(idx - 5, -1), -1):
                         prev_ln = src_lines[prev]
                         if len(prev_ln) > 6 and prev_ln[6] == "*":
-                            continue  # skip comments
+                            continue
                         prev_content = prev_ln[7:72].rstrip() if len(prev_ln) > 7 else prev_ln.rstrip()
                         if prev_content.endswith(".") and _num_only.match(prev_content.strip()):
-                            # Remove the premature period
                             src_lines[prev] = prev_ln.replace(
-                                prev_content,
-                                prev_content[:-1] + " ",
-                                1,
+                                prev_content, prev_content[:-1] + " ", 1,
                             )
                             fixed_count += 1
                             break
-                        break  # only check immediate predecessor
-
+                        break
                 else:
-                    # Not a numeric continuation — try commenting out
-                    # if it's not a primary field definition
+                    # Comment out non-definition lines
                     if len(ln) > 6 and ln[6] != "*":
-                        if ln_content.startswith("88 "):
-                            # Don't comment out 88-levels
-                            pass
-                        else:
+                        if not ln_content.startswith("88 "):
                             src_lines[idx] = ln[:6] + "*" + ln[7:]
                             fixed_count += 1
 
             if fixed_count == 0:
+                cache.save()
                 return False, f"Compilation failed:\n{result.stderr}\n{result.stdout}"
 
             source_path.write_text("".join(src_lines))
-            log.info("Auto-fix pass %d: fixed %d lines, retrying ...",
-                     attempt + 1, fixed_count)
+            log.info("Auto-fix pass %d: fixed %d lines (%d cached, %d LLM, rest rule-based), retrying ...",
+                     attempt + 1, fixed_count,
+                     fixed_count - len(uncached_errors),
+                     len([f for f in session_fixes if "LLM" in f]))
 
         except subprocess.TimeoutExpired:
+            cache.save()
             return False, "Compilation timed out"
         except Exception as e:
+            cache.save()
             return False, f"Compilation error: {e}"
 
+    cache.save()
     return False, "Compilation failed after auto-fix retries"
 
 

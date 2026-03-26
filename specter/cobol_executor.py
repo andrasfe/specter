@@ -92,6 +92,8 @@ def prepare_context(
     injectable_vars: list[str] | None = None,
     coverage_mode: bool = False,
     allow_hardening_fallback: bool = True,
+    llm_provider=None,
+    llm_model: str | None = None,
 ) -> CobolExecutionContext:
     """Instrument and compile a COBOL source for repeated execution.
 
@@ -188,6 +190,7 @@ def prepare_context(
     executable_path = work_dir / cobol_source.stem
     success, message = compile_cobol(
         instrumented_path, executable_path, copybook_paths,
+        llm_provider=llm_provider, llm_model=llm_model,
     )
     if not success and "unknown (signal)" in (message or "").lower():
         # cobc internal abort: attempt targeted local mitigation while preserving
@@ -205,6 +208,7 @@ def prepare_context(
             instrumented_path.write_text(source_text)
             success, message = compile_cobol(
                 instrumented_path, executable_path, copybook_paths,
+                llm_provider=llm_provider, llm_model=llm_model,
             )
             if not success:
                 missing = {
@@ -230,6 +234,7 @@ def prepare_context(
                     instrumented_path.write_text(source_text)
                     success, message = compile_cobol(
                         instrumented_path, executable_path, copybook_paths,
+                        llm_provider=llm_provider, llm_model=llm_model,
                     )
     if not success:
         raise RuntimeError(f"COBOL compilation failed: {message}")

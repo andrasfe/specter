@@ -1087,6 +1087,8 @@ def run_cobol_coverage(
             injectable_vars=strict_injectable,
             coverage_mode=True,
             allow_hardening_fallback=not strict_branch_coverage,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
         )
     except RuntimeError as e:
         if strict_branch_coverage and strict_injectable:
@@ -1102,6 +1104,8 @@ def run_cobol_coverage(
                 injectable_vars=[],
                 coverage_mode=True,
                 allow_hardening_fallback=not strict_branch_coverage,
+                llm_provider=llm_provider,
+                llm_model=llm_model,
             )
         else:
             log.error("COBOL compilation failed: %s", e)
