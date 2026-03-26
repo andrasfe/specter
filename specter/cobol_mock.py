@@ -3582,6 +3582,20 @@ def compile_cobol(
     # Pre-compile source-level fixups (IBM → GnuCOBOL syntax)
     _apply_source_fixups(source_path)
 
+    # Checkpoint: save a hash of the original source so we can detect
+    # if a prior fixed version is still valid on the next run.
+    import hashlib as _hl
+    checkpoint_path = source_path.parent / (source_path.stem + ".fixed.cbl")
+    checkpoint_hash_path = source_path.parent / (source_path.stem + ".fixed.sha256")
+    source_hash = _hl.sha256(source_path.read_bytes()).hexdigest()
+
+    # If a checkpoint exists and matches, start from the fixed version
+    if checkpoint_path.exists() and checkpoint_hash_path.exists():
+        saved_hash = checkpoint_hash_path.read_text().strip()
+        if saved_hash == source_hash:
+            log.info("Resuming from checkpoint: %s", checkpoint_path.name)
+            source_path.write_text(checkpoint_path.read_text())
+
     # pending_fixes: maps error_line → (error_msg, original_window, fixed_window)
     # Promoted to cache only when the error disappears on next recompile.
     pending_fixes: dict[int, tuple[str, list[str], list[str]]] = {}
@@ -3728,7 +3742,12 @@ def compile_cobol(
 
             log.info("=== Fix pass %d summary: %d fixed (%d cached, %d LLM, %d rule-based), %d skipped, recompiling... ===",
                      attempt + 1, total_fixed, total_cached, total_llm, total_rule, total_skipped)
-            source_path.write_text("".join(src_lines))
+            fixed_source = "".join(src_lines)
+            source_path.write_text(fixed_source)
+
+            # Save checkpoint so we can resume after crash
+            checkpoint_path.write_text(fixed_source)
+            checkpoint_hash_path.write_text(source_hash)
 
         except subprocess.TimeoutExpired:
             cache.save()
