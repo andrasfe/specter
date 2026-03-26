@@ -294,57 +294,33 @@ def _resolve_copies(
         if found:
             result.append(f"      * SPECTER: COPY {copyname} inlined from {found.name}\n")
             copy_lines = found.read_text(errors="replace").splitlines(keepends=True)
-            # Pre-process: fix VALUE clause continuation issues.
-            # Mainframe copybooks have comments interspersed in multi-line
-            # VALUE clauses (88-levels). GnuCOBOL breaks on these because
-            # comments inside a VALUE clause terminate parsing. We either:
-            # - Remove separator comments (like *PIC---* or *---*)
-            # - Uncomment continuation lines that contain value data
+            # Pre-process: fix copybook comment issues for GnuCOBOL.
+            # Mainframe copybooks have comments interspersed in 88-level
+            # VALUE clauses that break GnuCOBOL parsing. Process ALL
+            # comment lines unconditionally (no VALUE state tracking):
             _value_cont_re = re.compile(
-                r"^\s*\d[\d\s]*(?:THRU\s+\d+)?[\s.]*$", re.IGNORECASE,
+                r'^\s*\d[\d\s]*(?:THRU\s+\d+)?[\s.]*$', re.IGNORECASE,
             )
-            # Matches value data at end of line: need 2+ space-separated
-            # numbers or THRU to distinguish from dates like 12/12/2001.
+            _separator_re = re.compile(r'-{5,}|={5,}')
             _value_tail_re = re.compile(
-                r"\d{1,3}\s+\d{1,3}[\d\s]*[\s.]*$"
-                r"|\d{1,3}\s+THRU\s+\d{1,3}[\s.]*$",
+                r'\d{1,3}\s+\d{1,3}[\d\s]*[\s.]*$'
+                r'|\d{1,3}\s+THRU\s+\d{1,3}[\s.]*$',
                 re.IGNORECASE,
             )
-            # Separator comments: lines with 5+ consecutive dashes or equals
-            # (like *PIC---*, *---*, *M.A.V.---*, *TCS---2036---*).
-            # Must NOT match prose like **** GRCC START ****
-            _separator_comment_re = re.compile(r"-{5,}|={5,}")
-            in_value = False
             for ci in range(len(copy_lines)):
                 cl_raw = copy_lines[ci]
+                if len(cl_raw) <= 6 or cl_raw[6] not in ('*', '/'):
+                    continue  # not a comment line
                 cl_content = cl_raw[7:72].strip() if len(cl_raw) > 7 else cl_raw.strip()
-                cl_upper = cl_content.upper()
-                is_comment = len(cl_raw) > 6 and cl_raw[6] in ("*", "/")
-
-                if not is_comment and "VALUE" in cl_upper:
-                    in_value = not cl_content.rstrip().endswith(".")
-                elif in_value:
-                    if is_comment:
-                        if _value_cont_re.match(cl_content):
-                            # Pure value data line — uncomment it
-                            copy_lines[ci] = cl_raw[:6] + " " + cl_raw[7:]
-                        elif _separator_comment_re.search(cl_content):
-                            # Separator comment (*---*, *PIC---*) — blank it
-                            copy_lines[ci] = cl_raw[:6] + "*\n"
-                        elif _value_tail_re.search(cl_content):
-                            # Comment with value data at the end
-                            # (e.g., **** GRCC START ****  992 994.)
-                            # Blank the comment line — the value data on
-                            # this line is a duplicate from the original
-                            # commented-out version; the active version
-                            # follows on the next non-comment line.
-                            copy_lines[ci] = cl_raw[:6] + "*\n"
-                        # else: prose comment — just skip, don't end in_value
-                    elif not cl_content:
-                        pass  # blank line, skip
-                    else:
-                        if cl_content.rstrip().endswith("."):
-                            in_value = False
+                if _value_cont_re.match(cl_content):
+                    # Pure value data (e.g., *  140 142.) — uncomment
+                    copy_lines[ci] = cl_raw[:6] + ' ' + cl_raw[7:]
+                elif _separator_re.search(cl_content):
+                    # Separator (*---*, *PIC---*) — blank it
+                    copy_lines[ci] = cl_raw[:6] + "*\n"
+                elif _value_tail_re.search(cl_content):
+                    # Prose + value data (*GRCC*  992 994.) — blank it
+                    copy_lines[ci] = cl_raw[:6] + "*\n"
 
             for cl in copy_lines:
                 # Truncate to 72 columns — cols 73-80 are sequence numbers
