@@ -3697,6 +3697,60 @@ def compile_cobol(
                 else:
                     total_cascade_skipped += 1
 
+            # Pre-pass: detect cascade root causes.
+            # "expecting SECTION or ." on valid data defs = parser lost context.
+            # Scan backwards from the FIRST such error to find the real problem.
+            _data_def_re = re.compile(
+                r"^\s*(?:\d{2,3})\s+(?:[A-Z]|FILLER)", re.IGNORECASE,
+            )
+            cascade_root_fixes = 0
+            if deduped_errors:
+                first_section_err = None
+                for ln, msg in deduped_errors:
+                    if "expecting SECTION or" in msg:
+                        eidx = ln - 1
+                        if 0 <= eidx < len(src_lines):
+                            content = src_lines[eidx][7:72].strip() if len(src_lines[eidx]) > 7 else src_lines[eidx].strip()
+                            if _data_def_re.match(content):
+                                first_section_err = ln
+                                break
+
+                if first_section_err:
+                    # Scan backwards to find the root cause line
+                    scan_start = first_section_err - 2  # 0-indexed, before error
+                    for back_idx in range(scan_start, max(scan_start - 50, -1), -1):
+                        if back_idx < 0 or back_idx >= len(src_lines):
+                            continue
+                        bline = src_lines[back_idx]
+                        if len(bline) > 6 and bline[6] in ("*", "/"):
+                            continue  # skip comments
+                        bcontent = bline[7:72].strip() if len(bline) > 7 else bline.strip()
+                        if not bcontent:
+                            continue
+                        # Check for VALUES ARE that survived fixups
+                        if re.search(r"\bVALUES\s+ARE\b", bcontent, re.IGNORECASE):
+                            src_lines[back_idx] = re.sub(
+                                r"\bVALUES\s+ARE\b", "VALUE", bline, flags=re.IGNORECASE,
+                            )
+                            cascade_root_fixes += 1
+                            log.info("  Cascade root cause: VALUES ARE at line %d → fixed", back_idx + 1)
+                            break
+                        # Check for commented-out line that broke structure
+                        # (e.g., last-resort commented a parent record)
+                        if bline[6] == "*" and _data_def_re.match(bcontent):
+                            # A commented-out data def right before cascade — uncomment it
+                            src_lines[back_idx] = bline[:6] + " " + bline[7:]
+                            cascade_root_fixes += 1
+                            log.info("  Cascade root cause: uncommented data def at line %d", back_idx + 1)
+                            break
+                        # If we hit a valid active data def, stop scanning
+                        if _data_def_re.match(bcontent):
+                            break
+
+            if cascade_root_fixes:
+                total_fixed += cascade_root_fixes
+                log.info("  Fixed %d cascade root causes, will recompile to check", cascade_root_fixes)
+
             n_errors = len(deduped_errors)
             log.info("=== Fix pass %d: %d unique errors (%d cascade-skipped) ===",
                      attempt + 1, n_errors, total_cascade_skipped)
