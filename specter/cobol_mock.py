@@ -3378,7 +3378,7 @@ def compile_cobol(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300,  # 5 min per attempt for large programs
+                timeout=1800,  # 30 min per attempt for large programs
             )
             if result.returncode == 0:
                 fixed = f" (after {attempt} auto-fix passes)" if attempt > 0 else ""
