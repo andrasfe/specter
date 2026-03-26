@@ -42,6 +42,23 @@ def _gnucobol_source_fixups(source_text: str) -> str:
     Every rule here replaces an LLM call. If the LLM fix cache shows
     a pattern being fixed repeatedly, add it here as a regex rule.
     """
+    # --- DIAGNOSTIC: count VALUES ARE before/after ---
+    before_count = len(re.findall(r"VALUES\s+ARE", source_text, re.IGNORECASE))
+    if before_count:
+        log.info("GnuCOBOL fixups: found %d 'VALUES ARE' instances to fix", before_count)
+
+    # --- BRUTE FORCE pass first (catches everything, even edge cases) ---
+    # Simple case-insensitive replacement on the raw text.
+    # This runs BEFORE the line-by-line pass as a safety net.
+    source_text = re.sub(r"\bVALUES\s+ARE\b", "VALUE", source_text, flags=re.IGNORECASE)
+    source_text = re.sub(r"\bVALUES\s+IS\b", "VALUE", source_text, flags=re.IGNORECASE)
+
+    after_count = len(re.findall(r"VALUES\s+ARE", source_text, re.IGNORECASE))
+    if before_count:
+        log.info("GnuCOBOL fixups: %d 'VALUES ARE' after brute-force pass (%d removed)",
+                 after_count, before_count - after_count)
+
+    # --- Line-by-line pass for remaining fixups ---
     fixed_lines: list[str] = []
     fixes = 0
     in_procedure = False
@@ -55,30 +72,22 @@ def _gnucobol_source_fixups(source_text: str) -> str:
         if len(line) > 6 and line[6] not in ("*", "/"):
             orig = line
 
-            # --- VALUE clause fixes ---
-            # VALUES ARE → VALUE  (IBM plural syntax)
+            # --- VALUE clause fixes (belt-and-suspenders after brute force) ---
             line = re.sub(r"\bVALUES\s+ARE\b", "VALUE", line, flags=re.IGNORECASE)
-            # VALUES IS → VALUE
             line = re.sub(r"\bVALUES\s+IS\b", "VALUE", line, flags=re.IGNORECASE)
-            # Bare VALUES → VALUE (but not in PROCEDURE DIVISION where
-            # it could be part of HIGH-VALUES/LOW-VALUES/SPACES usage)
             if not in_procedure:
                 line = re.sub(r"\bVALUES\b(?!\s+(?:ARE|IS)\b)", "VALUE", line, flags=re.IGNORECASE)
 
             # --- PIC clause fixes ---
-            # P.I.C. → PIC
             line = re.sub(r"\bP\.I\.C\.", "PIC", line)
 
             # --- IBM compiler directives (not supported by GnuCOBOL) ---
             stripped = code_area.strip().upper()
-            # EJECT / SKIP1 / SKIP2 / SKIP3 — IBM page formatting
             if stripped in ("EJECT", "EJECT.", "SKIP1", "SKIP1.",
                             "SKIP2", "SKIP2.", "SKIP3", "SKIP3."):
                 line = line[:6] + "*" + line[7:]
-            # SERVICE RELOAD — IBM only
             elif stripped.startswith("SERVICE RELOAD") or stripped.startswith("SERVICE LABEL"):
                 line = line[:6] + "*" + line[7:]
-            # READY TRACE / RESET TRACE — IBM debug
             elif stripped.startswith("READY TRACE") or stripped.startswith("RESET TRACE"):
                 line = line[:6] + "*" + line[7:]
 
@@ -93,7 +102,7 @@ def _gnucobol_source_fixups(source_text: str) -> str:
         fixed_lines.append(line)
 
     if fixes:
-        log.info("GnuCOBOL source fixups: %d lines fixed", fixes)
+        log.info("GnuCOBOL source fixups: %d lines fixed (line-by-line pass)", fixes)
     return "".join(fixed_lines)
 
 
