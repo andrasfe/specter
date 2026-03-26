@@ -3628,8 +3628,16 @@ def compile_cobol(
                 r"^\s*\d[\d\s]*(?:THRU\s+\d+[\d\s]*)*[\s.]*$", re.IGNORECASE,
             )
             total_fixed = 0
+            total_cached = 0
+            total_llm = 0
+            total_rule = 0
+            total_skipped = 0
+            n_errors = len(current_errors)
 
-            for lineno, error_msg in current_errors:
+            log.info("=== Fix pass %d: %d errors to process ===",
+                     attempt + 1, n_errors)
+
+            for err_idx, (lineno, error_msg) in enumerate(current_errors):
                 idx = lineno - 1
                 if idx < 0 or idx >= len(src_lines):
                     continue
@@ -3644,15 +3652,19 @@ def compile_cobol(
                 if cached and len(cached) == len(window):
                     src_lines[window_start:window_end] = cached
                     fixed_count = 1
+                    total_cached += 1
 
                 # Phase 2: Try LLM (one error at a time — clean context)
                 if not fixed_count and llm_provider:
-                    # Save original window for verification-based caching
                     orig_window = list(src_lines[window_start:window_end])
+
+                    log.info("  [%d/%d] LLM fixing line %d: %s",
+                             err_idx + 1, n_errors, lineno, error_msg[:60])
 
                     llm_fixes = llm_fix_errors(
                         llm_provider, llm_model,
                         [(lineno, error_msg)], src_lines, session_fixes,
+                        source_name=str(source_path.name),
                     )
                     if llm_fixes:
                         for fix_lineno, fixed_line in llm_fixes.items():
@@ -3663,13 +3675,17 @@ def compile_cobol(
                         session_fixes.append(
                             f"Line {lineno}: LLM fix for '{error_msg[:40]}'"
                         )
-                        # Save to cache immediately as pending (survives crashes).
-                        # Will be promoted to verified if error disappears.
                         fixed_window = list(src_lines[window_start:window_end])
                         cache.record(error_msg, orig_window, fixed_window,
                                      source="llm", model=llm_model or "",
                                      verified=False)
                         pending_fixes[lineno] = (error_msg, orig_window, fixed_window)
+                        total_llm += 1
+                        log.info("  [%d/%d] ✓ LLM fixed %d lines at line %d",
+                                 err_idx + 1, n_errors, len(llm_fixes), lineno)
+                    else:
+                        log.info("  [%d/%d] ✗ LLM returned no fix for line %d",
+                                 err_idx + 1, n_errors, lineno)
 
                 # Phase 3: Rule-based fallback
                 if not fixed_count:
@@ -3695,6 +3711,11 @@ def compile_cobol(
                         if not is_data_def:
                             src_lines[idx] = ln[:6] + "*" + ln[7:]
                             fixed_count = 1
+                    if fixed_count:
+                        total_rule += 1
+
+                if fixed_count == 0:
+                    total_skipped += 1
 
                 total_fixed += fixed_count
 
@@ -3705,8 +3726,8 @@ def compile_cobol(
                     f"no fixes applied):\n{result.stderr}\n{result.stdout}"
                 )
 
-            log.info("Fix pass %d: applied %d fixes across %d errors, recompiling...",
-                     attempt + 1, total_fixed, len(current_errors))
+            log.info("=== Fix pass %d summary: %d fixed (%d cached, %d LLM, %d rule-based), %d skipped, recompiling... ===",
+                     attempt + 1, total_fixed, total_cached, total_llm, total_rule, total_skipped)
             source_path.write_text("".join(src_lines))
 
         except subprocess.TimeoutExpired:

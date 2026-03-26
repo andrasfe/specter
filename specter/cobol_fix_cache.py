@@ -218,6 +218,7 @@ def llm_fix_errors(
     errors: list[tuple[int, str]],
     src_lines: list[str],
     session_fixes: list[str],
+    source_name: str = "",
 ) -> dict[int, list[str]]:
     """Query LLM to fix compilation errors.
 
@@ -225,6 +226,7 @@ def llm_fix_errors(
         errors: List of (lineno, error_message).
         src_lines: Full source as list of lines.
         session_fixes: Prior fixes in this session (for context).
+        source_name: Filename for context in the prompt.
 
     Returns dict mapping error_lineno → fixed_lines (replacement for the window).
     """
@@ -253,12 +255,24 @@ def llm_fix_errors(
             f"Line {ln}: {msg}" for ln, msg in batch
         )
 
+        # Detect if the error region is DATA DIVISION or PROCEDURE DIVISION
+        division = "DATA DIVISION"
+        for i in range(min(min_line, len(src_lines))):
+            ln_text = src_lines[i][6:72] if len(src_lines[i]) > 6 else src_lines[i]
+            if "PROCEDURE DIVISION" in ln_text.upper():
+                division = "PROCEDURE DIVISION"
+                break
+
         prior_context = ""
         if session_fixes:
             prior_context = (
                 "\n\nPrior fixes applied in this session:\n"
                 + "\n".join(f"- {f}" for f in session_fixes[-10:])
             )
+
+        file_context = ""
+        if source_name:
+            file_context = f"File: {source_name}\n"
 
         # Number the lines for the LLM
         numbered = "\n".join(
@@ -269,13 +283,16 @@ def llm_fix_errors(
         prompt = (
             "You are fixing GnuCOBOL compilation errors in an instrumented COBOL source.\n"
             "The original code compiles on IBM mainframes but GnuCOBOL (-std=ibm) is stricter.\n\n"
+            f"{file_context}"
+            f"Section: {division} ({'data definitions / copybook content' if division == 'DATA DIVISION' else 'executable statements'})\n\n"
             f"Errors:\n{error_desc}\n\n"
             f"Context (lines {min_line+1}-{max_line}):\n"
             f"```cobol\n{numbered}\n```\n"
             f"{prior_context}\n\n"
             "Fix the COBOL so it compiles with GnuCOBOL while preserving the original semantics.\n"
-            "Common fixes: remove separator comments inside VALUE clauses, fix premature periods,\n"
-            "uncomment continuation lines, fix P.I.C. → PIC, remove duplicate definitions.\n\n"
+            "Common fixes: VALUES ARE → VALUE, remove separator comments inside VALUE clauses,\n"
+            "fix premature periods, uncomment continuation lines, P.I.C. → PIC,\n"
+            "remove duplicate definitions, fix level-number hierarchy issues.\n\n"
             "Output ONLY the corrected lines with their line numbers, same format as above.\n"
             "Do not add explanations. Only output lines that changed."
         )
