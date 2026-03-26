@@ -3699,13 +3699,15 @@ def compile_cobol(
 
             # Pre-pass: detect cascade root causes.
             # "expecting SECTION or ." on valid data defs = parser lost context.
-            # Scan backwards from the FIRST such error to find the real problem.
+            # The error is NOT on the reported line — it's 20-100 lines ABOVE.
+            from .cobol_fix_cache import llm_fix_cascade_root
             _data_def_re = re.compile(
                 r"^\s*(?:\d{2,3})\s+(?:[A-Z]|FILLER)", re.IGNORECASE,
             )
             cascade_root_fixes = 0
             if deduped_errors:
                 first_section_err = None
+                first_section_msg = ""
                 for ln, msg in deduped_errors:
                     if "expecting SECTION or" in msg:
                         eidx = ln - 1
@@ -3713,39 +3715,50 @@ def compile_cobol(
                             content = src_lines[eidx][7:72].strip() if len(src_lines[eidx]) > 7 else src_lines[eidx].strip()
                             if _data_def_re.match(content):
                                 first_section_err = ln
+                                first_section_msg = msg
                                 break
 
                 if first_section_err:
-                    # Scan backwards to find the root cause line
-                    scan_start = first_section_err - 2  # 0-indexed, before error
+                    # Step 1: Quick regex scan for known patterns
+                    scan_start = first_section_err - 2
+                    regex_fixed = False
                     for back_idx in range(scan_start, max(scan_start - 50, -1), -1):
                         if back_idx < 0 or back_idx >= len(src_lines):
                             continue
                         bline = src_lines[back_idx]
                         if len(bline) > 6 and bline[6] in ("*", "/"):
-                            continue  # skip comments
+                            continue
                         bcontent = bline[7:72].strip() if len(bline) > 7 else bline.strip()
                         if not bcontent:
                             continue
-                        # Check for VALUES ARE that survived fixups
                         if re.search(r"\bVALUES\s+ARE\b", bcontent, re.IGNORECASE):
                             src_lines[back_idx] = re.sub(
                                 r"\bVALUES\s+ARE\b", "VALUE", bline, flags=re.IGNORECASE,
                             )
                             cascade_root_fixes += 1
-                            log.info("  Cascade root cause: VALUES ARE at line %d → fixed", back_idx + 1)
+                            regex_fixed = True
+                            log.info("  Cascade root: VALUES ARE at line %d → fixed", back_idx + 1)
                             break
-                        # Check for commented-out line that broke structure
-                        # (e.g., last-resort commented a parent record)
-                        if bline[6] == "*" and _data_def_re.match(bcontent):
-                            # A commented-out data def right before cascade — uncomment it
-                            src_lines[back_idx] = bline[:6] + " " + bline[7:]
-                            cascade_root_fixes += 1
-                            log.info("  Cascade root cause: uncommented data def at line %d", back_idx + 1)
-                            break
-                        # If we hit a valid active data def, stop scanning
                         if _data_def_re.match(bcontent):
                             break
+
+                    # Step 2: If regex didn't find it, ask LLM with 100-line upstream window
+                    if not regex_fixed and llm_provider:
+                        log.info("  Cascade detected at line %d — asking LLM to find root cause (100-line window)...",
+                                 first_section_err)
+                        llm_cascade_fixes = llm_fix_cascade_root(
+                            llm_provider, llm_model,
+                            first_section_err, first_section_msg,
+                            src_lines, source_name=str(source_path.name),
+                        )
+                        if llm_cascade_fixes:
+                            for fix_ln, fix_content in llm_cascade_fixes.items():
+                                fix_idx = fix_ln - 1
+                                if 0 <= fix_idx < len(src_lines):
+                                    src_lines[fix_idx] = fix_content
+                                    cascade_root_fixes += 1
+                            log.info("  LLM found cascade root cause: %d lines fixed upstream",
+                                     len(llm_cascade_fixes))
 
             if cascade_root_fixes:
                 total_fixed += cascade_root_fixes

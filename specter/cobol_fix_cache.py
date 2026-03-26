@@ -311,6 +311,68 @@ def llm_fix_errors(
     return fixes
 
 
+def llm_fix_cascade_root(
+    llm_provider,
+    llm_model: str | None,
+    first_error_line: int,
+    error_msg: str,
+    src_lines: list[str],
+    source_name: str = "",
+) -> dict[int, str]:
+    """Ask LLM to find the root cause of a cascade of errors.
+
+    When "expecting SECTION or ." appears on valid data definitions,
+    the real problem is 20-100 lines ABOVE. Send the LLM a large
+    upstream window and ask it to find the malformed line.
+    """
+    from .llm_coverage import _query_llm_sync
+
+    # Large window: 100 lines before the error, 5 after
+    idx = first_error_line - 1
+    min_line = max(0, idx - 100)
+    max_line = min(len(src_lines), idx + 5)
+    window = src_lines[min_line:max_line]
+
+    numbered = "\n".join(
+        f"{min_line + i + 1:5d}: {line.rstrip()}"
+        for i, line in enumerate(window)
+    )
+
+    file_ctx = f"File: {source_name}\n" if source_name else ""
+
+    prompt = (
+        "You are debugging a GnuCOBOL compilation cascade failure.\n\n"
+        f"{file_ctx}"
+        f"Error at line {first_error_line}: {error_msg}\n\n"
+        "This line is VALID COBOL — the error is a CASCADE. The GnuCOBOL parser\n"
+        "lost track of the DATA DIVISION context due to a malformed line ABOVE.\n"
+        "Every line after the malformed line shows 'expecting SECTION or .' even\n"
+        "though those lines are perfectly valid data definitions.\n\n"
+        "The root cause is typically:\n"
+        "- A VALUE clause missing a terminal period\n"
+        "- A commented-out line that broke a multi-line VALUE or record structure\n"
+        "- An IBM-only syntax like VALUES ARE (should be VALUE)\n"
+        "- A separator comment (*---*) inside a VALUE clause\n"
+        "- A COPY statement that resolved incorrectly\n\n"
+        f"Look at the 100 lines BEFORE the error to find the root cause:\n"
+        f"```cobol\n{numbered}\n```\n\n"
+        "Find the ONE line that broke the parser context and fix it.\n"
+        "Output ONLY the corrected line(s) with line numbers, format: '12345: fixed content'.\n"
+        "Do not add explanations."
+    )
+
+    try:
+        response, _ = _query_llm_sync(llm_provider, prompt, llm_model)
+        parsed = _parse_llm_fix_response(response, min_line, max_line)
+        if parsed:
+            log.info("LLM cascade root fix: %d lines corrected upstream of line %d",
+                     len(parsed), first_error_line)
+        return parsed or {}
+    except Exception as e:
+        log.warning("LLM cascade root fix failed: %s", e)
+        return {}
+
+
 def _parse_llm_fix_response(
     response: str, min_line: int, max_line: int,
 ) -> dict[int, str]:
