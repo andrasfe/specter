@@ -3647,7 +3647,7 @@ def compile_cobol(
             if result.returncode == 0:
                 cache.save()
                 fixed = f" (after {attempt} fix passes)" if attempt > 0 else ""
-                lr_path = source_path.parent / "last_resort.log"
+                lr_path = Path.cwd() / "last_resort.log"
                 lr_note = ""
                 if lr_path.exists():
                     lr_count = sum(1 for l in lr_path.read_text().splitlines()
@@ -3837,7 +3837,7 @@ def compile_cobol(
 
             # Persist last-resort items for human review
             if last_resort_items:
-                lr_path = source_path.parent / "last_resort.log"
+                lr_path = Path.cwd() / "last_resort.log"
                 with open(lr_path, "a") as f:
                     f.write(f"\n--- Pass {attempt + 1} ---\n")
                     f.write("\n".join(last_resort_items) + "\n")
