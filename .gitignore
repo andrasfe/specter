@@ -29,3 +29,9 @@ Thumbs.db
 examples/tmp/
 *.mock
 /tmp/
+.claude/coordination/
+
+# Specter build artifacts
+.specter_build_*/
+last_resort.log
+cobol_fix_cache.json
