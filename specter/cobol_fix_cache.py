@@ -318,66 +318,154 @@ def llm_fix_errors(
     return fixes
 
 
-def llm_fix_cascade_root(
+def _format_numbered(src_lines: list[str], start: int, end: int) -> str:
+    """Format source lines with line numbers for LLM context."""
+    return "\n".join(
+        f"{start + i + 1:5d}: {line.rstrip()}"
+        for i, line in enumerate(src_lines[start:end])
+    )
+
+
+def llm_investigate_cascade(
     llm_provider,
     llm_model: str | None,
     first_error_line: int,
     error_msg: str,
+    all_errors: list[tuple[int, str]],
     src_lines: list[str],
     source_name: str = "",
+    max_turns: int = 5,
 ) -> dict[int, str]:
-    """Ask LLM to find the root cause of a cascade of errors.
+    """Multi-turn LLM investigation of cascade root cause.
 
-    When "expecting SECTION or ." appears on valid data definitions,
-    the real problem is 20-100 lines ABOVE. Send the LLM a large
-    upstream window and ask it to find the malformed line.
+    The LLM can request specific chunks of the source file to
+    investigate where the parser lost context. Up to max_turns
+    rounds of conversation.
     """
-    from .llm_coverage import _query_llm_sync
+    from .llm_coverage import _query_llm_sync, Message
 
-    # Large window: 100 lines before the error, 5 after
+    total_lines = len(src_lines)
     idx = first_error_line - 1
     min_line = max(0, idx - 100)
-    max_line = min(len(src_lines), idx + 5)
-    window = src_lines[min_line:max_line]
+    max_line = min(total_lines, idx + 5)
+    initial_window = _format_numbered(src_lines, min_line, max_line)
 
-    numbered = "\n".join(
-        f"{min_line + i + 1:5d}: {line.rstrip()}"
-        for i, line in enumerate(window)
+    # Show first 30 error locations as clues
+    error_locs = ", ".join(str(ln) for ln, _ in all_errors[:30])
+
+    file_ctx = f"File: {source_name} ({total_lines} lines total)\n" if source_name else ""
+
+    system_msg = Message(
+        role="system",
+        content=(
+            "You are investigating a GnuCOBOL compilation cascade failure in a "
+            "large instrumented COBOL source file. You can request chunks of the "
+            "file to investigate. Respond with ONLY JSON, no explanations."
+        ),
     )
 
-    file_ctx = f"File: {source_name}\n" if source_name else ""
-
-    prompt = (
-        "You are debugging a GnuCOBOL compilation cascade failure.\n\n"
-        f"{file_ctx}"
-        f"Error at line {first_error_line}: {error_msg}\n\n"
-        "This line is VALID COBOL — the error is a CASCADE. The GnuCOBOL parser\n"
-        "lost track of the DATA DIVISION context due to a malformed line ABOVE.\n"
-        "Every line after the malformed line shows 'expecting SECTION or .' even\n"
-        "though those lines are perfectly valid data definitions.\n\n"
-        "The root cause is typically:\n"
-        "- A VALUE clause missing a terminal period\n"
-        "- A commented-out line that broke a multi-line VALUE or record structure\n"
-        "- An IBM-only syntax like VALUES ARE (should be VALUE)\n"
-        "- A separator comment (*---*) inside a VALUE clause\n"
-        "- A COPY statement that resolved incorrectly\n\n"
-        f"Look at the 100 lines BEFORE the error to find the root cause:\n"
-        f"```cobol\n{numbered}\n```\n\n"
-        "Find the ONE line that broke the parser context and fix it.\n"
-        "Output ONLY the corrected line(s) as a flat JSON object: {\"12345\": \"       fixed content\"}\n"
-        "Do NOT wrap in outer keys. Do NOT add explanations. Preserve COBOL column formatting."
+    user_msg = Message(
+        role="user",
+        content=(
+            f"{file_ctx}"
+            f"The compiler reports {len(all_errors)} errors. "
+            f"The first error on a valid data definition is at line {first_error_line}:\n"
+            f"  {error_msg}\n\n"
+            "All errors from this line onward are CASCADE SYMPTOMS — the lines "
+            "themselves are valid COBOL. The root cause is a malformed line "
+            "somewhere ABOVE that broke the parser's DATA DIVISION context.\n\n"
+            "Common root causes:\n"
+            "- A VALUE clause missing a terminal period\n"
+            "- A commented-out line that broke a multi-line VALUE or record structure\n"
+            "- IBM-only syntax like VALUES ARE (should be VALUE)\n"
+            "- A separator comment inside a VALUE clause\n\n"
+            f"First error and 100 lines before it:\n"
+            f"```cobol\n{initial_window}\n```\n\n"
+            f"Other error locations: {error_locs}\n\n"
+            "You have TWO options:\n\n"
+            "OPTION A — You found the root cause. Return:\n"
+            "{\"fix\": {\"12345\": \"       fixed content line\"}}\n\n"
+            "OPTION B — You need to see more of the file. Return:\n"
+            "{\"need_context\": {\"start\": 3720, \"end\": 3770, \"reason\": \"checking first error area\"}}\n\n"
+            "Respond with ONLY the JSON."
+        ),
     )
 
-    try:
-        response, _ = _query_llm_sync(llm_provider, prompt, llm_model)
-        parsed = _parse_llm_fix_response(response, min_line, max_line)
-        if parsed:
-            log.info("LLM cascade root fix: %d lines corrected upstream of line %d",
-                     len(parsed), first_error_line)
-        return parsed or {}
-    except Exception as e:
-        log.warning("LLM cascade root fix failed: %s", e)
+    messages = [system_msg, user_msg]
+
+    for turn in range(max_turns):
+        try:
+            response, _ = _query_llm_sync(llm_provider, messages, llm_model)
+        except Exception as e:
+            log.warning("LLM cascade investigation failed on turn %d: %s", turn + 1, e)
+            return {}
+
+        # Strip markdown code blocks
+        cleaned = re.sub(r"```\w*\n?", "", response).strip()
+
+        # Try to parse JSON
+        try:
+            parsed = json.loads(cleaned)
+        except (json.JSONDecodeError, ValueError):
+            # Try to find JSON in the response
+            m = re.search(r"\{[^{}]*\{[^{}]*\}[^{}]*\}", cleaned) or re.search(r"\{[^{}]+\}", cleaned)
+            if m:
+                try:
+                    parsed = json.loads(m.group())
+                except (json.JSONDecodeError, ValueError):
+                    log.warning("  Turn %d: could not parse LLM response", turn + 1)
+                    return {}
+            else:
+                log.warning("  Turn %d: no JSON in LLM response", turn + 1)
+                return {}
+
+        # OPTION A: LLM found a fix
+        if "fix" in parsed:
+            fix_data = parsed["fix"]
+            if isinstance(fix_data, dict):
+                result = _parse_llm_fix_response(
+                    json.dumps(fix_data), 0, total_lines,
+                )
+                if result:
+                    log.info("  Turn %d: LLM found root cause — %d lines fixed",
+                             turn + 1, len(result))
+                    return result
+
+        # OPTION B: LLM needs more context
+        if "need_context" in parsed:
+            req = parsed["need_context"]
+            req_start = max(0, int(req.get("start", 1)) - 1)
+            req_end = min(total_lines, int(req.get("end", req_start + 50)))
+            reason = req.get("reason", "")
+
+            # Cap chunk size at 200 lines
+            if req_end - req_start > 200:
+                req_end = req_start + 200
+
+            chunk = _format_numbered(src_lines, req_start, req_end)
+
+            log.info("  Turn %d: LLM requested lines %d-%d (%s)",
+                     turn + 1, req_start + 1, req_end, reason)
+
+            messages.append(Message(role="assistant", content=response))
+            messages.append(Message(
+                role="user",
+                content=f"Lines {req_start + 1}-{req_end}:\n```cobol\n{chunk}\n```",
+            ))
+            continue
+
+        # Unrecognized — try parsing as a flat fix dict
+        result = _parse_llm_fix_response(json.dumps(parsed), 0, total_lines)
+        if result:
+            log.info("  Turn %d: LLM returned fix (flat format) — %d lines",
+                     turn + 1, len(result))
+            return result
+
+        log.warning("  Turn %d: unrecognized LLM response format", turn + 1)
         return {}
+
+    log.warning("  LLM cascade investigation exhausted %d turns", max_turns)
+    return {}
 
 
 def _parse_llm_fix_response(

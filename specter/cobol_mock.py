@@ -3710,7 +3710,7 @@ def compile_cobol(
             # Pre-pass: detect cascade root causes.
             # "expecting SECTION or ." on valid data defs = parser lost context.
             # The error is NOT on the reported line — it's 20-100 lines ABOVE.
-            from .cobol_fix_cache import llm_fix_cascade_root
+            from .cobol_fix_cache import llm_investigate_cascade
             _data_def_re = re.compile(
                 r"^\s*(?:\d{2,3})\s+(?:[A-Z]|FILLER)", re.IGNORECASE,
             )
@@ -3752,13 +3752,14 @@ def compile_cobol(
                         if _data_def_re.match(bcontent):
                             break
 
-                    # Step 2: If regex didn't find it, ask LLM with 100-line upstream window
+                    # Step 2: If regex didn't find it, ask LLM (multi-turn investigation)
                     if not regex_fixed and llm_provider:
-                        log.info("  Cascade detected at line %d — asking LLM to find root cause (100-line window)...",
+                        log.info("  Cascade at line %d — LLM investigating (can request file chunks)...",
                                  first_section_err)
-                        llm_cascade_fixes = llm_fix_cascade_root(
+                        llm_cascade_fixes = llm_investigate_cascade(
                             llm_provider, llm_model,
                             first_section_err, first_section_msg,
+                            current_errors,
                             src_lines, source_name=str(source_path.name),
                         )
                         if llm_cascade_fixes:

@@ -295,21 +295,29 @@ def _parse_llm_response(response_text: str) -> list[LLMSuggestion]:
 
 async def _query_llm(
     provider: LLMProvider,
-    prompt: str,
+    prompt: str | list,
     model: str | None = None,
 ) -> tuple[str, int]:
-    """Send a prompt to the LLM and return (response_text, tokens_used)."""
-    messages = [
-        Message(
-            role="system",
-            content=(
-                "You are an expert at analyzing COBOL program control flow. "
-                "You suggest precise variable values to reach uncovered code paths. "
-                "Always respond with valid JSON only."
+    """Send a prompt to the LLM and return (response_text, tokens_used).
+
+    Args:
+        prompt: Either a string (wrapped in system+user messages) or a
+                pre-built list of Message objects for multi-turn conversations.
+    """
+    if isinstance(prompt, list):
+        messages = prompt
+    else:
+        messages = [
+            Message(
+                role="system",
+                content=(
+                    "You are an expert at analyzing COBOL program control flow. "
+                    "You suggest precise variable values to reach uncovered code paths. "
+                    "Always respond with valid JSON only."
+                ),
             ),
-        ),
-        Message(role="user", content=prompt),
-    ]
+            Message(role="user", content=prompt),
+        ]
 
     response = await provider.complete(
         messages,
@@ -322,10 +330,14 @@ async def _query_llm(
 
 def _query_llm_sync(
     provider: LLMProvider,
-    prompt: str,
+    prompt: str | list,
     model: str | None = None,
 ) -> tuple[str, int]:
-    """Synchronous wrapper for _query_llm with 401 backoff/retry."""
+    """Synchronous wrapper for _query_llm with 401 backoff/retry.
+
+    Args:
+        prompt: Either a string or a list of Message objects for multi-turn.
+    """
 
     current_provider = provider
 
@@ -336,7 +348,6 @@ def _query_llm_sync(
             loop = None
 
         if loop and loop.is_running():
-            # Already in an async context - run in a new thread.
             import concurrent.futures
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
