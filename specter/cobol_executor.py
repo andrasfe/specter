@@ -94,14 +94,9 @@ def _gnucobol_source_fixups(source_text: str) -> str:
                 line = line[:6] + "*" + line[7:]
 
             # --- Truncate to 72 columns (sequence numbers in 73-80) ---
-            # If truncation removes a period, add it back within col 72.
             raw = line.rstrip("\n\r")
             if len(raw) > 72:
-                overflow = raw[72:]
-                line = raw[:72].rstrip()
-                if "." in overflow and not line.rstrip().endswith("."):
-                    line = line + "."
-                line = line + "\n"
+                line = raw[:72] + "\n"
 
             if line != orig:
                 fixes += 1

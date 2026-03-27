@@ -3438,10 +3438,21 @@ def clean_cobol_source(source_path: Path, fix_cache_dir: Path | None = None) -> 
     fixes = 0
     cleaned: list[str] = []
 
+    _val_like_re = re.compile(r"[\d]{3}|'[^']*'")
     for line in lines:
         raw = line.rstrip("\n\r")
         if len(raw) > 72:
-            line = raw[:72] + "\n"
+            overflow = raw[72:]
+            truncated = raw[:72]
+            # Preserve period from overflow if truncated content is
+            # VALUE-like (numbers/quoted strings) — not sequence numbers
+            if ("." in overflow
+                    and len(truncated) > 6
+                    and truncated[6] not in ("*", "/")
+                    and not truncated.rstrip().endswith(".")
+                    and _val_like_re.search(truncated[7:])):
+                truncated = truncated.rstrip() + "."
+            line = truncated + "\n"
             fixes += 1
 
         if len(line) > 6 and line[6] not in ("*", "/"):
@@ -3557,12 +3568,21 @@ def clean_copybooks(copybook_dirs: list[Path]) -> list[Path]:
             lines = cpy_file.read_text(errors="replace").splitlines(keepends=True)
             fixes = 0
 
+            _cpy_val_re = re.compile(r"[\d]{3}|'[^']*'")
             cleaned: list[str] = []
             for line in lines:
-                # 1. Truncate to 72 columns
+                # 1. Truncate to 72 columns (preserve VALUE periods)
                 raw = line.rstrip("\n\r")
                 if len(raw) > 72:
-                    line = raw[:72] + "\n"
+                    overflow = raw[72:]
+                    truncated = raw[:72]
+                    if ("." in overflow
+                            and len(truncated) > 6
+                            and truncated[6] not in ("*", "/")
+                            and not truncated.rstrip().endswith(".")
+                            and _cpy_val_re.search(truncated[7:])):
+                        truncated = truncated.rstrip() + "."
+                    line = truncated + "\n"
                     fixes += 1
 
                 # 2. P.I.C. → PIC (in code area only, not comments)
