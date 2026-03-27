@@ -3441,16 +3441,7 @@ def clean_cobol_source(source_path: Path, fix_cache_dir: Path | None = None) -> 
     for line in lines:
         raw = line.rstrip("\n\r")
         if len(raw) > 72:
-            overflow = raw[72:]
-            truncated = raw[:72]
-            if ("." in overflow
-                    and len(truncated) > 6
-                    and truncated[6] not in ("*", "/")
-                    and not truncated.rstrip().endswith(".")):
-                code = truncated[7:].strip()
-                if re.match(r"^[\s\d'A-Z. -]+$", code, re.IGNORECASE) and ("'" in code or re.search(r"\d{3}", code)):
-                    truncated = truncated.rstrip() + "."
-            line = truncated + "\n"
+            line = raw[:72] + "\n"
             fixes += 1
 
         if len(line) > 6 and line[6] not in ("*", "/"):
@@ -3569,23 +3560,9 @@ def clean_copybooks(copybook_dirs: list[Path]) -> list[Path]:
             cleaned: list[str] = []
             for line in lines:
                 # 1. Truncate to 72 columns
-                # Preserve period if the overflow contains one AND the
-                # truncated content looks like a VALUE continuation
-                # (numbers/quoted strings). This avoids breaking sequence
-                # numbers that happen to contain periods.
                 raw = line.rstrip("\n\r")
                 if len(raw) > 72:
-                    overflow = raw[72:]
-                    truncated = raw[:72]
-                    if ("." in overflow
-                            and len(truncated) > 6
-                            and truncated[6] not in ("*", "/")
-                            and not truncated.rstrip().endswith(".")):
-                        code = truncated[7:].strip()
-                        # Only preserve for VALUE-like content (numbers, quoted strings)
-                        if re.match(r"^[\s\d'A-Z. -]+$", code, re.IGNORECASE) and ("'" in code or re.search(r"\d{3}", code)):
-                            truncated = truncated.rstrip() + "."
-                    line = truncated + "\n"
+                    line = raw[:72] + "\n"
                     fixes += 1
 
                 # 2. P.I.C. → PIC (in code area only, not comments)
