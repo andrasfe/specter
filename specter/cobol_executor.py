@@ -103,6 +103,39 @@ def _gnucobol_source_fixups(source_text: str) -> str:
 
     if fixes:
         log.info("GnuCOBOL source fixups: %d lines fixed (line-by-line pass)", fixes)
+
+    # --- Multi-line pattern fixes ---
+    multi_fixes = 0
+
+    # 1. Commented-out REDEFINES target: line ends with REDEFINES,
+    #    next line is a comment with the target name → uncomment it.
+    #    Pattern:
+    #      05  DTE-DATE-E-G-8     REDEFINES
+    #      *            DTE-7-INPUT-DATE.
+    for i in range(len(fixed_lines) - 1):
+        ln = fixed_lines[i]
+        if len(ln) > 6 and ln[6] not in ("*", "/"):
+            content = ln[7:72].rstrip() if len(ln) > 7 else ln.rstrip()
+            if content.upper().endswith("REDEFINES"):
+                nxt = fixed_lines[i + 1]
+                if len(nxt) > 6 and nxt[6] in ("*", "/"):
+                    # Uncomment: the target name is on this commented line
+                    fixed_lines[i + 1] = nxt[:6] + " " + nxt[7:]
+                    multi_fixes += 1
+
+    # 2. Duplicate consecutive lines → remove the second copy.
+    deduped: list[str] = []
+    for i, ln in enumerate(fixed_lines):
+        if i > 0 and ln == fixed_lines[i - 1]:
+            # Skip exact duplicate (keep first)
+            multi_fixes += 1
+            continue
+        deduped.append(ln)
+    fixed_lines = deduped
+
+    if multi_fixes:
+        log.info("GnuCOBOL source fixups: %d multi-line fixes", multi_fixes)
+
     return "".join(fixed_lines)
 
 
