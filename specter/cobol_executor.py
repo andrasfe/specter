@@ -124,12 +124,16 @@ def _gnucobol_source_fixups(source_text: str) -> str:
                     multi_fixes += 1
 
     # 2. Duplicate consecutive lines → remove the second copy.
+    #    Compare code area only (cols 7-72), ignore trailing whitespace
+    #    and sequence numbers in cols 73-80.
     deduped: list[str] = []
     for i, ln in enumerate(fixed_lines):
-        if i > 0 and ln == fixed_lines[i - 1]:
-            # Skip exact duplicate (keep first)
-            multi_fixes += 1
-            continue
+        if i > 0:
+            cur = ln[6:72].rstrip() if len(ln) > 6 else ln.rstrip()
+            prev = fixed_lines[i - 1][6:72].rstrip() if len(fixed_lines[i - 1]) > 6 else fixed_lines[i - 1].rstrip()
+            if cur and cur == prev:
+                multi_fixes += 1
+                continue
         deduped.append(ln)
     fixed_lines = deduped
 
