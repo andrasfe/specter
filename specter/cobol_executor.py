@@ -125,9 +125,10 @@ def _gnucobol_source_fixups(source_text: str) -> str:
                     fixed_lines[i + 1] = nxt[:6] + " " + nxt[7:]
                     multi_fixes += 1
 
-    # 2. VALUE continuation without period before comment/88-level.
-    #    Pattern: active line with values (no period), followed by comment
-    #    or a new 88-level. The VALUE clause needs a terminal period.
+    # 2. VALUE continuation without period: scan for 88-level entries
+    #    where the VALUE clause has no terminal period before the next
+    #    88-level or comment block. Only add period to the LAST value
+    #    line in the chain (the one right before the break).
     _val_cont_re = re.compile(
         r"^\s*(?:'[^']*'|\d{3,})\s*(?:'[^']*'|\d{3,}\s*)*\s*$",
     )
@@ -135,17 +136,26 @@ def _gnucobol_source_fixups(source_text: str) -> str:
     for i in range(len(fixed_lines) - 1):
         ln = fixed_lines[i]
         if len(ln) > 6 and ln[6] not in ("*", "/"):
+            # Check FULL line for period (not just cols 7-72) to avoid double periods
+            full_content = ln.rstrip()
             content = ln[7:72].rstrip() if len(ln) > 7 else ln.rstrip()
-            # Is this a VALUE continuation line (numbers/literals, no period)?
-            if content and not content.endswith(".") and _val_cont_re.match(content):
-                nxt = fixed_lines[i + 1]
-                nxt_is_comment = len(nxt) > 6 and nxt[6] in ("*", "/")
-                nxt_content = nxt[7:72].strip() if len(nxt) > 7 else nxt.strip()
-                nxt_is_88 = _level_88_re.match(nxt_content) if nxt_content else False
-                nxt_is_blank = not nxt_content
-                if nxt_is_comment or nxt_is_88 or nxt_is_blank:
-                    fixed_lines[i] = ln.rstrip("\n\r").rstrip() + ".\n"
-                    multi_fixes += 1
+            if not content or "." in full_content:
+                continue  # already has a period somewhere
+            if not _val_cont_re.match(content):
+                continue
+            # Look at the next non-blank line
+            nxt = fixed_lines[i + 1]
+            nxt_is_comment = len(nxt) > 6 and nxt[6] in ("*", "/")
+            nxt_content = nxt[7:72].strip() if len(nxt) > 7 else nxt.strip()
+            nxt_is_88 = bool(_level_88_re.match(nxt_content)) if nxt_content else False
+            nxt_is_blank = not nxt_content
+            # Also check if next line is another value continuation (don't add period mid-chain)
+            nxt_is_value = bool(_val_cont_re.match(nxt_content)) if nxt_content else False
+            if (nxt_is_comment or nxt_is_88 or nxt_is_blank) and not nxt_is_value:
+                # Add period within column 72
+                trimmed = ln[:72].rstrip()
+                fixed_lines[i] = trimmed + ".\n"
+                multi_fixes += 1
 
     # 3. Duplicate consecutive lines → remove the second copy.
     #    Compare code area only (cols 7-72), ignore trailing whitespace
