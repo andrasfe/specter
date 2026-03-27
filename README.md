@@ -228,6 +228,35 @@ cobc -x -o program.mock program.mock.cbl
 
 Replaces all EXEC CICS/SQL/DLI blocks, file I/O, and CALL statements with reads from a sequential mock data file. Adds paragraph-level tracing via DISPLAY.
 
+### AWS CardDemo example
+
+Using the [AWS Mainframe Modernization CardDemo](https://github.com/aws-samples/aws-mainframe-modernization-carddemo) sample application:
+
+```bash
+# 1. Clone CardDemo alongside specter
+git clone https://github.com/aws-samples/aws-mainframe-modernization-carddemo
+
+# 2. Generate instrumented mock + compile + run coverage
+specter aws-mainframe-modernization-carddemo/app/cbl/COPAUA0C.cbl.ast \
+    --cobol-coverage \
+    --cobol-source aws-mainframe-modernization-carddemo/app/cbl/COPAUA0C.cbl \
+    --copybook-dir aws-mainframe-modernization-carddemo/app/cpy \
+    --test-store reports/COPAUA0C_tests.jsonl \
+    --coverage-budget 5000
+
+# 3. The compiled binary and instrumented source are in:
+#    aws-mainframe-modernization-carddemo/app/cbl/.specter_build_COPAUA0C/
+#      COPAUA0C           <- compiled executable
+#      COPAUA0C.mock.cbl  <- instrumented COBOL source
+```
+
+The instrumented `.mock.cbl` emits trace output when executed:
+- `SPECTER-TRACE:<PARAGRAPH>` — paragraph entry
+- `@@B:<id>:<T|F|W1|WO>` — branch probe (IF/EVALUATE direction taken)
+- `SPECTER-CALL:FROM=<caller>:TO=<callee>` — call chain (PERFORM targets)
+- `@@V:<id>:<var>=<val>` — variable snapshot at branch decision points
+- `SPECTER-MOCK:<operation>` — mock operation (CICS/SQL/DLI/CALL)
+
 ## Branch Coverage Features
 
 Specter includes several codegen and coverage engine features that maximize branch reachability:
