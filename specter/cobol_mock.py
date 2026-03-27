@@ -3822,7 +3822,29 @@ def compile_cobol(
                     fixed_count = 1
                     total_cached += 1
 
-                # Phase 2: Try LLM (skip if stuck — LLM already failed on these)
+                # Phase 1.5: Deterministic rules BEFORE LLM — these are known
+                # patterns that the LLM gets wrong (fixes symptom not cause).
+                if not fixed_count:
+                    ln = src_lines[idx]
+                    ln_content = ln[7:72].strip() if len(ln) > 7 else ln.strip()
+
+                    # Missing period: "unexpected Literal/Identifier" means the
+                    # previous active line needs a terminal period.
+                    if ("unexpected Literal" in error_msg or "unexpected Identifier" in error_msg):
+                        for prev in range(idx - 1, max(idx - 10, -1), -1):
+                            prev_ln = src_lines[prev]
+                            if len(prev_ln) > 6 and prev_ln[6] in ("*", "/"):
+                                continue
+                            prev_content = prev_ln[7:72].rstrip() if len(prev_ln) > 7 else prev_ln.rstrip()
+                            if prev_content and not prev_content.endswith("."):
+                                src_lines[prev] = prev_ln.rstrip("\n\r").rstrip() + ".\n"
+                                fixed_count += 1
+                                total_rule += 1
+                                log.info("  [%d/%d] rule: added missing period to line %d",
+                                         err_idx + 1, n_errors, prev + 1)
+                            break
+
+                # Phase 2: Try LLM
                 if not fixed_count and llm_provider:
                     orig_window = list(src_lines[window_start:window_end])
 
@@ -3860,22 +3882,6 @@ def compile_cobol(
                 if not fixed_count:
                     ln = src_lines[idx]
                     ln_content = ln[7:72].strip() if len(ln) > 7 else ln.strip()
-
-                    # 3a: "unexpected Literal" / "unexpected Identifier" often means
-                    # the previous active line is missing a terminal period.
-                    if ("unexpected Literal" in error_msg or "unexpected Identifier" in error_msg):
-                        for prev in range(idx - 1, max(idx - 10, -1), -1):
-                            prev_ln = src_lines[prev]
-                            if len(prev_ln) > 6 and prev_ln[6] in ("*", "/"):
-                                continue  # skip comments
-                            prev_content = prev_ln[7:72].rstrip() if len(prev_ln) > 7 else prev_ln.rstrip()
-                            if prev_content and not prev_content.endswith("."):
-                                # Add missing period
-                                src_lines[prev] = prev_ln.rstrip("\n\r").rstrip() + ".\n"
-                                fixed_count += 1
-                                log.info("  [%d/%d] rule: added missing period to line %d",
-                                         err_idx + 1, n_errors, prev + 1)
-                            break
 
                     # 3b: Pure numeric continuation — try to merge with previous VALUE
                     if not fixed_count and _num_only.match(ln_content):
