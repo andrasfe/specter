@@ -3626,6 +3626,7 @@ def compile_cobol(
     # for 3+ passes), the LLM is applying wrong fixes. Stop and use
     # last-resort for remaining errors.
     prev_error_counts: list[int] = []
+    stuck_investigated = False  # only investigate once
 
     for attempt in range(1 + auto_fix_retries):
         try:
@@ -3666,6 +3667,31 @@ def compile_cobol(
             stuck = (len(prev_error_counts) >= 3 and
                      prev_error_counts[-1] == prev_error_counts[-2] == prev_error_counts[-3])
             if stuck:
+                # Last chance: multi-turn LLM investigation on the stuck errors
+                if llm_provider and not stuck_investigated:
+                    from .cobol_fix_cache import llm_investigate_cascade
+                    src_lines = source_path.read_text().splitlines(keepends=True)
+                    first_ln, first_msg = current_errors[0]
+                    log.info("=== STUCK on %d errors — multi-turn LLM investigation on line %d ===",
+                             n_errs, first_ln)
+                    invest_fixes = llm_investigate_cascade(
+                        llm_provider, llm_model,
+                        first_ln, first_msg,
+                        current_errors,
+                        src_lines, source_name=str(source_path.name),
+                    )
+                    stuck_investigated = True
+                    if invest_fixes:
+                        for fix_ln, fix_content in invest_fixes.items():
+                            fix_idx = fix_ln - 1
+                            if 0 <= fix_idx < len(src_lines):
+                                src_lines[fix_idx] = fix_content
+                        source_path.write_text("".join(src_lines))
+                        log.info("  Multi-turn investigation fixed %d lines, recompiling...",
+                                 len(invest_fixes))
+                        prev_error_counts.clear()  # reset stuck detection
+                        continue  # retry compilation
+
                 cache.save()
                 log.error("=== STUCK: same %d errors for 3 passes — compilation failed ===", n_errs)
                 return False, (
