@@ -938,14 +938,25 @@ def _replace_accept_stmts(lines: list[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def _add_paragraph_tracing(lines: list[str]) -> tuple[list[str], int]:
-    """Add DISPLAY tracing at paragraph entry points."""
+    """Add DISPLAY tracing at paragraph entry points and call chain probes.
+
+    Emits:
+      SPECTER-TRACE:<PARAGRAPH>     — at each paragraph entry
+      SPECTER-CALL:FROM=X:TO=Y      — before each PERFORM targeting a paragraph
+    """
     result: list[str] = []
     count = 0
     in_procedure = False
+    current_para = ""
 
     # Paragraph: starts in area A (col 8-11), ends with period
     para_re = re.compile(
         r"^(\s{7})([A-Z0-9][A-Z0-9_-]*)\s*\.\s*$",
+        re.IGNORECASE,
+    )
+    # PERFORM <target> [THRU <end>] — extract target paragraph name
+    perform_re = re.compile(
+        r"^\s+PERFORM\s+([A-Z0-9][A-Z0-9_-]*)",
         re.IGNORECASE,
     )
 
@@ -954,19 +965,37 @@ def _add_paragraph_tracing(lines: list[str]) -> tuple[list[str], int]:
         if "PROCEDURE DIVISION" in upper:
             in_procedure = True
 
+        if in_procedure:
+            # Track current paragraph
+            m = para_re.match(line)
+            if m:
+                para_name = m.group(2).upper()
+                if not para_name.endswith("-SECTION"):
+                    current_para = para_name
+
+            # Detect PERFORM and insert call chain probe BEFORE it
+            if current_para and not (len(line) > 6 and line[6] in ("*", "/")):
+                pm = perform_re.match(line)
+                if pm:
+                    target = pm.group(1).upper()
+                    # Skip PERFORM UNTIL / PERFORM VARYING / PERFORM N TIMES
+                    if target not in ("UNTIL", "VARYING", "WITH", "TEST"):
+                        result.append(
+                            f"{_B}DISPLAY 'SPECTER-CALL:FROM="
+                            f"{current_para}:TO={target}'.\n"
+                        )
+
         result.append(line)
 
         if in_procedure:
             m = para_re.match(line)
             if m:
                 para_name = m.group(2).upper()
-                # Skip section headers
-                if para_name.endswith("-SECTION"):
-                    continue
-                result.append(
-                    f"{_B}DISPLAY 'SPECTER-TRACE:{para_name}'.\n"
-                )
-                count += 1
+                if not para_name.endswith("-SECTION"):
+                    result.append(
+                        f"{_B}DISPLAY 'SPECTER-TRACE:{para_name}'.\n"
+                    )
+                    count += 1
 
     return result, count
 
@@ -975,6 +1004,66 @@ def _add_paragraph_tracing(lines: list[str]) -> tuple[list[str], int]:
 # Phase 6b: Add branch tracing (IF/EVALUATE probes)
 # ---------------------------------------------------------------------------
 
+_COBOL_KEYWORDS = frozenset({
+    "IF", "ELSE", "END-IF", "EVALUATE", "WHEN", "END-EVALUATE",
+    "PERFORM", "MOVE", "ADD", "SUBTRACT", "COMPUTE", "DISPLAY",
+    "NOT", "AND", "OR", "EQUAL", "EQUALS", "GREATER", "LESS",
+    "THAN", "TO", "ALSO", "TRUE", "FALSE", "ZERO", "ZEROS",
+    "ZEROES", "SPACE", "SPACES", "HIGH-VALUE", "HIGH-VALUES",
+    "LOW-VALUE", "LOW-VALUES", "IS", "ARE", "OF", "IN", "THRU",
+    "THROUGH", "NUMERIC", "ALPHABETIC", "DFHRESP", "OTHER",
+})
+
+
+def _extract_condition_vars(condition: str, max_vars: int = 3) -> list[str]:
+    """Extract COBOL variable names from a condition string.
+
+    Returns up to max_vars variable names suitable for @@V: snapshot.
+    """
+    # Tokenize: split on spaces, operators, parens, quotes
+    tokens = re.findall(r"[A-Z][A-Z0-9_-]+", condition.upper())
+    seen: set[str] = set()
+    result: list[str] = []
+    for tok in tokens:
+        if tok in _COBOL_KEYWORDS or tok in seen:
+            continue
+        # Skip numeric-only tokens and short tokens
+        if re.match(r"^\d+$", tok) or len(tok) < 3:
+            continue
+        seen.add(tok)
+        result.append(tok)
+        if len(result) >= max_vars:
+            break
+    return result
+
+
+def _gen_var_snapshot(bid: str, var_names: list[str]) -> str:
+    """Generate COBOL DISPLAY statement for @@V: variable snapshot.
+
+    Produces: DISPLAY '@@V:<bid>:' <var1> ':' <var2> ':' ...
+    Uses COBOL string concatenation (space-separated DISPLAY operands).
+    """
+    if not var_names:
+        return ""
+    # Build: DISPLAY '@@V:5:VAR1=' VAR1 ':VAR2=' VAR2
+    parts = [f"'@@V:{bid}:"]
+    for i, var in enumerate(var_names):
+        if i > 0:
+            parts.append(f"':' '{var}=' ")
+        else:
+            parts.append(f"{var}=' ")
+        parts.append(var)
+    parts[0] = parts[0]  # first part starts the string
+    # Reassemble: DISPLAY '@@V:5:VAR1=' VAR1 ':VAR2=' VAR2
+    display_args = f"'@@V:{bid}:"
+    for i, var in enumerate(var_names):
+        if i > 0:
+            display_args += f"' ':' '{var}=' {var}"
+        else:
+            display_args += f"{var}=' {var}"
+    return f"{_B}DISPLAY {display_args}.\n"
+
+
 def _add_branch_tracing(
     lines: list[str],
 ) -> tuple[list[str], dict, int]:
@@ -982,6 +1071,7 @@ def _add_branch_tracing(
 
     Inserts DISPLAY statements at each branch direction so the coverage engine
     can determine which branches were taken during execution.
+    Also emits @@V: variable snapshots alongside each @@B: probe.
 
     Returns:
         (modified_lines, branch_meta, total_branch_probes)
@@ -1078,6 +1168,10 @@ def _add_branch_tracing(
             result.append(
                 f"{_B}DISPLAY '@@B:{bid}:T'\n"
             )
+            cond_vars = _extract_condition_vars(full_condition)
+            vs = _gen_var_snapshot(bid, cond_vars)
+            if vs:
+                result.append(vs)
 
             has_else = _scan_for_else(lines, i + 1)
             needs_else[bid] = not has_else
@@ -1093,6 +1187,11 @@ def _add_branch_tracing(
                 result.append(
                     f"{_B}DISPLAY '@@B:{bid}:F'\n"
                 )
+                meta = branch_meta.get(bid, {})
+                cond_vars = _extract_condition_vars(meta.get("condition", ""))
+                vs = _gen_var_snapshot(bid, cond_vars)
+                if vs:
+                    result.append(vs)
                 i += 1
                 continue
 
@@ -1105,6 +1204,11 @@ def _add_branch_tracing(
                     result.append(
                         f"{_B}DISPLAY '@@B:{bid}:F'\n"
                     )
+                    meta = branch_meta.get(bid, {})
+                    cond_vars = _extract_condition_vars(meta.get("condition", ""))
+                    vs = _gen_var_snapshot(bid, cond_vars)
+                    if vs:
+                        result.append(vs)
                     needs_else.pop(bid, None)
             result.append(line)
             i += 1
@@ -1140,6 +1244,11 @@ def _add_branch_tracing(
             result.append(
                 f"{_B}DISPLAY '@@B:{base_bid}:{direction}'\n"
             )
+            meta = branch_meta.get(base_bid, {})
+            cond_vars = _extract_condition_vars(meta.get("condition", ""))
+            vs = _gen_var_snapshot(base_bid, cond_vars)
+            if vs:
+                result.append(vs)
             i += 1
             continue
 
@@ -4030,3 +4139,42 @@ def parse_mock_ops(stdout: str) -> list[str]:
             op = line[len("SPECTER-MOCK:"):].strip()
             ops.append(op)
     return ops
+
+
+def parse_call_chain(stdout: str) -> list[tuple[str, str]]:
+    """Extract call chain from SPECTER-CALL:FROM=X:TO=Y lines.
+
+    Returns list of (caller, callee) tuples in execution order.
+    """
+    chain: list[tuple[str, str]] = []
+    for line in stdout.splitlines():
+        if line.startswith("SPECTER-CALL:"):
+            parts = line[len("SPECTER-CALL:"):].strip()
+            m = re.match(r"FROM=([^:]+):TO=(.+)", parts)
+            if m:
+                chain.append((m.group(1).strip(), m.group(2).strip()))
+    return chain
+
+
+def parse_variable_snapshots(stdout: str) -> dict[str, dict[str, str]]:
+    """Extract variable snapshots from @@V:<bid>:<var>=<val> lines.
+
+    Returns dict mapping branch_id to {var_name: value}.
+    """
+    snapshots: dict[str, dict[str, str]] = {}
+    for line in stdout.splitlines():
+        if line.startswith("@@V:"):
+            rest = line[4:].strip()
+            # Format: <bid>:<var1>=<val1>:<var2>=<val2>
+            parts = rest.split(":", 1)
+            if len(parts) < 2:
+                continue
+            bid = parts[0]
+            vars_part = parts[1]
+            var_dict: dict[str, str] = {}
+            for kv in vars_part.split(":"):
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    var_dict[k.strip()] = v.strip()
+            snapshots[bid] = var_dict
+    return snapshots

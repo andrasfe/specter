@@ -21,7 +21,9 @@ from .cobol_mock import (
     generate_init_records,
     generate_mock_data_ordered,
     instrument_cobol,
+    parse_call_chain,
     parse_trace,
+    parse_variable_snapshots,
     run_cobol,
 )
 
@@ -167,6 +169,8 @@ class CobolTestResult:
 
     paragraphs_hit: list[str] = field(default_factory=list)
     branches_hit: set[str] = field(default_factory=set)
+    call_chain: list[tuple[str, str]] = field(default_factory=list)
+    variable_snapshots: dict[str, dict[str, str]] = field(default_factory=dict)
     display_output: list[str] = field(default_factory=list)
     return_code: int = 0
     execution_time_ms: float = 0.0
@@ -478,6 +482,8 @@ def run_test_case(
     # Parse outputs
     paragraphs = parse_trace(stdout)
     branches = parse_branch_coverage(stdout)
+    call_chain = parse_call_chain(stdout)
+    var_snapshots = parse_variable_snapshots(stdout)
 
     # Collect non-trace display output
     displays = []
@@ -486,13 +492,16 @@ def run_test_case(
         if (not stripped.startswith("SPECTER-TRACE:")
                 and not stripped.startswith("SPECTER-MOCK:")
                 and not stripped.startswith("SPECTER-")
-                and not stripped.startswith("@@B:")):
+                and not stripped.startswith("@@B:")
+                and not stripped.startswith("@@V:")):
             if stripped:
                 displays.append(stripped)
 
     return CobolTestResult(
         paragraphs_hit=paragraphs,
         branches_hit=branches,
+        call_chain=call_chain,
+        variable_snapshots=var_snapshots,
         display_output=displays,
         return_code=rc,
         execution_time_ms=elapsed_ms,
