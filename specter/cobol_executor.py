@@ -144,18 +144,16 @@ def _gnucobol_source_fixups(source_text: str) -> str:
             break
 
         if is_comment or not content:
-            # Comment or blank — check if previous active line needs a period
+            # Comment or blank — in DATA DIVISION, every statement must
+            # end with a period. If the last active line doesn't, add one.
+            # Exception: lines ending with REDEFINES (target is on next line,
+            # which might be commented — handled by rule #1 above).
             if last_active_idx is not None:
                 prev = fixed_lines[last_active_idx]
                 prev_stripped = prev.rstrip()
                 if prev_stripped and not prev_stripped.endswith("."):
-                    # Check if prev looks like VALUE content (not a level/PIC definition)
                     prev_content = prev[7:72].strip() if len(prev) > 7 else prev.strip()
-                    # VALUE continuations: numbers, quoted strings, THRU ranges
-                    if (prev_content and
-                            not re.match(r"^\s*\d{2}\s+", prev_content) and  # not a level number line
-                            not "PIC " in prev_content.upper() and
-                            not "REDEFINES" in prev_content.upper()):
+                    if prev_content and not prev_content.upper().rstrip().endswith("REDEFINES"):
                         fixed_lines[last_active_idx] = prev_stripped + ".\n"
                         multi_fixes += 1
                 last_active_idx = None
