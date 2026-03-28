@@ -3451,19 +3451,18 @@ def clean_cobol_source(source_path: Path, fix_cache_dir: Path | None = None) -> 
     fixes = 0
     cleaned: list[str] = []
 
-    _val_like_re = re.compile(r"[\d]{3}|'[^']*'")
     for line in lines:
         raw = line.rstrip("\n\r")
         if len(raw) > 72:
             overflow = raw[72:]
             truncated = raw[:72]
-            # Preserve period from overflow if truncated content is
-            # VALUE-like (numbers/quoted strings) — not sequence numbers
+            # Preserve period from overflow — code that extends past col 72
+            # often has the terminating period in the overflow area.
+            # Only preserve for non-comment active code lines.
             if ("." in overflow
                     and len(truncated) > 6
                     and truncated[6] not in ("*", "/")
-                    and not truncated.rstrip().endswith(".")
-                    and _val_like_re.search(truncated[7:])):
+                    and not truncated.rstrip().endswith(".")):
                 truncated = truncated.rstrip() + "."
             line = truncated + "\n"
             fixes += 1
@@ -3581,10 +3580,9 @@ def clean_copybooks(copybook_dirs: list[Path]) -> list[Path]:
             lines = cpy_file.read_text(errors="replace").splitlines(keepends=True)
             fixes = 0
 
-            _cpy_val_re = re.compile(r"[\d]{3}|'[^']*'")
             cleaned: list[str] = []
             for line in lines:
-                # 1. Truncate to 72 columns (preserve VALUE periods)
+                # 1. Truncate to 72 columns (preserve periods from overflow)
                 raw = line.rstrip("\n\r")
                 if len(raw) > 72:
                     overflow = raw[72:]
@@ -3592,8 +3590,7 @@ def clean_copybooks(copybook_dirs: list[Path]) -> list[Path]:
                     if ("." in overflow
                             and len(truncated) > 6
                             and truncated[6] not in ("*", "/")
-                            and not truncated.rstrip().endswith(".")
-                            and _cpy_val_re.search(truncated[7:])):
+                            and not truncated.rstrip().endswith(".")):
                         truncated = truncated.rstrip() + "."
                     line = truncated + "\n"
                     fixes += 1
