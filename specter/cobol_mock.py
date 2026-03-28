@@ -1173,9 +1173,13 @@ def _add_branch_tracing(
             if vs:
                 result.append(vs)
 
-            has_else = _scan_for_else(lines, i + 1)
-            needs_else[bid] = not has_else
-            id_stack.append(bid)
+            has_else, has_end_if = _scan_for_else(lines, i + 1)
+            if has_end_if:
+                # Structured IF (has END-IF) — safe to track for ELSE injection
+                needs_else[bid] = not has_else
+                id_stack.append(bid)
+            # else: period-delimited IF — don't push to stack, don't track.
+            # TRUE probe already inserted; FALSE probe not possible without END-IF.
             i = j  # continue from the body line (don't skip it)
             continue
 
@@ -1327,20 +1331,31 @@ def _restore_paragraph_tracing(lines: list[str]) -> list[str]:
     return result
 
 
-def _scan_for_else(lines: list[str], start: int) -> bool:
-    """Scan forward from start to find an ELSE at the same nesting level."""
+def _scan_for_else(lines: list[str], start: int) -> tuple[bool, bool]:
+    """Scan forward to find ELSE and/or END-IF at the same nesting level.
+
+    Returns (has_else, has_end_if):
+      (True, True)   — structured IF with ELSE
+      (False, True)  — structured IF without ELSE (has END-IF)
+      (False, False) — period-delimited IF (no END-IF, terminated by period)
+    """
     depth = 1  # We're inside one IF
     for j in range(start, len(lines)):
         content = _get_cobol_content(lines[j]).strip().upper() if len(lines[j]) > 7 else ""
+        if not content:
+            continue
         if content.startswith("IF ") and not content.startswith("IF-"):
             depth += 1
         elif content.startswith("END-IF"):
             depth -= 1
             if depth == 0:
-                return False  # Hit END-IF without finding ELSE at our level
+                return False, True  # structured IF, no ELSE
         elif (content == "ELSE" or content.startswith("ELSE ")) and depth == 1:
-            return True
-    return False
+            return True, True       # structured IF with ELSE
+        # Sentence-terminating period at our depth = period-delimited IF
+        if depth == 1 and content.endswith(".") and not content.startswith("IF "):
+            return False, False     # period-delimited
+    return False, False             # reached end, period-delimited
 
 
 # COBOL verbs / keywords that indicate the start of an IF body (not

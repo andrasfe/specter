@@ -358,11 +358,8 @@ def prepare_context(
         source_text = "".join(lines)
         if hardened_mode and total_branches == 0:
             log.warning(
-                "Branch tracing disabled by hardening fallback: instrumented source "
-                "contains SPECTER-HARDENED-ENTRY and no active IF/EVALUATE "
-                "constructs remain. Paragraph coverage is still valid, but branch "
-                "coverage will report 0/0 until compilation succeeds without full "
-                "procedure hardening."
+                "Branch tracing: 0 probes in hardened mode. Paragraph coverage "
+                "is still valid; branch coverage will report 0/0."
             )
 
     # Apply IBM→GnuCOBOL source-level fixes on the final instrumented text.
