@@ -3747,7 +3747,7 @@ def compile_cobol(
     auto_fix_retries: int = 20,
     llm_provider=None,
     llm_model: str | None = None,
-    wall_clock_timeout: float = 1800.0,
+    wall_clock_timeout: float = 7200.0,
 ) -> tuple[bool, str]:
     """Compile COBOL source with GnuCOBOL.
 
