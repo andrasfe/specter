@@ -982,7 +982,7 @@ def _add_paragraph_tracing(lines: list[str]) -> tuple[list[str], int]:
                     if target not in ("UNTIL", "VARYING", "WITH", "TEST"):
                         result.append(
                             f"{_B}DISPLAY 'SPECTER-CALL:FROM="
-                            f"{current_para}:TO={target}'.\n"
+                            f"{current_para}:TO={target}'\n"
                         )
 
         result.append(line)
@@ -1061,7 +1061,7 @@ def _gen_var_snapshot(bid: str, var_names: list[str]) -> str:
             display_args += f"' ':' '{var}=' {var}"
         else:
             display_args += f"{var}=' {var}"
-    return f"{_B}DISPLAY {display_args}.\n"
+    return f"{_B}DISPLAY {display_args}\n"
 
 
 def _add_branch_tracing(
