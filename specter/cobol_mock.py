@@ -186,6 +186,16 @@ def instrument_cobol(
             if "SPECTER-TRACE:" in l and not l.strip().startswith("*")
         )
 
+    # Phase 12b2: Add branch tracing AFTER all compilation fixes.
+    # Must run post-Phase-12 so probes are only inserted into active
+    # (non-neutralized) IF/EVALUATE statements.
+    if config.trace_paragraphs:
+        lines, _branch_meta, _branch_count = _add_branch_tracing(lines)
+        stats["branches_probed"] = sum(
+            1 for l in lines
+            if "@@B:" in l and not l.strip().startswith("*")
+        )
+
     # Phase 12c: Ensure sentence boundaries before paragraph headers so
     # inserted probes don't cause the next paragraph label to be parsed
     # as an identifier in the same sentence.
