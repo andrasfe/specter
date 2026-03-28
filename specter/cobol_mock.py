@@ -1040,28 +1040,11 @@ def _extract_condition_vars(condition: str, max_vars: int = 3) -> list[str]:
 def _gen_var_snapshot(bid: str, var_names: list[str]) -> str:
     """Generate COBOL DISPLAY statement for @@V: variable snapshot.
 
-    Produces: DISPLAY '@@V:<bid>:' <var1> ':' <var2> ':' ...
-    Uses COBOL string concatenation (space-separated DISPLAY operands).
+    Disabled for COBOL mock mode — @@V: snapshots cause compilation errors
+    because 88-level condition names and complex expressions cannot be
+    DISPLAYed.  Branch probes (@@B:) alone provide sufficient coverage data.
     """
-    if not var_names:
-        return ""
-    # Build: DISPLAY '@@V:5:VAR1=' VAR1 ':VAR2=' VAR2
-    parts = [f"'@@V:{bid}:"]
-    for i, var in enumerate(var_names):
-        if i > 0:
-            parts.append(f"':' '{var}=' ")
-        else:
-            parts.append(f"{var}=' ")
-        parts.append(var)
-    parts[0] = parts[0]  # first part starts the string
-    # Reassemble: DISPLAY '@@V:5:VAR1=' VAR1 ':VAR2=' VAR2
-    display_args = f"'@@V:{bid}:"
-    for i, var in enumerate(var_names):
-        if i > 0:
-            display_args += f"' ':' '{var}=' {var}"
-        else:
-            display_args += f"{var}=' {var}"
-    return f"{_B}DISPLAY {display_args}\n"
+    return ""
 
 
 def _add_branch_tracing(
@@ -1156,6 +1139,15 @@ def _add_branch_tracing(
                 i = j
                 continue
 
+            # Check IF style BEFORE inserting any probes
+            has_else, has_end_if = _scan_for_else(lines, i + 1)
+
+            # Skip period-delimited IFs — inserting a DISPLAY between
+            # the condition and body would break the sentence scope.
+            if not has_end_if:
+                i = j
+                continue
+
             branch_id += 1
             bid = str(branch_id)
             branch_meta[bid] = {
@@ -1164,7 +1156,7 @@ def _add_branch_tracing(
                 "type": "IF",
             }
 
-            # Now insert the TRUE probe before the first body line
+            # Insert the TRUE probe before the first body line
             result.append(
                 f"{_B}DISPLAY '@@B:{bid}:T'\n"
             )
@@ -1173,13 +1165,9 @@ def _add_branch_tracing(
             if vs:
                 result.append(vs)
 
-            has_else, has_end_if = _scan_for_else(lines, i + 1)
-            if has_end_if:
-                # Structured IF (has END-IF) — safe to track for ELSE injection
-                needs_else[bid] = not has_else
-                id_stack.append(bid)
-            # else: period-delimited IF — don't push to stack, don't track.
-            # TRUE probe already inserted; FALSE probe not possible without END-IF.
+            # Structured IF (has END-IF) — track for ELSE injection
+            needs_else[bid] = not has_else
+            id_stack.append(bid)
             i = j  # continue from the body line (don't skip it)
             continue
 
