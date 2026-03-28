@@ -3691,6 +3691,55 @@ def _apply_source_fixups(source_path: Path) -> None:
         log.info("Pre-compile fixups applied to %s", source_path.name)
 
 
+def _try_fix_and_verify(
+    source_path: Path,
+    src_lines: list[str],
+    proposed_fixes: dict[int, str],
+    cmd: list[str],
+    prev_error_count: int,
+    failed_fix_hashes: set[str],
+    parse_errors_fn,
+    src_name: str,
+) -> tuple[list[str], int, bool]:
+    """Apply proposed fixes, recompile, revert if error count increased.
+
+    Returns (updated_lines, new_error_count, accepted).
+    """
+    import hashlib as _fh
+    fix_hash = _fh.sha256(str(sorted(proposed_fixes.items())).encode()).hexdigest()[:16]
+    if fix_hash in failed_fix_hashes:
+        return src_lines, prev_error_count, False  # skip known-bad fix
+
+    # Save snapshot
+    snapshot = list(src_lines)
+
+    # Apply fixes
+    for fix_ln, fix_content in proposed_fixes.items():
+        fix_idx = fix_ln - 1
+        if 0 <= fix_idx < len(src_lines):
+            src_lines[fix_idx] = fix_content
+
+    # Write and recompile
+    source_path.write_text("".join(src_lines))
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+
+    if result.returncode == 0:
+        return src_lines, 0, True  # success!
+
+    new_errors = parse_errors_fn(result.stderr or "", src_name)
+    new_count = len(new_errors)
+
+    if new_count > prev_error_count:
+        # Fix made things worse -- revert
+        src_lines[:] = snapshot
+        source_path.write_text("".join(src_lines))
+        failed_fix_hashes.add(fix_hash)
+        log.warning("Fix reverted: error count increased %d -> %d", prev_error_count, new_count)
+        return src_lines, prev_error_count, False
+
+    return src_lines, new_count, True
+
+
 def compile_cobol(
     source_path: str | Path,
     output_path: str | Path | None = None,
@@ -3698,15 +3747,19 @@ def compile_cobol(
     auto_fix_retries: int = 20,
     llm_provider=None,
     llm_model: str | None = None,
+    wall_clock_timeout: float = 1800.0,
 ) -> tuple[bool, str]:
     """Compile COBOL source with GnuCOBOL.
 
-    If compilation fails:
+    If compilation fails, enters a never-give-up fix loop that only exits
+    on success or wall-clock timeout:
     1. Check fix cache for matching error patterns
-    2. If LLM available, ask it to fix uncached errors (up to 3 LLM passes)
+    2. If LLM available, ask it to fix uncached errors
     3. Fallback: comment out non-definition error lines
+    4. On stall: escalate to multi-turn LLM investigation, revert-and-retry
 
-    Retries up to auto_fix_retries times. Fixes are cached for reuse.
+    The ``auto_fix_retries`` parameter is accepted for backward compatibility
+    but ignored -- the loop is driven by ``wall_clock_timeout`` instead.
 
     Returns (success, message).
     """
@@ -3731,16 +3784,17 @@ def compile_cobol(
     # Initialize fix cache
     from .cobol_fix_cache import (
         CobolFixCache,
+        EscalationState,
         llm_fix_errors,
+        llm_investigate_cascade,
         parse_compilation_errors,
     )
     cache_path = source_path.parent / "cobol_fix_cache.json"
     cache = CobolFixCache(cache_path)
     session_fixes: list[str] = []
 
-    # Pre-compile source-level fixups (IBM → GnuCOBOL syntax)
+    # Pre-compile source-level fixups (IBM -> GnuCOBOL syntax)
     _apply_source_fixups(source_path)
-
 
     # Checkpoint: save a hash of the original source so we can detect
     # if a prior fixed version is still valid on the next run.
@@ -3756,24 +3810,27 @@ def compile_cobol(
             log.info("Resuming from checkpoint: %s", checkpoint_path.name)
             source_path.write_text(checkpoint_path.read_text())
 
-    # pending_fixes: maps error_line → (error_msg, original_window, fixed_window)
+    # pending_fixes: maps error_line -> (error_msg, original_window, fixed_window)
     # Promoted to cache only when the error disappears on next recompile.
     pending_fixes: dict[int, tuple[str, list[str], list[str]]] = {}
-    prev_error_lines: set[int] = set()
 
-    # Loop detection: track error count per pass. If stuck (same count
-    # for 3+ passes), the LLM is applying wrong fixes. Stop and use
-    # last-resort for remaining errors.
-    prev_error_counts: list[int] = []
-    stuck_investigated = False  # only investigate once
+    # Escalation state machine replaces the old stuck detection
+    escalation = EscalationState()
+    prior_investigation_attempts: list[str] = []
 
-    for attempt in range(1 + auto_fix_retries):
+    # Wall-clock deadline -- the ONLY way this loop terminates without
+    # success is hitting this deadline.
+    deadline = time.monotonic() + wall_clock_timeout
+    attempt = 0
+    last_stderr = ""
+
+    while time.monotonic() < deadline:
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=1800,  # 30 min per attempt for large programs
+                timeout=max(60, deadline - time.monotonic()),
             )
 
             # Parse errors for this attempt
@@ -3782,6 +3839,7 @@ def compile_cobol(
                 result.stderr or "", src_name,
             ) if result.returncode != 0 else []
             current_error_lines = {ln for ln, _ in current_errors}
+            last_stderr = result.stderr or ""
 
             # Promote pending fixes whose errors disappeared (proven)
             for pline, (perr, porig, pfixed) in list(pending_fixes.items()):
@@ -3795,54 +3853,111 @@ def compile_cobol(
                 fixed = f" (after {attempt} fix passes)" if attempt > 0 else ""
                 return True, f"Compiled: {output_path}{fixed}"
 
-            if attempt >= auto_fix_retries or not current_errors:
+            if not current_errors:
+                # Non-zero return but no parseable errors -- unexpected
                 cache.save()
                 return False, f"Compilation failed:\n{result.stderr}\n{result.stdout}"
 
-            # Loop detection: if error count hasn't changed for 3 passes,
-            # we're stuck — LLM is applying wrong fixes repeatedly. Fail.
             n_errs = len(current_errors)
-            prev_error_counts.append(n_errs)
-            stuck = (len(prev_error_counts) >= 3 and
-                     prev_error_counts[-1] == prev_error_counts[-2] == prev_error_counts[-3])
-            if stuck:
-                # Last chance: multi-turn LLM investigation on the stuck errors
-                if llm_provider and not stuck_investigated:
-                    from .cobol_fix_cache import llm_investigate_cascade
-                    src_lines = source_path.read_text().splitlines(keepends=True)
-                    first_ln, first_msg = current_errors[0]
-                    log.info("=== STUCK on %d errors — multi-turn LLM investigation on line %d ===",
-                             n_errs, first_ln)
-                    invest_fixes = llm_investigate_cascade(
-                        llm_provider, llm_model,
-                        first_ln, first_msg,
-                        current_errors,
-                        src_lines, source_name=str(source_path.name),
-                    )
-                    stuck_investigated = True
-                    if invest_fixes:
-                        for fix_ln, fix_content in invest_fixes.items():
-                            fix_idx = fix_ln - 1
-                            if 0 <= fix_idx < len(src_lines):
-                                src_lines[fix_idx] = fix_content
-                        source_path.write_text("".join(src_lines))
-                        log.info("  Multi-turn investigation fixed %d lines, recompiling...",
-                                 len(invest_fixes))
-                        prev_error_counts.clear()  # reset stuck detection
-                        continue  # retry compilation
 
-                cache.save()
-                log.error("=== STUCK: same %d errors for 3 passes — compilation failed ===", n_errs)
-                return False, (
-                    f"Compilation stuck: {n_errs} unfixable errors after {attempt} passes.\n"
-                    f"{result.stderr}"
-                )
+            # Update escalation state
+            current_source = source_path.read_text()
+            escalation.update(n_errs, current_source)
+
+            log.info("=== Pass %d: %d errors, escalation level=%d stall=%d (best=%d) ===",
+                     attempt + 1, n_errs, escalation.level, escalation.stall_count,
+                     escalation.best_error_count)
+
+            # Escalation level 3 + stall >= 6: revert to best snapshot, try different error
+            if escalation.level >= 3 and escalation.best_source:
+                log.info("=== Escalation L3: reverting to best snapshot (%d errors) ===",
+                         escalation.best_error_count)
+                source_path.write_text(escalation.best_source)
+                # Reset stall partially so we re-enter the fix loop
+                escalation.stall_count = max(0, escalation.stall_count - 3)
+                escalation.level = 1
+                attempt += 1
+                continue
+
+            # Escalation stall >= 8: clear investigated set, start fresh
+            if escalation.stall_count >= 8:
+                log.info("=== Escalation: clearing investigated sigs, fresh start ===")
+                escalation.investigated_sigs.clear()
+                escalation.stall_count = 2  # reset to level 1
+                escalation.level = 1
+                attempt += 1
+                continue
 
             src_lines = source_path.read_text().splitlines(keepends=True)
 
-            # Walk ALL errors one by one. For each: try cache → LLM
-            # (one error) → rule-based. Apply all fixes, then recompile
-            # once. Give up only when a full pass makes zero progress.
+            # --- Escalation level >= 1: multi-turn LLM investigation ---
+            if escalation.level >= 1 and llm_provider:
+                # Pick an error we haven't investigated yet at this level
+                invest_target = None
+                for ln, msg in current_errors:
+                    sig = f"{ln}:{msg[:40]}"
+                    if sig not in escalation.investigated_sigs:
+                        invest_target = (ln, msg)
+                        break
+                if invest_target is None and current_errors:
+                    # All investigated -- pick first anyway
+                    invest_target = current_errors[0]
+
+                if invest_target:
+                    inv_ln, inv_msg = invest_target
+                    sig = f"{inv_ln}:{inv_msg[:40]}"
+                    escalation.investigated_sigs.add(sig)
+
+                    log.info("=== Escalation L%d: investigating line %d: %s ===",
+                             escalation.level, inv_ln, inv_msg[:60])
+
+                    invest_result = llm_investigate_cascade(
+                        llm_provider, llm_model,
+                        inv_ln, inv_msg,
+                        current_errors,
+                        src_lines,
+                        source_name=str(source_path.name),
+                        max_turns=10,
+                        prior_attempts=prior_investigation_attempts or None,
+                    )
+
+                    if invest_result.fixes:
+                        # Use _try_fix_and_verify to apply with rollback
+                        src_lines, new_count, accepted = _try_fix_and_verify(
+                            source_path, src_lines, invest_result.fixes, cmd,
+                            n_errs, escalation.failed_fix_hashes,
+                            parse_compilation_errors, src_name,
+                        )
+                        if accepted:
+                            prior_investigation_attempts.append(
+                                f"Line {inv_ln}: fixed {len(invest_result.fixes)} lines"
+                            )
+                            if new_count == 0:
+                                cache.save()
+                                return True, f"Compiled: {output_path} (after {attempt + 1} fix passes)"
+                            log.info("  Investigation fix accepted: %d -> %d errors",
+                                     n_errs, new_count)
+                            attempt += 1
+                            continue
+                        else:
+                            prior_investigation_attempts.append(
+                                f"Line {inv_ln}: fix reverted (made things worse)"
+                            )
+                    elif invest_result.suggested_next_target:
+                        # LLM redirected to a different error
+                        log.info("  Investigation redirected to line %d",
+                                 invest_result.suggested_next_target)
+                        prior_investigation_attempts.append(
+                            f"Line {inv_ln}: gave up, suggested line {invest_result.suggested_next_target}"
+                        )
+                    elif invest_result.exhausted:
+                        prior_investigation_attempts.append(
+                            f"Line {inv_ln}: investigation exhausted"
+                        )
+
+            # Walk ALL errors one by one. For each: try cache -> LLM
+            # (one error) -> rule-based. Apply all fixes, then recompile
+            # once.
             _num_only = re.compile(
                 r"^\s*\d[\d\s]*(?:THRU\s+\d+[\d\s]*)*[\s.]*$", re.IGNORECASE,
             )
@@ -3874,15 +3989,14 @@ def compile_cobol(
 
             # Pre-pass: detect cascade root causes.
             # "expecting SECTION or ." on valid data defs = parser lost context.
-            # The error is NOT on the reported line — it's 20-100 lines ABOVE.
-            from .cobol_fix_cache import llm_investigate_cascade
+            # The error is NOT on the reported line -- it's 20-100 lines ABOVE.
             _data_def_re = re.compile(
                 r"^\s*(?:\d{2,3})\s+(?:[A-Z]|FILLER)", re.IGNORECASE,
             )
             cascade_root_fixes = 0
+            first_section_err = None
+            first_section_msg = ""
             if deduped_errors:
-                first_section_err = None
-                first_section_msg = ""
                 for ln, msg in deduped_errors:
                     if "expecting SECTION or" in msg:
                         eidx = ln - 1
@@ -3912,21 +4026,22 @@ def compile_cobol(
                             )
                             cascade_root_fixes += 1
                             regex_fixed = True
-                            log.info("  Cascade root: VALUES ARE at line %d → fixed", back_idx + 1)
+                            log.info("  Cascade root: VALUES ARE at line %d -> fixed", back_idx + 1)
                             break
                         if _data_def_re.match(bcontent):
                             break
 
                     # Step 2: If regex didn't find it, ask LLM (multi-turn investigation)
                     if not regex_fixed and llm_provider:
-                        log.info("  Cascade at line %d — LLM investigating (can request file chunks)...",
+                        log.info("  Cascade at line %d -- LLM investigating (can request file chunks)...",
                                  first_section_err)
-                        llm_cascade_fixes = llm_investigate_cascade(
+                        cascade_result = llm_investigate_cascade(
                             llm_provider, llm_model,
                             first_section_err, first_section_msg,
                             current_errors,
                             src_lines, source_name=str(source_path.name),
                         )
+                        llm_cascade_fixes = cascade_result.fixes
                         if llm_cascade_fixes:
                             for fix_ln, fix_content in llm_cascade_fixes.items():
                                 fix_idx = fix_ln - 1
@@ -3936,8 +4051,7 @@ def compile_cobol(
                             log.info("  LLM found cascade root cause: %d lines fixed upstream",
                                      len(llm_cascade_fixes))
 
-            # Remove cascade errors from the deduped list — UNLESS we're stuck,
-            # in which case let them fall through to last-resort.
+            # Remove cascade errors from the deduped list
             if first_section_err:
                 cascade_removed = 0
                 non_cascade: list[tuple[int, str]] = []
@@ -3987,7 +4101,7 @@ def compile_cobol(
                     fixed_count = 1
                     total_cached += 1
 
-                # Phase 1.5: Deterministic rules BEFORE LLM — these are known
+                # Phase 1.5: Deterministic rules BEFORE LLM -- these are known
                 # patterns that the LLM gets wrong (fixes symptom not cause).
                 if not fixed_count:
                     ln = src_lines[idx]
@@ -4036,11 +4150,11 @@ def compile_cobol(
                                      verified=False)
                         pending_fixes[lineno] = (error_msg, orig_window, fixed_window)
                         total_llm += 1
-                        log.info("  [%d/%d] ✓ LLM fixed %d lines at line %d",
+                        log.info("  [%d/%d] LLM fixed %d lines at line %d",
                                  err_idx + 1, n_errors, len(llm_fixes), lineno)
                     else:
                         failed_msgs.add(error_msg)
-                        log.info("  [%d/%d] ✗ LLM no fix for line %d (will skip same error)",
+                        log.info("  [%d/%d] LLM no fix for line %d (will skip same error)",
                                  err_idx + 1, n_errors, lineno)
 
                 # Phase 3: Rule-based fallback
@@ -4048,7 +4162,7 @@ def compile_cobol(
                     ln = src_lines[idx]
                     ln_content = ln[7:72].strip() if len(ln) > 7 else ln.strip()
 
-                    # 3b: Pure numeric continuation — try to merge with previous VALUE
+                    # 3b: Pure numeric continuation -- try to merge with previous VALUE
                     if not fixed_count and _num_only.match(ln_content):
                         for prev in range(idx - 1, max(idx - 5, -1), -1):
                             prev_ln = src_lines[prev]
@@ -4081,11 +4195,18 @@ def compile_cobol(
                 total_fixed += fixed_count
 
             if total_fixed == 0:
-                cache.save()
-                return False, (
-                    f"Compilation failed ({len(current_errors)} errors, "
-                    f"no fixes applied):\n{result.stderr}\n{result.stdout}"
-                )
+                # Instead of returning False, escalate and continue
+                log.warning("Zero-progress pass %d (%d errors) -- escalating",
+                            attempt + 1, len(current_errors))
+                escalation.stall_count += 2
+                if escalation.stall_count >= 2 and escalation.level < 1:
+                    escalation.level = 1
+                if escalation.stall_count >= 4 and escalation.level < 2:
+                    escalation.level = 2
+                if escalation.stall_count >= 6 and escalation.level < 3:
+                    escalation.level = 3
+                attempt += 1
+                continue
 
             log.info("=== Fix pass %d summary: %d fixed (%d cached, %d LLM, %d rule-based), %d skipped, recompiling... ===",
                      attempt + 1, total_fixed, total_cached, total_llm, total_rule, total_skipped)
@@ -4104,8 +4225,13 @@ def compile_cobol(
             cache.save()
             return False, f"Compilation error: {e}"
 
+        attempt += 1
+
     cache.save()
-    return False, "Compilation failed after auto-fix retries"
+    return False, (
+        f"Compilation timed out after {attempt} passes "
+        f"({escalation.best_error_count} best errors):\n{last_stderr}"
+    )
 
 
 def run_cobol(

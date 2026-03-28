@@ -47,6 +47,51 @@ class FixEntry:
     verified: bool = False  # True once error disappeared on recompile
 
 
+@dataclass
+class InvestigationResult:
+    """Result from a multi-turn LLM investigation of a compilation error."""
+    fixes: dict[int, str]
+    diagnosis: str = ""
+    suggested_next_target: int | None = None
+    exhausted: bool = False
+
+
+@dataclass
+class EscalationState:
+    """Tracks escalation through increasingly aggressive fix strategies.
+
+    Levels:
+      0 — normal (cache + single-error LLM + rules)
+      1 — investigate: multi-turn LLM investigation (10 turns)
+      2 — deep: wider context investigation
+      3 — revert-and-retry: revert to best snapshot, try different error
+    """
+    level: int = 0
+    stall_count: int = 0
+    best_error_count: int = 999999
+    best_source: str = ""
+    investigated_sigs: set = field(default_factory=set)
+    failed_fix_hashes: set = field(default_factory=set)
+    pass_number: int = 0
+
+    def update(self, error_count: int, current_source: str):
+        """Update escalation state after a compilation attempt."""
+        self.pass_number += 1
+        if error_count < self.best_error_count:
+            self.best_error_count = error_count
+            self.best_source = current_source
+            self.stall_count = 0
+            self.level = 0
+        else:
+            self.stall_count += 1
+            if self.stall_count >= 2 and self.level < 1:
+                self.level = 1
+            if self.stall_count >= 4 and self.level < 2:
+                self.level = 2
+            if self.stall_count >= 6 and self.level < 3:
+                self.level = 3
+
+
 class CobolFixCache:
     """Persistent cache for COBOL compilation fixes."""
 
@@ -334,15 +379,21 @@ def llm_investigate_cascade(
     all_errors: list[tuple[int, str]],
     src_lines: list[str],
     source_name: str = "",
-    max_turns: int = 5,
-) -> dict[int, str]:
+    max_turns: int = 10,
+    prior_attempts: list[str] | None = None,
+) -> InvestigationResult:
     """Multi-turn LLM investigation of cascade root cause.
 
     The LLM can request specific chunks of the source file to
     investigate where the parser lost context. Up to max_turns
     rounds of conversation.
+
+    Returns an InvestigationResult with fixes, diagnosis, and optional
+    redirect to a different error line.
     """
     from .llm_coverage import _query_llm_sync, Message
+
+    _empty = InvestigationResult(fixes={})
 
     total_lines = len(src_lines)
     idx = first_error_line - 1
@@ -355,12 +406,22 @@ def llm_investigate_cascade(
 
     file_ctx = f"File: {source_name} ({total_lines} lines total)\n" if source_name else ""
 
+    prior_ctx = ""
+    if prior_attempts:
+        prior_ctx = (
+            "\n\nIMPORTANT — The following fix approaches were already tried "
+            "and DID NOT resolve the error. Do NOT repeat them:\n"
+            + "\n".join(f"- {a}" for a in prior_attempts[-10:])
+            + "\n"
+        )
+
     system_msg = Message(
         role="system",
         content=(
             "You are investigating a GnuCOBOL compilation cascade failure in a "
             "large instrumented COBOL source file. You can request chunks of the "
             "file to investigate. Respond with ONLY JSON, no explanations."
+            + prior_ctx
         ),
     )
 
@@ -382,28 +443,34 @@ def llm_investigate_cascade(
             f"First error and 100 lines before it:\n"
             f"```cobol\n{initial_window}\n```\n\n"
             f"Other error locations: {error_locs}\n\n"
-            "You have TWO options:\n\n"
+            "You have THREE options:\n\n"
             "OPTION A — You found the root cause. Return:\n"
             "{\"fix\": {\"12345\": \"       fixed content line\"}}\n\n"
             "OPTION B — You need to see more of the file. Return:\n"
             "{\"need_context\": {\"start\": 3720, \"end\": 3770, \"reason\": \"checking first error area\"}}\n\n"
+            "OPTION C — You believe this error line is NOT the real problem and "
+            "want to redirect investigation. Return:\n"
+            "{\"give_up\": {\"reason\": \"explanation\", \"suggested_line\": 5432}}\n\n"
             "Respond with ONLY the JSON."
         ),
     )
 
     messages = [system_msg, user_msg]
+    parse_retries = 0
+    max_parse_retries = 2
 
     for turn in range(max_turns):
         try:
             response, _ = _query_llm_sync(llm_provider, messages, llm_model)
         except Exception as e:
             log.warning("LLM cascade investigation failed on turn %d: %s", turn + 1, e)
-            return {}
+            return _empty
 
         # Strip markdown code blocks
         cleaned = re.sub(r"```\w*\n?", "", response).strip()
 
         # Try to parse JSON
+        parsed = None
         try:
             parsed = json.loads(cleaned)
         except (json.JSONDecodeError, ValueError):
@@ -413,11 +480,49 @@ def llm_investigate_cascade(
                 try:
                     parsed = json.loads(m.group())
                 except (json.JSONDecodeError, ValueError):
-                    log.warning("  Turn %d: could not parse LLM response", turn + 1)
-                    return {}
+                    pass
+
+        if parsed is None:
+            # JSON parse failure — send corrective message instead of aborting
+            parse_retries += 1
+            if parse_retries > max_parse_retries:
+                log.warning("  Turn %d: JSON parse failed %d times, giving up",
+                            turn + 1, parse_retries)
+                return InvestigationResult(fixes={}, exhausted=True)
+
+            log.info("  Turn %d: JSON parse failed, sending correction (retry %d/%d)",
+                     turn + 1, parse_retries, max_parse_retries)
+            messages.append(Message(role="assistant", content=response))
+            messages.append(Message(
+                role="user",
+                content=(
+                    "Your response was not valid JSON. Please respond with ONLY "
+                    "a JSON object in one of these formats:\n"
+                    '{\"fix\": {\"LINE\": \"content\"}}\n'
+                    '{\"need_context\": {\"start\": N, \"end\": M, \"reason\": \"...\"}}\n'
+                    '{\"give_up\": {\"reason\": \"...\", \"suggested_line\": N}}\n'
+                    "No markdown, no explanation — just the JSON."
+                ),
+            ))
+            continue
+
+        # OPTION C: LLM gives up on this error, suggests different target
+        if "give_up" in parsed:
+            give_up_data = parsed["give_up"]
+            reason = give_up_data.get("reason", "unknown")
+            suggested = give_up_data.get("suggested_line")
+            if isinstance(suggested, (int, float)):
+                suggested = int(suggested)
             else:
-                log.warning("  Turn %d: no JSON in LLM response", turn + 1)
-                return {}
+                suggested = None
+            log.info("  Turn %d: LLM gave up on line %d: %s (suggested: %s)",
+                     turn + 1, first_error_line, reason, suggested)
+            return InvestigationResult(
+                fixes={},
+                diagnosis=reason,
+                suggested_next_target=suggested,
+                exhausted=True,
+            )
 
         # OPTION A: LLM found a fix
         if "fix" in parsed:
@@ -429,7 +534,7 @@ def llm_investigate_cascade(
                 if result:
                     log.info("  Turn %d: LLM found root cause — %d lines fixed",
                              turn + 1, len(result))
-                    return result
+                    return InvestigationResult(fixes=result)
 
         # OPTION B: LLM needs more context
         if "need_context" in parsed:
@@ -459,13 +564,13 @@ def llm_investigate_cascade(
         if result:
             log.info("  Turn %d: LLM returned fix (flat format) — %d lines",
                      turn + 1, len(result))
-            return result
+            return InvestigationResult(fixes=result)
 
         log.warning("  Turn %d: unrecognized LLM response format", turn + 1)
-        return {}
+        return _empty
 
     log.warning("  LLM cascade investigation exhausted %d turns", max_turns)
-    return {}
+    return InvestigationResult(fixes={}, exhausted=True)
 
 
 def _parse_llm_fix_response(
