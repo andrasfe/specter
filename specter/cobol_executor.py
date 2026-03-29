@@ -125,30 +125,47 @@ def _gnucobol_source_fixups(source_text: str) -> str:
                     fixed_lines[i + 1] = nxt[:6] + " " + nxt[7:]
                     multi_fixes += 1
 
-    # 2. Fix unterminated VALUE continuation lines.
-    #    Only add periods to lines that look like VALUE data (numbers,
-    #    quoted strings, THRU ranges) — NOT to general data definitions
-    #    which may legitimately continue on the next line.
-    _val_cont_re = re.compile(
-        r"^\s*(?:'[^']*'|\d{2,})\s*(?:'[^']*'|\d{2,}\s*)*(?:\s+THRU\s+\d+)?\s*$",
-    )
-    for i in range(len(fixed_lines) - 1):
+    # 2. Ensure every DATA DIVISION statement ends with a period.
+    #    In COBOL, a new level number (01/05/10/15/20/25/77/88) ALWAYS
+    #    starts a new statement. So the previous active line MUST end
+    #    with a period. Scan through DATA DIVISION and find active lines
+    #    without periods where the next active line is a new level number.
+    _level_re = re.compile(r"^\s*(?:01|05|10|15|20|25|77|88|66)\s+", re.IGNORECASE)
+    in_data = True
+    last_active_idx: int | None = None
+    for i in range(len(fixed_lines)):
         ln = fixed_lines[i]
-        if len(ln) > 6 and ln[6] not in ("*", "/"):
-            content = ln[7:72].rstrip() if len(ln) > 7 else ln.rstrip()
-            full_line = ln.rstrip()
-            if not content or "." in full_line:
-                continue
-            if not _val_cont_re.match(content):
-                continue
-            # Next line is comment or blank — this VALUE continuation needs a period
-            nxt = fixed_lines[i + 1]
-            nxt_content = nxt[7:72].strip() if len(nxt) > 7 else nxt.strip()
-            nxt_is_comment = len(nxt) > 6 and nxt[6] in ("*", "/")
-            nxt_is_blank = not nxt_content
-            if nxt_is_comment or nxt_is_blank:
-                fixed_lines[i] = full_line + ".\n"
-                multi_fixes += 1
+        is_comment = len(ln) > 6 and ln[6] in ("*", "/")
+        content = ln[7:72].strip() if len(ln) > 7 else ln.strip()
+        upper = content.upper() if content else ""
+
+        if "PROCEDURE DIVISION" in upper and not is_comment:
+            in_data = False
+        if not in_data:
+            break
+
+        if is_comment or not content:
+            continue  # skip comments/blanks, keep last_active_idx
+
+        # This is an active line
+        if last_active_idx is not None and _level_re.match(content):
+            # New level number starting — previous active line must end with period
+            prev = fixed_lines[last_active_idx]
+            prev_stripped = prev.rstrip()
+            if prev_stripped and not prev_stripped.endswith("."):
+                prev_content = prev[7:72].strip() if len(prev) > 7 else prev.strip()
+                prev_upper = prev_content.upper().rstrip() if prev_content else ""
+                # Don't add period after keywords expecting continuation
+                if (prev_content
+                        and not prev_upper.endswith("REDEFINES")
+                        and not prev_upper.endswith("VALUE")
+                        and not prev_upper.endswith("VALUES")
+                        and not prev_upper.endswith("ARE")
+                        and not prev_upper.endswith("IS")):
+                    fixed_lines[last_active_idx] = prev_stripped + ".\n"
+                    multi_fixes += 1
+
+        last_active_idx = i
 
     # 3. Duplicate consecutive lines → remove the second copy.
     #    Compare code area only (cols 7-72), ignore trailing whitespace
