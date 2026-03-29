@@ -153,7 +153,16 @@ def _gnucobol_source_fixups(source_text: str) -> str:
                 prev_stripped = prev.rstrip()
                 if prev_stripped and not prev_stripped.endswith("."):
                     prev_content = prev[7:72].strip() if len(prev) > 7 else prev.strip()
-                    if prev_content and not prev_content.upper().rstrip().endswith("REDEFINES"):
+                    prev_upper = prev_content.upper().rstrip()
+                    # Don't add period if line ends with a keyword that
+                    # expects continuation (VALUE needs literal, REDEFINES
+                    # needs target name, etc.)
+                    if (prev_content
+                            and not prev_upper.endswith("REDEFINES")
+                            and not prev_upper.endswith("VALUE")
+                            and not prev_upper.endswith("VALUES")
+                            and not prev_upper.endswith("ARE")
+                            and not prev_upper.endswith("IS")):
                         fixed_lines[last_active_idx] = prev_stripped + ".\n"
                         multi_fixes += 1
                 last_active_idx = None
