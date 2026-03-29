@@ -4106,10 +4106,10 @@ def compile_cobol(
                     total_cached += 1
 
                 # Phase 1.5: Deterministic rules BEFORE LLM.
-                # Skip when few errors remain — the rules helped get from
-                # thousands to ~10, but for the last few they can be wrong
-                # (adding periods to continuation lines that shouldn't have them).
-                if not fixed_count and n_errs > 10:
+                # Skip when errors are below the best-seen threshold — the rules
+                # got us here but can cause regressions on edge cases.
+                rules_safe = n_errs > max(50, escalation.best_error_count * 2)
+                if not fixed_count and rules_safe:
                     ln = src_lines[idx]
                     ln_content = ln[7:72].strip() if len(ln) > 7 else ln.strip()
 

@@ -400,7 +400,7 @@ def llm_investigate_cascade(
     # When few errors remain, expand initial window dramatically —
     # the root cause may be hundreds of lines before the error
     n_errors = len(all_errors)
-    lookback = 500 if n_errors <= 5 else (200 if n_errors <= 20 else 100)
+    lookback = 1000 if n_errors <= 20 else (500 if n_errors <= 100 else 200)
     min_line = max(0, idx - lookback)
     max_line = min(total_lines, idx + 5)
     initial_window = _format_numbered(src_lines, min_line, max_line)
@@ -548,7 +548,7 @@ def llm_investigate_cascade(
             reason = req.get("reason", "")
 
             # Cap chunk size — generous when few errors remain
-            max_chunk = 500 if n_errors <= 5 else 200
+            max_chunk = 1000 if n_errors <= 20 else (500 if n_errors <= 100 else 200)
             if req_end - req_start > max_chunk:
                 req_end = req_start + max_chunk
 
