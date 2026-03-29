@@ -125,51 +125,30 @@ def _gnucobol_source_fixups(source_text: str) -> str:
                     fixed_lines[i + 1] = nxt[:6] + " " + nxt[7:]
                     multi_fixes += 1
 
-    # 2. Fix unterminated VALUE clauses in DATA DIVISION.
-    #    Scan for the last active (non-comment) line before each 88-level
-    #    or comment block. If that line has no period, add one.
-    #    This catches ALL cases where truncation or copy-paste lost the period.
-    in_data_div = True
-    last_active_idx: int | None = None
-    for i in range(len(fixed_lines)):
+    # 2. Fix unterminated VALUE continuation lines.
+    #    Only add periods to lines that look like VALUE data (numbers,
+    #    quoted strings, THRU ranges) — NOT to general data definitions
+    #    which may legitimately continue on the next line.
+    _val_cont_re = re.compile(
+        r"^\s*(?:'[^']*'|\d{2,})\s*(?:'[^']*'|\d{2,}\s*)*(?:\s+THRU\s+\d+)?\s*$",
+    )
+    for i in range(len(fixed_lines) - 1):
         ln = fixed_lines[i]
-        content = ln[7:72].strip() if len(ln) > 7 else ln.strip()
-        is_comment = len(ln) > 6 and ln[6] in ("*", "/")
-        upper = content.upper() if content else ""
-
-        if "PROCEDURE DIVISION" in upper and not is_comment:
-            in_data_div = False
-
-        if not in_data_div:
-            break
-
-        if is_comment or not content:
-            # Comment or blank — in DATA DIVISION, every statement must
-            # end with a period. If the last active line doesn't, add one.
-            # Exception: lines ending with REDEFINES (target is on next line,
-            # which might be commented — handled by rule #1 above).
-            if last_active_idx is not None:
-                prev = fixed_lines[last_active_idx]
-                prev_stripped = prev.rstrip()
-                if prev_stripped and not prev_stripped.endswith("."):
-                    prev_content = prev[7:72].strip() if len(prev) > 7 else prev.strip()
-                    prev_upper = prev_content.upper().rstrip()
-                    # Don't add period if line ends with a keyword that
-                    # expects continuation (VALUE needs literal, REDEFINES
-                    # needs target name, etc.)
-                    if (prev_content
-                            and not prev_upper.endswith("REDEFINES")
-                            and not prev_upper.endswith("VALUE")
-                            and not prev_upper.endswith("VALUES")
-                            and not prev_upper.endswith("ARE")
-                            and not prev_upper.endswith("IS")):
-                        fixed_lines[last_active_idx] = prev_stripped + ".\n"
-                        multi_fixes += 1
-                last_active_idx = None
-            continue
-
-        # Active line
-        last_active_idx = i
+        if len(ln) > 6 and ln[6] not in ("*", "/"):
+            content = ln[7:72].rstrip() if len(ln) > 7 else ln.rstrip()
+            full_line = ln.rstrip()
+            if not content or "." in full_line:
+                continue
+            if not _val_cont_re.match(content):
+                continue
+            # Next line is comment or blank — this VALUE continuation needs a period
+            nxt = fixed_lines[i + 1]
+            nxt_content = nxt[7:72].strip() if len(nxt) > 7 else nxt.strip()
+            nxt_is_comment = len(nxt) > 6 and nxt[6] in ("*", "/")
+            nxt_is_blank = not nxt_content
+            if nxt_is_comment or nxt_is_blank:
+                fixed_lines[i] = full_line + ".\n"
+                multi_fixes += 1
 
     # 3. Duplicate consecutive lines → remove the second copy.
     #    Compare code area only (cols 7-72), ignore trailing whitespace
