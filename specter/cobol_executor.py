@@ -167,7 +167,36 @@ def _gnucobol_source_fixups(source_text: str) -> str:
 
         last_active_idx = i
 
-    # 3. Duplicate consecutive lines → remove the second copy.
+    # 3. Comment out orphaned VALUE continuations after a period.
+    #    Lines with just numbers/THRU ranges that appear after a
+    #    period-terminated line are orphaned — they belong to no VALUE clause.
+    _orphan_re = re.compile(
+        r"^\s*(?:\d{2,}(?:\s+THRU\s+\d+)?[\s]*)+\s*$", re.IGNORECASE,
+    )
+    in_data2 = True
+    prev_had_period = False
+    for i in range(len(fixed_lines)):
+        ln = fixed_lines[i]
+        is_comment = len(ln) > 6 and ln[6] in ("*", "/")
+        content = ln[7:72].strip() if len(ln) > 7 else ln.strip()
+        upper = content.upper() if content else ""
+
+        if "PROCEDURE DIVISION" in upper and not is_comment:
+            in_data2 = False
+        if not in_data2:
+            break
+        if is_comment or not content:
+            continue
+
+        if prev_had_period and _orphan_re.match(content):
+            # This line has numbers/THRU but the previous statement ended
+            fixed_lines[i] = ln[:6] + "*" + ln[7:]
+            multi_fixes += 1
+            continue
+
+        prev_had_period = content.endswith(".") or ln.rstrip().endswith(".")
+
+    # 4. Duplicate consecutive lines → remove the second copy.
     #    Compare code area only (cols 7-72), ignore trailing whitespace
     #    and sequence numbers in cols 73-80.
     deduped: list[str] = []
