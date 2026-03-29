@@ -4105,9 +4105,11 @@ def compile_cobol(
                     fixed_count = 1
                     total_cached += 1
 
-                # Phase 1.5: Deterministic rules BEFORE LLM -- these are known
-                # patterns that the LLM gets wrong (fixes symptom not cause).
-                if not fixed_count:
+                # Phase 1.5: Deterministic rules BEFORE LLM.
+                # Skip when few errors remain — the rules helped get from
+                # thousands to ~10, but for the last few they can be wrong
+                # (adding periods to continuation lines that shouldn't have them).
+                if not fixed_count and n_errs > 10:
                     ln = src_lines[idx]
                     ln_content = ln[7:72].strip() if len(ln) > 7 else ln.strip()
 
