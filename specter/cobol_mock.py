@@ -3873,9 +3873,13 @@ def compile_cobol(
                 log.info("=== Escalation L3: reverting to best snapshot (%d errors) ===",
                          escalation.best_error_count)
                 source_path.write_text(escalation.best_source)
+                # Clear cache — fixes from post-revert state are invalid for
+                # the reverted state and cause error count to spike
+                cache = CobolFixCache(cache_path)
+                log.info("  Cache cleared after revert")
                 # Reset stall partially so we re-enter the fix loop
                 escalation.stall_count = max(0, escalation.stall_count - 3)
-                escalation.level = 1
+                escalation.level = 2  # skip L1 (individual fixes), go to investigation
                 attempt += 1
                 continue
 
