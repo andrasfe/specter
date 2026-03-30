@@ -1338,9 +1338,12 @@ def _scan_for_else(lines: list[str], start: int) -> tuple[bool, bool]:
       (False, True)  — structured IF without ELSE (has END-IF)
       (False, False) — period-delimited IF (no END-IF, terminated by period)
     """
+    # Paragraph label pattern — area A (col 8-11), ends with period
+    _para_re = re.compile(r"^\s{0,4}[A-Z0-9][A-Z0-9_-]*\s*\.\s*$", re.IGNORECASE)
     depth = 1  # We're inside one IF
     for j in range(start, len(lines)):
-        content = _get_cobol_content(lines[j]).strip().upper() if len(lines[j]) > 7 else ""
+        line = lines[j]
+        content = _get_cobol_content(line).strip().upper() if len(line) > 7 else ""
         if not content:
             continue
         if content.startswith("IF ") and not content.startswith("IF-"):
@@ -1351,9 +1354,10 @@ def _scan_for_else(lines: list[str], start: int) -> tuple[bool, bool]:
                 return False, True  # structured IF, no ELSE
         elif (content == "ELSE" or content.startswith("ELSE ")) and depth == 1:
             return True, True       # structured IF with ELSE
-        # Sentence-terminating period at our depth = period-delimited IF
-        if depth == 1 and content.endswith(".") and not content.startswith("IF "):
-            return False, False     # period-delimited
+        # Hit a new paragraph label — the IF was period-delimited
+        # (no END-IF found before the next paragraph)
+        if _para_re.match(content):
+            return False, False
     return False, False             # reached end, period-delimited
 
 
