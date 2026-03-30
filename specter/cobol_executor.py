@@ -171,7 +171,7 @@ def _gnucobol_source_fixups(source_text: str) -> str:
     #    Lines with just numbers/THRU ranges that appear after a
     #    period-terminated line are orphaned — they belong to no VALUE clause.
     _orphan_re = re.compile(
-        r"^\s*(?:\d{2,}(?:\s+THRU\s+\d+)?[\s]*)+\s*$", re.IGNORECASE,
+        r"^\s*(?:\d{2,}(?:\s+THRU\s+\d+)?[\s]*)+\.?\s*$", re.IGNORECASE,
     )
     in_data2 = True
     prev_had_period = False
@@ -189,9 +189,14 @@ def _gnucobol_source_fixups(source_text: str) -> str:
             continue
 
         if prev_had_period and _orphan_re.match(content):
-            # This line has numbers/THRU but the previous statement ended
+            # This line has numbers/THRU but the previous statement ended —
+            # it's orphaned. Comment it out and keep prev_had_period=True
+            # so subsequent orphaned lines are also caught.
             fixed_lines[i] = ln[:6] + "*" + ln[7:]
             multi_fixes += 1
+            # If this orphaned line had a period, next line is also orphaned
+            if content.endswith("."):
+                prev_had_period = True
             continue
 
         prev_had_period = content.endswith(".") or ln.rstrip().endswith(".")
