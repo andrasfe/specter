@@ -348,10 +348,12 @@ def prepare_context(
             )
 
     # Pre-clean copybooks AND source for GnuCOBOL compatibility.
-    # Pass work_dir so cached LLM fixes from prior runs can be applied.
+    log.info("Instrumenting and compiling COBOL (work_dir=%s) ...", work_dir)
     if copybook_paths:
         from .cobol_mock import clean_copybooks, clean_cobol_source
+        log.info("  Cleaning copybooks ...")
         copybook_paths = clean_copybooks(copybook_paths)
+        log.info("  Cleaning source ...")
         cobol_source = clean_cobol_source(cobol_source, fix_cache_dir=work_dir)
 
     # Build initial_values dict for instrumentation — placeholder values
@@ -389,6 +391,8 @@ def prepare_context(
         allow_hardening_fallback=allow_hardening_fallback,
     )
 
+    log.info("  Instrumentation done (%d lines). Applying branch tracing ...",
+             len(result.source.splitlines()))
     # Apply branch tracing if requested
     source_text = result.source
     branch_meta: dict = {}
@@ -407,12 +411,13 @@ def prepare_context(
             )
 
     # Apply IBM→GnuCOBOL source-level fixes on the final instrumented text.
-    # This catches patterns from inlined copybooks that bypass pre-clean.
+    log.info("  Applying GnuCOBOL source fixups ...")
     source_text = _gnucobol_source_fixups(source_text)
 
     # Write instrumented source
     instrumented_path = work_dir / (cobol_source.stem + ".mock.cbl")
     instrumented_path.write_text(source_text)
+    log.info("  Written %s (%d lines)", instrumented_path, len(source_text.splitlines()))
 
     # Compile
     executable_path = work_dir / cobol_source.stem
