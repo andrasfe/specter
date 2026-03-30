@@ -1143,9 +1143,10 @@ def _add_branch_tracing(
             close_parens = full_condition.count(")")
             trailing_bool = re.search(r"\b(?:AND|OR)\s*$", full_condition, re.IGNORECASE) is not None
 
-            # Conservative guard: avoid probing IFs that likely became malformed
-            # after prior neutralization/commenting passes.
-            if saw_comment_between_if_and_body or open_parens != close_parens or trailing_bool:
+            # Guard: skip IFs with malformed conditions (unbalanced parens
+            # or trailing AND/OR). Comments between IF and body are normal
+            # in enterprise COBOL and don't indicate malformation.
+            if open_parens != close_parens or trailing_bool:
                 i = j
                 continue
 
