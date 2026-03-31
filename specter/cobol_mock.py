@@ -992,8 +992,10 @@ def _add_paragraph_tracing(lines: list[str]) -> tuple[list[str], int]:
                     if target not in ("UNTIL", "VARYING", "WITH", "TEST"):
                         # Truncate to fit col 72: _B(11) + DISPLAY '...'(max 61)
                         call_tag = f"SPECTER-CALL:FROM={current_para}:TO={target}"
-                        if len(call_tag) > 59:
-                            call_tag = call_tag[:59]
+                        # _B(11) + DISPLAY '(9) + tag + '(1) + \n must fit col 72
+                        # Max tag length: 72 - 11 - 9 - 1 = 51, use 50 for safety
+                        if len(call_tag) > 50:
+                            call_tag = call_tag[:50]
                         result.append(
                             f"{_B}DISPLAY '{call_tag}'\n"
                         )
