@@ -2180,7 +2180,9 @@ def _auto_stub_undefined_with_cobc(
             tmp_src.write_text("".join(current))
             try:
                 proc = subprocess.run(
-                    ["cobc", "-fsyntax-only", str(tmp_src)],
+                    ["cobc", "-fsyntax-only", "-std=ibm",
+                     "-Wno-dialect", "-frelax-syntax-checks",
+                     "-frelax-level-hierarchy", str(tmp_src)],
                     capture_output=True,
                     text=True,
                     check=False,
@@ -2346,7 +2348,7 @@ def _auto_stub_undefined_with_cobc(
             tmp_src = Path(td) / "autocheck-final.cbl"
             tmp_src.write_text("".join(current))
             proc = subprocess.run(
-                ["cobc", "-fsyntax-only", str(tmp_src)],
+                ["cobc", "-fsyntax-only", "-std=ibm", "-Wno-dialect", "-frelax-syntax-checks", "-frelax-level-hierarchy", str(tmp_src)],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -2401,7 +2403,7 @@ def _auto_stub_undefined_with_cobc(
                     tmp_src2 = Path(td2) / "autocheck-targeted.cbl"
                     tmp_src2.write_text("".join(tentative))
                     proc2 = subprocess.run(
-                        ["cobc", "-fsyntax-only", str(tmp_src2)],
+                        ["cobc", "-fsyntax-only", "-std=ibm", "-Wno-dialect", "-frelax-syntax-checks", "-frelax-level-hierarchy", str(tmp_src2)],
                         capture_output=True,
                         text=True,
                         check=False,
@@ -2423,7 +2425,7 @@ def _auto_stub_undefined_with_cobc(
                     tmp_src3 = Path(td3) / "autocheck-salvage.cbl"
                     tmp_src3.write_text("".join(salvage))
                     proc3 = subprocess.run(
-                        ["cobc", "-fsyntax-only", str(tmp_src3)],
+                        ["cobc", "-fsyntax-only", "-std=ibm", "-Wno-dialect", "-frelax-syntax-checks", "-frelax-level-hierarchy", str(tmp_src3)],
                         capture_output=True,
                         text=True,
                         check=False,
@@ -2443,7 +2445,7 @@ def _auto_stub_undefined_with_cobc(
                     tmp_src4 = Path(td4) / "autocheck-salvage2.cbl"
                     tmp_src4.write_text("".join(salvage2))
                     proc4 = subprocess.run(
-                        ["cobc", "-fsyntax-only", str(tmp_src4)],
+                        ["cobc", "-fsyntax-only", "-std=ibm", "-Wno-dialect", "-frelax-syntax-checks", "-frelax-level-hierarchy", str(tmp_src4)],
                         capture_output=True,
                         text=True,
                         check=False,
@@ -2617,7 +2619,7 @@ def _progressive_syntax_salvage(lines: list[str], max_rounds: int = 20) -> list[
             tmp_src = Path(td) / "salvage.cbl"
             tmp_src.write_text("".join(current))
             proc = subprocess.run(
-                ["cobc", "-fsyntax-only", str(tmp_src)],
+                ["cobc", "-fsyntax-only", "-std=ibm", "-Wno-dialect", "-frelax-syntax-checks", "-frelax-level-hierarchy", str(tmp_src)],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -3041,7 +3043,7 @@ def _mitigate_cobc_internal_abort(
                 tmp_src = Path(td) / "abort-salvage.cbl"
                 tmp_src.write_text("".join(salvage))
                 proc = subprocess.run(
-                    ["cobc", "-fsyntax-only", str(tmp_src)],
+                    ["cobc", "-fsyntax-only", "-std=ibm", "-Wno-dialect", "-frelax-syntax-checks", "-frelax-level-hierarchy", str(tmp_src)],
                     capture_output=True,
                     text=True,
                     check=False,
@@ -3068,7 +3070,7 @@ def _mitigate_cobc_internal_abort(
             tmp_src = Path(td) / "abort-mitigate.cbl"
             tmp_src.write_text("".join(current))
             proc = subprocess.run(
-                ["cobc", "-fsyntax-only", str(tmp_src)],
+                ["cobc", "-fsyntax-only", "-std=ibm", "-Wno-dialect", "-frelax-syntax-checks", "-frelax-level-hierarchy", str(tmp_src)],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -3085,7 +3087,7 @@ def _mitigate_cobc_internal_abort(
         tmp_src = Path(td) / "abort-salvage-final.cbl"
         tmp_src.write_text("".join(salvage))
         proc = subprocess.run(
-            ["cobc", "-fsyntax-only", str(tmp_src)],
+            ["cobc", "-fsyntax-only", "-std=ibm", "-Wno-dialect", "-frelax-syntax-checks", "-frelax-level-hierarchy", str(tmp_src)],
             capture_output=True,
             text=True,
             check=False,
