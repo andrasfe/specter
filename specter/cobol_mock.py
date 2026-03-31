@@ -242,11 +242,7 @@ def _resolve_copies(
         r"^\s{6}[*/]\s*COPY\s+'?([A-Za-z0-9_-]+)'?(?:\s+REPLACING\b.*)?\s*\.?\s*$",
         re.IGNORECASE,
     )
-    ws_commented_copy_deny = {
-        # This legacy include carries non-standard formatting that breaks parsing
-        # when inlined verbatim.
-        "GOADTEL3",
-    }
+    ws_commented_copy_deny: set[str] = set()  # no denials — inline everything
 
     resolved = 0
     stubbed = 0
@@ -2289,10 +2285,11 @@ def _auto_stub_undefined_with_cobc(
                         bad_paragraphs.add(para)
                     continue
 
+                # Only comment out data blocks that are structurally broken,
+                # NOT duplicate definitions ("is not the original definition")
+                # which are harmless — GnuCOBOL uses the first definition.
                 if (
-                    "is not the original definition" in msg
-                    or "PICTURE clause required" in msg
-                    or "larger REDEFINES used" in msg
+                    "PICTURE clause required" in msg
                 ) and (1 <= ln <= len(current)):
                     data_block_comment_lines.add(ln)
                     continue
@@ -2316,15 +2313,8 @@ def _auto_stub_undefined_with_cobc(
             if data_block_comment_lines:
                 current = _comment_data_blocks(current, data_block_comment_lines)
 
-            current = _comment_named_data_items(
-                current,
-                {
-                    "LAST-BILLING-DATE-WS-R",
-                    "COLL-START-DATE-WS-R",
-                    "DATEA-DU-R1-WS",
-                    "DATEB-DU-R1-WS",
-                },
-            )
+            # Don't comment out named data items — they may be referenced
+            # elsewhere. Let the compile loop handle genuine conflicts.
 
             if bad_paragraphs:
                 current = _neutralize_paragraphs(current, bad_paragraphs)
