@@ -291,9 +291,9 @@ def llm_fix_errors(
     fixes: dict[int, list[str]] = {}
 
     for batch in batches[:10]:  # max 10 LLM calls per pass
-        # Extract window around the batch — 50 lines context minimum
-        min_line = max(0, batch[0][0] - 51)
-        max_line = min(len(src_lines), batch[-1][0] + 20)
+        # Extract window — 1000 lines before, error line only after
+        min_line = max(0, batch[0][0] - 1001)
+        max_line = min(len(src_lines), batch[-1][0] + 1)
         window = src_lines[min_line:max_line]
 
         error_desc = "\n".join(
@@ -397,12 +397,13 @@ def llm_investigate_cascade(
 
     total_lines = len(src_lines)
     idx = first_error_line - 1
-    # When few errors remain, expand initial window dramatically —
-    # the root cause may be hundreds of lines before the error
+    # Always show 1000 lines before the error — the root cause (e.g. a
+    # misplaced @@B probe) can be 900+ lines before the reported error.
+    # Nothing after — the error line itself gives enough forward context.
     n_errors = len(all_errors)
-    lookback = 1000 if n_errors <= 20 else (500 if n_errors <= 100 else 200)
+    lookback = 1000
     min_line = max(0, idx - lookback)
-    max_line = min(total_lines, idx + 5)
+    max_line = min(total_lines, idx + 1)
     initial_window = _format_numbered(src_lines, min_line, max_line)
 
     # Show first 30 error locations as clues
@@ -547,8 +548,8 @@ def llm_investigate_cascade(
             req_end = min(total_lines, int(req.get("end", req_start + 50)))
             reason = req.get("reason", "")
 
-            # Cap chunk size — generous when few errors remain
-            max_chunk = 1000 if n_errors <= 20 else (500 if n_errors <= 100 else 200)
+            # Cap chunk size at 1000 lines
+            max_chunk = 1000
             if req_end - req_start > max_chunk:
                 req_end = req_start + max_chunk
 
