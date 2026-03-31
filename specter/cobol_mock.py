@@ -2796,9 +2796,10 @@ def _cleanup_unbalanced_procedure(lines: list[str]) -> list[str]:
             continue
 
         if re.match(r"^COMPUTE\b", c):
-            if re.search(r"[+\-*/]\s*\.?$", c) or re.search(r"=\s*\.?$", c):
-                out[i - 1] = _comment_line(line)
-                continue
+            # Only comment out COMPUTE if it's truly incomplete — a trailing
+            # operator with NO operand. COMPUTE X = (continuation on next line)
+            # is valid COBOL and should NOT be commented out.
+            pass  # keep COMPUTE lines as-is; let GnuCOBOL handle them
             prev_active = c
             continue
         if re.match(r"^EVALUATE\b", c):
@@ -2822,11 +2823,10 @@ def _cleanup_unbalanced_procedure(lines: list[str]) -> list[str]:
                 out[i - 1] = _comment_line(line)
             continue
 
-        # Comment deeply-indented dangling fragments left after line commenting
-        # (e.g. continuation targets from a commented MOVE statement).
-        if lead >= 20 and re.match(r"^[A-Z0-9-]+\.?\s*$", c):
-            out[i - 1] = _comment_line(line)
-            continue
+        # Skip: previously commented out deeply-indented identifiers as
+        # "dangling fragments", but these can be valid MOVE continuation
+        # targets (MOVE X TO A B C where B and C are on continuation lines).
+        # Let GnuCOBOL handle genuinely orphaned identifiers.
 
         prev_active = c
 
