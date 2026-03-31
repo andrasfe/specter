@@ -385,10 +385,13 @@ def prepare_context(
         eib_calen=100 if coverage_mode else 0,
         eib_aid="X'7D'" if coverage_mode else "SPACES",  # X'7D' = DFHENTER
     )
+    # Try without hardening first to preserve IF/EVALUATE for branch tracing.
+    # If compilation fails with undefined variables, auto-stub them and retry.
+    # Only fall back to hardening if auto-stubbing also fails.
     result = instrument_cobol(
         cobol_source,
         config,
-        allow_hardening_fallback=allow_hardening_fallback,
+        allow_hardening_fallback=False,  # try strict first
     )
 
     log.info("  Instrumentation done (%d lines). Applying branch tracing ...",
@@ -419,12 +422,36 @@ def prepare_context(
     instrumented_path.write_text(source_text)
     log.info("  Written %s (%d lines)", instrumented_path, len(source_text.splitlines()))
 
-    # Compile
+    # Compile — first attempt without hardening (preserves IF/EVALUATE for branch probes)
     executable_path = work_dir / cobol_source.stem
     success, message = compile_cobol(
         instrumented_path, executable_path, copybook_paths,
         llm_provider=llm_provider, llm_model=llm_model,
     )
+
+    # If compilation failed and hardening is allowed, retry with hardening.
+    # This loses branch probes but handles programs with unresolvable copybook issues.
+    if not success and allow_hardening_fallback:
+        log.warning("Strict compile failed, retrying with hardening fallback (branch probes will be lost)")
+        result = instrument_cobol(
+            cobol_source,
+            config,
+            allow_hardening_fallback=True,
+        )
+        source_text = result.source
+        hardened_mode = "SPECTER-HARDENED-ENTRY" in source_text
+        # Re-apply fixups (no branch tracing on hardened source)
+        source_text = _gnucobol_source_fixups(source_text)
+        instrumented_path.write_text(source_text)
+        log.info("  Re-written %s with hardening (%d lines)", instrumented_path,
+                 len(source_text.splitlines()))
+        branch_meta = {}
+        total_branches = 0
+        success, message = compile_cobol(
+            instrumented_path, executable_path, copybook_paths,
+            llm_provider=llm_provider, llm_model=llm_model,
+        )
+
     if not success and "unknown (signal)" in (message or "").lower():
         # cobc internal abort: attempt targeted local mitigation while preserving
         # strict mode semantics (no full hardening fallback).
