@@ -385,10 +385,15 @@ def prepare_context(
         eib_calen=100 if coverage_mode else 0,
         eib_aid="X'7D'" if coverage_mode else "SPACES",  # X'7D' = DFHENTER
     )
+    # When branch tracing is requested, disable hardening fallback so
+    # that IF/EVALUATE structures are preserved for probe insertion.
+    # Hardening rewrites the entire PROCEDURE DIVISION as a simple wrapper,
+    # removing all conditional logic.
+    effective_hardening = allow_hardening_fallback and not enable_branch_tracing
     result = instrument_cobol(
         cobol_source,
         config,
-        allow_hardening_fallback=allow_hardening_fallback,
+        allow_hardening_fallback=effective_hardening,
     )
 
     log.info("  Instrumentation done (%d lines). Applying branch tracing ...",
