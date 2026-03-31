@@ -291,8 +291,17 @@ def llm_fix_errors(
     fixes: dict[int, list[str]] = {}
 
     for batch in batches[:10]:  # max 10 LLM calls per pass
-        # Extract window — 1000 lines before, error line only after
-        min_line = max(0, batch[0][0] - 1001)
+        # Find last @@B: probe before the error — show from there to error
+        err_idx = batch[0][0] - 1
+        probe_start = None
+        for scan in range(err_idx - 1, max(err_idx - 2000, -1), -1):
+            if 0 <= scan < len(src_lines) and "@@B:" in src_lines[scan]:
+                probe_start = scan
+                break
+        if probe_start is not None:
+            min_line = max(0, probe_start - 10)
+        else:
+            min_line = max(0, err_idx - 1000)
         max_line = min(len(src_lines), batch[-1][0] + 1)
         window = src_lines[min_line:max_line]
 
@@ -397,12 +406,21 @@ def llm_investigate_cascade(
 
     total_lines = len(src_lines)
     idx = first_error_line - 1
-    # Always show 1000 lines before the error — the root cause (e.g. a
-    # misplaced @@B probe) can be 900+ lines before the reported error.
-    # Nothing after — the error line itself gives enough forward context.
+    # Find the last @@B: probe before the error line — the root cause is
+    # usually near the most recent instrumentation insertion. Show from
+    # 10 lines before that probe to the error line.
     n_errors = len(all_errors)
-    lookback = 1000
-    min_line = max(0, idx - lookback)
+    probe_line = None
+    for scan in range(idx - 1, max(idx - 2000, -1), -1):
+        if scan < 0 or scan >= total_lines:
+            continue
+        if "@@B:" in src_lines[scan]:
+            probe_line = scan
+            break
+    if probe_line is not None:
+        min_line = max(0, probe_line - 10)
+    else:
+        min_line = max(0, idx - 1000)  # fallback if no probe found
     max_line = min(total_lines, idx + 1)
     initial_window = _format_numbered(src_lines, min_line, max_line)
 
