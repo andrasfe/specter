@@ -1605,6 +1605,7 @@ def _disable_original_fd_blocks(lines: list[str], config: MockConfig) -> list[st
                 out.append(line)
                 out.append(f"{_CMT} SPECTER: record layouts preserved from FILE SECTION\n")
                 out.extend(preserved_records)
+                preserved_records.clear()
                 continue
             out.append(line)
             continue
