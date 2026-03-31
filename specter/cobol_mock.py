@@ -1075,6 +1075,7 @@ def _add_branch_tracing(
     branch_meta: dict[str, dict] = {}
     in_procedure = False
     current_para = ""
+    _stats: dict[str, int] = {}  # diagnostic counters
 
     # Local state for nesting tracking
     id_stack: list[str] = []
@@ -1147,6 +1148,10 @@ def _add_branch_tracing(
             # or trailing AND/OR). Comments between IF and body are normal
             # in enterprise COBOL and don't indicate malformation.
             if open_parens != close_parens or trailing_bool:
+                _skip_reason = "parens" if open_parens != close_parens else "trailing_bool"
+                log.debug("Branch tracing: skip IF at line %d (%s): %s",
+                          i + 1, _skip_reason, full_condition[:50])
+                _stats["skip_" + _skip_reason] = _stats.get("skip_" + _skip_reason, 0) + 1
                 i = j
                 continue
 
@@ -1156,9 +1161,13 @@ def _add_branch_tracing(
             # Skip period-delimited IFs — inserting a DISPLAY between
             # the condition and body would break the sentence scope.
             if not has_end_if:
+                log.debug("Branch tracing: skip period-delimited IF at line %d: %s",
+                          i + 1, full_condition[:50])
+                _stats["skip_period_delim"] = _stats.get("skip_period_delim", 0) + 1
                 i = j
                 continue
 
+            _stats["probed"] = _stats.get("probed", 0) + 1
             branch_id += 1
             bid = str(branch_id)
             branch_meta[bid] = {
@@ -1275,6 +1284,7 @@ def _add_branch_tracing(
         elif meta["type"] == "EVALUATE":
             total_directions += meta.get("when_count", 1)
 
+    log.info("Branch tracing stats: %s", _stats)
     return result, branch_meta, total_directions
 
 
