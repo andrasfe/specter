@@ -1081,6 +1081,7 @@ def _add_branch_tracing(
     in_procedure = False
     current_para = ""
     _stats: dict[str, int] = {}  # diagnostic counters
+    skip_depth = 0  # depth of skipped (period-delimited) IFs — ignore their ELSE/END-IF
 
     # Local state for nesting tracking
     id_stack: list[str] = []
@@ -1108,14 +1109,22 @@ def _add_branch_tracing(
             i += 1
             continue
 
-        # Track current paragraph
+        # Track current paragraph — also reset skip_depth since a new
+        # paragraph exits any pending period-delimited IF scope
         m_para = para_re.match(line)
         if m_para:
             current_para = m_para.group(2).upper()
+            skip_depth = 0
 
         # Detect IF statement (starts with IF, not END-IF)
         content = _get_cobol_content(line).strip().upper() if len(line) > 7 else ""
         if content.startswith("IF ") and not content.startswith("IF-"):
+            # If inside a skipped IF, just increment skip depth
+            if skip_depth > 0:
+                skip_depth += 1
+                result.append(line)
+                i += 1
+                continue
             cond_parts: list[str] = [content[3:].rstrip(".")]
             saw_comment_between_if_and_body = False
 
@@ -1169,6 +1178,9 @@ def _add_branch_tracing(
                 log.debug("Branch tracing: skip period-delimited IF at line %d: %s",
                           i + 1, full_condition[:50])
                 _stats["skip_period_delim"] = _stats.get("skip_period_delim", 0) + 1
+                # DON'T push to id_stack, but track depth so we ignore
+                # the ELSE/END-IF that belong to this skipped IF.
+                skip_depth += 1
                 i = j
                 continue
 
@@ -1196,8 +1208,12 @@ def _add_branch_tracing(
             i = j  # continue from the body line (don't skip it)
             continue
 
-        # Detect ELSE
+        # Detect ELSE — but ignore if it belongs to a skipped IF
         if content == "ELSE" or content.startswith("ELSE "):
+            if skip_depth > 0:
+                result.append(line)
+                i += 1
+                continue
             if id_stack:
                 bid = id_stack[-1]
                 result.append(line)
@@ -1212,8 +1228,13 @@ def _add_branch_tracing(
                 i += 1
                 continue
 
-        # Detect END-IF
+        # Detect END-IF — but ignore if it belongs to a skipped IF
         if content.startswith("END-IF"):
+            if skip_depth > 0:
+                skip_depth -= 1
+                result.append(line)
+                i += 1
+                continue
             if id_stack:
                 bid = id_stack.pop()
                 if needs_else.get(bid, False):
