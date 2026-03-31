@@ -1573,10 +1573,17 @@ def _strip_skip_directives(lines: list[str]) -> list[str]:
 
 
 def _disable_original_fd_blocks(lines: list[str], config: MockConfig) -> list[str]:
-    """Comment out non-mock FD/SD blocks in FILE SECTION."""
+    """Comment out non-mock FD/SD blocks but PRESERVE record layouts.
+
+    FD/SD lines and LABEL/BLOCK/RECORD clauses are commented out.
+    But 01-level record layouts and their subordinates (which define
+    the data fields referenced in PROCEDURE DIVISION) are moved to
+    WORKING-STORAGE SECTION so they remain accessible.
+    """
     out: list[str] = []
     in_file_section = False
     in_disabled_block = False
+    preserved_records: list[str] = []  # record layouts to move to WS
 
     for line in lines:
         content = _get_cobol_content(line)
@@ -1588,9 +1595,17 @@ def _disable_original_fd_blocks(lines: list[str], config: MockConfig) -> list[st
             out.append(line)
             continue
 
-        if in_file_section and "PROCEDURE DIVISION" in upper:
+        if in_file_section and ("WORKING-STORAGE SECTION" in upper or
+                                "LINKAGE SECTION" in upper or
+                                "PROCEDURE DIVISION" in upper):
             in_file_section = False
             in_disabled_block = False
+            # Insert preserved record layouts into WORKING-STORAGE
+            if preserved_records and "WORKING-STORAGE SECTION" in upper:
+                out.append(line)
+                out.append(f"{_CMT} SPECTER: record layouts preserved from FILE SECTION\n")
+                out.extend(preserved_records)
+                continue
             out.append(line)
             continue
 
@@ -1611,16 +1626,33 @@ def _disable_original_fd_blocks(lines: list[str], config: MockConfig) -> list[st
             out.append(line if keep else _comment_line(line))
             continue
 
-        # End disabled block at next division/section header or new FD/SD
         if in_disabled_block:
-            if any(tok in upper for tok in ("WORKING-STORAGE SECTION", "LINKAGE SECTION", "LOCAL-STORAGE SECTION")):
-                in_disabled_block = False
-                out.append(line)
+            # Check if this is a record layout (01 level) or subordinate data
+            m_level = re.match(r"^\s*(\d{2})\s+", upper)
+            if m_level or upper.startswith("LABEL ") or upper.startswith("BLOCK ") or upper.startswith("RECORD ") or upper.startswith("DATA "):
+                # FD metadata lines (LABEL RECORDS, BLOCK CONTAINS, etc.) — comment out
+                if upper.startswith("LABEL ") or upper.startswith("BLOCK ") or upper.startswith("RECORD ") or upper.startswith("DATA "):
+                    out.append(_comment_line(line))
+                else:
+                    # Data definition (01/05/10/etc.) — preserve for WORKING-STORAGE
+                    out.append(_comment_line(line))  # comment in FILE SECTION
+                    preserved_records.append(line)    # but also save for WS
             else:
                 out.append(_comment_line(line))
             continue
 
         out.append(line)
+
+    # If WS wasn't found after FILE SECTION, insert before PROCEDURE DIVISION
+    if preserved_records:
+        for i, line in enumerate(out):
+            if "WORKING-STORAGE SECTION" in line.upper() and not line.strip().startswith("*"):
+                insert_at = i + 1
+                out.insert(insert_at, f"{_CMT} SPECTER: record layouts preserved from FILE SECTION\n")
+                for j, rec in enumerate(preserved_records):
+                    out.insert(insert_at + 1 + j, rec)
+                preserved_records.clear()
+                break
 
     return out
 
