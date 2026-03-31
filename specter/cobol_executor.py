@@ -423,10 +423,13 @@ def prepare_context(
     log.info("  Written %s (%d lines)", instrumented_path, len(source_text.splitlines()))
 
     # Compile — first attempt without hardening (preserves IF/EVALUATE for branch probes)
+    # Use a 15-minute timeout for the strict attempt — if the LLM can't resolve
+    # missing copybook variables in that time, fall back to hardening.
     executable_path = work_dir / cobol_source.stem
     success, message = compile_cobol(
         instrumented_path, executable_path, copybook_paths,
         llm_provider=llm_provider, llm_model=llm_model,
+        wall_clock_timeout=900.0,  # 15 min for strict attempt
     )
 
     # If compilation failed and hardening is allowed, retry with hardening.
