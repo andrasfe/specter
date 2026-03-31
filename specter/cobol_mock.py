@@ -2321,11 +2321,9 @@ def _auto_stub_undefined_with_cobc(
                 # Only comment out data blocks that are structurally broken,
                 # NOT duplicate definitions ("is not the original definition")
                 # which are harmless — GnuCOBOL uses the first definition.
-                if (
-                    "PICTURE clause required" in msg
-                ) and (1 <= ln <= len(current)):
-                    data_block_comment_lines.add(ln)
-                    continue
+                # Don't comment out data blocks — preserved record layouts
+                # from FILE SECTION may have complex clauses that trigger
+                # cobc warnings. The compile loop handles these.
 
             if missing_data or missing_para:
                 current = _inject_fallback_data_items(current, sorted(missing_data))
@@ -2343,8 +2341,8 @@ def _auto_stub_undefined_with_cobc(
             if numeric_names or multidim_names:
                 current = _promote_fallback_types(current, numeric_names, multidim_names)
 
-            if data_block_comment_lines:
-                current = _comment_data_blocks(current, data_block_comment_lines)
+            # _comment_data_blocks disabled — never remove data definitions.
+            # The compile loop handles any remaining issues.
 
             # Don't comment out named data items — they may be referenced
             # elsewhere. Let the compile loop handle genuine conflicts.
