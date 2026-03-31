@@ -272,13 +272,9 @@ def _resolve_copies(
             continue
 
         copyname = (m.group(2) if m else mc.group(1)).upper()
-        # Conservative mode for commented COPY lines.
-        # - FILE SECTION: inline (needed for FD/record layouts)
-        # - WORKING-STORAGE: inline by default, except known-bad copybooks
-        # - Other sections: leave untouched
-        if mc and section not in ("file", "ws"):
-            result.append(line)
-            continue
+        # Inline commented COPY lines in all sections — enterprise COBOL
+        # has essential copybooks in PROCEDURE DIVISION (code includes)
+        # as well as FILE SECTION and WORKING-STORAGE.
         if mc and section == "ws" and copyname in ws_commented_copy_deny:
             result.append(line)
             # Preserve a valid subordinate entry for preceding group items.
