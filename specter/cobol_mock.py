@@ -473,16 +473,38 @@ def _parse_copy_replacing_pairs(copy_stmt_line: str) -> list[tuple[str, str]]:
 def _normalize_copy_line(line: str) -> str:
     """Normalize raw copybook lines into fixed-format COBOL.
 
-    Many .cpy files are stored without sequence/indicator columns.
+    Handles three common copybook formats:
+    1. Already fixed-format (cols 1-6 blank, col 7 indicator)
+    2. Fixed-format with sequence numbers in cols 1-6
+    3. Free-form (no sequence area, content starts at col 1)
     """
     raw = line.rstrip("\n\r")
     if not raw:
         return "\n"
 
-    # Already fixed-format (has seq area + valid indicator column)
+    # Case 1: Already fixed-format (cols 1-6 blank, valid indicator in col 7)
     if len(raw) >= 7 and not raw[:6].strip() and raw[6] in (" ", "*", "/", "-", "D", "d"):
         return raw + "\n"
 
+    # Case 2: Fixed-format with sequence numbers in cols 1-6.
+    # Detect: cols 1-6 contain non-space characters AND col 7 is a valid
+    # indicator. Strip the sequence numbers and keep cols 7+.
+    # Also handle 5-char sequence (some copybooks use cols 1-5 for seq,
+    # with indicator in col 6 instead of col 7).
+    if len(raw) >= 6 and raw[:6].strip():
+        # Check for comment/continuation indicators embedded in the
+        # sequence area (5-char or 6-char sequence formats)
+        # Try col 6 (position 5): 5-char sequence + indicator
+        if raw[5] in ("*", "/", "-"):
+            remainder = raw[5:] if len(raw) > 5 else "*"
+            return "      " + remainder + "\n"
+        # Standard: col 7 (position 6) is indicator
+        if raw[6] in (" ", "*", "/", "-", "D", "d"):
+            return "      " + raw[6:] + "\n"
+        # Sequence numbers but no clear indicator — treat col 7+ as code
+        return "      " + " " + raw[6:] + "\n"
+
+    # Case 3: Free-form — content starts at col 1
     s = raw.lstrip()
     if s.startswith("*"):
         return "      *" + s[1:] + "\n"
