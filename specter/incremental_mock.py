@@ -653,14 +653,26 @@ def _compile_and_fix(
             all_success = [f"- {s}" for s in res_summaries] + [f"- {s}" for s in successful_fixes[-5:]]
             history_text += "WHAT WORKED (apply these patterns):\n" + "\n".join(all_success[:20]) + "\n\n"
 
+        had_comment_rejections = False
         if failed_attempts:
             recent_failed = failed_attempts[-10:]
             failed_lines = []
             for fl, fe, fs, fr in recent_failed:
                 failed_lines.append(f"  - Line {fl}: {fe[:60]} | Tried: {fs[:80]} | Result: {fr}")
+                if "commenting out" in fr.lower() or "commented out" in fs.lower():
+                    had_comment_rejections = True
             history_text += (
                 "WHAT FAILED (do NOT repeat — try a different approach):\n"
                 + "\n".join(failed_lines) + "\n\n"
+            )
+        if had_comment_rejections:
+            history_text += (
+                "⚠️ HARD CONSTRAINT: Do NOT comment out lines (no * in column 7). "
+                "Previous attempts to comment out code were REJECTED. You MUST either:\n"
+                "  1. Add a stub variable definition (e.g., 01 X PIC X(256).)\n"
+                "  2. Modify the existing line to fix the syntax\n"
+                "  3. Add a missing period or keyword\n"
+                "Commenting out is NEVER acceptable.\n\n"
             )
 
         if use_batch_mode:
@@ -889,7 +901,9 @@ def _compile_and_fix(
                     next(iter(targeted_lines)),
                     largest_group_type if use_batch_mode else chosen_msg,
                     f"commented out {n_commented}/{total_changes} lines",
-                    "rejected: mostly commenting out code (destructive)",
+                    "REJECTED — commenting out code is NOT allowed. "
+                    "You MUST add a stub definition (01 X PIC ...) or "
+                    "modify the line, NOT comment it out with * in col 7",
                 ))
                 for tl in targeted_lines:
                     failed_error_lines.add(tl)
