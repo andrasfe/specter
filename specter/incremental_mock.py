@@ -636,33 +636,6 @@ def _phase_mock_infrastructure(
     return lines, desc
 
 
-def _phase_exec_replacement(
-    lines: list[str],
-    config,
-) -> tuple[list[str], str]:
-    """Phase 3: Replace all EXEC blocks with mock reads."""
-    from .cobol_mock import _replace_exec_blocks
-    new_lines, count = _replace_exec_blocks(lines, config)
-    return new_lines, f"Replaced {count} EXEC blocks"
-
-
-def _phase_io_replacement(
-    lines: list[str],
-) -> tuple[list[str], str]:
-    """Phase 4: Replace file I/O verbs with mock operations."""
-    from .cobol_mock import _replace_io_verbs
-    new_lines, count = _replace_io_verbs(lines)
-    return new_lines, f"Replaced {count} I/O verbs"
-
-
-def _phase_call_replacement(
-    lines: list[str],
-) -> tuple[list[str], str]:
-    """Phase 5: Replace CALL statements with mock stubs."""
-    from .cobol_mock import _replace_call_stmts, _replace_accept_stmts
-    new_lines, count = _replace_call_stmts(lines)
-    new_lines = _replace_accept_stmts(new_lines)
-    return new_lines, f"Replaced {count} CALL statements"
 
 
 def _phase_paragraph_tracing(
@@ -924,67 +897,168 @@ def incremental_instrument(
         log.info("Phase 2: Mock infrastructure (skipped — resuming)")
 
     # -----------------------------------------------------------------------
-    # Phase 3: EXEC replacement
+    # Phase 3: EXEC replacement (incremental, batch_size blocks at a time)
     # -----------------------------------------------------------------------
     if start_phase <= 3:
-        log.info("Phase 3: EXEC replacement")
-        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-        lines, desc = _phase_exec_replacement(lines, config)
-        mock_path.write_text("".join(lines))
-        log.info("  %s", desc)
+        log.info("Phase 3: EXEC replacement (incremental, batch_size=%d)", batch_size)
+        from .cobol_mock import _replace_exec_blocks
+        batch_num = 0
+        while True:
+            lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+            new_lines, replaced = _replace_exec_blocks(lines, config, max_count=batch_size)
+            if replaced == 0:
+                break
+            batch_num += 1
+            log.info("  Batch %d: replaced %d EXEC blocks", batch_num, replaced)
+            snapshot = "".join(lines)  # pre-batch state for revert
+            mock_path.write_text("".join(new_lines))
 
-        new_res = _compile_and_fix(
-            mock_path, "exec_replacement", 0, resolutions,
-            copybook_dirs=copybook_dirs,
-            llm_provider=llm_provider, llm_model=llm_model,
-            baseline_errors=baseline_errors,
-        )
-        resolutions.extend(new_res)
-        _save_resolutions(resolutions, resolution_log_path)
+            new_res = _compile_and_fix(
+                mock_path, "exec_replacement", batch_num, resolutions,
+                copybook_dirs=copybook_dirs,
+                llm_provider=llm_provider, llm_model=llm_model,
+                baseline_errors=baseline_errors,
+            )
+            resolutions.extend(new_res)
+            _save_resolutions(resolutions, resolution_log_path)
+
+            # Check if batch made things unfixable — revert and retry one-by-one
+            rc, stderr = _cobc_syntax_check(mock_path, copybook_dirs)
+            if rc != 0:
+                errs = _parse_errors(stderr, mock_path.name)
+                if len(errs) > 10:
+                    log.warning("  Batch %d: %d errors remain, reverting to one-by-one",
+                                batch_num, len(errs))
+                    mock_path.write_text(snapshot)
+                    for _ in range(batch_size):
+                        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+                        one_lines, one_replaced = _replace_exec_blocks(lines, config, max_count=1)
+                        if one_replaced == 0:
+                            break
+                        mock_path.write_text("".join(one_lines))
+                        one_res = _compile_and_fix(
+                            mock_path, "exec_replacement", batch_num, resolutions,
+                            copybook_dirs=copybook_dirs,
+                            llm_provider=llm_provider, llm_model=llm_model,
+                            baseline_errors=baseline_errors,
+                        )
+                        resolutions.extend(one_res)
+                        _save_resolutions(resolutions, resolution_log_path)
+
+        log.info("  Phase 3 complete (%d batches)", batch_num)
         _save_checkpoint(output_dir, "exec_replacement", 3, mock_path)
     else:
         log.info("Phase 3: EXEC replacement (skipped — resuming)")
 
     # -----------------------------------------------------------------------
-    # Phase 4: I/O replacement
+    # Phase 4: I/O replacement (incremental, batch_size blocks at a time)
     # -----------------------------------------------------------------------
     if start_phase <= 4:
-        log.info("Phase 4: I/O replacement")
-        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-        lines, desc = _phase_io_replacement(lines)
-        mock_path.write_text("".join(lines))
-        log.info("  %s", desc)
+        log.info("Phase 4: I/O replacement (incremental, batch_size=%d)", batch_size)
+        from .cobol_mock import _replace_io_verbs
+        batch_num = 0
+        while True:
+            lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+            new_lines, replaced = _replace_io_verbs(lines, max_count=batch_size)
+            if replaced == 0:
+                break
+            batch_num += 1
+            log.info("  Batch %d: replaced %d I/O verbs", batch_num, replaced)
+            snapshot = "".join(lines)
+            mock_path.write_text("".join(new_lines))
 
-        new_res = _compile_and_fix(
-            mock_path, "io_replacement", 0, resolutions,
-            copybook_dirs=copybook_dirs,
-            llm_provider=llm_provider, llm_model=llm_model,
-            baseline_errors=baseline_errors,
-        )
-        resolutions.extend(new_res)
-        _save_resolutions(resolutions, resolution_log_path)
+            new_res = _compile_and_fix(
+                mock_path, "io_replacement", batch_num, resolutions,
+                copybook_dirs=copybook_dirs,
+                llm_provider=llm_provider, llm_model=llm_model,
+                baseline_errors=baseline_errors,
+            )
+            resolutions.extend(new_res)
+            _save_resolutions(resolutions, resolution_log_path)
+
+            # Revert + one-by-one if batch causes too many errors
+            rc, stderr = _cobc_syntax_check(mock_path, copybook_dirs)
+            if rc != 0:
+                errs = _parse_errors(stderr, mock_path.name)
+                if len(errs) > 10:
+                    log.warning("  Batch %d: %d errors remain, reverting to one-by-one",
+                                batch_num, len(errs))
+                    mock_path.write_text(snapshot)
+                    for _ in range(batch_size):
+                        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+                        one_lines, one_replaced = _replace_io_verbs(lines, max_count=1)
+                        if one_replaced == 0:
+                            break
+                        mock_path.write_text("".join(one_lines))
+                        one_res = _compile_and_fix(
+                            mock_path, "io_replacement", batch_num, resolutions,
+                            copybook_dirs=copybook_dirs,
+                            llm_provider=llm_provider, llm_model=llm_model,
+                            baseline_errors=baseline_errors,
+                        )
+                        resolutions.extend(one_res)
+                        _save_resolutions(resolutions, resolution_log_path)
+
+        log.info("  Phase 4 complete (%d batches)", batch_num)
         _save_checkpoint(output_dir, "io_replacement", 4, mock_path)
     else:
         log.info("Phase 4: I/O replacement (skipped — resuming)")
 
     # -----------------------------------------------------------------------
-    # Phase 5: CALL replacement
+    # Phase 5: CALL replacement (incremental, batch_size blocks at a time)
     # -----------------------------------------------------------------------
     if start_phase <= 5:
-        log.info("Phase 5: CALL replacement")
-        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-        lines, desc = _phase_call_replacement(lines)
-        mock_path.write_text("".join(lines))
-        log.info("  %s", desc)
+        log.info("Phase 5: CALL replacement (incremental, batch_size=%d)", batch_size)
+        from .cobol_mock import _replace_call_stmts, _replace_accept_stmts
+        batch_num = 0
+        while True:
+            lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+            new_lines, replaced = _replace_call_stmts(lines, max_count=batch_size)
+            if replaced == 0:
+                break
+            batch_num += 1
+            log.info("  Batch %d: replaced %d CALL statements", batch_num, replaced)
+            snapshot = "".join(lines)
+            mock_path.write_text("".join(new_lines))
 
-        new_res = _compile_and_fix(
-            mock_path, "call_replacement", 0, resolutions,
-            copybook_dirs=copybook_dirs,
-            llm_provider=llm_provider, llm_model=llm_model,
-            baseline_errors=baseline_errors,
-        )
-        resolutions.extend(new_res)
-        _save_resolutions(resolutions, resolution_log_path)
+            new_res = _compile_and_fix(
+                mock_path, "call_replacement", batch_num, resolutions,
+                copybook_dirs=copybook_dirs,
+                llm_provider=llm_provider, llm_model=llm_model,
+                baseline_errors=baseline_errors,
+            )
+            resolutions.extend(new_res)
+            _save_resolutions(resolutions, resolution_log_path)
+
+            # Revert + one-by-one if batch causes too many errors
+            rc, stderr = _cobc_syntax_check(mock_path, copybook_dirs)
+            if rc != 0:
+                errs = _parse_errors(stderr, mock_path.name)
+                if len(errs) > 10:
+                    log.warning("  Batch %d: %d errors remain, reverting to one-by-one",
+                                batch_num, len(errs))
+                    mock_path.write_text(snapshot)
+                    for _ in range(batch_size):
+                        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+                        one_lines, one_replaced = _replace_call_stmts(lines, max_count=1)
+                        if one_replaced == 0:
+                            break
+                        mock_path.write_text("".join(one_lines))
+                        one_res = _compile_and_fix(
+                            mock_path, "call_replacement", batch_num, resolutions,
+                            copybook_dirs=copybook_dirs,
+                            llm_provider=llm_provider, llm_model=llm_model,
+                            baseline_errors=baseline_errors,
+                        )
+                        resolutions.extend(one_res)
+                        _save_resolutions(resolutions, resolution_log_path)
+
+        # Replace ACCEPT statements (safe, one-shot — just substitutes CONTINUE)
+        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+        lines = _replace_accept_stmts(lines)
+        mock_path.write_text("".join(lines))
+
+        log.info("  Phase 5 complete (%d batches)", batch_num)
         _save_checkpoint(output_dir, "call_replacement", 5, mock_path)
     else:
         log.info("Phase 5: CALL replacement (skipped — resuming)")

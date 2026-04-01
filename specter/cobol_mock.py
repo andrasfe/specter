@@ -450,8 +450,13 @@ def _find_divisions(lines: list[str]) -> dict[str, int]:
 def _replace_exec_blocks(
     lines: list[str],
     config: MockConfig,
+    max_count: int = 0,
 ) -> tuple[list[str], int]:
-    """Replace EXEC CICS/SQL/DLI ... END-EXEC with mock reads."""
+    """Replace EXEC CICS/SQL/DLI ... END-EXEC with mock reads.
+
+    Args:
+        max_count: Maximum blocks to replace (0 = unlimited).
+    """
     result: list[str] = []
     count = 0
     i = 0
@@ -487,6 +492,10 @@ def _replace_exec_blocks(
 
             count += 1
             i = j
+            if max_count and count >= max_count:
+                # Append remaining lines unchanged
+                result.extend(lines[i:])
+                return result, count
         else:
             result.append(line)
             i += 1
@@ -691,8 +700,12 @@ def _extract_file_status_map(lines: list[str]) -> dict[str, str]:
     return status_map
 
 
-def _replace_io_verbs(lines: list[str]) -> tuple[list[str], int]:
-    """Replace standalone READ/WRITE/OPEN/CLOSE/START/DELETE with mocks."""
+def _replace_io_verbs(lines: list[str], max_count: int = 0) -> tuple[list[str], int]:
+    """Replace standalone READ/WRITE/OPEN/CLOSE/START/DELETE with mocks.
+
+    Args:
+        max_count: Maximum blocks to replace (0 = unlimited).
+    """
     result: list[str] = []
     count = 0
 
@@ -811,6 +824,9 @@ def _replace_io_verbs(lines: list[str]) -> tuple[list[str], int]:
 
             count += 1
             i = j
+            if max_count and count >= max_count:
+                result.extend(lines[i:])
+                return result, count
         else:
             result.append(line)
             i += 1
@@ -822,8 +838,12 @@ def _replace_io_verbs(lines: list[str]) -> tuple[list[str], int]:
 # Phase 5: Replace CALL statements
 # ---------------------------------------------------------------------------
 
-def _replace_call_stmts(lines: list[str]) -> tuple[list[str], int]:
-    """Replace CALL 'program' USING ... with mock reads."""
+def _replace_call_stmts(lines: list[str], max_count: int = 0) -> tuple[list[str], int]:
+    """Replace CALL 'program' USING ... with mock reads.
+
+    Args:
+        max_count: Maximum blocks to replace (0 = unlimited).
+    """
     result: list[str] = []
     count = 0
     call_re = re.compile(
@@ -885,6 +905,9 @@ def _replace_call_stmts(lines: list[str]) -> tuple[list[str], int]:
 
             count += 1
             i = j
+            if max_count and count >= max_count:
+                result.extend(lines[i:])
+                return result, count
         else:
             result.append(line)
             i += 1
