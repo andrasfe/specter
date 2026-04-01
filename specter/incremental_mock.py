@@ -546,8 +546,34 @@ def _generate_record_stubs(
         if field in undefined or parent in undefined:
             parent_fields.setdefault(parent, set()).add(field)
 
+    # Check which variables are ALREADY defined in the source
+    # (prevents "ambiguous" errors from duplicate definitions)
+    already_defined: set[str] = set()
+    def_re = re.compile(
+        r"^\s{6}\s+\d{2}\s+([A-Z0-9_-]+)\b",
+        re.IGNORECASE,
+    )
+    for src_line in src_lines:
+        if len(src_line) > 6 and src_line[6:7] == "*":
+            continue  # skip comments
+        dm = def_re.match(src_line)
+        if dm:
+            already_defined.add(dm.group(1).upper())
+
+    # Remove already-defined variables from undefined set
+    actually_undefined = undefined - already_defined
+    if not actually_undefined:
+        return []
+
+    # Remove already-defined fields from parent groups
+    for parent in list(parent_fields.keys()):
+        parent_fields[parent] = {
+            f for f in parent_fields[parent] if f in actually_undefined
+        }
+
     # Variables not in any OF relationship
-    for var in undefined:
+    standalone: set[str] = set()
+    for var in actually_undefined:
         is_child = any(var in fields for fields in parent_fields.values())
         is_parent = var in parent_fields
         if not is_child and not is_parent:
@@ -595,7 +621,7 @@ def _generate_record_stubs(
 
     # Generate parent records with children
     for parent, fields in sorted(parent_fields.items()):
-        if parent in undefined:
+        if parent in actually_undefined:
             stubs.append(f"{_A}01  {parent}.\n")
             for field in sorted(fields):
                 pic = _infer_pic(field)
@@ -604,11 +630,10 @@ def _generate_record_stubs(
             if not fields:
                 stubs.append(f"{_B}05  FILLER PIC X.\n")
             log.debug("  Stub: 01 %s with %d fields", parent, len(fields))
-        elif any(f in undefined for f in fields):
+        elif any(f in actually_undefined for f in fields):
             # Parent exists but some fields are undefined — add just the fields
-            # This happens when DCLGEN was partially inlined
             for field in sorted(fields):
-                if field in undefined:
+                if field in actually_undefined:
                     pic = _infer_pic(field)
                     stubs.append(f"{_A}01  {field} {pic}.\n")
                     log.debug("  Stub: 01 %s (orphan field of %s)", field, parent)
@@ -622,8 +647,10 @@ def _generate_record_stubs(
     if len(stubs) <= 1:  # only the comment
         return []
 
-    log.info("  Pre-fix: generated %d stub lines for %d undefined vars",
-             len(stubs) - 1, len(undefined))
+    log.info("  Pre-fix: generated %d stub lines for %d undefined vars "
+             "(%d already defined, skipped)",
+             len(stubs) - 1, len(actually_undefined),
+             len(undefined - actually_undefined))
 
     return stubs
 
@@ -1270,6 +1297,37 @@ def _compile_and_fix(
                            f"ACCEPTED — errors reduced ({n_errors}→{new_error_count}, -{reduced})")
             log.info("  [%d/%d] ✓ Progress: %d → %d errors (-%d)",
                      attempt + 1, max_fix_attempts, n_errors, new_error_count, reduced)
+
+            # After a big drop, re-run pre-fix stubs — new "not defined"
+            # errors may have appeared that weren't visible before
+            if reduced >= 10:
+                rc_re, stderr_re = _cobc_syntax_check(source_path, copybook_dirs)
+                if rc_re != 0:
+                    re_errors = _parse_errors(stderr_re, source_name)
+                    re_nd = [(ln, msg) for ln, msg in re_errors
+                             if "is not defined" in msg]
+                    if re_nd:
+                        re_src = source_path.read_text(errors="replace").splitlines(keepends=True)
+                        re_stubs = _generate_record_stubs(re_nd, re_src)
+                        if re_stubs:
+                            ws_r = _find_working_storage_range(re_src)
+                            if ws_r:
+                                ins = ws_r[1]
+                                for si, sl in enumerate(re_stubs):
+                                    re_src.insert(ins + si, sl)
+                                source_path.write_text("".join(re_src))
+                                rc_v, stderr_v = _cobc_syntax_check(
+                                    source_path, copybook_dirs)
+                                v_errs = _parse_errors(stderr_v, source_name) if rc_v != 0 else []
+                                v_nd = sum(1 for _, m in v_errs if "is not defined" in m)
+                                if v_nd < len(re_nd):
+                                    log.info("  Re-stubs after drop: 'not defined' "
+                                             "%d → %d", len(re_nd), v_nd)
+                                else:
+                                    # Revert
+                                    re_src = re_src[:ins] + re_src[ins + len(re_stubs):]
+                                    source_path.write_text("".join(re_src))
+
             # Don't return — keep going to fix remaining errors
             continue
 
