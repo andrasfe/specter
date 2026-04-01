@@ -865,7 +865,14 @@ def _compile_and_fix(
                 failed_error_lines.add(tl)
             continue
 
-        fix_summary = f"changed {len(fixes)} lines ({sorted(fixes.keys())[:5]}...)" if len(fixes) > 5 else f"changed lines {sorted(fixes.keys())}"
+        # Build a meaningful summary of what the fix actually does
+        fix_details = []
+        for ln in sorted(fixes.keys())[:5]:
+            content = fixes[ln].strip()[:60]
+            fix_details.append(f"L{ln}: {content}")
+        fix_summary = "; ".join(fix_details)
+        if len(fixes) > 5:
+            fix_summary += f" (+{len(fixes)-5} more)"
 
         # ===== Quality gate: reject fixes that are mostly commenting out =====
         n_commented = 0
