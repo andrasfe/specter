@@ -603,14 +603,27 @@ def _generate_record_stubs(
             # Ensure parent has at least one child
             if not fields:
                 stubs.append(f"{_B}05  FILLER PIC X.\n")
+            log.debug("  Stub: 01 %s with %d fields", parent, len(fields))
+        elif any(f in undefined for f in fields):
+            # Parent exists but some fields are undefined — add just the fields
+            # This happens when DCLGEN was partially inlined
+            for field in sorted(fields):
+                if field in undefined:
+                    pic = _infer_pic(field)
+                    stubs.append(f"{_A}01  {field} {pic}.\n")
+                    log.debug("  Stub: 01 %s (orphan field of %s)", field, parent)
 
     # Generate standalone stubs
     for var in sorted(standalone):
         pic = _infer_pic(var)
         stubs.append(f"{_A}01  {var} {pic}.\n")
+        log.debug("  Stub: 01 %s %s (standalone)", var, pic)
 
     if len(stubs) <= 1:  # only the comment
         return []
+
+    log.info("  Pre-fix: generated %d stub lines for %d undefined vars",
+             len(stubs) - 1, len(undefined))
 
     return stubs
 
@@ -699,34 +712,40 @@ def _compile_and_fix(
     rc_pre, stderr_pre = _cobc_syntax_check(source_path, copybook_dirs)
     if rc_pre != 0:
         pre_errors = _parse_errors(stderr_pre, source_name)
-        not_defined = [(ln, msg) for ln, msg in pre_errors
-                       if "is not defined" in msg]
-        if not_defined:
+        not_defined_before = [(ln, msg) for ln, msg in pre_errors
+                              if "is not defined" in msg]
+        if not_defined_before:
             src = source_path.read_text(errors="replace").splitlines(keepends=True)
-            stubs = _generate_record_stubs(not_defined, src)
+            stubs = _generate_record_stubs(not_defined_before, src)
             if stubs:
                 ws_range = _find_working_storage_range(src)
                 if ws_range:
                     ws_start, ws_end = ws_range
-                    # Insert stubs at end of WORKING-STORAGE
                     insert_at = ws_end
                     for i, s_line in enumerate(stubs):
                         src.insert(insert_at + i, s_line)
                     source_path.write_text("".join(src))
                     rc_check, stderr_check = _cobc_syntax_check(
                         source_path, copybook_dirs)
-                    new_count = len(_parse_errors(stderr_check, source_name)) if rc_check != 0 else 0
-                    old_count = len(pre_errors)
-                    if new_count < old_count:
-                        log.info("  Pre-fix: auto-stubs reduced %d → %d errors "
-                                 "(added %d stub lines)", old_count, new_count,
-                                 len(stubs))
+                    new_errors = _parse_errors(stderr_check, source_name) if rc_check != 0 else []
+                    not_defined_after = [
+                        (ln, msg) for ln, msg in new_errors
+                        if "is not defined" in msg
+                    ]
+                    # Keep stubs if "not defined" count decreased — even if
+                    # total errors went up (duplicates etc. are easier to fix)
+                    if len(not_defined_after) < len(not_defined_before):
+                        log.info("  Pre-fix: auto-stubs reduced 'not defined' "
+                                 "%d → %d (total: %d → %d, added %d stub lines)",
+                                 len(not_defined_before), len(not_defined_after),
+                                 len(pre_errors), len(new_errors), len(stubs))
                     else:
-                        # Stubs didn't help — revert
+                        # Stubs didn't reduce "not defined" — revert
                         src = src[:insert_at] + src[insert_at + len(stubs):]
                         source_path.write_text("".join(src))
-                        log.info("  Pre-fix: auto-stubs didn't help (%d → %d), "
-                                 "reverted", old_count, new_count)
+                        log.info("  Pre-fix: auto-stubs didn't reduce 'not defined' "
+                                 "(%d → %d), reverted",
+                                 len(not_defined_before), len(not_defined_after))
 
     failed_error_lines: set[int] = set()
     # Fingerprints of fixes already tried — reject exact duplicates
