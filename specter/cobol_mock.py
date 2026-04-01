@@ -144,8 +144,11 @@ def instrument_cobol(
 
     # Phase 7b: Disable original SELECT clauses (mock mode only uses MOCK-FILE)
     lines = _disable_original_selects(lines, config)
-    # Phase 7c: Disable original FD/SD blocks that no longer have active SELECTs
-    lines = _disable_original_fd_blocks(lines, config)
+    # Phase 7c: Keep original FD/SD blocks — their record layouts define
+    # variables referenced in PROCEDURE DIVISION. Commenting them out
+    # causes dozens of "is not defined" errors. GnuCOBOL handles
+    # duplicate FDs with the mock FD via -frelax-syntax-checks.
+    # lines = _disable_original_fd_blocks(lines, config)  # DISABLED
     # Phase 8: Convert LINKAGE to WORKING-STORAGE
     lines = _convert_linkage(lines)
 
