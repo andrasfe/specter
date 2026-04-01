@@ -203,6 +203,70 @@ def _save_resolutions(resolutions: list[Resolution], path: Path) -> None:
     path.write_text(json.dumps(data, indent=2, default=str))
 
 
+def _audit_fix(
+    audit_path: Path,
+    phase: str,
+    batch: int,
+    attempt: int,
+    fixes: dict[int, str],
+    old_lines: list[str],
+    error_desc: str,
+    result: str,
+) -> None:
+    """Append a human-readable entry to the fix audit log.
+
+    Each entry shows: the phase, what error triggered the fix, and for
+    every changed line the BEFORE and AFTER content.  This lets the user
+    verify the LLM isn't commenting out valid code.
+    """
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    lines_out: list[str] = []
+    lines_out.append(f"{'='*72}")
+    lines_out.append(f"[{ts}] Phase: {phase}  Batch: {batch}  Attempt: {attempt}")
+    lines_out.append(f"Error: {error_desc}")
+    lines_out.append(f"Result: {result}")
+    lines_out.append(f"Lines changed: {len(fixes)}")
+    lines_out.append("")
+
+    n_commented_out = 0
+    n_stub_added = 0
+    n_modified = 0
+
+    for ln in sorted(fixes.keys()):
+        idx = ln - 1
+        old = old_lines[idx].rstrip() if 0 <= idx < len(old_lines) else "(new line)"
+        new = fixes[ln].rstrip() if fixes[ln] else "(deleted)"
+
+        was_comment = isinstance(old, str) and len(old) > 6 and old[6:7] == "*"
+        is_comment = isinstance(new, str) and len(new) > 6 and new[6:7] == "*"
+
+        tag = ""
+        if is_comment and not was_comment:
+            tag = " [COMMENTED OUT]"
+            n_commented_out += 1
+        elif not is_comment and old == "(new line)":
+            tag = " [ADDED]"
+            n_stub_added += 1
+        elif old != new:
+            tag = " [MODIFIED]"
+            n_modified += 1
+
+        lines_out.append(f"  Line {ln}{tag}:")
+        lines_out.append(f"    OLD: {old}")
+        lines_out.append(f"    NEW: {new}")
+
+    lines_out.append("")
+    lines_out.append(f"  Summary: {n_commented_out} commented out, "
+                     f"{n_stub_added} added, {n_modified} modified")
+    if n_commented_out > n_stub_added + n_modified:
+        lines_out.append(f"  ⚠️  WARNING: More lines commented out than added/modified!")
+    lines_out.append("")
+
+    with open(audit_path, "a") as f:
+        f.write("\n".join(lines_out) + "\n")
+
+
 # ---------------------------------------------------------------------------
 # Phase checkpoint for resume
 # ---------------------------------------------------------------------------
@@ -453,6 +517,7 @@ def _compile_and_fix(
     llm_model: str | None = None,
     max_fix_attempts: int = 10,
     baseline_errors: set[str] | None = None,
+    audit_path: Path | None = None,
 ) -> list[Resolution]:
     """Compile, fix errors using LLM — smart batching + memory.
 
@@ -748,6 +813,46 @@ def _compile_and_fix(
 
         fix_summary = f"changed {len(fixes)} lines ({sorted(fixes.keys())[:5]}...)" if len(fixes) > 5 else f"changed lines {sorted(fixes.keys())}"
 
+        # ===== Quality gate: reject fixes that are mostly commenting out =====
+        n_commented = 0
+        n_added_stub = 0
+        n_other = 0
+        for fix_ln, fix_content in fixes.items():
+            content_stripped = fix_content.strip()
+            idx = fix_ln - 1
+            was_comment = (0 <= idx < len(src_lines)
+                           and len(src_lines[idx]) > 6
+                           and src_lines[idx][6:7] == "*")
+            is_comment = len(content_stripped) > 0 and content_stripped[0] == "*"
+            if is_comment and not was_comment:
+                n_commented += 1
+            elif (0 <= idx < len(src_lines)
+                  and src_lines[idx].strip() != content_stripped):
+                # Actual content change (not a no-op)
+                if any(kw in content_stripped.upper()
+                       for kw in ("PIC ", "PIC(", "VALUE ", "FILLER")):
+                    n_added_stub += 1
+                else:
+                    n_other += 1
+
+        total_changes = n_commented + n_added_stub + n_other
+        if total_changes > 0 and n_commented > 0:
+            comment_pct = n_commented / total_changes
+            if comment_pct > 0.5 and n_added_stub == 0:
+                # More than half the fix is commenting out code with no stubs
+                log.warning("  [%d/%d] ✗ Rejected: fix comments out %d/%d lines "
+                            "(no stubs added) — likely destructive",
+                            attempt + 1, max_fix_attempts, n_commented, total_changes)
+                failed_attempts.append((
+                    next(iter(targeted_lines)),
+                    largest_group_type if use_batch_mode else chosen_msg,
+                    f"commented out {n_commented}/{total_changes} lines",
+                    "rejected: mostly commenting out code (destructive)",
+                ))
+                for tl in targeted_lines:
+                    failed_error_lines.add(tl)
+                continue
+
         # ===== Apply, recompile, verify =====
         snapshot = list(src_lines)
 
@@ -779,6 +884,10 @@ def _compile_and_fix(
                 timestamp=datetime.now(timezone.utc).isoformat(),
             ))
             successful_fixes.append(f"Fixed {desc}: {len(fixes)} lines changed → 0 errors")
+            if audit_path:
+                _audit_fix(audit_path, phase, batch, attempt + 1, fixes, snapshot,
+                           largest_group_type if use_batch_mode else chosen_msg,
+                           f"ACCEPTED — all errors resolved ({n_errors}→0)")
             log.info("  [%d/%d] ✓ All errors fixed!", attempt + 1, max_fix_attempts)
             return new_resolutions
 
@@ -799,6 +908,10 @@ def _compile_and_fix(
                 timestamp=datetime.now(timezone.utc).isoformat(),
             ))
             successful_fixes.append(f"Fixed {desc}: {n_errors}→{new_error_count} errors (-{reduced})")
+            if audit_path:
+                _audit_fix(audit_path, phase, batch, attempt + 1, fixes, snapshot,
+                           largest_group_type if use_batch_mode else chosen_msg,
+                           f"ACCEPTED — errors reduced ({n_errors}→{new_error_count}, -{reduced})")
             log.info("  [%d/%d] ✓ Progress: %d → %d errors (-%d)",
                      attempt + 1, max_fix_attempts, n_errors, new_error_count, reduced)
             # Don't return — keep going to fix remaining errors
@@ -1036,6 +1149,9 @@ def incremental_instrument(
     if resolution_log_path is None:
         resolution_log_path = output_dir / "resolution_log.json"
 
+    # Fix audit log — records every accepted LLM fix with before/after diffs
+    audit_path = output_dir / "fix_audit.log"
+
     # Build MockConfig for phase functions that need it
     from .cobol_mock import MockConfig
     config = MockConfig(
@@ -1103,6 +1219,7 @@ def incremental_instrument(
             copybook_dirs=copybook_dirs,
             llm_provider=llm_provider, llm_model=llm_model,
             baseline_errors=baseline_errors,
+            audit_path=audit_path,
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
@@ -1125,6 +1242,7 @@ def incremental_instrument(
             copybook_dirs=copybook_dirs,
             llm_provider=llm_provider, llm_model=llm_model,
             baseline_errors=baseline_errors,
+            audit_path=audit_path,
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
@@ -1314,6 +1432,7 @@ def incremental_instrument(
             copybook_dirs=copybook_dirs,
             llm_provider=llm_provider, llm_model=llm_model,
             baseline_errors=baseline_errors,
+            audit_path=audit_path,
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
@@ -1336,6 +1455,7 @@ def incremental_instrument(
             copybook_dirs=copybook_dirs,
             llm_provider=llm_provider, llm_model=llm_model,
             baseline_errors=baseline_errors,
+            audit_path=audit_path,
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
@@ -1366,6 +1486,7 @@ def incremental_instrument(
             copybook_dirs=copybook_dirs,
             llm_provider=llm_provider, llm_model=llm_model,
             baseline_errors=baseline_errors,
+            audit_path=audit_path,
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
@@ -1393,6 +1514,7 @@ def incremental_instrument(
             mock_path, "final_fix", 0, resolutions,
             copybook_dirs=copybook_dirs,
             llm_provider=llm_provider, llm_model=llm_model,
+            audit_path=audit_path,
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
@@ -1417,6 +1539,7 @@ def incremental_instrument(
             copybook_dirs=copybook_dirs,
             llm_provider=llm_provider, llm_model=llm_model,
             max_fix_attempts=15,
+            audit_path=audit_path,
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
@@ -1452,6 +1575,7 @@ def incremental_instrument(
                 copybook_dirs=copybook_dirs,
                 llm_provider=llm_provider, llm_model=llm_model,
                 max_fix_attempts=5,
+                audit_path=audit_path,
             )
             resolutions.extend(new_res)
             _save_resolutions(resolutions, resolution_log_path)
@@ -1480,6 +1604,40 @@ def incremental_instrument(
 
     # Save final resolution log
     _save_resolutions(resolutions, resolution_log_path)
+
+    # -----------------------------------------------------------------------
+    # Integrity check: verify the LLM didn't comment out important code
+    # -----------------------------------------------------------------------
+    final_lines = mock_path.read_text(errors="replace").splitlines()
+    n_trace = sum(1 for l in final_lines
+                  if "SPECTER-TRACE:" in l and not l.strip().startswith("*"))
+    n_mock_display = sum(1 for l in final_lines
+                         if "SPECTER-MOCK:" in l and not l.strip().startswith("*"))
+    n_comment = sum(1 for l in final_lines if len(l) > 6 and l[6:7] == "*")
+    n_total = len(final_lines)
+    comment_pct = (n_comment / n_total * 100) if n_total else 0
+
+    integrity_msg = (
+        f"Integrity: {n_trace} paragraph traces, {n_mock_display} mock probes, "
+        f"{n_comment}/{n_total} lines commented ({comment_pct:.1f}%)"
+    )
+    log.info(integrity_msg)
+    if comment_pct > 40:
+        log.warning("  ⚠️  High comment ratio (%.1f%%) — check fix_audit.log "
+                     "for destructive fixes", comment_pct)
+
+    # Write integrity summary to audit log
+    if audit_path:
+        with open(audit_path, "a") as f:
+            f.write(f"\n{'='*72}\n")
+            f.write(f"FINAL INTEGRITY CHECK\n")
+            f.write(f"  Paragraph traces (SPECTER-TRACE): {n_trace}\n")
+            f.write(f"  Mock probes (SPECTER-MOCK): {n_mock_display}\n")
+            f.write(f"  Total lines: {n_total}\n")
+            f.write(f"  Comment lines: {n_comment} ({comment_pct:.1f}%)\n")
+            f.write(f"  Resolutions applied: {len(resolutions)}\n")
+            f.write(f"  Branch probes: {total_branches}\n")
+            f.write(f"{'='*72}\n")
 
     # Summary
     total_resolutions = len(resolutions)
