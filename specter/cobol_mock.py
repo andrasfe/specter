@@ -1705,10 +1705,8 @@ def _disable_original_selects(lines: list[str], config: MockConfig) -> list[str]
                 # Replace with dummy SELECT
                 if select_file_name:
                     result.append(
-                        f"{_B}SELECT {select_file_name}\n"
-                    )
-                    result.append(
-                        f"{_B}    ASSIGN TO '{select_file_name}'.\n"
+                        f"{_B}SELECT {select_file_name}"
+                        f" ASSIGN TO '{select_file_name}'.\n"
                     )
             continue
 
@@ -1719,10 +1717,8 @@ def _disable_original_selects(lines: list[str], config: MockConfig) -> list[str]
                 # Replace with dummy SELECT
                 if select_file_name:
                     result.append(
-                        f"{_B}SELECT {select_file_name}\n"
-                    )
-                    result.append(
-                        f"{_B}    ASSIGN TO '{select_file_name}'.\n"
+                        f"{_B}SELECT {select_file_name}"
+                        f" ASSIGN TO '{select_file_name}'.\n"
                     )
             continue
 
