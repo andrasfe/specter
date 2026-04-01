@@ -286,14 +286,10 @@ def prepare_context(
                 coverage_mode=coverage_mode,
             )
 
-    # Pre-clean copybooks AND source for GnuCOBOL compatibility.
+    # No pre-clean — the incremental pipeline handles errors via LLM.
+    # Pre-clean regex (column truncation, VALUES ARE, P.I.C.) created as
+    # many problems as it solved (double periods, orphaned lines, etc.).
     log.info("Instrumenting and compiling COBOL (work_dir=%s) ...", work_dir)
-    if copybook_paths:
-        from .cobol_mock import clean_copybooks, clean_cobol_source
-        log.info("  Cleaning copybooks ...")
-        copybook_paths = clean_copybooks(copybook_paths)
-        log.info("  Cleaning source ...")
-        cobol_source = clean_cobol_source(cobol_source, fix_cache_dir=work_dir)
 
     # Build initial_values dict for instrumentation — placeholder values
     # just to register the variable names for the EVALUATE dispatch.
@@ -312,137 +308,42 @@ def prepare_context(
             if var.upper() not in _EIB_FIELDS:
                 init_values[var] = "__DYNAMIC__"
 
-    # Instrument — in coverage mode, don't terminate on CICS RETURN/XCTL
-    # so that coverage engine can explore post-transaction logic.
-    # Also set EIBCALEN > 0 so CICS programs get past first-time init.
-    config = MockConfig(
-        copybook_dirs=copybook_paths,
-        trace_paragraphs=True,
+    # Use incremental instrumentation pipeline: apply transformations one
+    # phase at a time, compiling and fixing errors after each phase.
+    from .incremental_mock import incremental_instrument
+    mock_path, branch_meta, total_branches = incremental_instrument(
+        cobol_source,
+        copybook_paths,
+        work_dir,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        coverage_mode=coverage_mode,
+        allow_hardening_fallback=allow_hardening_fallback,
         initial_values=init_values,
         stop_on_exec_return=not coverage_mode,
         stop_on_exec_xctl=not coverage_mode,
         eib_calen=100 if coverage_mode else 0,
-        eib_aid="X'7D'" if coverage_mode else "SPACES",  # X'7D' = DFHENTER
-    )
-    result = instrument_cobol(
-        cobol_source,
-        config,
-        allow_hardening_fallback=allow_hardening_fallback,
+        eib_aid="X'7D'" if coverage_mode else "SPACES",
     )
 
-    log.info("  Instrumentation done (%d lines).",
-             len(result.source.splitlines()))
-    # Branch tracing (@@B: probes) is deferred to post-compilation
-    # LLM-guided insertion (Phase B). Rule-based _add_branch_tracing()
-    # is disabled — it breaks enterprise COBOL control flow.
-    # See docs/llm-guided-branch-instrumentation-spec.md
-    source_text = result.source
-    branch_meta: dict = {}
-    total_branches = 0
-    hardened_mode = "SPECTER-HARDENED-ENTRY" in source_text
-
-    # Apply IBM→GnuCOBOL source-level fixes on the final instrumented text.
-    log.info("  Applying GnuCOBOL source fixups ...")
-    source_text = _gnucobol_source_fixups(source_text)
-
-    # Write instrumented source
-    instrumented_path = work_dir / (cobol_source.stem + ".mock.cbl")
-    instrumented_path.write_text(source_text)
-    log.info("  Written %s (%d lines)", instrumented_path, len(source_text.splitlines()))
-
-    # Compile using agent_compile (LLM-driven error fixing loop).
+    instrumented_path = mock_path
     executable_path = work_dir / cobol_source.stem
-
-    from .agent_compile import agent_compile
-    success, message = agent_compile(
-        instrumented_path,
-        output_path=executable_path,
-        copybook_dirs=copybook_paths,
-        llm_provider=llm_provider,
-        llm_model=llm_model,
-        wall_clock_timeout=1800.0,
+    source_text = instrumented_path.read_text(errors="replace")
+    hardened_mode = "SPECTER-HARDENED-ENTRY" in source_text
+    total_paragraphs = sum(
+        1 for l in source_text.splitlines()
+        if "SPECTER-TRACE:" in l and not l.strip().startswith("*")
     )
-
-    # If strict compile failed and hardening is allowed, retry with hardening.
-    # Hardening replaces the PROCEDURE DIVISION with a simple wrapper,
-    # avoiding undefined variable issues from missing copybooks.
-    if not success and allow_hardening_fallback:
-        log.warning("Strict compile failed (%s). Retrying with hardening ...", message[:80])
-        result = instrument_cobol(
-            cobol_source, config,
-            allow_hardening_fallback=True,
-        )
-        source_text = result.source
-        hardened_mode = "SPECTER-HARDENED-ENTRY" in source_text
-        source_text = _gnucobol_source_fixups(source_text)
-        instrumented_path.write_text(source_text)
-        branch_meta = {}
-        total_branches = 0
-        success, message = agent_compile(
-            instrumented_path,
-            output_path=executable_path,
-            copybook_dirs=copybook_paths,
-            llm_provider=llm_provider,
-            llm_model=llm_model,
-            wall_clock_timeout=900.0,
-        )
-
-    if not success:
-        raise RuntimeError(f"COBOL compilation failed: {message}")
-
-    log.info("Compiled COBOL: %s (%d paragraphs traced)",
-             executable_path, result.paragraphs_traced)
-
-    # Post-compilation: LLM-guided branch probe insertion.
-    # Only attempt if an LLM provider is available — branch probes are
-    # a nice-to-have for deeper coverage, not required for basic execution.
-    if llm_provider:
-        try:
-            from .branch_instrumenter import instrument_branches
-            probes, paras_instrumented, b_meta = instrument_branches(
-                instrumented_path, llm_provider, llm_model,
-            )
-            if probes > 0:
-                branch_meta = b_meta
-                total_branches = probes
-                log.info("Branch probes inserted: %d probes in %d paragraphs",
-                         probes, paras_instrumented)
-
-                # Re-compile with the branch probes included.
-                success2, message2 = agent_compile(
-                    instrumented_path,
-                    output_path=executable_path,
-                    copybook_dirs=copybook_paths,
-                    llm_provider=llm_provider,
-                    llm_model=llm_model,
-                    wall_clock_timeout=300.0,  # 5 min for re-compile
-                )
-                if not success2:
-                    log.warning("Re-compile with branch probes failed: %s. "
-                                "Reverting to version without probes.", message2)
-                    # Revert to the probe-free source
-                    instrumented_path.write_text(source_text)
-                    branch_meta = {}
-                    total_branches = 0
-                    # Re-compile the clean version
-                    agent_compile(
-                        instrumented_path,
-                        output_path=executable_path,
-                        copybook_dirs=copybook_paths,
-                        wall_clock_timeout=300.0,
-                    )
-        except Exception as e:
-            log.warning("Branch instrumentation failed: %s", e)
 
     log.info("Compiled COBOL: %s (%d paragraphs traced, %d branch probes)",
-             executable_path, result.paragraphs_traced, total_branches)
+             executable_path, total_paragraphs, total_branches)
 
     return CobolExecutionContext(
         executable_path=executable_path,
         instrumented_source_path=instrumented_path,
         branch_meta=branch_meta,
         injectable_vars=[],  # populated by caller from domain model
-        total_paragraphs=result.paragraphs_traced,
+        total_paragraphs=total_paragraphs,
         total_branches=total_branches,
         hardened_mode=hardened_mode,
         coverage_mode=coverage_mode,

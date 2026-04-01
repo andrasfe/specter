@@ -1037,33 +1037,29 @@ def incremental_instrument(
     # Phase 8: Auto-stub undefined symbols
     # -----------------------------------------------------------------------
     if start_phase <= 8:
-        log.info("Phase 8: Auto-stub undefined symbols")
-        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-        lines, desc = _phase_auto_stub(lines, allow_hardening_fallback)
-        mock_path.write_text("".join(lines))
-        log.info("  %s", desc)
+        # Phase 8: Skip auto-stub — the compile-and-fix loop handles
+        # undefined symbols via LLM, one at a time with verification.
+        # Auto-stub was running cobc up to 48 times and its destructive
+        # cleanup phases (_comment_data_blocks, _cleanup_unbalanced_procedure)
+        # caused more errors than they fixed.
+        log.info("Phase 8: Compile-and-fix (LLM handles undefined symbols)")
 
-        # Phase 8b: Restore tracing probes that auto-stub may have destroyed
+        # Recount paragraphs
         lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-        lines, desc_restore = _phase_restore_tracing(lines)
-        mock_path.write_text("".join(lines))
-        log.info("  %s", desc_restore)
-
-        # Recount paragraphs after restore
         total_paragraphs = sum(
             1 for l in lines
             if "SPECTER-TRACE:" in l and not l.strip().startswith("*")
         )
 
         new_res = _compile_and_fix(
-            mock_path, "auto_stub", 0, resolutions,
+            mock_path, "compile_fix", 0, resolutions,
             copybook_dirs=copybook_dirs,
             llm_provider=llm_provider, llm_model=llm_model,
             baseline_errors=baseline_errors,
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
-        _save_checkpoint(output_dir, "auto_stub", 8, mock_path)
+        _save_checkpoint(output_dir, "compile_fix", 8, mock_path)
     else:
         log.info("Phase 8: Auto-stub (skipped — resuming)")
         # Recount paragraphs from existing mock
@@ -1077,13 +1073,14 @@ def incremental_instrument(
     # Apply GnuCOBOL source fixups on the complete instrumented source
     # -----------------------------------------------------------------------
     if start_phase <= 9:
-        log.info("Applying GnuCOBOL source fixups")
-        source_text = mock_path.read_text(errors="replace")
-        source_text = _apply_gnucobol_fixups(source_text)
-        mock_path.write_text(source_text)
+        # GnuCOBOL fixups disabled — the brute-force VALUES ARE replacement
+        # is the only safe one, and it's now handled by the LLM when it sees
+        # the compilation error. The multi-line rules (period before level,
+        # orphaned VALUE, duplicate removal) caused more problems than they solved.
+        log.info("Phase 9: Final compile-and-fix")
 
         new_res = _compile_and_fix(
-            mock_path, "gnucobol_fixups", 0, resolutions,
+            mock_path, "final_fix", 0, resolutions,
             copybook_dirs=copybook_dirs,
             llm_provider=llm_provider, llm_model=llm_model,
         )
