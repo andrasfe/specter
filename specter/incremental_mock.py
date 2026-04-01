@@ -507,6 +507,61 @@ def _find_working_storage_range(src_lines: list[str]) -> tuple[int, int] | None:
     return None
 
 
+def _fix_long_lines(src_lines: list[str]) -> tuple[list[str], int]:
+    """Fix lines where COBOL content extends past column 72.
+
+    In fixed-format COBOL, cols 73-80 are ignored (sequence area).
+    If a statement's period or identifier spills past col 72, the
+    compiler sees a truncated line → "unexpected identifier" errors.
+
+    Fix: wrap long lines by splitting before col 72 and continuing
+    on the next line (area B indent).
+    """
+    result: list[str] = []
+    fixed = 0
+    for line in src_lines:
+        # Only fix non-comment lines
+        if len(line) > 7 and line[6:7] == "*":
+            result.append(line)
+            continue
+
+        # Check if meaningful content extends past col 72
+        content = line.rstrip("\n\r")
+        if len(content) <= 72:
+            result.append(line)
+            continue
+
+        # Content past col 72 — need to wrap
+        # Find a safe split point before col 72 (at a space)
+        active = content[:72]
+        overflow = content[72:].lstrip()
+
+        # Don't fix if overflow is just sequence numbers (digits/spaces)
+        if not overflow or overflow.replace(" ", "").isdigit():
+            result.append(line)
+            continue
+
+        # Find last space in the active area to split at
+        split_at = active.rfind(" ", 12, 72)
+        if split_at < 12:
+            # No good split point — use col 72 boundary
+            split_at = 72
+
+        first_part = content[:split_at].rstrip()
+        remainder = content[split_at:].strip()
+
+        # If remainder has the overflow too, include it
+        if len(content) > 72:
+            remainder = content[split_at:].strip()
+
+        result.append(first_part + "\n")
+        # Continuation line in area B
+        result.append(f"{_B}{remainder}\n")
+        fixed += 1
+
+    return result, fixed
+
+
 def _generate_record_stubs(
     errors: list[tuple[int, str]],
     src_lines: list[str],
@@ -732,6 +787,16 @@ def _compile_and_fix(
 
     new_resolutions: list[Resolution] = []
     source_name = source_path.name
+
+    # --- Pre-fix: fix lines extending past column 72 ---
+    # In fixed-format COBOL, cols 73-80 are ignored. If a period or
+    # identifier spills past col 72, the compiler sees truncated code.
+    src_text = source_path.read_text(errors="replace")
+    fixed_lines, n_long = _fix_long_lines(src_text.splitlines(keepends=True))
+    if n_long > 0:
+        source_path.write_text("".join(fixed_lines))
+        log.info("  Pre-fix: wrapped %d lines that extended past column 72",
+                 n_long)
 
     # --- Pre-fix: deterministic stub generation for "not defined" errors ---
     # Insert stubs ONE AT A TIME, verifying each. This way we keep stubs
@@ -1127,8 +1192,9 @@ def _compile_and_fix(
                 f"- 'duplicate definition': comment the duplicate\n"
                 f"- 'PICTURE clause required': add appropriate PIC clause\n"
                 f"- 'unexpected Identifier, expecting SECTION or .': a previous "
-                f"line is missing a terminal period or a copybook inlined without "
-                f"proper section boundaries — look BEFORE the error\n"
+                f"line is missing a terminal period, OR the line extends past "
+                f"column 72 (fixed-format COBOL truncates at col 72). Split "
+                f"the long line by putting the TO/identifier on the next line.\n"
                 f"- Don't comment out data definitions other code references\n\n"
                 f"Return ONLY fixed lines as flat JSON: "
                 f"{{\"<line_number>\": \"<fixed_content>\"}}\n"
