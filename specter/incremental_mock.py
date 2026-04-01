@@ -359,7 +359,7 @@ def _apply_preventive_fixes(
     return lines
 
 
-_MAX_CONTEXT_LINES = 500  # configurable max lines sent to LLM per error
+_MAX_CONTEXT_LINES = 1000  # max lines sent to LLM per error (was 500)
 
 
 def _cluster_errors(
@@ -384,6 +384,65 @@ def _cluster_errors(
     return clusters
 
 
+def _group_errors_by_type(
+    errors: list[tuple[int, str]],
+) -> dict[str, list[tuple[int, str]]]:
+    """Group errors by their type signature for batch fixing.
+
+    E.g., all "'X' is not defined" errors go into one group so the LLM
+    can add all stub definitions at once rather than one at a time.
+    """
+    groups: dict[str, list[tuple[int, str]]] = {}
+    for ln, msg in errors:
+        # Normalize: "'FNPLN' is not defined" → "is not defined"
+        # Keep the general pattern, drop the specific variable name
+        if "is not defined" in msg:
+            key = "is not defined"
+        elif "syntax error" in msg:
+            key = "syntax error"
+        elif "PICTURE clause" in msg.upper():
+            key = "PICTURE clause"
+        elif "duplicate" in msg.lower():
+            key = "duplicate"
+        else:
+            key = msg.split(",")[0].strip()[:40]
+        groups.setdefault(key, []).append((ln, msg))
+    return groups
+
+
+def _find_working_storage_range(src_lines: list[str]) -> tuple[int, int] | None:
+    """Find the WORKING-STORAGE SECTION line range.
+
+    Returns (start_idx, end_idx) or None if not found.  Used to give the LLM
+    a second context chunk so it can add stub definitions in the right place.
+    """
+    ws_start = None
+    ws_end = None
+    for i, line in enumerate(src_lines):
+        upper = line.upper().strip()
+        if upper.startswith("*"):
+            continue
+        if "WORKING-STORAGE SECTION" in upper:
+            ws_start = i
+        elif ws_start is not None and any(
+            kw in upper for kw in (
+                "PROCEDURE DIVISION",
+                "LINKAGE SECTION",
+                "LOCAL-STORAGE SECTION",
+                "REPORT SECTION",
+                "SCREEN SECTION",
+                "FILE SECTION",
+            )
+        ):
+            ws_end = i
+            break
+    if ws_start is not None:
+        if ws_end is None:
+            ws_end = min(ws_start + 500, len(src_lines))
+        return ws_start, ws_end
+    return None
+
+
 def _compile_and_fix(
     source_path: Path,
     phase: str,
@@ -395,16 +454,19 @@ def _compile_and_fix(
     max_fix_attempts: int = 10,
     baseline_errors: set[str] | None = None,
 ) -> list[Resolution]:
-    """Compile, fix errors using LLM with agent-chosen context.
+    """Compile, fix errors using LLM — smart batching + memory.
 
-    Key improvements over naive one-at-a-time:
-    1. **Failed attempt memory**: The LLM sees what was already tried and
-       failed (line, error, attempted fix summary, why it was reverted).
-    2. **Error clustering**: Adjacent errors (within 10 lines) are grouped
-       as one root cause. Failing to fix any line in a cluster marks the
-       entire cluster as attempted.
-    3. **Conversation history**: The choose/fix prompts include failed
-       attempts so the LLM knows what NOT to repeat.
+    Key capabilities:
+    1. **Batch similar errors**: When 50+ "not defined" errors exist, the
+       LLM sees ALL of them and can add all stubs at once.
+    2. **Two-chunk context**: For "not defined" errors, the LLM also sees
+       WORKING-STORAGE so it knows where to add definitions.
+    3. **Failed attempt memory**: The LLM sees what was tried and failed
+       with the reason, so it tries fundamentally different approaches.
+    4. **Error clustering**: Adjacent errors are one root cause.
+    5. **Relaxed verification**: Accept if total error count drops, even
+       if the specific targeted line still has an error (line numbers
+       shift when stubs are added).
 
     Returns new resolutions added during this cycle.
     """
@@ -413,10 +475,12 @@ def _compile_and_fix(
 
     new_resolutions: list[Resolution] = []
     source_name = source_path.name
-    failed_error_lines: set[int] = set()  # errors we already tried and failed
+    failed_error_lines: set[int] = set()
 
     # Memory of failed attempts: (line, error_msg, fix_summary, reason)
     failed_attempts: list[tuple[int, str, str, str]] = []
+    # Memory of successful fixes for context
+    successful_fixes: list[str] = []
 
     for attempt in range(max_fix_attempts):
         rc, stderr = _cobc_syntax_check(source_path, copybook_dirs)
@@ -453,12 +517,17 @@ def _compile_and_fix(
                 log.info("    Line %d: %s", ln, msg)
             return new_resolutions
 
-        # --- Step 1: Present top 15 errors, let LLM choose which to fix ---
-        top_errors = actionable[:15]
-        error_list = "\n".join(f"  {i+1}. Line {ln}: {msg}" for i, (ln, msg) in enumerate(top_errors))
+        src_lines = source_path.read_text(errors="replace").splitlines(keepends=True)
+        total_lines = len(src_lines)
 
-        # Build relevant resolution summaries
-        current_error_types = {msg.split(",")[0].strip() for _, msg in top_errors}
+        # ----- Decide: batch mode or single-error mode -----
+        error_groups = _group_errors_by_type(actionable)
+        largest_group_type = max(error_groups, key=lambda k: len(error_groups[k]))
+        largest_group = error_groups[largest_group_type]
+        use_batch_mode = len(largest_group) >= 5
+
+        # Build resolution + failure memory text (shared by both modes)
+        current_error_types = {msg.split(",")[0].strip() for _, msg in actionable[:15]}
         relevant_res = [r for r in resolutions + new_resolutions
                         if r.verified and any(et in r.error for et in current_error_types)]
         recent_res = (resolutions + new_resolutions)[-10:]
@@ -472,239 +541,298 @@ def _compile_and_fix(
             if len(res_summaries) >= 20:
                 break
 
-        res_text = ""
-        if res_summaries:
-            res_text = ("Prior verified resolutions (apply proactively):\n"
-                        + "\n".join(f"- {s}" for s in res_summaries) + "\n\n")
+        history_text = ""
+        if res_summaries or successful_fixes:
+            all_success = [f"- {s}" for s in res_summaries] + [f"- {s}" for s in successful_fixes[-5:]]
+            history_text += "WHAT WORKED (apply these patterns):\n" + "\n".join(all_success[:20]) + "\n\n"
 
-        # Build failed-attempt memory for the LLM
-        failed_text = ""
         if failed_attempts:
-            recent_failed = failed_attempts[-10:]  # Last 10 to avoid prompt bloat
+            recent_failed = failed_attempts[-10:]
             failed_lines = []
             for fl, fe, fs, fr in recent_failed:
-                failed_lines.append(
-                    f"  - Line {fl}: {fe[:80]}\n"
-                    f"    Tried: {fs[:120]}\n"
-                    f"    Result: {fr}"
-                )
-            failed_text = (
-                "FAILED ATTEMPTS (do NOT repeat these — try a fundamentally different "
-                "approach, such as fixing the ROOT CAUSE which may be EARLIER in the "
-                "file, e.g. a missing period, unclosed SECTION, or malformed copybook "
-                "expansion):\n"
+                failed_lines.append(f"  - Line {fl}: {fe[:60]} | Tried: {fs[:80]} | Result: {fr}")
+            history_text += (
+                "WHAT FAILED (do NOT repeat — try a different approach):\n"
                 + "\n".join(failed_lines) + "\n\n"
             )
 
-        src_lines = source_path.read_text(errors="replace").splitlines(keepends=True)
-        total_lines = len(src_lines)
+        if use_batch_mode:
+            # ===== BATCH MODE: Fix all similar errors at once =====
+            batch_errors = largest_group[:30]  # Cap at 30 to fit context
+            error_list = "\n".join(f"  - Line {ln}: {msg}" for ln, msg in batch_errors)
 
-        choose_prompt = (
-            f"You are fixing GnuCOBOL compilation errors in {source_name} "
-            f"({total_lines} lines, phase: {phase}).\n\n"
-            f"{res_text}"
-            f"{failed_text}"
-            f"Current compilation errors ({n_errors} total, showing top 15):\n"
-            f"{error_list}\n\n"
-            f"Choose ONE error to fix. Respond with JSON:\n"
-            f'{{"choose_error": {{"line": <line_number>, "context_start": <start>, "context_end": <end>}}}}\n\n'
-            f"Where context_start/context_end define the code range you need to see "
-            f"(max {_MAX_CONTEXT_LINES} lines). Pick the error you're most confident "
-            f"you can fix. If many errors cluster around the same area, the ROOT CAUSE "
-            f"is likely BEFORE the first error — request context starting well before "
-            f"the error cluster."
-        )
+            log.info("  [%d/%d] BATCH: fixing %d '%s' errors at once",
+                     attempt + 1, max_fix_attempts, len(batch_errors), largest_group_type[:40])
 
-        try:
-            response, _ = _query_llm_sync(llm_provider, choose_prompt, llm_model)
-        except Exception as exc:
-            log.warning("  LLM choose query failed: %s", exc)
-            return new_resolutions
+            # Build context: error area + optionally WORKING-STORAGE
+            # For "not defined" errors, show WS so LLM knows where to add stubs
+            context_chunks = []
 
-        # Parse LLM's choice
-        chosen_line = None
-        ctx_start = None
-        ctx_end = None
-        try:
-            cleaned = re.sub(r"```\w*\n?", "", response).strip()
-            parsed = json.loads(cleaned)
-            if "choose_error" in parsed:
-                choice = parsed["choose_error"]
-                chosen_line = int(choice.get("line", 0))
-                ctx_start = max(0, int(choice.get("context_start", chosen_line - 50)) - 1)
-                ctx_end = min(total_lines, int(choice.get("context_end", chosen_line + 50)))
-        except (json.JSONDecodeError, TypeError, ValueError, KeyError):
-            pass
+            # Primary chunk: around the error lines
+            err_lines_sorted = sorted(ln for ln, _ in batch_errors)
+            first_err = err_lines_sorted[0]
+            last_err = err_lines_sorted[-1]
+            ctx_start = max(0, first_err - 20)
+            ctx_end = min(total_lines, last_err + 20)
+            if ctx_end - ctx_start > _MAX_CONTEXT_LINES:
+                ctx_end = ctx_start + _MAX_CONTEXT_LINES
 
-        if not chosen_line:
-            # Fallback: pick first actionable error
-            chosen_line = actionable[0][0]
-            ctx_start = max(0, chosen_line - 100)
-            ctx_end = min(total_lines, chosen_line + 20)
-
-        # Cap context to MAX_CONTEXT_LINES
-        if ctx_end - ctx_start > _MAX_CONTEXT_LINES:
-            ctx_end = ctx_start + _MAX_CONTEXT_LINES
-
-        chosen_msg = next((msg for ln, msg in actionable if ln == chosen_line), "unknown")
-        log.info("  [%d/%d] Fixing line %d: %s (context: %d-%d)",
-                 attempt + 1, max_fix_attempts, chosen_line, chosen_msg[:60],
-                 ctx_start + 1, ctx_end)
-
-        # --- Step 2: Send chosen context, get fix ---
-        numbered_context = "\n".join(
-            f"{ctx_start + i + 1:5d}: {line.rstrip()}"
-            for i, line in enumerate(src_lines[ctx_start:ctx_end])
-        )
-
-        # Include relevant failed attempts for this error's neighborhood
-        nearby_failed = [
-            (fl, fe, fs, fr) for fl, fe, fs, fr in failed_attempts
-            if abs(fl - chosen_line) < 50
-        ]
-        nearby_text = ""
-        if nearby_failed:
-            nf_lines = []
-            for fl, fe, fs, fr in nearby_failed[-5:]:
-                nf_lines.append(f"  - Line {fl}: tried {fs[:100]} → {fr}")
-            nearby_text = (
-                "\nPrevious failed fixes near this area (DO NOT repeat):\n"
-                + "\n".join(nf_lines) + "\n"
-                "Consider: the root cause may be EARLIER in the file "
-                "(missing period, unclosed statement, malformed copybook).\n\n"
+            numbered = "\n".join(
+                f"{ctx_start + i + 1:5d}: {line.rstrip()}"
+                for i, line in enumerate(src_lines[ctx_start:ctx_end])
+            )
+            context_chunks.append(
+                f"Error area (lines {ctx_start+1}-{ctx_end}):\n```cobol\n{numbered}\n```"
             )
 
-        fix_prompt = (
-            f"Fix this GnuCOBOL compilation error:\n"
-            f"  Line {chosen_line}: {chosen_msg}\n\n"
-            f"{res_text}"
-            f"{nearby_text}"
-            f"Source context (lines {ctx_start+1}-{ctx_end}):\n"
-            f"```cobol\n{numbered_context}\n```\n\n"
-            f"Common fixes:\n"
-            f"- 'X is not defined': add 01 X PIC X(256). to WORKING-STORAGE\n"
-            f"- 'duplicate definition': comment the duplicate\n"
-            f"- 'PICTURE clause required': add appropriate PIC clause\n"
-            f"- 'unexpected ELSE/END-IF': fix IF nesting\n"
-            f"- 'unexpected Identifier, expecting SECTION or .': a previous "
-            f"line is missing a terminal period, or a copybook was inlined "
-            f"without proper section boundaries — look BEFORE the error\n"
-            f"- Don't comment out data definitions other code references\n\n"
-            f"Return ONLY fixed lines as flat JSON: {{\"<line_number>\": \"<fixed_content>\"}}\n"
-            f"Do NOT wrap in outer keys. Only include lines that changed."
-        )
+            # Secondary chunk: WORKING-STORAGE (for "not defined" errors)
+            if "not defined" in largest_group_type:
+                ws_range = _find_working_storage_range(src_lines)
+                if ws_range:
+                    ws_start, ws_end = ws_range
+                    # Show last 200 lines of WS (where stubs should be added)
+                    ws_show_start = max(ws_start, ws_end - 200)
+                    ws_numbered = "\n".join(
+                        f"{ws_show_start + i + 1:5d}: {line.rstrip()}"
+                        for i, line in enumerate(src_lines[ws_show_start:ws_end])
+                    )
+                    context_chunks.append(
+                        f"\nWORKING-STORAGE tail (lines {ws_show_start+1}-{ws_end}, "
+                        f"add new definitions BEFORE the last line shown here):\n"
+                        f"```cobol\n{ws_numbered}\n```"
+                    )
 
+            all_context = "\n\n".join(context_chunks)
+
+            fix_prompt = (
+                f"Fix ALL of these GnuCOBOL compilation errors at once in {source_name} "
+                f"({total_lines} lines, phase: {phase}).\n\n"
+                f"{history_text}"
+                f"Errors to fix ({len(batch_errors)} errors, type: {largest_group_type}):\n"
+                f"{error_list}\n\n"
+                f"{all_context}\n\n"
+                f"IMPORTANT: Fix ALL {len(batch_errors)} errors in a single response.\n"
+                f"For 'not defined' errors: add ALL stub definitions together in "
+                f"WORKING-STORAGE (before PROCEDURE DIVISION). Use appropriate PIC "
+                f"clauses based on how the variables are used in the code.\n"
+                f"For syntax errors: look for the root cause BEFORE the error lines.\n\n"
+                f"Return ALL fixed/added lines as flat JSON: "
+                f"{{\"<line_number>\": \"<content>\"}}\n"
+                f"Do NOT wrap in outer keys. Include ALL lines that need changing."
+            )
+
+            targeted_lines = set(err_lines_sorted)
+
+        else:
+            # ===== SINGLE ERROR MODE: Choose + fix one error =====
+            top_errors = actionable[:15]
+            error_list = "\n".join(f"  {i+1}. Line {ln}: {msg}" for i, (ln, msg) in enumerate(top_errors))
+
+            choose_prompt = (
+                f"You are fixing GnuCOBOL compilation errors in {source_name} "
+                f"({total_lines} lines, phase: {phase}).\n\n"
+                f"{history_text}"
+                f"Current compilation errors ({n_errors} total, showing top 15):\n"
+                f"{error_list}\n\n"
+                f"Choose ONE error to fix. Respond with JSON:\n"
+                f'{{"choose_error": {{"line": <line_number>, "context_start": <start>, "context_end": <end>}}}}\n\n'
+                f"Where context_start/context_end define the code range you need to see "
+                f"(max {_MAX_CONTEXT_LINES} lines). If many errors cluster, the ROOT CAUSE "
+                f"is likely BEFORE the cluster — request context starting well before."
+            )
+
+            try:
+                response, _ = _query_llm_sync(llm_provider, choose_prompt, llm_model)
+            except Exception as exc:
+                log.warning("  LLM choose query failed: %s", exc)
+                return new_resolutions
+
+            # Parse LLM's choice
+            chosen_line = None
+            ctx_start = None
+            ctx_end = None
+            try:
+                cleaned = re.sub(r"```\w*\n?", "", response).strip()
+                parsed = json.loads(cleaned)
+                if "choose_error" in parsed:
+                    choice = parsed["choose_error"]
+                    chosen_line = int(choice.get("line", 0))
+                    ctx_start = max(0, int(choice.get("context_start", chosen_line - 50)) - 1)
+                    ctx_end = min(total_lines, int(choice.get("context_end", chosen_line + 50)))
+            except (json.JSONDecodeError, TypeError, ValueError, KeyError):
+                pass
+
+            if not chosen_line:
+                chosen_line = actionable[0][0]
+                ctx_start = max(0, chosen_line - 100)
+                ctx_end = min(total_lines, chosen_line + 20)
+
+            if ctx_end - ctx_start > _MAX_CONTEXT_LINES:
+                ctx_end = ctx_start + _MAX_CONTEXT_LINES
+
+            chosen_msg = next((msg for ln, msg in actionable if ln == chosen_line), "unknown")
+            log.info("  [%d/%d] Fixing line %d: %s (context: %d-%d)",
+                     attempt + 1, max_fix_attempts, chosen_line, chosen_msg[:60],
+                     ctx_start + 1, ctx_end)
+
+            numbered_context = "\n".join(
+                f"{ctx_start + i + 1:5d}: {line.rstrip()}"
+                for i, line in enumerate(src_lines[ctx_start:ctx_end])
+            )
+
+            # Include nearby failed attempts
+            nearby_failed = [
+                (fl, fe, fs, fr) for fl, fe, fs, fr in failed_attempts
+                if abs(fl - chosen_line) < 50
+            ]
+            nearby_text = ""
+            if nearby_failed:
+                nf_lines = [f"  - Line {fl}: tried {fs[:100]} → {fr}"
+                            for fl, fe, fs, fr in nearby_failed[-5:]]
+                nearby_text = (
+                    "\nPrevious failed fixes near this area (DO NOT repeat):\n"
+                    + "\n".join(nf_lines) + "\n"
+                    "Consider: the root cause may be EARLIER in the file.\n\n"
+                )
+
+            fix_prompt = (
+                f"Fix this GnuCOBOL compilation error:\n"
+                f"  Line {chosen_line}: {chosen_msg}\n\n"
+                f"{history_text}"
+                f"{nearby_text}"
+                f"Source context (lines {ctx_start+1}-{ctx_end}):\n"
+                f"```cobol\n{numbered_context}\n```\n\n"
+                f"Common fixes:\n"
+                f"- 'X is not defined': add 01 X PIC X(256). to WORKING-STORAGE\n"
+                f"- 'duplicate definition': comment the duplicate\n"
+                f"- 'PICTURE clause required': add appropriate PIC clause\n"
+                f"- 'unexpected Identifier, expecting SECTION or .': a previous "
+                f"line is missing a terminal period or a copybook inlined without "
+                f"proper section boundaries — look BEFORE the error\n"
+                f"- Don't comment out data definitions other code references\n\n"
+                f"Return ONLY fixed lines as flat JSON: "
+                f"{{\"<line_number>\": \"<fixed_content>\"}}\n"
+                f"Do NOT wrap in outer keys. Only include lines that changed."
+            )
+
+            targeted_lines = {chosen_line}
+
+        # ===== Send fix prompt (shared by both modes) =====
         try:
             response2, _ = _query_llm_sync(llm_provider, fix_prompt, llm_model)
         except Exception as exc:
             log.warning("  LLM fix query failed: %s", exc)
-            failed_error_lines.add(chosen_line)
+            for tl in targeted_lines:
+                failed_error_lines.add(tl)
             continue
 
-        fixes = _parse_llm_fix_response(response2, ctx_start, ctx_end + 100)
+        # Parse response — allow broader line range for batch mode (stubs
+        # may be added in WORKING-STORAGE, far from the error)
+        parse_min = 0 if use_batch_mode else (ctx_start if not use_batch_mode else 0)
+        parse_max = total_lines + 100  # Allow appending lines
+        fixes = _parse_llm_fix_response(response2, parse_min, parse_max)
 
         if not fixes:
             snippet = response2[:200].replace("\n", "\\n") if response2 else "(empty)"
             log.info("  LLM response not parsed: %s", snippet)
+            fix_desc = "batch" if use_batch_mode else f"line {next(iter(targeted_lines))}"
             failed_attempts.append((
-                chosen_line, chosen_msg,
-                "LLM returned unparseable response",
+                next(iter(targeted_lines)),
+                largest_group_type if use_batch_mode else chosen_msg,
+                "unparseable response",
                 "response not parsed as JSON",
             ))
-            failed_error_lines.add(chosen_line)
+            for tl in targeted_lines:
+                failed_error_lines.add(tl)
             continue
 
-        fix_summary = f"changed lines {sorted(fixes.keys())}"
+        fix_summary = f"changed {len(fixes)} lines ({sorted(fixes.keys())[:5]}...)" if len(fixes) > 5 else f"changed lines {sorted(fixes.keys())}"
 
-        # --- Step 3: Apply, recompile, verify the specific error is gone ---
+        # ===== Apply, recompile, verify =====
         snapshot = list(src_lines)
 
         for fix_ln, fix_content in fixes.items():
             idx = fix_ln - 1
             if 0 <= idx < len(src_lines):
                 src_lines[idx] = fix_content
+            elif fix_ln == len(src_lines) + 1:
+                # Appending a new line (e.g., adding stub at end of section)
+                src_lines.append(fix_content)
 
         source_path.write_text("".join(src_lines))
 
         rc2, stderr2 = _cobc_syntax_check(source_path, copybook_dirs)
         new_error_list = _parse_errors(stderr2, source_name) if rc2 != 0 else []
-        new_error_lines = {ln for ln, _ in new_error_list}
+        new_error_lines_set = {ln for ln, _ in new_error_list}
         new_error_count = len(new_error_list)
 
-        # Check if the SPECIFIC error we targeted is gone
-        error_gone = chosen_line not in new_error_lines
-
         if rc2 == 0:
-            # Everything compiles clean
             fix_lines_dict = {str(k): v for k, v in fixes.items()}
+            desc = f"batch {len(targeted_lines)} errors" if use_batch_mode else f"line {next(iter(targeted_lines))}"
             new_resolutions.append(Resolution(
                 phase=phase, batch=batch,
-                transformation=f"Fix line {chosen_line} in phase {phase}",
-                error=chosen_msg,
-                fix=f"LLM fix ({len(fixes)} lines changed) — all errors resolved",
+                transformation=f"Fix {desc} in phase {phase}",
+                error=largest_group_type if use_batch_mode else chosen_msg,
+                fix=f"LLM fix ({len(fixes)} lines) — all errors resolved",
                 fix_lines=fix_lines_dict,
                 verified=True,
                 timestamp=datetime.now(timezone.utc).isoformat(),
             ))
+            successful_fixes.append(f"Fixed {desc}: {len(fixes)} lines changed → 0 errors")
             log.info("  [%d/%d] ✓ All errors fixed!", attempt + 1, max_fix_attempts)
             return new_resolutions
 
-        if error_gone and new_error_count <= n_errors:
-            # Targeted error is gone AND we didn't make things worse
+        # Relaxed verification: accept if error count DECREASED, even if
+        # the specific targeted line still has an error (line numbers shift
+        # when stubs are added)
+        if new_error_count < n_errors:
             fix_lines_dict = {str(k): v for k, v in fixes.items()}
+            reduced = n_errors - new_error_count
+            desc = f"batch {len(targeted_lines)} errors" if use_batch_mode else f"line {next(iter(targeted_lines))}"
             new_resolutions.append(Resolution(
                 phase=phase, batch=batch,
-                transformation=f"Fix line {chosen_line} in phase {phase}",
-                error=chosen_msg,
-                fix=f"LLM fix ({len(fixes)} lines) — error gone, {new_error_count} remaining",
+                transformation=f"Fix {desc} in phase {phase}",
+                error=largest_group_type if use_batch_mode else chosen_msg,
+                fix=f"LLM fix ({len(fixes)} lines) — reduced by {reduced} ({new_error_count} remaining)",
                 fix_lines=fix_lines_dict,
                 verified=True,
                 timestamp=datetime.now(timezone.utc).isoformat(),
             ))
-            log.info("  [%d/%d] ✓ Error at line %d fixed (%d → %d errors)",
-                     attempt + 1, max_fix_attempts, chosen_line, n_errors, new_error_count)
-            # Update src_lines for next iteration
+            successful_fixes.append(f"Fixed {desc}: {n_errors}→{new_error_count} errors (-{reduced})")
+            log.info("  [%d/%d] ✓ Progress: %d → %d errors (-%d)",
+                     attempt + 1, max_fix_attempts, n_errors, new_error_count, reduced)
+            # Don't return — keep going to fix remaining errors
             continue
 
-        # Error still there or things got worse — revert
+        # Error count same or worse — revert
         source_path.write_text("".join(snapshot))
+        src_lines = snapshot  # Reset for next iteration
 
-        revert_reason = (
-            f"error persists, {n_errors}→{new_error_count}"
-            if not error_gone else
-            f"error gone but worse ({n_errors}→{new_error_count})"
-        )
-
-        # Record failed attempt for LLM memory
+        revert_reason = f"no improvement ({n_errors}→{new_error_count})"
         failed_attempts.append((
-            chosen_line, chosen_msg, fix_summary, revert_reason,
+            next(iter(targeted_lines)),
+            largest_group_type if use_batch_mode else chosen_msg,
+            fix_summary,
+            revert_reason,
         ))
 
-        # Mark entire error cluster as failed — not just this one line
-        # This prevents trying adjacent lines with the same root cause
-        clusters = _cluster_errors(actionable)
-        for cluster in clusters:
-            cluster_lines = {ln for ln, _ in cluster}
-            if chosen_line in cluster_lines:
-                failed_error_lines.update(cluster_lines)
-                if len(cluster_lines) > 1:
-                    log.info("  [%d/%d] ✗ Reverted + marked cluster of %d lines "
-                             "(%s, %d → %d errors)",
-                             attempt + 1, max_fix_attempts, len(cluster_lines),
-                             "persists" if not error_gone else "gone but worse",
-                             n_errors, new_error_count)
-                else:
-                    log.info("  [%d/%d] ✗ Reverted (error %s, %d → %d errors)",
-                             attempt + 1, max_fix_attempts,
-                             "persists" if not error_gone else "gone but worse",
-                             n_errors, new_error_count)
-                break
+        # Mark error cluster as failed
+        if use_batch_mode:
+            for ln, _ in batch_errors:
+                failed_error_lines.add(ln)
+            log.info("  [%d/%d] ✗ Reverted batch (%d → %d errors)",
+                     attempt + 1, max_fix_attempts, n_errors, new_error_count)
         else:
-            failed_error_lines.add(chosen_line)
-            log.info("  [%d/%d] ✗ Reverted (error %s, %d → %d errors)",
-                     attempt + 1, max_fix_attempts,
-                     "persists" if not error_gone else "gone but worse",
-                     n_errors, new_error_count)
+            clusters = _cluster_errors(actionable)
+            for cluster in clusters:
+                cluster_lines = {ln for ln, _ in cluster}
+                if next(iter(targeted_lines)) in cluster_lines:
+                    failed_error_lines.update(cluster_lines)
+                    break
+            else:
+                failed_error_lines.update(targeted_lines)
+            log.info("  [%d/%d] ✗ Reverted (%d → %d errors)",
+                     attempt + 1, max_fix_attempts, n_errors, new_error_count)
 
     return new_resolutions
 
