@@ -1240,25 +1240,33 @@ def incremental_instrument(
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
 
-        # Phase gate: don't proceed if too many errors remain
+        # Phase gate: keep running fix passes until errors reach 0 or plateau
         remaining = _count_current_errors(mock_path, copybook_dirs)
-        if remaining > 0:
-            log.warning("Phase 1 ended with %d errors — running extra fix pass "
-                        "before proceeding", remaining)
+        extra_round = 0
+        while remaining > 0 and llm_provider:
+            extra_round += 1
+            log.warning("Phase 1: %d errors remain — extra fix round %d",
+                        remaining, extra_round)
             new_res = _compile_and_fix(
-                mock_path, "copy_resolution_extra", 0, resolutions,
+                mock_path, f"copy_resolution_r{extra_round}", 0, resolutions,
                 copybook_dirs=copybook_dirs,
                 llm_provider=llm_provider, llm_model=llm_model,
                 baseline_errors=baseline_errors,
                 audit_path=audit_path,
-                max_fix_attempts=max(20, remaining // 2),
+                max_fix_attempts=max(20, remaining * 2),
             )
             resolutions.extend(new_res)
             _save_resolutions(resolutions, resolution_log_path)
-            remaining = _count_current_errors(mock_path, copybook_dirs)
-            if remaining > 0:
-                log.warning("Phase 1: %d errors remain after extra pass — "
-                            "proceeding cautiously", remaining)
+            new_remaining = _count_current_errors(mock_path, copybook_dirs)
+            if new_remaining >= remaining:
+                log.warning("Phase 1: no progress (%d→%d) — moving on",
+                            remaining, new_remaining)
+                break
+            remaining = new_remaining
+            if extra_round >= 5:
+                log.warning("Phase 1: %d errors after 5 extra rounds — moving on",
+                            remaining)
+                break
 
         _save_checkpoint(output_dir, "copy_resolution", 1, mock_path)
     else:
@@ -1268,21 +1276,33 @@ def incremental_instrument(
     # Phase 2: Mock infrastructure
     # -----------------------------------------------------------------------
     if start_phase <= 2:
-        # Gate: check if prior phases left too many errors
+        # Gate: fix remaining errors from prior phases before adding more
         pre_errors = _count_current_errors(mock_path, copybook_dirs)
-        if pre_errors > 50 and llm_provider:
-            log.warning("Phase 2: %d errors from prior phases — fixing before "
-                        "adding mock infrastructure", pre_errors)
+        gate_round = 0
+        while pre_errors > 0 and llm_provider:
+            gate_round += 1
+            log.warning("Pre-Phase 2 gate: %d errors — fix round %d",
+                        pre_errors, gate_round)
             new_res = _compile_and_fix(
-                mock_path, "pre_phase2_fix", 0, resolutions,
+                mock_path, f"pre_phase2_r{gate_round}", 0, resolutions,
                 copybook_dirs=copybook_dirs,
                 llm_provider=llm_provider, llm_model=llm_model,
                 baseline_errors=baseline_errors,
                 audit_path=audit_path,
-                max_fix_attempts=max(20, pre_errors // 2),
+                max_fix_attempts=max(20, pre_errors * 2),
             )
             resolutions.extend(new_res)
             _save_resolutions(resolutions, resolution_log_path)
+            new_pre = _count_current_errors(mock_path, copybook_dirs)
+            if new_pre >= pre_errors:
+                log.warning("Pre-Phase 2: no progress (%d→%d) — proceeding",
+                            pre_errors, new_pre)
+                break
+            pre_errors = new_pre
+            if gate_round >= 5:
+                log.warning("Pre-Phase 2: %d errors after 5 rounds — proceeding",
+                            pre_errors)
+                break
 
         log.info("Phase 2: Mock infrastructure")
         lines = mock_path.read_text(errors="replace").splitlines(keepends=True)

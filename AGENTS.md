@@ -147,9 +147,9 @@ Returns `(mock_cbl_path, branch_meta, total_branches)`.
 
 **Batch loop** (Phases 3-5): Replace `batch_size` blocks → write → compile → fix → next batch. If batch causes >10 errors, revert and retry one-by-one.
 
-**Phase gating**: After Phase 1 (COPY resolution), if errors remain, runs an extra fix pass with scaled attempts before proceeding. Before Phase 2 (mock infrastructure), if >50 errors exist from prior phases, runs a pre-fix pass to reduce them first. This prevents piling transformations on top of broken code.
+**Phase gating**: After Phase 1 and before Phase 2, a gate loop keeps running fix passes until errors reach 0 or stop decreasing. Each pass gets fresh `failed_error_lines` (not blocked by prior clustering decisions). The loop stops when: errors hit 0, no progress between rounds, or 5 rounds exhausted. This prevents piling transformations on top of broken code.
 
-**Scaled attempts**: `max_fix_attempts` scales with error count — `max(10, n_errors // 3)` for initial passes, `max(20, n_errors // 2)` for extra passes. Each `_compile_and_fix` call has its own fresh `failed_error_lines`, so extra passes get a fresh start.
+**Scaled attempts**: `max_fix_attempts` scales with error count — `max(10, n_errors // 3)` for initial passes, `max(20, n_errors * 2)` for gate loop passes. Each `_compile_and_fix` call has its own fresh `failed_error_lines`, so each round gets a fresh start.
 
 **Resume**: Checkpoint file (`phase_checkpoint.json`) tracks last completed phase. Mock.cbl on disk is the checkpoint for within-phase resume.
 
