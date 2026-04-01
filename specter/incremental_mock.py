@@ -600,10 +600,25 @@ def _generate_record_stubs(
     """
     # Collect all undefined variable names
     undefined: set[str] = set()
+    _error_qualified: dict[str, set[str]] = {}  # parent→{fields} from errors
     for _, msg in errors:
-        m = re.match(r"'([A-Z0-9_-]+)'\s+is not defined", msg, re.IGNORECASE)
+        # Match both simple ('X') and qualified ('X IN Y') names
+        m = re.match(
+            r"'([A-Z0-9_-]+(?:\s+(?:IN|OF)\s+[A-Z0-9_-]+)?)'\s+is not defined",
+            msg, re.IGNORECASE,
+        )
         if m:
-            undefined.add(m.group(1).upper())
+            name = m.group(1).upper()
+            # Parse qualified names: "FIELD IN RECORD" → track both
+            qm = re.match(r"([A-Z0-9_-]+)\s+(?:IN|OF)\s+([A-Z0-9_-]+)", name)
+            if qm:
+                field, parent = qm.group(1), qm.group(2)
+                undefined.add(field)
+                undefined.add(parent)
+                # Pre-populate parent→field mapping from the error itself
+                _error_qualified.setdefault(parent, set()).add(field)
+            else:
+                undefined.add(name)
 
     if not undefined:
         return []
@@ -611,7 +626,7 @@ def _generate_record_stubs(
     source_text = "".join(src_lines)
     source_upper = source_text.upper()
 
-    # Group fields by parent record (via OF qualifier)
+    # Group fields by parent record (via OF/IN qualifier)
     # Pattern: FIELD-NAME OF RECORD-NAME
     of_re = re.compile(
         r"\b([A-Z0-9_-]+)\s+(?:OF|IN)\s+([A-Z0-9_-]+)\b",
@@ -625,6 +640,10 @@ def _generate_record_stubs(
         parent = match.group(2)
         if field in undefined or parent in undefined:
             parent_fields.setdefault(parent, set()).add(field)
+
+    # Merge qualified names from error messages themselves
+    for parent, fields in _error_qualified.items():
+        parent_fields.setdefault(parent, set()).update(fields)
 
     # Check which variables are ALREADY defined in the source
     # (prevents "ambiguous" errors from duplicate definitions)
