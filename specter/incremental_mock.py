@@ -789,6 +789,9 @@ def _compile_and_fix(
     max_fix_attempts: int = 200,
     baseline_errors: set[str] | None = None,
     audit_path: Path | None = None,
+    checkpoint_dir: Path | None = None,
+    checkpoint_name: str | None = None,
+    checkpoint_number: int | None = None,
 ) -> list[Resolution]:
     """Compile, fix errors sequentially until 0 errors or no progress.
 
@@ -809,6 +812,12 @@ def _compile_and_fix(
     """
     from .llm_coverage import _query_llm_sync, Message
     from .cobol_fix_cache import _parse_llm_fix_response
+
+    def _save_progress():
+        """Save checkpoint with current mock hash — safe to Ctrl-C after."""
+        if checkpoint_dir and checkpoint_name is not None and checkpoint_number is not None:
+            _save_checkpoint(checkpoint_dir, checkpoint_name,
+                             checkpoint_number, source_path)
 
     new_resolutions: list[Resolution] = []
     source_name = source_path.name
@@ -1352,6 +1361,7 @@ def _compile_and_fix(
                            largest_group_type if use_batch_mode else chosen_msg,
                            f"ACCEPTED — all errors resolved ({n_errors}→0)")
             log.info("  [%d/%d] ✓ All errors fixed!", attempt + 1, max_fix_attempts)
+            _save_progress()
             return new_resolutions
 
         # Relaxed verification: accept if error count DECREASED, even if
@@ -1377,6 +1387,7 @@ def _compile_and_fix(
                            f"ACCEPTED — errors reduced ({n_errors}→{new_error_count}, -{reduced})")
             log.info("  [%d/%d] ✓ Progress: %d → %d errors (-%d)",
                      attempt + 1, max_fix_attempts, n_errors, new_error_count, reduced)
+            _save_progress()
 
             # After a big drop, re-run pre-fix stubs — new "not defined"
             # errors may have appeared that weren't visible before
@@ -1681,9 +1692,8 @@ def incremental_instrument(
     branch_meta: dict = {}
     total_branches = 0
 
-    # -----------------------------------------------------------------------
-    # Phase 0: Baseline -- compile original and record pre-existing errors
-    # -----------------------------------------------------------------------
+    # Track the most recent sub-checkpoint so we can re-save on Ctrl-C.
+    # Updated by each phase before calling compile_and_fix.
     baseline_errors: set[str] = set()
     if start_phase <= 0:
         log.info("Phase 0: Baseline compilation check")
@@ -1725,6 +1735,9 @@ def incremental_instrument(
             llm_provider=llm_provider, llm_model=llm_model,
             baseline_errors=baseline_errors,
             audit_path=audit_path,
+            checkpoint_dir=output_dir,
+            checkpoint_name="copy_resolution_transformed",
+            checkpoint_number=0,
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
@@ -1757,6 +1770,9 @@ def incremental_instrument(
             llm_provider=llm_provider, llm_model=llm_model,
             baseline_errors=baseline_errors,
             audit_path=audit_path,
+            checkpoint_dir=output_dir,
+            checkpoint_name="mock_infra_transformed",
+            checkpoint_number=1,
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
