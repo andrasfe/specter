@@ -359,6 +359,9 @@ def _apply_preventive_fixes(
     return lines
 
 
+_MAX_CONTEXT_LINES = 500  # configurable max lines sent to LLM per error
+
+
 def _compile_and_fix(
     source_path: Path,
     phase: str,
@@ -370,12 +373,25 @@ def _compile_and_fix(
     max_fix_attempts: int = 10,
     baseline_errors: set[str] | None = None,
 ) -> list[Resolution]:
-    """Compile, fix any NEW errors using LLM + prior resolutions.
+    """Compile, fix errors ONE AT A TIME using LLM with agent-chosen context.
+
+    Flow per attempt:
+    1. Compile and get ALL errors
+    2. Present top 15 errors to LLM, let it choose which to fix
+    3. LLM requests a code chunk (max 500 lines) around the chosen error
+    4. LLM returns fix as JSON
+    5. Apply fix, recompile, verify the specific error is gone
+    6. If error gone → record as verified resolution
+    7. If error persists or new errors → revert
 
     Returns new resolutions added during this cycle.
     """
+    from .llm_coverage import _query_llm_sync, Message
+    from .cobol_fix_cache import _parse_llm_fix_response
+
     new_resolutions: list[Resolution] = []
     source_name = source_path.name
+    failed_error_lines: set[int] = set()  # errors we already tried and failed
 
     for attempt in range(max_fix_attempts):
         rc, stderr = _cobc_syntax_check(source_path, copybook_dirs)
@@ -385,63 +401,148 @@ def _compile_and_fix(
 
         errors = _parse_errors(stderr, source_name)
         if not errors:
-            # No parseable errors but compilation failed -- nothing we can do
-            log.warning("  Phase %s batch %d: %d errors (unparseable)",
-                        phase, batch, rc)
+            log.warning("  Phase %s batch %d: compilation failed (unparseable)", phase, batch)
             return new_resolutions
 
-        # Filter out baseline errors (pre-existing issues)
+        # Filter out baseline errors
         if baseline_errors:
-            new_errors = [
-                (ln, msg) for ln, msg in errors
-                if msg not in baseline_errors
-            ]
+            new_errors = [(ln, msg) for ln, msg in errors if msg not in baseline_errors]
             if not new_errors:
-                log.info("  Phase %s batch %d: %d errors (all baseline, ignoring)",
-                         phase, batch, len(errors))
+                log.info("  Phase %s batch %d: %d errors (all baseline)", phase, batch, len(errors))
                 return new_resolutions
         else:
             new_errors = errors
 
+        # Skip errors we already tried and failed
+        actionable = [(ln, msg) for ln, msg in new_errors if ln not in failed_error_lines]
+        if not actionable:
+            log.info("  Phase %s batch %d: %d errors remaining (all attempted)", phase, batch, len(new_errors))
+            return new_resolutions
+
         n_errors = len(new_errors)
-        log.info("  Phase %s batch %d attempt %d: %d errors",
-                 phase, batch, attempt + 1, n_errors)
+        log.info("  Phase %s batch %d attempt %d: %d errors (%d actionable)",
+                 phase, batch, attempt + 1, n_errors, len(actionable))
 
         if not llm_provider:
-            # No LLM -- just report errors and move on
-            for ln, msg in new_errors[:5]:
+            for ln, msg in actionable[:5]:
                 log.info("    Line %d: %s", ln, msg)
             return new_resolutions
 
-        # Build LLM prompt with all prior resolutions
+        # --- Step 1: Present top 15 errors, let LLM choose which to fix ---
+        top_errors = actionable[:15]
+        error_list = "\n".join(f"  {i+1}. Line {ln}: {msg}" for i, (ln, msg) in enumerate(top_errors))
+
+        # Build relevant resolution summaries
+        current_error_types = {msg.split(",")[0].strip() for _, msg in top_errors}
+        relevant_res = [r for r in resolutions + new_resolutions
+                        if r.verified and any(et in r.error for et in current_error_types)]
+        recent_res = (resolutions + new_resolutions)[-10:]
+        seen_keys: set[str] = set()
+        res_summaries: list[str] = []
+        for r in relevant_res + recent_res:
+            key = f"{r.error}:{r.fix}"
+            if key not in seen_keys:
+                seen_keys.add(key)
+                res_summaries.append(r.summary())
+            if len(res_summaries) >= 20:
+                break
+
+        res_text = ""
+        if res_summaries:
+            res_text = ("Prior verified resolutions (apply proactively):\n"
+                        + "\n".join(f"- {s}" for s in res_summaries) + "\n\n")
+
         src_lines = source_path.read_text(errors="replace").splitlines(keepends=True)
-        prompt = _build_fix_prompt(
-            new_errors, src_lines, source_name, phase, resolutions + new_resolutions,
+        total_lines = len(src_lines)
+
+        choose_prompt = (
+            f"You are fixing GnuCOBOL compilation errors in {source_name} "
+            f"({total_lines} lines, phase: {phase}).\n\n"
+            f"{res_text}"
+            f"Current compilation errors ({n_errors} total, showing top 15):\n"
+            f"{error_list}\n\n"
+            f"Choose ONE error to fix. Respond with JSON:\n"
+            f'{{"choose_error": {{"line": <line_number>, "context_start": <start>, "context_end": <end>}}}}\n\n'
+            f"Where context_start/context_end define the code range you need to see "
+            f"(max {_MAX_CONTEXT_LINES} lines). Pick the error you're most confident you can fix."
         )
 
         try:
-            from .llm_coverage import _query_llm_sync
-            response, _ = _query_llm_sync(llm_provider, prompt, llm_model)
+            response, _ = _query_llm_sync(llm_provider, choose_prompt, llm_model)
         except Exception as exc:
-            log.warning("  LLM query failed: %s", exc)
+            log.warning("  LLM choose query failed: %s", exc)
             return new_resolutions
 
-        # Parse response
-        from .cobol_fix_cache import _parse_llm_fix_response
-        error_lines = sorted(set(e[0] for e in new_errors))
-        min_line = max(0, error_lines[0] - 101) if error_lines else 0
-        max_line = min(len(src_lines), error_lines[-1] + 20) if error_lines else len(src_lines)
-        fixes = _parse_llm_fix_response(response, min_line, max_line)
+        # Parse LLM's choice
+        chosen_line = None
+        ctx_start = None
+        ctx_end = None
+        try:
+            cleaned = re.sub(r"```\w*\n?", "", response).strip()
+            parsed = json.loads(cleaned)
+            if "choose_error" in parsed:
+                choice = parsed["choose_error"]
+                chosen_line = int(choice.get("line", 0))
+                ctx_start = max(0, int(choice.get("context_start", chosen_line - 50)) - 1)
+                ctx_end = min(total_lines, int(choice.get("context_end", chosen_line + 50)))
+        except (json.JSONDecodeError, TypeError, ValueError, KeyError):
+            pass
+
+        if not chosen_line:
+            # Fallback: pick first actionable error
+            chosen_line = actionable[0][0]
+            ctx_start = max(0, chosen_line - 100)
+            ctx_end = min(total_lines, chosen_line + 20)
+
+        # Cap context to MAX_CONTEXT_LINES
+        if ctx_end - ctx_start > _MAX_CONTEXT_LINES:
+            ctx_end = ctx_start + _MAX_CONTEXT_LINES
+
+        chosen_msg = next((msg for ln, msg in actionable if ln == chosen_line), "unknown")
+        log.info("  [%d/%d] Fixing line %d: %s (context: %d-%d)",
+                 attempt + 1, max_fix_attempts, chosen_line, chosen_msg[:60],
+                 ctx_start + 1, ctx_end)
+
+        # --- Step 2: Send chosen context, get fix ---
+        numbered_context = "\n".join(
+            f"{ctx_start + i + 1:5d}: {line.rstrip()}"
+            for i, line in enumerate(src_lines[ctx_start:ctx_end])
+        )
+
+        fix_prompt = (
+            f"Fix this GnuCOBOL compilation error:\n"
+            f"  Line {chosen_line}: {chosen_msg}\n\n"
+            f"{res_text}"
+            f"Source context (lines {ctx_start+1}-{ctx_end}):\n"
+            f"```cobol\n{numbered_context}\n```\n\n"
+            f"Common fixes:\n"
+            f"- 'X is not defined': add 01 X PIC X(256). to WORKING-STORAGE\n"
+            f"- 'duplicate definition': comment the duplicate\n"
+            f"- 'PICTURE clause required': add appropriate PIC clause\n"
+            f"- 'unexpected ELSE/END-IF': fix IF nesting\n"
+            f"- Don't comment out data definitions other code references\n\n"
+            f"Return ONLY fixed lines as flat JSON: {{\"<line_number>\": \"<fixed_content>\"}}\n"
+            f"Do NOT wrap in outer keys. Only include lines that changed."
+        )
+
+        try:
+            response2, _ = _query_llm_sync(llm_provider, fix_prompt, llm_model)
+        except Exception as exc:
+            log.warning("  LLM fix query failed: %s", exc)
+            failed_error_lines.add(chosen_line)
+            continue
+
+        fixes = _parse_llm_fix_response(response2, ctx_start, ctx_end + 100)
 
         if not fixes:
-            snippet = response[:200].replace("\n", "\\n") if response else "(empty)"
+            snippet = response2[:200].replace("\n", "\\n") if response2 else "(empty)"
             log.info("  LLM response not parsed: %s", snippet)
-            return new_resolutions
+            failed_error_lines.add(chosen_line)
+            continue
 
-        # Take a snapshot for revert
+        # --- Step 3: Apply, recompile, verify the specific error is gone ---
         snapshot = list(src_lines)
 
-        # Apply fixes
         for fix_ln, fix_content in fixes.items():
             idx = fix_ln - 1
             if 0 <= idx < len(src_lines):
@@ -449,50 +550,53 @@ def _compile_and_fix(
 
         source_path.write_text("".join(src_lines))
 
-        # Verify fix didn't make things worse
         rc2, stderr2 = _cobc_syntax_check(source_path, copybook_dirs)
+        new_error_list = _parse_errors(stderr2, source_name) if rc2 != 0 else []
+        new_error_lines = {ln for ln, _ in new_error_list}
+        new_error_count = len(new_error_list)
+
+        # Check if the SPECIFIC error we targeted is gone
+        error_gone = chosen_line not in new_error_lines
+
         if rc2 == 0:
-            # Fixed everything
-            fix_lines = {str(k): v for k, v in fixes.items()}
-            for ln, msg in new_errors:
-                new_resolutions.append(Resolution(
-                    phase=phase,
-                    batch=batch,
-                    transformation=f"Fix {len(new_errors)} errors in phase {phase}",
-                    error=msg,
-                    fix=f"LLM fix applied ({len(fixes)} lines changed)",
-                    fix_lines=fix_lines,
-                    verified=True,
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                ))
-            log.info("  Phase %s batch %d: all errors fixed", phase, batch)
+            # Everything compiles clean
+            fix_lines_dict = {str(k): v for k, v in fixes.items()}
+            new_resolutions.append(Resolution(
+                phase=phase, batch=batch,
+                transformation=f"Fix line {chosen_line} in phase {phase}",
+                error=chosen_msg,
+                fix=f"LLM fix ({len(fixes)} lines changed) — all errors resolved",
+                fix_lines=fix_lines_dict,
+                verified=True,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            ))
+            log.info("  [%d/%d] ✓ All errors fixed!", attempt + 1, max_fix_attempts)
             return new_resolutions
 
-        new_error_count = len(_parse_errors(stderr2, source_name))
-        if new_error_count < n_errors:
-            # Partial improvement, record and continue
-            fix_lines = {str(k): v for k, v in fixes.items()}
-            for ln, msg in new_errors:
-                new_resolutions.append(Resolution(
-                    phase=phase,
-                    batch=batch,
-                    transformation=f"Partial fix in phase {phase}",
-                    error=msg,
-                    fix=f"LLM fix ({n_errors} -> {new_error_count} errors)",
-                    fix_lines=fix_lines,
-                    verified=False,
-                    timestamp=datetime.now(timezone.utc).isoformat(),
-                ))
-            log.info("  Phase %s batch %d: %d -> %d errors (partial fix)",
-                     phase, batch, n_errors, new_error_count)
-            # Continue loop to try to fix remaining errors
+        if error_gone and new_error_count <= n_errors:
+            # Targeted error is gone AND we didn't make things worse
+            fix_lines_dict = {str(k): v for k, v in fixes.items()}
+            new_resolutions.append(Resolution(
+                phase=phase, batch=batch,
+                transformation=f"Fix line {chosen_line} in phase {phase}",
+                error=chosen_msg,
+                fix=f"LLM fix ({len(fixes)} lines) — error gone, {new_error_count} remaining",
+                fix_lines=fix_lines_dict,
+                verified=True,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            ))
+            log.info("  [%d/%d] ✓ Error at line %d fixed (%d → %d errors)",
+                     attempt + 1, max_fix_attempts, chosen_line, n_errors, new_error_count)
+            # Update src_lines for next iteration
             continue
-        else:
-            # Fix made things worse or no improvement -- revert
-            source_path.write_text("".join(snapshot))
-            log.info("  Phase %s batch %d: fix reverted (%d -> %d errors)",
-                     phase, batch, n_errors, new_error_count)
-            return new_resolutions
+
+        # Error still there or things got worse — revert
+        source_path.write_text("".join(snapshot))
+        failed_error_lines.add(chosen_line)
+        log.info("  [%d/%d] ✗ Reverted (error %s, %d → %d errors)",
+                 attempt + 1, max_fix_attempts,
+                 "persists" if not error_gone else "gone but worse",
+                 n_errors, new_error_count)
 
     return new_resolutions
 
