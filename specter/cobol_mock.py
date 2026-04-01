@@ -171,7 +171,10 @@ def instrument_cobol(
     # (e.g. "3136-INT-NO-CARGADOS-ALL...") into valid headers.
     lines = _normalize_paragraph_ellipsis(lines)
 
-    # Phase 12: Auto-stub unresolved symbols reported by cobc (if available)
+    # Phase 12: Auto-stub unresolved symbols reported by cobc (if available).
+    # The compile_cobol() never-give-up loop with LLM handles remaining errors.
+    # Phase 12 only adds stub definitions — it no longer comments out data
+    # blocks or cleanup unbalanced procedures (those were destructive).
     lines = _auto_stub_undefined_with_cobc(
         lines,
         allow_hardening_fallback=allow_hardening_fallback,
@@ -2356,7 +2359,10 @@ def _auto_stub_undefined_with_cobc(
             if procedure_single_comment_lines:
                 current = _comment_specific_lines(current, procedure_single_comment_lines)
 
-            current = _cleanup_unbalanced_procedure(current)
+            # _cleanup_unbalanced_procedure DISABLED — it was commenting out
+            # valid MOVE continuations, COMPUTE lines, and deeply-indented
+            # identifiers. The compile loop handles genuine issues.
+            # current = _cleanup_unbalanced_procedure(current)
             current = _normalize_subscript_forms(current)
             current = _normalize_paragraph_ellipsis(current)
             current = _force_neutralize_paragraphs(current, bad_paragraphs)
