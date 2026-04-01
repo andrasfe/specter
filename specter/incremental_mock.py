@@ -627,9 +627,9 @@ def _compile_and_fix(
             else:
                 rounds_without_progress += 1
 
-            # Dynamic stall limit: always persistent, extremely so near 0
-            # 1 error → 100 rounds, 5 → 20, 10 → 10, 50+ → 10
-            stall_limit = max(10, 100 // max(n_errors, 1))
+            # Dynamic stall limit: minimum 50 rounds, more near 0
+            # 1 error → 100 rounds, 2 → 50, 10 → 50, 100 → 50
+            stall_limit = max(50, 100 // max(n_errors, 1))
 
             if rounds_without_progress >= stall_limit:
                 log.info("  Phase %s batch %d: stalled at %d errors "
