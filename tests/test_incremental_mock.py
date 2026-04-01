@@ -220,7 +220,7 @@ class TestCompileAndFix:
 
         resolutions = _compile_and_fix(src, "test", 0, [])
         assert resolutions == []
-        mock_check.assert_called_once()
+        assert mock_check.call_count >= 1  # pre-fix + main loop
 
     @patch("specter.incremental_mock._cobc_syntax_check")
     def test_no_llm_reports_errors(self, mock_check, tmp_path):

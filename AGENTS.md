@@ -193,6 +193,7 @@ Two modes, chosen automatically per attempt:
 
 #### Helper Functions
 
+- **`_generate_record_stubs(errors, src_lines)`**: Deterministic pre-fix for "not defined" errors. Analyzes OF qualifiers to build parent-child record structures, infers PIC clauses from usage patterns (NUMERIC tests, subscripts, MOVE targets, name heuristics). Runs once before the LLM loop — no LLM cost.
 - **`_cluster_errors(errors, gap=10)`**: Group adjacent errors as one root cause
 - **`_group_errors_by_type(errors)`**: Group by error type for batch fixing
 - **`_find_working_storage_range(src_lines)`**: Find WS boundaries for dual-context prompts

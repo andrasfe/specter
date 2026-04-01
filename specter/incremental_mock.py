@@ -507,6 +507,114 @@ def _find_working_storage_range(src_lines: list[str]) -> tuple[int, int] | None:
     return None
 
 
+def _generate_record_stubs(
+    errors: list[tuple[int, str]],
+    src_lines: list[str],
+) -> list[str]:
+    """Generate deterministic stub definitions for 'not defined' errors.
+
+    Analyzes usage patterns in the source to build proper record structures
+    instead of flat PIC X(256) stubs that the LLM keeps trying.
+
+    Returns COBOL lines to insert into WORKING-STORAGE.
+    """
+    # Collect all undefined variable names
+    undefined: set[str] = set()
+    for _, msg in errors:
+        m = re.match(r"'([A-Z0-9_-]+)'\s+is not defined", msg, re.IGNORECASE)
+        if m:
+            undefined.add(m.group(1).upper())
+
+    if not undefined:
+        return []
+
+    source_text = "".join(src_lines)
+    source_upper = source_text.upper()
+
+    # Group fields by parent record (via OF qualifier)
+    # Pattern: FIELD-NAME OF RECORD-NAME
+    of_re = re.compile(
+        r"\b([A-Z0-9_-]+)\s+OF\s+([A-Z0-9_-]+)\b",
+        re.IGNORECASE,
+    )
+    parent_fields: dict[str, set[str]] = {}  # parent → {fields}
+    standalone: set[str] = set()  # not used with OF
+
+    for match in of_re.finditer(source_upper):
+        field = match.group(1)
+        parent = match.group(2)
+        if field in undefined or parent in undefined:
+            parent_fields.setdefault(parent, set()).add(field)
+
+    # Variables not in any OF relationship
+    for var in undefined:
+        is_child = any(var in fields for fields in parent_fields.values())
+        is_parent = var in parent_fields
+        if not is_child and not is_parent:
+            standalone.add(var)
+
+    # Infer PIC clause from usage context
+    def _infer_pic(var_name: str) -> str:
+        # Check for NUMERIC test → alphanumeric
+        if re.search(rf"\b{re.escape(var_name)}\b\s+(NOT\s+)?NUMERIC",
+                      source_upper):
+            return "PIC X(20)"
+        # Check for MOVE from known numeric
+        m = re.search(rf"MOVE\s+\d+\s+TO\s+{re.escape(var_name)}\b",
+                       source_upper)
+        if m:
+            return "PIC 9(10)"
+        # Check subscript usage like VAR(5:11) → alphanumeric with length
+        m = re.search(rf"\b{re.escape(var_name)}\s*\(\s*(\d+)\s*:\s*(\d+)\s*\)",
+                       source_upper)
+        if m:
+            total = int(m.group(1)) + int(m.group(2))
+            return f"PIC X({total})"
+        # Check for comparison with spaces/string
+        if re.search(rf"\b{re.escape(var_name)}\b\s+(NOT\s+)?(=|EQUAL)\s+SPACES",
+                      source_upper):
+            return "PIC X(20)"
+        # Check for comparison with numeric literal
+        if re.search(rf"\b{re.escape(var_name)}\b\s+(NOT\s+)?(=|EQUAL)\s+\d",
+                      source_upper):
+            return "PIC 9(10)"
+        # Check name patterns
+        upper = var_name.upper()
+        if any(kw in upper for kw in ("STATUS", "CD", "CODE", "IND", "FLAG")):
+            return "PIC X(02)"
+        if any(kw in upper for kw in ("AMT", "RATE", "BAL", "AMOUNT")):
+            return "PIC S9(13)V99 COMP-3"
+        if any(kw in upper for kw in ("DT", "DATE")):
+            return "PIC X(10)"
+        if any(kw in upper for kw in ("NO", "NBR", "NUM", "ID", "ACCT")):
+            return "PIC X(20)"
+        return "PIC X(256)"
+
+    stubs: list[str] = []
+    stubs.append(f"{_CMT} SPECTER: Auto-generated stubs for undefined variables\n")
+
+    # Generate parent records with children
+    for parent, fields in sorted(parent_fields.items()):
+        if parent in undefined:
+            stubs.append(f"{_A}01  {parent}.\n")
+            for field in sorted(fields):
+                pic = _infer_pic(field)
+                stubs.append(f"{_B}05  {field} {pic}.\n")
+            # Ensure parent has at least one child
+            if not fields:
+                stubs.append(f"{_B}05  FILLER PIC X.\n")
+
+    # Generate standalone stubs
+    for var in sorted(standalone):
+        pic = _infer_pic(var)
+        stubs.append(f"{_A}01  {var} {pic}.\n")
+
+    if len(stubs) <= 1:  # only the comment
+        return []
+
+    return stubs
+
+
 def _assert_clean(
     source_path: Path,
     phase_name: str,
@@ -584,6 +692,42 @@ def _compile_and_fix(
 
     new_resolutions: list[Resolution] = []
     source_name = source_path.name
+
+    # --- Pre-fix: deterministic stub generation for "not defined" errors ---
+    # Run once before the LLM loop. Analyzes usage patterns (OF qualifiers,
+    # NUMERIC tests, name heuristics) to build proper record stubs.
+    rc_pre, stderr_pre = _cobc_syntax_check(source_path, copybook_dirs)
+    if rc_pre != 0:
+        pre_errors = _parse_errors(stderr_pre, source_name)
+        not_defined = [(ln, msg) for ln, msg in pre_errors
+                       if "is not defined" in msg]
+        if not_defined:
+            src = source_path.read_text(errors="replace").splitlines(keepends=True)
+            stubs = _generate_record_stubs(not_defined, src)
+            if stubs:
+                ws_range = _find_working_storage_range(src)
+                if ws_range:
+                    ws_start, ws_end = ws_range
+                    # Insert stubs at end of WORKING-STORAGE
+                    insert_at = ws_end
+                    for i, s_line in enumerate(stubs):
+                        src.insert(insert_at + i, s_line)
+                    source_path.write_text("".join(src))
+                    rc_check, stderr_check = _cobc_syntax_check(
+                        source_path, copybook_dirs)
+                    new_count = len(_parse_errors(stderr_check, source_name)) if rc_check != 0 else 0
+                    old_count = len(pre_errors)
+                    if new_count < old_count:
+                        log.info("  Pre-fix: auto-stubs reduced %d → %d errors "
+                                 "(added %d stub lines)", old_count, new_count,
+                                 len(stubs))
+                    else:
+                        # Stubs didn't help — revert
+                        src = src[:insert_at] + src[insert_at + len(stubs):]
+                        source_path.write_text("".join(src))
+                        log.info("  Pre-fix: auto-stubs didn't help (%d → %d), "
+                                 "reverted", old_count, new_count)
+
     failed_error_lines: set[int] = set()
     # Fingerprints of fixes already tried — reject exact duplicates
     tried_fix_fingerprints: set[str] = set()
