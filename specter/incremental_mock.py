@@ -553,6 +553,8 @@ def _compile_and_fix(
     new_resolutions: list[Resolution] = []
     source_name = source_path.name
     failed_error_lines: set[int] = set()
+    # Fingerprints of fixes already tried — reject exact duplicates
+    tried_fix_fingerprints: set[str] = set()
 
     # Memory of failed attempts: (line, error_msg, fix_summary, reason)
     failed_attempts: list[tuple[int, str, str, str]] = []
@@ -631,7 +633,13 @@ def _compile_and_fix(
         error_groups = _group_errors_by_type(actionable)
         largest_group_type = max(error_groups, key=lambda k: len(error_groups[k]))
         largest_group = error_groups[largest_group_type]
-        use_batch_mode = len(largest_group) >= 5
+        # Use batch only if 5+ same-type errors AND batch hasn't failed yet
+        batch_already_failed = any(
+            "batch" in fs.lower() or len(fs) > 100
+            for _, fe, fs, _ in failed_attempts
+            if largest_group_type[:20] in fe
+        )
+        use_batch_mode = len(largest_group) >= 5 and not batch_already_failed
 
         # Build resolution + failure memory text (shared by both modes)
         current_error_types = {msg.split(",")[0].strip() for _, msg in actionable[:15]}
@@ -873,6 +881,25 @@ def _compile_and_fix(
         fix_summary = "; ".join(fix_details)
         if len(fixes) > 5:
             fix_summary += f" (+{len(fixes)-5} more)"
+
+        # ===== Duplicate detection: reject if we've tried this exact fix =====
+        fix_fingerprint = "|".join(
+            f"{ln}:{fixes[ln].strip()}" for ln in sorted(fixes.keys())
+        )
+        if fix_fingerprint in tried_fix_fingerprints:
+            log.info("  [%d/%d] ✗ Skipped: duplicate fix (already tried this exact change)",
+                     attempt, max_fix_attempts)
+            failed_attempts.append((
+                next(iter(targeted_lines)),
+                largest_group_type if use_batch_mode else chosen_msg,
+                fix_summary,
+                "SKIPPED — exact same fix already tried and failed. "
+                "You MUST try something fundamentally different",
+            ))
+            for tl in targeted_lines:
+                failed_error_lines.add(tl)
+            continue
+        tried_fix_fingerprints.add(fix_fingerprint)
 
         # ===== Quality gate: reject fixes that are mostly commenting out =====
         n_commented = 0
