@@ -42,6 +42,38 @@ _COBC_COMMON_FLAGS = [
     "-frelax-level-hierarchy",
 ]
 
+_COBOL_FIX_KNOWLEDGE = """\
+COBOL FIXED-FORMAT RULES:
+- Cols 1-6: sequence numbers (ignored). Col 7: indicator (* = comment, - = continuation, space = code). Cols 8-72: code. Cols 73-80: ignored.
+- ALL code must fit within columns 8-72. If a statement extends past col 72, the compiler silently truncates it → "unexpected identifier". Fix by splitting the line.
+- 01-level items start in Area A (col 8). 05/10/etc items start in Area B (col 12+).
+- Every data definition and statement MUST end with a period.
+
+ERROR PATTERNS AND FIXES:
+- 'X is not defined': X is used but has no definition. If X is used as 'FIELD OF RECORD', you need:
+    01 RECORD.
+       05 FIELD PIC X(20).
+  Add ALL fields used with 'OF RECORD', not just one. Put in WORKING-STORAGE before PROCEDURE DIVISION.
+- 'X is ambiguous; needs qualification': X is defined in multiple records. Use 'X OF RECORD-NAME' to qualify, or comment out the duplicate 01-level definition.
+- 'duplicate definition': two definitions for same name. Comment out one with * in col 7.
+- 'PICTURE clause required': a group item (01/05) has no PIC and no subordinate items. Add PIC X(256) or add child 05 items.
+- 'unexpected Identifier, expecting SECTION or .': the PREVIOUS line is missing its terminal period, or content extends past col 72.
+- 'syntax error, unexpected .': a period is in the wrong place (e.g., inside an IF block). Remove it or add END-IF before it.
+- 'unexpected ELSE/END-IF': mismatched IF/ELSE/END-IF. The IF block structure is broken.
+- 'invalid target for TALLYING/INSPECT': the target variable needs to be defined as numeric (PIC 9).
+- VALUES ARE → VALUE (GnuCOBOL doesn't accept VALUES ARE).
+
+CRITICAL RULES:
+- NEVER comment out lines that other code references — this creates cascading "not defined" errors.
+- When adding stub definitions, use the correct PIC clause based on how the variable is used:
+  * Compared to SPACES or moved from string → PIC X(n)
+  * Tested with NUMERIC or used in COMPUTE → PIC 9(n) or PIC S9(n)V99 COMP-3
+  * Used as status code (STATUS, CD, IND) → PIC XX or PIC 99
+  * Used as date (DT, DATE) → PIC X(10)
+  * Used as amount (AMT, RATE, BAL) → PIC S9(13)V99 COMP-3
+- When splitting long lines: put the continuation on the next line starting at col 12 (Area B).
+"""
+
 _COBC_SYNTAX_TIMEOUT = 90
 _COBC_COMPILE_TIMEOUT = 120
 
@@ -378,14 +410,7 @@ def _build_fix_prompt(
         f"Current errors to fix:\n{error_desc}\n\n"
         f"Source context (lines {ctx_start + 1}-{ctx_end}):\n"
         f"```cobol\n{numbered_context}\n```\n\n"
-        "Common fixes:\n"
-        "- 'X is not defined': add '       01 X PIC X(256).' to WORKING-STORAGE\n"
-        "- 'duplicate FD/SELECT': comment the duplicate with * in column 7\n"
-        "- 'PICTURE clause required': add appropriate PIC clause\n"
-        "- 'unexpected ELSE/END-IF': fix IF nesting or add missing IF\n"
-        "- VALUES ARE -> VALUE\n"
-        "- Missing terminal period on data definition\n"
-        "- Don't comment out data definitions that other code references\n\n"
+        f"{_COBOL_FIX_KNOWLEDGE}\n"
         "Output ONLY the corrected lines as a flat JSON object mapping "
         "line number to fixed content.\n"
         'Example: {"5417": "       10  EXT-K1-WS  PIC 99.", '
@@ -1096,11 +1121,8 @@ def _compile_and_fix(
                 f"Errors to fix ({len(batch_errors)} errors, type: {largest_group_type}):\n"
                 f"{error_list}\n\n"
                 f"{all_context}\n\n"
-                f"IMPORTANT: Fix ALL {len(batch_errors)} errors in a single response.\n"
-                f"For 'not defined' errors: add ALL stub definitions together in "
-                f"WORKING-STORAGE (before PROCEDURE DIVISION). Use appropriate PIC "
-                f"clauses based on how the variables are used in the code.\n"
-                f"For syntax errors: look for the root cause BEFORE the error lines.\n\n"
+                f"IMPORTANT: Fix ALL {len(batch_errors)} errors in a single response.\n\n"
+                f"{_COBOL_FIX_KNOWLEDGE}\n"
                 f"Return ALL fixed/added lines as flat JSON: "
                 f"{{\"<line_number>\": \"<content>\"}}\n"
                 f"Do NOT wrap in outer keys. Include ALL lines that need changing."
@@ -1187,15 +1209,7 @@ def _compile_and_fix(
                 f"{nearby_text}"
                 f"Source context (lines {ctx_start+1}-{ctx_end}):\n"
                 f"```cobol\n{numbered_context}\n```\n\n"
-                f"Common fixes:\n"
-                f"- 'X is not defined': add 01 X PIC X(256). to WORKING-STORAGE\n"
-                f"- 'duplicate definition': comment the duplicate\n"
-                f"- 'PICTURE clause required': add appropriate PIC clause\n"
-                f"- 'unexpected Identifier, expecting SECTION or .': a previous "
-                f"line is missing a terminal period, OR the line extends past "
-                f"column 72 (fixed-format COBOL truncates at col 72). Split "
-                f"the long line by putting the TO/identifier on the next line.\n"
-                f"- Don't comment out data definitions other code references\n\n"
+                f"{_COBOL_FIX_KNOWLEDGE}\n"
                 f"Return ONLY fixed lines as flat JSON: "
                 f"{{\"<line_number>\": \"<fixed_content>\"}}\n"
                 f"Do NOT wrap in outer keys. Only include lines that changed."
