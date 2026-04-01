@@ -360,8 +360,32 @@ def prepare_context(
         copybook_dirs=copybook_paths,
         llm_provider=llm_provider,
         llm_model=llm_model,
-        wall_clock_timeout=900.0,  # 15 min for strict attempt
+        wall_clock_timeout=1800.0,
     )
+
+    # If strict compile failed and hardening is allowed, retry with hardening.
+    # Hardening replaces the PROCEDURE DIVISION with a simple wrapper,
+    # avoiding undefined variable issues from missing copybooks.
+    if not success and allow_hardening_fallback:
+        log.warning("Strict compile failed (%s). Retrying with hardening ...", message[:80])
+        result = instrument_cobol(
+            cobol_source, config,
+            allow_hardening_fallback=True,
+        )
+        source_text = result.source
+        hardened_mode = "SPECTER-HARDENED-ENTRY" in source_text
+        source_text = _gnucobol_source_fixups(source_text)
+        instrumented_path.write_text(source_text)
+        branch_meta = {}
+        total_branches = 0
+        success, message = agent_compile(
+            instrumented_path,
+            output_path=executable_path,
+            copybook_dirs=copybook_paths,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            wall_clock_timeout=900.0,
+        )
 
     if not success:
         raise RuntimeError(f"COBOL compilation failed: {message}")
