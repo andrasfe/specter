@@ -707,45 +707,86 @@ def _compile_and_fix(
     source_name = source_path.name
 
     # --- Pre-fix: deterministic stub generation for "not defined" errors ---
-    # Run once before the LLM loop. Analyzes usage patterns (OF qualifiers,
-    # NUMERIC tests, name heuristics) to build proper record stubs.
+    # Insert stubs ONE AT A TIME, verifying each. This way we keep stubs
+    # that work and skip ones that don't, instead of all-or-nothing.
     rc_pre, stderr_pre = _cobc_syntax_check(source_path, copybook_dirs)
     if rc_pre != 0:
         pre_errors = _parse_errors(stderr_pre, source_name)
-        not_defined_before = [(ln, msg) for ln, msg in pre_errors
-                              if "is not defined" in msg]
-        if not_defined_before:
+        not_defined = [(ln, msg) for ln, msg in pre_errors
+                       if "is not defined" in msg]
+        if not_defined:
             src = source_path.read_text(errors="replace").splitlines(keepends=True)
-            stubs = _generate_record_stubs(not_defined_before, src)
+            stubs = _generate_record_stubs(not_defined, src)
             if stubs:
                 ws_range = _find_working_storage_range(src)
                 if ws_range:
-                    ws_start, ws_end = ws_range
-                    insert_at = ws_end
-                    for i, s_line in enumerate(stubs):
-                        src.insert(insert_at + i, s_line)
-                    source_path.write_text("".join(src))
-                    rc_check, stderr_check = _cobc_syntax_check(
-                        source_path, copybook_dirs)
-                    new_errors = _parse_errors(stderr_check, source_name) if rc_check != 0 else []
-                    not_defined_after = [
-                        (ln, msg) for ln, msg in new_errors
-                        if "is not defined" in msg
-                    ]
-                    # Keep stubs if "not defined" count decreased — even if
-                    # total errors went up (duplicates etc. are easier to fix)
-                    if len(not_defined_after) < len(not_defined_before):
-                        log.info("  Pre-fix: auto-stubs reduced 'not defined' "
-                                 "%d → %d (total: %d → %d, added %d stub lines)",
-                                 len(not_defined_before), len(not_defined_after),
-                                 len(pre_errors), len(new_errors), len(stubs))
-                    else:
-                        # Stubs didn't reduce "not defined" — revert
-                        src = src[:insert_at] + src[insert_at + len(stubs):]
-                        source_path.write_text("".join(src))
-                        log.info("  Pre-fix: auto-stubs didn't reduce 'not defined' "
-                                 "(%d → %d), reverted",
-                                 len(not_defined_before), len(not_defined_after))
+                    _, ws_end = ws_range
+                    # Split stubs into individual definitions (each 01-level
+                    # with its children)
+                    stub_groups: list[list[str]] = []
+                    current_group: list[str] = []
+                    for s_line in stubs:
+                        stripped = s_line.strip()
+                        if stripped.startswith("*"):
+                            continue  # skip comment header
+                        if re.match(r"^\s*01\s+", s_line):
+                            if current_group:
+                                stub_groups.append(current_group)
+                            current_group = [s_line]
+                        elif current_group:
+                            current_group.append(s_line)
+                    if current_group:
+                        stub_groups.append(current_group)
+
+                    stubs_kept = 0
+                    stubs_rejected = 0
+                    for group in stub_groups:
+                        group_name = group[0].strip().split()[1] if len(group[0].strip().split()) > 1 else "?"
+                        # Count "not defined" before
+                        src_text = source_path.read_text(errors="replace")
+                        src_lines_now = src_text.splitlines(keepends=True)
+                        ws_range_now = _find_working_storage_range(src_lines_now)
+                        if not ws_range_now:
+                            break
+                        insert_at = ws_range_now[1]
+
+                        # Insert this group
+                        for gi, g_line in enumerate(group):
+                            src_lines_now.insert(insert_at + gi, g_line)
+                        source_path.write_text("".join(src_lines_now))
+
+                        rc_after, stderr_after = _cobc_syntax_check(
+                            source_path, copybook_dirs)
+                        errs_after = _parse_errors(stderr_after, source_name) if rc_after != 0 else []
+                        nd_after = sum(1 for _, m in errs_after if "is not defined" in m)
+                        nd_before = sum(1 for _, m in _parse_errors(stderr_pre, source_name)
+                                        if "is not defined" in m) if stubs_kept == 0 else nd_after
+
+                        # Recount from current baseline
+                        rc_before, stderr_before = _cobc_syntax_check(
+                            source_path, copybook_dirs) if stubs_kept > 0 else (rc_pre, stderr_pre)
+
+                        # Keep if it didn't make things worse
+                        if len(errs_after) <= len(pre_errors) + stubs_kept + 3:
+                            stubs_kept += 1
+                            # Update pre_errors baseline for next iteration
+                            stderr_pre = stderr_after
+                            pre_errors = errs_after
+                            log.info("  Pre-fix: kept stub %s (%d lines, "
+                                     "errors now %d)",
+                                     group_name, len(group), len(errs_after))
+                        else:
+                            # Revert this group
+                            reverted = src_lines_now[:insert_at] + src_lines_now[insert_at + len(group):]
+                            source_path.write_text("".join(reverted))
+                            stubs_rejected += 1
+                            log.info("  Pre-fix: rejected stub %s "
+                                     "(%d → %d errors)",
+                                     group_name, len(pre_errors), len(errs_after))
+
+                    if stubs_kept > 0 or stubs_rejected > 0:
+                        log.info("  Pre-fix: %d stubs kept, %d rejected",
+                                 stubs_kept, stubs_rejected)
 
     failed_error_lines: set[int] = set()
     # Fingerprints of fixes already tried — reject exact duplicates
