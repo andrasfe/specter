@@ -1109,9 +1109,7 @@ def run_cobol_coverage(
             )
         else:
             log.error("COBOL compilation failed: %s", e)
-            if strict_branch_coverage:
-                raise
-            return CobolCoverageReport(elapsed_seconds=time.time() - setup_start)
+            raise
 
     if strict_branch_coverage and context.total_branches == 0:
         msg = (

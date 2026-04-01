@@ -555,8 +555,8 @@ def _compile_and_fix(
     """Compile, fix errors sequentially until 0 errors or no progress.
 
     Runs in a simple loop: compile → pick error → fix → compile → repeat.
-    Stops when: errors reach 0, or no error count decrease in
-    `_STALL_LIMIT` consecutive attempts.
+    Stops when errors reach 0 or stalled (dynamic limit: 10 rounds for
+    1 error, 3 rounds for 20+ errors).
 
     Key capabilities:
     1. **Batch similar errors**: When 5+ errors share the same type, the
@@ -584,10 +584,10 @@ def _compile_and_fix(
     successful_fixes: list[str] = []
 
     # Stall detection: stop only when error count has not decreased for
-    # _STALL_LIMIT consecutive *resets*.  A reset happens when all errors
+    # stall_limit consecutive *resets*.  A reset happens when all errors
     # have been attempted and we clear failed_error_lines to try again.
     # Individual failed attempts within a round do NOT count toward stall.
-    _STALL_LIMIT = 3          # 3 full rounds with no progress → truly stuck
+    # The limit scales with error count — try much harder when close to 0.
     rounds_without_progress = 0
     best_error_count = 999999
     attempt = 0
@@ -627,16 +627,20 @@ def _compile_and_fix(
             else:
                 rounds_without_progress += 1
 
-            if rounds_without_progress >= _STALL_LIMIT:
+            # Dynamic stall limit: try MUCH harder when close to 0
+            # 1 error → 50 rounds, 2 → 25, 5 → 10, 10 → 5, 20+ → 3
+            stall_limit = max(3, 50 // max(n_errors, 1))
+
+            if rounds_without_progress >= stall_limit:
                 log.info("  Phase %s batch %d: stalled at %d errors "
                          "(%d full rounds with no progress) — stopping",
-                         phase, batch, n_errors, _STALL_LIMIT)
+                         phase, batch, n_errors, stall_limit)
                 return new_resolutions
 
             log.info("  Phase %s batch %d: all %d errors attempted — "
                      "resetting for fresh round (%d/%d stall rounds)",
                      phase, batch, n_errors,
-                     rounds_without_progress, _STALL_LIMIT)
+                     rounds_without_progress, stall_limit)
             failed_error_lines.clear()
             actionable = new_errors
 
