@@ -373,23 +373,57 @@ def _resolve_copies(
                 cooked = cl
                 for old, new in replacing_pairs:
                     cooked = cooked.replace(old, new)
-                up = cooked.upper()
-                if any(h in up for h in (
-                    "IDENTIFICATION DIVISION",
-                    "ENVIRONMENT DIVISION",
-                    "DATA DIVISION",
-                    "PROCEDURE DIVISION",
-                    "WORKING-STORAGE SECTION",
-                    "FILE SECTION",
-                    "LINKAGE SECTION",
-                    "LOCAL-STORAGE SECTION",
-                    "INPUT-OUTPUT SECTION",
-                    "CONFIGURATION SECTION",
-                )):
-                    # Prevent nested division/section headers from copybooks
-                    # from corrupting the surrounding host program structure.
+                up = cooked.upper().strip()
+                # Skip comment lines in copybooks — don't filter them
+                is_header = False
+                if not up.startswith("*"):
+                    # Only match ACTUAL division/section headers, not lines
+                    # that happen to contain the words as substrings
+                    is_header = bool(re.match(
+                        r"^\s*(IDENTIFICATION|ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION\b"
+                        r"|^\s*(WORKING-STORAGE|FILE|LINKAGE|LOCAL-STORAGE"
+                        r"|INPUT-OUTPUT|CONFIGURATION|REPORT|SCREEN)\s+SECTION\b",
+                        up,
+                    ))
+                if is_header:
                     cooked = "* SPECTER: skipped nested division/section header: " + cooked.lstrip()
                 result.append(_normalize_copy_line(cooked))
+
+            # Check if the inlined copybook provided active children for
+            # the preceding group item. If not, add a FILLER to prevent
+            # "PICTURE clause required" errors.
+            has_active_child = False
+            for inlined in copy_lines:
+                il = inlined.strip()
+                if il and not il.startswith("*"):
+                    # Check if it defines a subordinate item (05-49 level)
+                    cm = re.match(r"(\d{2})\s+", il)
+                    if cm:
+                        lv = int(cm.group(1))
+                        if 2 <= lv <= 49:
+                            has_active_child = True
+                            break
+            if not has_active_child:
+                # Find the preceding group item and add a FILLER child
+                for ri in range(len(result) - 1, max(0, len(result) - 20), -1):
+                    rl = _get_cobol_content(result[ri]).strip()
+                    if not rl or rl.startswith("*"):
+                        continue
+                    pm = re.match(r"(\d{2})\s+([A-Z0-9_-]+)", rl, re.IGNORECASE)
+                    if pm:
+                        plv = int(pm.group(1))
+                        pname = pm.group(2)
+                        # Group items at 01-level without PIC need a child
+                        if plv <= 5 and "PIC" not in rl.upper():
+                            child_lv = min(plv + 4, 49)
+                            result.append(
+                                f"       {child_lv:02d}  FILLER PIC X.\n"
+                            )
+                            log.debug("  Added FILLER child for group %s "
+                                      "(copybook %s had no active children)",
+                                      pname, copyname)
+                        break
+
             resolved += 1
         else:
             # Generate stub — comment out the COPY
