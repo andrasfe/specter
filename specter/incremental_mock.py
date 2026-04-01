@@ -619,21 +619,22 @@ def _compile_and_fix(
 
         n_errors = len(new_errors)
 
-        # Permanently skip lines that have been reverted too many times
+        # Permanently skip lines reverted too many times — BUT only if
+        # there are other errors to work on. If it's the last error(s),
+        # keep trying (the LLM might find a different approach eventually).
         permanently_failed = {
             ln for ln, cnt in revert_count.items()
             if cnt >= _MAX_REVERTS_PER_LINE
         }
+        # Don't permanently ban if ALL errors would be banned
+        if permanently_failed and permanently_failed >= {ln for ln, _ in new_errors}:
+            permanently_failed = set()  # unban — they're the only ones left
 
-        # Skip errors we already tried — but if ALL are attempted,
-        # reset and try again (the LLM now has more failed-attempt
-        # memory to guide it toward different approaches)
         actionable = [
             (ln, msg) for ln, msg in new_errors
             if ln not in failed_error_lines and ln not in permanently_failed
         ]
         if not actionable:
-            # Check if ALL remaining errors are permanently failed
             still_possible = [
                 (ln, msg) for ln, msg in new_errors
                 if ln not in permanently_failed
