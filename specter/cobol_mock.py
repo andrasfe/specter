@@ -248,6 +248,18 @@ def _resolve_copies(
         r"^\s{6}[*/]\s*COPY\s+'?([A-Za-z0-9_-]+)'?(?:\s+REPLACING\b.*)?\s*\.?\s*$",
         re.IGNORECASE,
     )
+    # EXEC SQL INCLUDE inlines DCLGEN copybooks (host variable definitions
+    # for SQL tables). Must be resolved here in Phase 1 so the definitions
+    # are available before Phase 3 replaces EXEC blocks.
+    sql_include_re = re.compile(
+        r"^\s{6}\s+EXEC\s+SQL\s+INCLUDE\s+([A-Za-z0-9_-]+)\s*END-EXEC\s*\.?\s*$",
+        re.IGNORECASE,
+    )
+    # Multi-line: just detect start — we'll collect to END-EXEC
+    sql_include_start_re = re.compile(
+        r"^\s{6}\s+EXEC\s+SQL\s+INCLUDE\s+([A-Za-z0-9_-]+)",
+        re.IGNORECASE,
+    )
     ws_commented_copy_deny: set[str] = set()  # no denials — inline everything
 
     resolved = 0
@@ -255,7 +267,9 @@ def _resolve_copies(
     warnings = []
     result: list[str] = []
     section = ""
-    for line in lines:
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         stripped = line.rstrip("\n\r")
         upper_line = stripped.upper()
         if "FILE SECTION" in upper_line:
@@ -267,10 +281,59 @@ def _resolve_copies(
         elif "PROCEDURE DIVISION" in upper_line:
             section = "proc"
 
+        # Check for EXEC SQL INCLUDE (DCLGEN copybooks)
+        sql_m = sql_include_re.match(stripped)
+        if not sql_m:
+            # Try multi-line: EXEC SQL INCLUDE name\n  END-EXEC
+            sql_m2 = sql_include_start_re.match(stripped)
+            if sql_m2 and "END-EXEC" not in upper_line:
+                include_name = sql_m2.group(1).upper()
+                # Collect lines until END-EXEC
+                block_lines = [line]
+                j = i + 1
+                while j < len(lines):
+                    block_lines.append(lines[j])
+                    if "END-EXEC" in lines[j].upper():
+                        j += 1
+                        break
+                    j += 1
+                found = _find_copybook(include_name, copybook_dirs)
+                if found:
+                    for bl in block_lines:
+                        result.append(_comment_line(bl))
+                    result.append(f"      * SPECTER: EXEC SQL INCLUDE {include_name} inlined from {found.name}\n")
+                    copy_lines = found.read_text(errors="replace").splitlines(keepends=True)
+                    for cl in copy_lines:
+                        result.append(_normalize_copy_line(cl))
+                    resolved += 1
+                else:
+                    for bl in block_lines:
+                        result.append(bl)
+                    warnings.append(f"EXEC SQL INCLUDE {include_name}: copybook not found")
+                i = j
+                continue
+
+        if sql_m:
+            include_name = sql_m.group(1).upper()
+            found = _find_copybook(include_name, copybook_dirs)
+            if found:
+                result.append(_comment_line(line))
+                result.append(f"      * SPECTER: EXEC SQL INCLUDE {include_name} inlined from {found.name}\n")
+                copy_lines = found.read_text(errors="replace").splitlines(keepends=True)
+                for cl in copy_lines:
+                    result.append(_normalize_copy_line(cl))
+                resolved += 1
+            else:
+                result.append(line)
+                warnings.append(f"EXEC SQL INCLUDE {include_name}: copybook not found")
+            i += 1
+            continue
+
         m = copy_re.match(stripped)
         mc = commented_copy_re.match(stripped)
         if not m and not mc:
             result.append(line)
+            i += 1
             continue
 
         copyname = (m.group(2) if m else mc.group(1)).upper()
@@ -296,6 +359,7 @@ def _resolve_copies(
                         f"       {child_level:02d} SPECTER-MISSING-{copyname[:20]} PIC X.\n"
                     )
                 break
+            i += 1
             continue
 
         replacing_pairs = _parse_copy_replacing_pairs(stripped)
@@ -351,6 +415,8 @@ def _resolve_copies(
                     break
             stubbed += 1
             warnings.append(f"Copybook not found: {copyname}")
+
+        i += 1
 
     return result, resolved, stubbed, warnings
 

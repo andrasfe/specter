@@ -219,7 +219,7 @@ The underlying transformation functions called by `incremental_mock.py`.
 
 | Function | Line | Purpose |
 |----------|------|---------|
-| `_resolve_copies(lines, dirs)` | L236 | Inline COPY statements from copybook dirs |
+| `_resolve_copies(lines, dirs)` | L236 | Inline COPY statements + EXEC SQL INCLUDE (DCLGEN) from copybook dirs |
 | `_replace_exec_blocks(lines, config, max_count=0)` | L450 | Replace EXEC CICS/SQL/DLI → mock reads |
 | `_replace_io_verbs(lines, max_count=0)` | L703 | Replace READ/WRITE/OPEN/CLOSE → mocks |
 | `_replace_call_stmts(lines, max_count=0)` | L841 | Replace CALL 'prog' → mock reads |
