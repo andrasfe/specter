@@ -1670,14 +1670,16 @@ def _add_mock_infrastructure(
 
 
 def _disable_original_selects(lines: list[str], config: MockConfig) -> list[str]:
-    """Comment out original SELECT clauses except MOCK-FILE.
+    """Replace original SELECT clauses with dummy assigns except MOCK-FILE.
 
-    In mock mode all external I/O goes through MOCK-FILE, so original file-control
-    SELECT blocks are unnecessary and often reference symbols from unavailable
-    copybooks.
+    In mock mode all external I/O goes through MOCK-FILE.  Original SELECTs
+    reference symbols from unavailable copybooks.  Instead of commenting them
+    out (which orphans FD entries → "not defined"), replace with minimal
+    dummy SELECTs that keep the file name valid for compilation.
     """
     result: list[str] = []
     in_select = False
+    select_file_name: str = ""
 
     for line in lines:
         content = _get_cobol_content(line)
@@ -1694,15 +1696,34 @@ def _disable_original_selects(lines: list[str], config: MockConfig) -> list[str]
         )
         if not in_select and upper.startswith("SELECT ") and not keep_mock_select:
             in_select = True
+            # Extract the file name from SELECT <name>
+            m = re.match(r"SELECT\s+([A-Z0-9_-]+)", upper)
+            select_file_name = m.group(1) if m else ""
             result.append(_comment_line(line))
             if upper.endswith("."):
                 in_select = False
+                # Replace with dummy SELECT
+                if select_file_name:
+                    result.append(
+                        f"{_B}SELECT {select_file_name}\n"
+                    )
+                    result.append(
+                        f"{_B}    ASSIGN TO '{select_file_name}'.\n"
+                    )
             continue
 
         if in_select:
             result.append(_comment_line(line))
             if upper.endswith("."):
                 in_select = False
+                # Replace with dummy SELECT
+                if select_file_name:
+                    result.append(
+                        f"{_B}SELECT {select_file_name}\n"
+                    )
+                    result.append(
+                        f"{_B}    ASSIGN TO '{select_file_name}'.\n"
+                    )
             continue
 
         result.append(line)
