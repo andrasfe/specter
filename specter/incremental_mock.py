@@ -62,16 +62,30 @@ ERROR PATTERNS AND FIXES:
 - 'unexpected ELSE/END-IF': mismatched IF/ELSE/END-IF. The IF block structure is broken.
 - 'invalid target for TALLYING/INSPECT': the target variable needs to be defined as numeric (PIC 9).
 - VALUES ARE → VALUE (GnuCOBOL doesn't accept VALUES ARE).
+- 'continuation character expected': the previous line was split past col 72 but the next line doesn't have '-' in col 7. Two fixes:
+  (a) If the line is too long: split it so the first part ends before col 72, and start the remainder on a new line at col 12 (Area B). No continuation needed for statements split at a space boundary.
+  (b) If a string literal is split across lines: col 7 of the continuation line MUST be '-' and the string resumes with a quote in Area B: `      -    'rest of string'`
+- 'could not find a match for PICTURE': the PIC clause format is wrong. Common PIC types:
+  * PIC X(n) — alphanumeric, n chars
+  * PIC 9(n) — unsigned integer
+  * PIC S9(n) — signed integer
+  * PIC S9(n)V9(m) — signed decimal, m decimal places
+  * PIC S9(n)V9(m) COMP-3 — packed decimal (common for amounts)
+  * PIC 99 — 2-digit number (status codes)
+- 'PERFORM/VARYING identifier expected': a PERFORM VARYING loop uses an undefined variable. Add the loop counter as 01 var PIC 9(4).
+- 'is not a numeric value': a VALUE clause uses a non-numeric literal for a numeric PIC. Use VALUE 0 (not VALUE SPACES) for PIC 9 fields.
 
 CRITICAL RULES:
 - NEVER comment out lines that other code references — this creates cascading "not defined" errors.
+- ALL lines must fit within cols 8-72. Count carefully! Col 1 is position 1. If content would go past col 72, split the line.
 - When adding stub definitions, use the correct PIC clause based on how the variable is used:
   * Compared to SPACES or moved from string → PIC X(n)
   * Tested with NUMERIC or used in COMPUTE → PIC 9(n) or PIC S9(n)V99 COMP-3
   * Used as status code (STATUS, CD, IND) → PIC XX or PIC 99
   * Used as date (DT, DATE) → PIC X(10)
   * Used as amount (AMT, RATE, BAL) → PIC S9(13)V99 COMP-3
-- When splitting long lines: put the continuation on the next line starting at col 12 (Area B).
+  * Used as counter/index → PIC 9(4) or PIC S9(4) COMP
+- When splitting long lines: put the continuation on the next line starting at col 12 (Area B). Do NOT use continuation character (-) unless splitting a string literal.
 """
 
 _COBC_SYNTAX_TIMEOUT = 90
