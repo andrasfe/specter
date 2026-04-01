@@ -614,7 +614,7 @@ def _generate_record_stubs(
     # Group fields by parent record (via OF qualifier)
     # Pattern: FIELD-NAME OF RECORD-NAME
     of_re = re.compile(
-        r"\b([A-Z0-9_-]+)\s+OF\s+([A-Z0-9_-]+)\b",
+        r"\b([A-Z0-9_-]+)\s+(?:OF|IN)\s+([A-Z0-9_-]+)\b",
         re.IGNORECASE,
     )
     parent_fields: dict[str, set[str]] = {}  # parent → {fields}
