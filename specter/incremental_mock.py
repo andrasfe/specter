@@ -507,6 +507,17 @@ def _find_working_storage_range(src_lines: list[str]) -> tuple[int, int] | None:
     return None
 
 
+def _count_current_errors(
+    source_path: Path,
+    copybook_dirs: list[Path] | None = None,
+) -> int:
+    """Quick error count for gating decisions between phases."""
+    rc, stderr = _cobc_syntax_check(source_path, copybook_dirs)
+    if rc == 0:
+        return 0
+    return len(_parse_errors(stderr, source_path.name))
+
+
 def _compile_and_fix(
     source_path: Path,
     phase: str,
@@ -1214,15 +1225,41 @@ def incremental_instrument(
         mock_path.write_text("".join(lines))
         log.info("  %s", desc)
 
+        # Scale attempts to error count — 10 attempts is too few for 100+ errors
+        pre_errors = _count_current_errors(mock_path, copybook_dirs)
+        fix_attempts = max(10, pre_errors // 3) if pre_errors else 10
+
         new_res = _compile_and_fix(
             mock_path, "copy_resolution", 0, resolutions,
             copybook_dirs=copybook_dirs,
             llm_provider=llm_provider, llm_model=llm_model,
             baseline_errors=baseline_errors,
             audit_path=audit_path,
+            max_fix_attempts=fix_attempts,
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
+
+        # Phase gate: don't proceed if too many errors remain
+        remaining = _count_current_errors(mock_path, copybook_dirs)
+        if remaining > 0:
+            log.warning("Phase 1 ended with %d errors — running extra fix pass "
+                        "before proceeding", remaining)
+            new_res = _compile_and_fix(
+                mock_path, "copy_resolution_extra", 0, resolutions,
+                copybook_dirs=copybook_dirs,
+                llm_provider=llm_provider, llm_model=llm_model,
+                baseline_errors=baseline_errors,
+                audit_path=audit_path,
+                max_fix_attempts=max(20, remaining // 2),
+            )
+            resolutions.extend(new_res)
+            _save_resolutions(resolutions, resolution_log_path)
+            remaining = _count_current_errors(mock_path, copybook_dirs)
+            if remaining > 0:
+                log.warning("Phase 1: %d errors remain after extra pass — "
+                            "proceeding cautiously", remaining)
+
         _save_checkpoint(output_dir, "copy_resolution", 1, mock_path)
     else:
         log.info("Phase 1: COPY resolution (skipped — resuming)")
@@ -1231,6 +1268,22 @@ def incremental_instrument(
     # Phase 2: Mock infrastructure
     # -----------------------------------------------------------------------
     if start_phase <= 2:
+        # Gate: check if prior phases left too many errors
+        pre_errors = _count_current_errors(mock_path, copybook_dirs)
+        if pre_errors > 50 and llm_provider:
+            log.warning("Phase 2: %d errors from prior phases — fixing before "
+                        "adding mock infrastructure", pre_errors)
+            new_res = _compile_and_fix(
+                mock_path, "pre_phase2_fix", 0, resolutions,
+                copybook_dirs=copybook_dirs,
+                llm_provider=llm_provider, llm_model=llm_model,
+                baseline_errors=baseline_errors,
+                audit_path=audit_path,
+                max_fix_attempts=max(20, pre_errors // 2),
+            )
+            resolutions.extend(new_res)
+            _save_resolutions(resolutions, resolution_log_path)
+
         log.info("Phase 2: Mock infrastructure")
         lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
         lines, desc = _phase_mock_infrastructure(lines, config)
