@@ -577,6 +577,10 @@ def _compile_and_fix(
     failed_error_lines: set[int] = set()
     # Fingerprints of fixes already tried — reject exact duplicates
     tried_fix_fingerprints: set[str] = set()
+    # Revert counter per error line — survives resets. After 3 reverts
+    # for the same line, it's permanently skipped.
+    revert_count: dict[int, int] = {}
+    _MAX_REVERTS_PER_LINE = 3
 
     # Memory of failed attempts: (line, error_msg, fix_summary, reason)
     failed_attempts: list[tuple[int, str, str, str]] = []
@@ -615,11 +619,32 @@ def _compile_and_fix(
 
         n_errors = len(new_errors)
 
+        # Permanently skip lines that have been reverted too many times
+        permanently_failed = {
+            ln for ln, cnt in revert_count.items()
+            if cnt >= _MAX_REVERTS_PER_LINE
+        }
+
         # Skip errors we already tried — but if ALL are attempted,
         # reset and try again (the LLM now has more failed-attempt
         # memory to guide it toward different approaches)
-        actionable = [(ln, msg) for ln, msg in new_errors if ln not in failed_error_lines]
+        actionable = [
+            (ln, msg) for ln, msg in new_errors
+            if ln not in failed_error_lines and ln not in permanently_failed
+        ]
         if not actionable:
+            # Check if ALL remaining errors are permanently failed
+            still_possible = [
+                (ln, msg) for ln, msg in new_errors
+                if ln not in permanently_failed
+            ]
+            if not still_possible:
+                log.info("  Phase %s batch %d: %d errors remain but all "
+                         "permanently failed (reverted %d+ times each) "
+                         "— stopping",
+                         phase, batch, n_errors, _MAX_REVERTS_PER_LINE)
+                return new_resolutions
+
             # End of a round — check if this round made progress
             if n_errors < best_error_count:
                 best_error_count = n_errors
@@ -642,7 +667,7 @@ def _compile_and_fix(
                      phase, batch, n_errors,
                      rounds_without_progress, stall_limit)
             failed_error_lines.clear()
-            actionable = new_errors
+            actionable = still_possible
 
         log.info("  Phase %s batch %d attempt %d: %d errors (%d actionable)",
                  phase, batch, attempt, n_errors, len(actionable))
@@ -1045,12 +1070,16 @@ def _compile_and_fix(
             revert_reason,
         ))
 
+        # Track revert count per line — permanent across resets
+        for tl in targeted_lines:
+            revert_count[tl] = revert_count.get(tl, 0) + 1
+
         # Mark error cluster as failed
         if use_batch_mode:
             for ln, _ in batch_errors:
                 failed_error_lines.add(ln)
             log.info("  [%d/%d] ✗ Reverted batch (%d → %d errors)",
-                     attempt + 1, max_fix_attempts, n_errors, new_error_count)
+                     attempt, max_fix_attempts, n_errors, new_error_count)
         else:
             clusters = _cluster_errors(actionable)
             for cluster in clusters:
@@ -1061,7 +1090,7 @@ def _compile_and_fix(
             else:
                 failed_error_lines.update(targeted_lines)
             log.info("  [%d/%d] ✗ Reverted (%d → %d errors)",
-                     attempt + 1, max_fix_attempts, n_errors, new_error_count)
+                     attempt, max_fix_attempts, n_errors, new_error_count)
 
     return new_resolutions
 
