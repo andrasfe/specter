@@ -74,6 +74,7 @@ ERROR PATTERNS AND FIXES:
   * PIC 99 — 2-digit number (status codes)
 - 'PERFORM/VARYING identifier expected': a PERFORM VARYING loop uses an undefined variable. Add the loop counter as 01 var PIC 9(4).
 - 'is not a numeric value': a VALUE clause uses a non-numeric literal for a numeric PIC. Use VALUE 0 (not VALUE SPACES) for PIC 9 fields.
+- 'group item X cannot have PICTURE clause': a group item (has subordinate 05/10 items) cannot also have a PIC clause. Remove the PIC clause from the group item line. This is valid in IBM COBOL but rejected by GnuCOBOL.
 
 CRITICAL RULES:
 - NEVER comment out lines that other code references — this creates cascading "not defined" errors.
@@ -513,6 +514,52 @@ def _group_errors_by_type(
     return groups
 
 
+def _fix_group_item_pic(
+    errors: list[tuple[int, str]],
+    src_lines: list[str],
+) -> tuple[list[str], int]:
+    """Fix 'group item X cannot have PICTURE clause' errors.
+
+    GnuCOBOL rejects PIC clauses on group items (items with children).
+    IBM COBOL is more lenient. Fix: remove the PIC clause from the
+    identified group item.
+    """
+    # Collect group item names from errors
+    group_items: dict[str, int] = {}  # name → error line
+    for ln, msg in errors:
+        m = re.match(r"group item '([A-Z0-9_-]+)' cannot have PICTURE",
+                     msg, re.IGNORECASE)
+        if m:
+            group_items[m.group(1).upper()] = ln
+
+    if not group_items:
+        return src_lines, 0
+
+    fixed = 0
+    result = list(src_lines)
+    for i, line in enumerate(result):
+        if len(line) > 6 and line[6:7] == "*":
+            continue
+        upper = line.upper()
+        for name in group_items:
+            if name in upper and "PIC" in upper:
+                # Remove PIC clause from this line
+                new_line = re.sub(
+                    r"\s+PIC(?:TURE)?\s+\S+",
+                    "",
+                    line.rstrip("\n"),
+                    flags=re.IGNORECASE,
+                )
+                # Ensure it still ends with period if it did before
+                if line.rstrip().endswith(".") and not new_line.rstrip().endswith("."):
+                    new_line = new_line.rstrip() + "."
+                result[i] = new_line + "\n"
+                fixed += 1
+                break
+
+    return result, fixed
+
+
 def _find_working_storage_range(src_lines: list[str]) -> tuple[int, int] | None:
     """Find the WORKING-STORAGE SECTION line range.
 
@@ -864,6 +911,20 @@ def _compile_and_fix(
         source_path.write_text("".join(fixed_lines))
         log.info("  Pre-fix: wrapped %d lines that extended past column 72",
                  n_long)
+
+    # --- Pre-fix: fix "group item cannot have PICTURE clause" errors ---
+    # GnuCOBOL rejects PIC on group items; IBM COBOL allows it.
+    rc_grp, stderr_grp = _cobc_syntax_check(source_path, copybook_dirs)
+    if rc_grp != 0:
+        grp_errors = _parse_errors(stderr_grp, source_name)
+        grp_pic = [(ln, msg) for ln, msg in grp_errors
+                   if "cannot have PICTURE" in msg]
+        if grp_pic:
+            src_grp = source_path.read_text(errors="replace").splitlines(keepends=True)
+            src_grp, n_grp = _fix_group_item_pic(grp_pic, src_grp)
+            if n_grp > 0:
+                source_path.write_text("".join(src_grp))
+                log.info("  Pre-fix: removed PIC from %d group items", n_grp)
 
     # --- Pre-fix: deterministic stub generation for "not defined" errors ---
     # Insert stubs ONE AT A TIME, verifying each. This way we keep stubs
