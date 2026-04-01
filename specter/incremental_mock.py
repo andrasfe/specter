@@ -559,9 +559,12 @@ def _compile_and_fix(
     # Memory of successful fixes for context
     successful_fixes: list[str] = []
 
-    # Stall detection: stop if no progress for this many consecutive attempts
-    _STALL_LIMIT = 8
-    stall_counter = 0
+    # Stall detection: stop only when error count has not decreased for
+    # _STALL_LIMIT consecutive *resets*.  A reset happens when all errors
+    # have been attempted and we clear failed_error_lines to try again.
+    # Individual failed attempts within a round do NOT count toward stall.
+    _STALL_LIMIT = 3          # 3 full rounds with no progress → truly stuck
+    rounds_without_progress = 0
     best_error_count = 999999
     attempt = 0
 
@@ -588,25 +591,28 @@ def _compile_and_fix(
 
         n_errors = len(new_errors)
 
-        # Stall detection: track whether we're making progress
-        if n_errors < best_error_count:
-            best_error_count = n_errors
-            stall_counter = 0
-        else:
-            stall_counter += 1
-            if stall_counter >= _STALL_LIMIT:
-                log.info("  Phase %s batch %d: stalled at %d errors "
-                         "(no progress for %d attempts) — stopping",
-                         phase, batch, n_errors, _STALL_LIMIT)
-                return new_resolutions
-
         # Skip errors we already tried — but if ALL are attempted,
         # reset and try again (the LLM now has more failed-attempt
         # memory to guide it toward different approaches)
         actionable = [(ln, msg) for ln, msg in new_errors if ln not in failed_error_lines]
         if not actionable:
+            # End of a round — check if this round made progress
+            if n_errors < best_error_count:
+                best_error_count = n_errors
+                rounds_without_progress = 0
+            else:
+                rounds_without_progress += 1
+
+            if rounds_without_progress >= _STALL_LIMIT:
+                log.info("  Phase %s batch %d: stalled at %d errors "
+                         "(%d full rounds with no progress) — stopping",
+                         phase, batch, n_errors, _STALL_LIMIT)
+                return new_resolutions
+
             log.info("  Phase %s batch %d: all %d errors attempted — "
-                     "resetting for fresh round", phase, batch, n_errors)
+                     "resetting for fresh round (%d/%d stall rounds)",
+                     phase, batch, n_errors,
+                     rounds_without_progress, _STALL_LIMIT)
             failed_error_lines.clear()
             actionable = new_errors
 
