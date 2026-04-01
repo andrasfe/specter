@@ -17,7 +17,6 @@ import re
 from .cobol_mock import (
     InstrumentResult,
     MockConfig,
-    compile_cobol,
     generate_init_records,
     generate_mock_data_ordered,
     instrument_cobol,
@@ -107,10 +106,15 @@ def _gnucobol_source_fixups(source_text: str) -> str:
         log.info("GnuCOBOL source fixups: %d lines fixed (line-by-line pass)", fixes)
 
     # --- Multi-line pattern fixes ---
+    # Only safe, non-destructive multi-line rules are kept here.
+    # The "period before next level number" and "orphaned VALUE continuation"
+    # rules have been removed — they caused more errors than they fixed on
+    # enterprise COBOL sources.  The agent_compile LLM loop handles those
+    # edge cases instead.
     multi_fixes = 0
 
     # 1. Commented-out REDEFINES target: line ends with REDEFINES,
-    #    next line is a comment with the target name → uncomment it.
+    #    next line is a comment with the target name -> uncomment it.
     #    Pattern:
     #      05  DTE-DATE-E-G-8     REDEFINES
     #      *            DTE-7-INPUT-DATE.
@@ -125,83 +129,7 @@ def _gnucobol_source_fixups(source_text: str) -> str:
                     fixed_lines[i + 1] = nxt[:6] + " " + nxt[7:]
                     multi_fixes += 1
 
-    # 2. Ensure every DATA DIVISION statement ends with a period.
-    #    In COBOL, a new level number (01/05/10/15/20/25/77/88) ALWAYS
-    #    starts a new statement. So the previous active line MUST end
-    #    with a period. Scan through DATA DIVISION and find active lines
-    #    without periods where the next active line is a new level number.
-    _level_re = re.compile(r"^\s*(?:01|05|10|15|20|25|77|88|66)\s+", re.IGNORECASE)
-    in_data = True
-    last_active_idx: int | None = None
-    for i in range(len(fixed_lines)):
-        ln = fixed_lines[i]
-        is_comment = len(ln) > 6 and ln[6] in ("*", "/")
-        content = ln[7:72].strip() if len(ln) > 7 else ln.strip()
-        upper = content.upper() if content else ""
-
-        if "PROCEDURE DIVISION" in upper and not is_comment:
-            in_data = False
-        if not in_data:
-            break
-
-        if is_comment or not content:
-            continue  # skip comments/blanks, keep last_active_idx
-
-        # This is an active line
-        if last_active_idx is not None and _level_re.match(content):
-            # New level number starting — previous active line must end with period
-            prev = fixed_lines[last_active_idx]
-            prev_stripped = prev.rstrip()
-            if prev_stripped and not prev_stripped.endswith("."):
-                prev_content = prev[7:72].strip() if len(prev) > 7 else prev.strip()
-                prev_upper = prev_content.upper().rstrip() if prev_content else ""
-                # Don't add period after keywords expecting continuation
-                if (prev_content
-                        and not prev_upper.endswith("REDEFINES")
-                        and not prev_upper.endswith("VALUE")
-                        and not prev_upper.endswith("VALUES")
-                        and not prev_upper.endswith("ARE")
-                        and not prev_upper.endswith("IS")):
-                    fixed_lines[last_active_idx] = prev_stripped + ".\n"
-                    multi_fixes += 1
-
-        last_active_idx = i
-
-    # 3. Comment out orphaned VALUE continuations after a period.
-    #    Lines with just numbers/THRU ranges that appear after a
-    #    period-terminated line are orphaned — they belong to no VALUE clause.
-    _orphan_re = re.compile(
-        r"^\s*(?:\d{2,}(?:\s+THRU\s+\d+)?[\s]*)+\.?\s*$", re.IGNORECASE,
-    )
-    in_data2 = True
-    prev_had_period = False
-    for i in range(len(fixed_lines)):
-        ln = fixed_lines[i]
-        is_comment = len(ln) > 6 and ln[6] in ("*", "/")
-        content = ln[7:72].strip() if len(ln) > 7 else ln.strip()
-        upper = content.upper() if content else ""
-
-        if "PROCEDURE DIVISION" in upper and not is_comment:
-            in_data2 = False
-        if not in_data2:
-            break
-        if is_comment or not content:
-            continue
-
-        if prev_had_period and _orphan_re.match(content):
-            # This line has numbers/THRU but the previous statement ended —
-            # it's orphaned. Comment it out and keep prev_had_period=True
-            # so subsequent orphaned lines are also caught.
-            fixed_lines[i] = ln[:6] + "*" + ln[7:]
-            multi_fixes += 1
-            # If this orphaned line had a period, next line is also orphaned
-            if content.endswith("."):
-                prev_had_period = True
-            continue
-
-        prev_had_period = content.endswith(".") or ln.rstrip().endswith(".")
-
-    # 4. Duplicate consecutive lines → remove the second copy.
+    # 2. Duplicate consecutive lines -> remove the second copy.
     #    Compare code area only (cols 7-72), ignore trailing whitespace
     #    and sequence numbers in cols 73-80.
     deduped: list[str] = []
@@ -331,9 +259,20 @@ def prepare_context(
             total_branches = 0
             total_paragraphs = 0
             if enable_branch_tracing:
-                from .cobol_mock import _add_branch_tracing, _ensure_sentence_break_before_paragraphs
-                lines = source_text.splitlines(keepends=True)
-                _, branch_meta, total_branches = _add_branch_tracing(lines)
+                # Count @@B: probes already in the source (from LLM or rule-based insertion)
+                import re as _re
+                _para_re = _re.compile(r"^\s{7}([A-Z0-9][A-Z0-9_-]*)\s*\.\s*$", _re.IGNORECASE)
+                current_para = ""
+                for line in source_text.splitlines():
+                    m_para = _para_re.match(line)
+                    if m_para:
+                        current_para = m_para.group(1).upper()
+                    m_probe = _re.search(r"@@B:(\d+):(T|F|W\d+)", line)
+                    if m_probe and not (len(line) > 6 and line[6] in ("*", "/")):
+                        bid = m_probe.group(1)
+                        total_branches += 1
+                        if bid not in branch_meta:
+                            branch_meta[bid] = {"paragraph": current_para}
             # Count paragraph traces
             total_paragraphs = source_text.count("SPECTER-TRACE:")
             return CobolExecutionContext(
@@ -411,63 +350,65 @@ def prepare_context(
     instrumented_path.write_text(source_text)
     log.info("  Written %s (%d lines)", instrumented_path, len(source_text.splitlines()))
 
-    # Compile — first attempt without hardening (preserves IF/EVALUATE for branch probes)
-    # Use a 15-minute timeout for the strict attempt — if the LLM can't resolve
-    # missing copybook variables in that time, fall back to hardening.
+    # Compile using agent_compile (LLM-driven error fixing loop).
     executable_path = work_dir / cobol_source.stem
-    success, message = compile_cobol(
-        instrumented_path, executable_path, copybook_paths,
-        llm_provider=llm_provider, llm_model=llm_model,
+
+    from .agent_compile import agent_compile
+    success, message = agent_compile(
+        instrumented_path,
+        output_path=executable_path,
+        copybook_dirs=copybook_paths,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
         wall_clock_timeout=900.0,  # 15 min for strict attempt
     )
 
-    # If compilation failed and hardening is allowed, retry with hardening.
-    if not success and "unknown (signal)" in (message or "").lower():
-        # cobc internal abort: attempt targeted local mitigation while preserving
-        # strict mode semantics (no full hardening fallback).
-        from .cobol_mock import _mitigate_cobc_internal_abort
-
-        mitigated_lines = _mitigate_cobc_internal_abort(
-            source_text.splitlines(keepends=True),
-            message,
-            allow_hardening_fallback=False,
-        )
-        mitigated_source = "".join(mitigated_lines)
-        if mitigated_source != source_text:
-            source_text = mitigated_source
-            instrumented_path.write_text(source_text)
-            success, message = compile_cobol(
-                instrumented_path, executable_path, copybook_paths,
-                llm_provider=llm_provider, llm_model=llm_model,
-            )
-            if not success:
-                missing = {
-                    sym.strip().upper()
-                    for sym in re.findall(r"'([^']+)'\s+is\s+not\s+defined", message or "", re.IGNORECASE)
-                    if re.match(r"^[A-Z0-9-]+$", sym.strip().upper())
-                }
-                if missing:
-                    from .cobol_mock import _inject_fallback_paragraphs
-
-                    # Filter out symbols already defined as paragraphs
-                    existing = set()
-                    for ln in source_text.splitlines():
-                        stripped = ln[7:72].strip() if len(ln) > 7 else ln.strip()
-                        m = re.match(r"^([A-Z0-9][A-Z0-9-]*)\s*\.", stripped, re.IGNORECASE)
-                        if m:
-                            existing.add(m.group(1).upper())
-                    missing = missing - existing
-
-                    lines = source_text.splitlines(keepends=True)
-                    lines = _inject_fallback_paragraphs(lines, sorted(missing))
-                    source_text = "".join(lines)
-                    instrumented_path.write_text(source_text)
-                    success, message = compile_cobol(
-                        instrumented_path, executable_path, copybook_paths,
-                        llm_provider=llm_provider, llm_model=llm_model,
-                    )
     if not success:
         raise RuntimeError(f"COBOL compilation failed: {message}")
+
+    log.info("Compiled COBOL: %s (%d paragraphs traced)",
+             executable_path, result.paragraphs_traced)
+
+    # Post-compilation: LLM-guided branch probe insertion.
+    # Only attempt if an LLM provider is available — branch probes are
+    # a nice-to-have for deeper coverage, not required for basic execution.
+    if llm_provider:
+        try:
+            from .branch_instrumenter import instrument_branches
+            probes, paras_instrumented, b_meta = instrument_branches(
+                instrumented_path, llm_provider, llm_model,
+            )
+            if probes > 0:
+                branch_meta = b_meta
+                total_branches = probes
+                log.info("Branch probes inserted: %d probes in %d paragraphs",
+                         probes, paras_instrumented)
+
+                # Re-compile with the branch probes included.
+                success2, message2 = agent_compile(
+                    instrumented_path,
+                    output_path=executable_path,
+                    copybook_dirs=copybook_paths,
+                    llm_provider=llm_provider,
+                    llm_model=llm_model,
+                    wall_clock_timeout=300.0,  # 5 min for re-compile
+                )
+                if not success2:
+                    log.warning("Re-compile with branch probes failed: %s. "
+                                "Reverting to version without probes.", message2)
+                    # Revert to the probe-free source
+                    instrumented_path.write_text(source_text)
+                    branch_meta = {}
+                    total_branches = 0
+                    # Re-compile the clean version
+                    agent_compile(
+                        instrumented_path,
+                        output_path=executable_path,
+                        copybook_dirs=copybook_paths,
+                        wall_clock_timeout=300.0,
+                    )
+        except Exception as e:
+            log.warning("Branch instrumentation failed: %s", e)
 
     log.info("Compiled COBOL: %s (%d paragraphs traced, %d branch probes)",
              executable_path, result.paragraphs_traced, total_branches)
