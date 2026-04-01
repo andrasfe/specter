@@ -526,23 +526,24 @@ def _compile_and_fix(
     copybook_dirs: list[Path] | None = None,
     llm_provider=None,
     llm_model: str | None = None,
-    max_fix_attempts: int = 10,
+    max_fix_attempts: int = 200,
     baseline_errors: set[str] | None = None,
     audit_path: Path | None = None,
 ) -> list[Resolution]:
-    """Compile, fix errors using LLM — smart batching + memory.
+    """Compile, fix errors sequentially until 0 errors or no progress.
+
+    Runs in a simple loop: compile → pick error → fix → compile → repeat.
+    Stops when: errors reach 0, or no error count decrease in
+    `_STALL_LIMIT` consecutive attempts.
 
     Key capabilities:
-    1. **Batch similar errors**: When 50+ "not defined" errors exist, the
+    1. **Batch similar errors**: When 5+ errors share the same type, the
        LLM sees ALL of them and can add all stubs at once.
     2. **Two-chunk context**: For "not defined" errors, the LLM also sees
        WORKING-STORAGE so it knows where to add definitions.
-    3. **Failed attempt memory**: The LLM sees what was tried and failed
-       with the reason, so it tries fundamentally different approaches.
-    4. **Error clustering**: Adjacent errors are one root cause.
-    5. **Relaxed verification**: Accept if total error count drops, even
-       if the specific targeted line still has an error (line numbers
-       shift when stubs are added).
+    3. **Failed attempt memory**: The LLM sees what was tried and failed.
+    4. **Error clustering**: Adjacent errors treated as one root cause.
+    5. **Relaxed verification**: Accept if total error count drops.
 
     Returns new resolutions added during this cycle.
     """
@@ -558,7 +559,14 @@ def _compile_and_fix(
     # Memory of successful fixes for context
     successful_fixes: list[str] = []
 
-    for attempt in range(max_fix_attempts):
+    # Stall detection: stop if no progress for this many consecutive attempts
+    _STALL_LIMIT = 8
+    stall_counter = 0
+    best_error_count = 999999
+    attempt = 0
+
+    while attempt < max_fix_attempts:
+        attempt += 1
         rc, stderr = _cobc_syntax_check(source_path, copybook_dirs)
         if rc == 0:
             log.info("  Phase %s batch %d: compiles clean", phase, batch)
@@ -578,15 +586,32 @@ def _compile_and_fix(
         else:
             new_errors = errors
 
-        # Skip errors we already tried and failed
+        n_errors = len(new_errors)
+
+        # Stall detection: track whether we're making progress
+        if n_errors < best_error_count:
+            best_error_count = n_errors
+            stall_counter = 0
+        else:
+            stall_counter += 1
+            if stall_counter >= _STALL_LIMIT:
+                log.info("  Phase %s batch %d: stalled at %d errors "
+                         "(no progress for %d attempts) — stopping",
+                         phase, batch, n_errors, _STALL_LIMIT)
+                return new_resolutions
+
+        # Skip errors we already tried — but if ALL are attempted,
+        # reset and try again (the LLM now has more failed-attempt
+        # memory to guide it toward different approaches)
         actionable = [(ln, msg) for ln, msg in new_errors if ln not in failed_error_lines]
         if not actionable:
-            log.info("  Phase %s batch %d: %d errors remaining (all attempted)", phase, batch, len(new_errors))
-            return new_resolutions
+            log.info("  Phase %s batch %d: all %d errors attempted — "
+                     "resetting for fresh round", phase, batch, n_errors)
+            failed_error_lines.clear()
+            actionable = new_errors
 
-        n_errors = len(new_errors)
         log.info("  Phase %s batch %d attempt %d: %d errors (%d actionable)",
-                 phase, batch, attempt + 1, n_errors, len(actionable))
+                 phase, batch, attempt, n_errors, len(actionable))
 
         if not llm_provider:
             for ln, msg in actionable[:5]:
@@ -1225,49 +1250,15 @@ def incremental_instrument(
         mock_path.write_text("".join(lines))
         log.info("  %s", desc)
 
-        # Scale attempts to error count — 10 attempts is too few for 100+ errors
-        pre_errors = _count_current_errors(mock_path, copybook_dirs)
-        fix_attempts = max(10, pre_errors // 3) if pre_errors else 10
-
         new_res = _compile_and_fix(
             mock_path, "copy_resolution", 0, resolutions,
             copybook_dirs=copybook_dirs,
             llm_provider=llm_provider, llm_model=llm_model,
             baseline_errors=baseline_errors,
             audit_path=audit_path,
-            max_fix_attempts=fix_attempts,
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
-
-        # Phase gate: keep running fix passes until errors reach 0 or plateau
-        remaining = _count_current_errors(mock_path, copybook_dirs)
-        extra_round = 0
-        while remaining > 0 and llm_provider:
-            extra_round += 1
-            log.warning("Phase 1: %d errors remain — extra fix round %d",
-                        remaining, extra_round)
-            new_res = _compile_and_fix(
-                mock_path, f"copy_resolution_r{extra_round}", 0, resolutions,
-                copybook_dirs=copybook_dirs,
-                llm_provider=llm_provider, llm_model=llm_model,
-                baseline_errors=baseline_errors,
-                audit_path=audit_path,
-                max_fix_attempts=max(20, remaining * 2),
-            )
-            resolutions.extend(new_res)
-            _save_resolutions(resolutions, resolution_log_path)
-            new_remaining = _count_current_errors(mock_path, copybook_dirs)
-            if new_remaining >= remaining:
-                log.warning("Phase 1: no progress (%d→%d) — moving on",
-                            remaining, new_remaining)
-                break
-            remaining = new_remaining
-            if extra_round >= 5:
-                log.warning("Phase 1: %d errors after 5 extra rounds — moving on",
-                            remaining)
-                break
-
         _save_checkpoint(output_dir, "copy_resolution", 1, mock_path)
     else:
         log.info("Phase 1: COPY resolution (skipped — resuming)")
@@ -1276,34 +1267,6 @@ def incremental_instrument(
     # Phase 2: Mock infrastructure
     # -----------------------------------------------------------------------
     if start_phase <= 2:
-        # Gate: fix remaining errors from prior phases before adding more
-        pre_errors = _count_current_errors(mock_path, copybook_dirs)
-        gate_round = 0
-        while pre_errors > 0 and llm_provider:
-            gate_round += 1
-            log.warning("Pre-Phase 2 gate: %d errors — fix round %d",
-                        pre_errors, gate_round)
-            new_res = _compile_and_fix(
-                mock_path, f"pre_phase2_r{gate_round}", 0, resolutions,
-                copybook_dirs=copybook_dirs,
-                llm_provider=llm_provider, llm_model=llm_model,
-                baseline_errors=baseline_errors,
-                audit_path=audit_path,
-                max_fix_attempts=max(20, pre_errors * 2),
-            )
-            resolutions.extend(new_res)
-            _save_resolutions(resolutions, resolution_log_path)
-            new_pre = _count_current_errors(mock_path, copybook_dirs)
-            if new_pre >= pre_errors:
-                log.warning("Pre-Phase 2: no progress (%d→%d) — proceeding",
-                            pre_errors, new_pre)
-                break
-            pre_errors = new_pre
-            if gate_round >= 5:
-                log.warning("Pre-Phase 2: %d errors after 5 rounds — proceeding",
-                            pre_errors)
-                break
-
         log.info("Phase 2: Mock infrastructure")
         lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
         lines, desc = _phase_mock_infrastructure(lines, config)
