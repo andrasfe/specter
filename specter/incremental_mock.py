@@ -204,6 +204,48 @@ def _save_resolutions(resolutions: list[Resolution], path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Phase checkpoint for resume
+# ---------------------------------------------------------------------------
+
+def _load_checkpoint(output_dir: Path) -> dict:
+    """Load phase checkpoint. Returns {} if none exists."""
+    path = output_dir / "phase_checkpoint.json"
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text())
+        mock_path = output_dir / data.get("mock_cbl_name", "")
+        if mock_path.exists():
+            import hashlib
+            actual_hash = hashlib.sha256(mock_path.read_bytes()).hexdigest()
+            if actual_hash != data.get("mock_cbl_hash", ""):
+                log.warning("Checkpoint hash mismatch — starting fresh")
+                return {}
+        log.info("Resuming from phase %d (%s)",
+                 data.get("last_completed_phase_number", -1),
+                 data.get("last_completed_phase", "unknown"))
+        return data
+    except (json.JSONDecodeError, TypeError, KeyError) as exc:
+        log.warning("Failed to load checkpoint: %s", exc)
+        return {}
+
+
+def _save_checkpoint(output_dir: Path, phase_name: str, phase_number: int,
+                     mock_path: Path) -> None:
+    """Save phase checkpoint after successful completion."""
+    import hashlib
+    path = output_dir / "phase_checkpoint.json"
+    data = {
+        "last_completed_phase": phase_name,
+        "last_completed_phase_number": phase_number,
+        "mock_cbl_name": mock_path.name,
+        "mock_cbl_hash": hashlib.sha256(mock_path.read_bytes()).hexdigest(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    path.write_text(json.dumps(data, indent=2))
+
+
+# ---------------------------------------------------------------------------
 # LLM-driven error fixing
 # ---------------------------------------------------------------------------
 
@@ -693,13 +735,20 @@ def incremental_instrument(
         eib_aid=eib_aid,
     )
 
-    # Load prior resolutions
+    # Load prior resolutions and checkpoint for resume
     resolutions = _load_resolutions(resolution_log_path)
     phase_results: list[PhaseResult] = []
+    checkpoint = _load_checkpoint(output_dir)
+    start_phase = checkpoint.get("last_completed_phase_number", -1) + 1
 
-    # Working copy of the source
+    # Working copy of the source — only copy if starting fresh
     mock_path = output_dir / (source_path.stem + ".mock.cbl")
-    shutil.copy2(source_path, mock_path)
+    if start_phase <= 0:
+        shutil.copy2(source_path, mock_path)
+    elif not mock_path.exists():
+        log.warning("Checkpoint exists but mock.cbl missing — starting fresh")
+        start_phase = 0
+        shutil.copy2(source_path, mock_path)
 
     total_paragraphs = 0
     branch_meta: dict = {}
@@ -708,192 +757,237 @@ def incremental_instrument(
     # -----------------------------------------------------------------------
     # Phase 0: Baseline -- compile original and record pre-existing errors
     # -----------------------------------------------------------------------
-    log.info("Phase 0: Baseline compilation check")
-    rc, stderr = _cobc_syntax_check(mock_path, copybook_dirs)
     baseline_errors: set[str] = set()
-    if rc != 0:
-        errors = _parse_errors(stderr, mock_path.name)
-        baseline_errors = {msg for _, msg in errors}
-        log.info("  Baseline: %d pre-existing errors", len(errors))
+    if start_phase <= 0:
+        log.info("Phase 0: Baseline compilation check")
+        rc, stderr = _cobc_syntax_check(mock_path, copybook_dirs)
+        if rc != 0:
+            errors = _parse_errors(stderr, mock_path.name)
+            baseline_errors = {msg for _, msg in errors}
+            log.info("  Baseline: %d pre-existing errors", len(errors))
+        else:
+            log.info("  Baseline: compiles clean")
+        phase_results.append(PhaseResult(
+            phase="baseline", errors_before=len(baseline_errors),
+            errors_after=len(baseline_errors),
+        ))
+        _save_checkpoint(output_dir, "baseline", 0, mock_path)
     else:
-        log.info("  Baseline: compiles clean")
-    phase_results.append(PhaseResult(
-        phase="baseline", errors_before=len(baseline_errors),
-        errors_after=len(baseline_errors),
-    ))
+        log.info("Phase 0: Baseline (skipped — resuming)")
 
     # -----------------------------------------------------------------------
     # Phase 1: COPY resolution
     # -----------------------------------------------------------------------
-    log.info("Phase 1: COPY resolution")
-    lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-    lines, desc = _phase_copy_resolution(lines, copybook_dirs)
-    mock_path.write_text("".join(lines))
-    log.info("  %s", desc)
+    if start_phase <= 1:
+        log.info("Phase 1: COPY resolution")
+        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+        lines, desc = _phase_copy_resolution(lines, copybook_dirs)
+        mock_path.write_text("".join(lines))
+        log.info("  %s", desc)
 
-    new_res = _compile_and_fix(
-        mock_path, "copy_resolution", 0, resolutions,
-        copybook_dirs=copybook_dirs,
-        llm_provider=llm_provider, llm_model=llm_model,
-        baseline_errors=baseline_errors,
-    )
-    resolutions.extend(new_res)
-    _save_resolutions(resolutions, resolution_log_path)
+        new_res = _compile_and_fix(
+            mock_path, "copy_resolution", 0, resolutions,
+            copybook_dirs=copybook_dirs,
+            llm_provider=llm_provider, llm_model=llm_model,
+            baseline_errors=baseline_errors,
+        )
+        resolutions.extend(new_res)
+        _save_resolutions(resolutions, resolution_log_path)
+        _save_checkpoint(output_dir, "copy_resolution", 1, mock_path)
+    else:
+        log.info("Phase 1: COPY resolution (skipped — resuming)")
 
     # -----------------------------------------------------------------------
     # Phase 2: Mock infrastructure
     # -----------------------------------------------------------------------
-    log.info("Phase 2: Mock infrastructure")
-    lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-    lines, desc = _phase_mock_infrastructure(lines, config)
-    mock_path.write_text("".join(lines))
-    log.info("  %s", desc)
+    if start_phase <= 2:
+        log.info("Phase 2: Mock infrastructure")
+        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+        lines, desc = _phase_mock_infrastructure(lines, config)
+        mock_path.write_text("".join(lines))
+        log.info("  %s", desc)
 
-    new_res = _compile_and_fix(
-        mock_path, "mock_infrastructure", 0, resolutions,
-        copybook_dirs=copybook_dirs,
-        llm_provider=llm_provider, llm_model=llm_model,
-        baseline_errors=baseline_errors,
-    )
-    resolutions.extend(new_res)
-    _save_resolutions(resolutions, resolution_log_path)
+        new_res = _compile_and_fix(
+            mock_path, "mock_infrastructure", 0, resolutions,
+            copybook_dirs=copybook_dirs,
+            llm_provider=llm_provider, llm_model=llm_model,
+            baseline_errors=baseline_errors,
+        )
+        resolutions.extend(new_res)
+        _save_resolutions(resolutions, resolution_log_path)
+        _save_checkpoint(output_dir, "mock_infrastructure", 2, mock_path)
+    else:
+        log.info("Phase 2: Mock infrastructure (skipped — resuming)")
 
     # -----------------------------------------------------------------------
     # Phase 3: EXEC replacement
     # -----------------------------------------------------------------------
-    log.info("Phase 3: EXEC replacement")
-    lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-    lines, desc = _phase_exec_replacement(lines, config)
-    mock_path.write_text("".join(lines))
-    log.info("  %s", desc)
+    if start_phase <= 3:
+        log.info("Phase 3: EXEC replacement")
+        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+        lines, desc = _phase_exec_replacement(lines, config)
+        mock_path.write_text("".join(lines))
+        log.info("  %s", desc)
 
-    new_res = _compile_and_fix(
-        mock_path, "exec_replacement", 0, resolutions,
-        copybook_dirs=copybook_dirs,
-        llm_provider=llm_provider, llm_model=llm_model,
-        baseline_errors=baseline_errors,
-    )
-    resolutions.extend(new_res)
-    _save_resolutions(resolutions, resolution_log_path)
+        new_res = _compile_and_fix(
+            mock_path, "exec_replacement", 0, resolutions,
+            copybook_dirs=copybook_dirs,
+            llm_provider=llm_provider, llm_model=llm_model,
+            baseline_errors=baseline_errors,
+        )
+        resolutions.extend(new_res)
+        _save_resolutions(resolutions, resolution_log_path)
+        _save_checkpoint(output_dir, "exec_replacement", 3, mock_path)
+    else:
+        log.info("Phase 3: EXEC replacement (skipped — resuming)")
 
     # -----------------------------------------------------------------------
     # Phase 4: I/O replacement
     # -----------------------------------------------------------------------
-    log.info("Phase 4: I/O replacement")
-    lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-    lines, desc = _phase_io_replacement(lines)
-    mock_path.write_text("".join(lines))
-    log.info("  %s", desc)
+    if start_phase <= 4:
+        log.info("Phase 4: I/O replacement")
+        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+        lines, desc = _phase_io_replacement(lines)
+        mock_path.write_text("".join(lines))
+        log.info("  %s", desc)
 
-    new_res = _compile_and_fix(
-        mock_path, "io_replacement", 0, resolutions,
-        copybook_dirs=copybook_dirs,
-        llm_provider=llm_provider, llm_model=llm_model,
-        baseline_errors=baseline_errors,
-    )
-    resolutions.extend(new_res)
-    _save_resolutions(resolutions, resolution_log_path)
+        new_res = _compile_and_fix(
+            mock_path, "io_replacement", 0, resolutions,
+            copybook_dirs=copybook_dirs,
+            llm_provider=llm_provider, llm_model=llm_model,
+            baseline_errors=baseline_errors,
+        )
+        resolutions.extend(new_res)
+        _save_resolutions(resolutions, resolution_log_path)
+        _save_checkpoint(output_dir, "io_replacement", 4, mock_path)
+    else:
+        log.info("Phase 4: I/O replacement (skipped — resuming)")
 
     # -----------------------------------------------------------------------
     # Phase 5: CALL replacement
     # -----------------------------------------------------------------------
-    log.info("Phase 5: CALL replacement")
-    lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-    lines, desc = _phase_call_replacement(lines)
-    mock_path.write_text("".join(lines))
-    log.info("  %s", desc)
+    if start_phase <= 5:
+        log.info("Phase 5: CALL replacement")
+        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+        lines, desc = _phase_call_replacement(lines)
+        mock_path.write_text("".join(lines))
+        log.info("  %s", desc)
 
-    new_res = _compile_and_fix(
-        mock_path, "call_replacement", 0, resolutions,
-        copybook_dirs=copybook_dirs,
-        llm_provider=llm_provider, llm_model=llm_model,
-        baseline_errors=baseline_errors,
-    )
-    resolutions.extend(new_res)
-    _save_resolutions(resolutions, resolution_log_path)
+        new_res = _compile_and_fix(
+            mock_path, "call_replacement", 0, resolutions,
+            copybook_dirs=copybook_dirs,
+            llm_provider=llm_provider, llm_model=llm_model,
+            baseline_errors=baseline_errors,
+        )
+        resolutions.extend(new_res)
+        _save_resolutions(resolutions, resolution_log_path)
+        _save_checkpoint(output_dir, "call_replacement", 5, mock_path)
+    else:
+        log.info("Phase 5: CALL replacement (skipped — resuming)")
 
     # -----------------------------------------------------------------------
     # Phase 6: Paragraph tracing
     # -----------------------------------------------------------------------
-    log.info("Phase 6: Paragraph tracing")
-    lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-    lines, desc, total_paragraphs = _phase_paragraph_tracing(lines)
-    mock_path.write_text("".join(lines))
-    log.info("  %s", desc)
+    if start_phase <= 6:
+        log.info("Phase 6: Paragraph tracing")
+        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+        lines, desc, total_paragraphs = _phase_paragraph_tracing(lines)
+        mock_path.write_text("".join(lines))
+        log.info("  %s", desc)
 
-    new_res = _compile_and_fix(
-        mock_path, "paragraph_tracing", 0, resolutions,
-        copybook_dirs=copybook_dirs,
-        llm_provider=llm_provider, llm_model=llm_model,
-        baseline_errors=baseline_errors,
-    )
-    resolutions.extend(new_res)
-    _save_resolutions(resolutions, resolution_log_path)
+        new_res = _compile_and_fix(
+            mock_path, "paragraph_tracing", 0, resolutions,
+            copybook_dirs=copybook_dirs,
+            llm_provider=llm_provider, llm_model=llm_model,
+            baseline_errors=baseline_errors,
+        )
+        resolutions.extend(new_res)
+        _save_resolutions(resolutions, resolution_log_path)
+        _save_checkpoint(output_dir, "paragraph_tracing", 6, mock_path)
+    else:
+        log.info("Phase 6: Paragraph tracing (skipped — resuming)")
 
     # -----------------------------------------------------------------------
     # Phase 7: Normalization
     # -----------------------------------------------------------------------
-    log.info("Phase 7: Normalization")
-    lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-    lines, desc = _phase_normalization(lines, config)
-    mock_path.write_text("".join(lines))
-    log.info("  %s", desc)
+    if start_phase <= 7:
+        log.info("Phase 7: Normalization")
+        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+        lines, desc = _phase_normalization(lines, config)
+        mock_path.write_text("".join(lines))
+        log.info("  %s", desc)
 
-    new_res = _compile_and_fix(
-        mock_path, "normalization", 0, resolutions,
-        copybook_dirs=copybook_dirs,
-        llm_provider=llm_provider, llm_model=llm_model,
-        baseline_errors=baseline_errors,
-    )
-    resolutions.extend(new_res)
-    _save_resolutions(resolutions, resolution_log_path)
+        new_res = _compile_and_fix(
+            mock_path, "normalization", 0, resolutions,
+            copybook_dirs=copybook_dirs,
+            llm_provider=llm_provider, llm_model=llm_model,
+            baseline_errors=baseline_errors,
+        )
+        resolutions.extend(new_res)
+        _save_resolutions(resolutions, resolution_log_path)
+        _save_checkpoint(output_dir, "normalization", 7, mock_path)
+    else:
+        log.info("Phase 7: Normalization (skipped — resuming)")
 
     # -----------------------------------------------------------------------
     # Phase 8: Auto-stub undefined symbols
     # -----------------------------------------------------------------------
-    log.info("Phase 8: Auto-stub undefined symbols")
-    lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-    lines, desc = _phase_auto_stub(lines, allow_hardening_fallback)
-    mock_path.write_text("".join(lines))
-    log.info("  %s", desc)
+    if start_phase <= 8:
+        log.info("Phase 8: Auto-stub undefined symbols")
+        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+        lines, desc = _phase_auto_stub(lines, allow_hardening_fallback)
+        mock_path.write_text("".join(lines))
+        log.info("  %s", desc)
 
-    # Phase 8b: Restore tracing probes that auto-stub may have destroyed
-    lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-    lines, desc_restore = _phase_restore_tracing(lines)
-    mock_path.write_text("".join(lines))
-    log.info("  %s", desc_restore)
+        # Phase 8b: Restore tracing probes that auto-stub may have destroyed
+        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+        lines, desc_restore = _phase_restore_tracing(lines)
+        mock_path.write_text("".join(lines))
+        log.info("  %s", desc_restore)
 
-    # Recount paragraphs after restore
-    total_paragraphs = sum(
-        1 for l in lines
-        if "SPECTER-TRACE:" in l and not l.strip().startswith("*")
-    )
+        # Recount paragraphs after restore
+        total_paragraphs = sum(
+            1 for l in lines
+            if "SPECTER-TRACE:" in l and not l.strip().startswith("*")
+        )
 
-    new_res = _compile_and_fix(
-        mock_path, "auto_stub", 0, resolutions,
-        copybook_dirs=copybook_dirs,
-        llm_provider=llm_provider, llm_model=llm_model,
-        baseline_errors=baseline_errors,
-    )
-    resolutions.extend(new_res)
-    _save_resolutions(resolutions, resolution_log_path)
+        new_res = _compile_and_fix(
+            mock_path, "auto_stub", 0, resolutions,
+            copybook_dirs=copybook_dirs,
+            llm_provider=llm_provider, llm_model=llm_model,
+            baseline_errors=baseline_errors,
+        )
+        resolutions.extend(new_res)
+        _save_resolutions(resolutions, resolution_log_path)
+        _save_checkpoint(output_dir, "auto_stub", 8, mock_path)
+    else:
+        log.info("Phase 8: Auto-stub (skipped — resuming)")
+        # Recount paragraphs from existing mock
+        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+        total_paragraphs = sum(
+            1 for l in lines
+            if "SPECTER-TRACE:" in l and not l.strip().startswith("*")
+        )
 
     # -----------------------------------------------------------------------
     # Apply GnuCOBOL source fixups on the complete instrumented source
     # -----------------------------------------------------------------------
-    log.info("Applying GnuCOBOL source fixups")
-    source_text = mock_path.read_text(errors="replace")
-    source_text = _apply_gnucobol_fixups(source_text)
-    mock_path.write_text(source_text)
+    if start_phase <= 9:
+        log.info("Applying GnuCOBOL source fixups")
+        source_text = mock_path.read_text(errors="replace")
+        source_text = _apply_gnucobol_fixups(source_text)
+        mock_path.write_text(source_text)
 
-    # Final fix cycle after GnuCOBOL fixups
-    new_res = _compile_and_fix(
-        mock_path, "gnucobol_fixups", 0, resolutions,
-        copybook_dirs=copybook_dirs,
-        llm_provider=llm_provider, llm_model=llm_model,
-    )
-    resolutions.extend(new_res)
-    _save_resolutions(resolutions, resolution_log_path)
+        new_res = _compile_and_fix(
+            mock_path, "gnucobol_fixups", 0, resolutions,
+            copybook_dirs=copybook_dirs,
+            llm_provider=llm_provider, llm_model=llm_model,
+        )
+        resolutions.extend(new_res)
+        _save_resolutions(resolutions, resolution_log_path)
+        _save_checkpoint(output_dir, "gnucobol_fixups", 9, mock_path)
+    else:
+        log.info("GnuCOBOL fixups (skipped — resuming)")
 
     # -----------------------------------------------------------------------
     # Final compilation to executable
