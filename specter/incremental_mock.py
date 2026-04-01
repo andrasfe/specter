@@ -362,6 +362,28 @@ def _apply_preventive_fixes(
 _MAX_CONTEXT_LINES = 500  # configurable max lines sent to LLM per error
 
 
+def _cluster_errors(
+    errors: list[tuple[int, str]],
+    gap: int = 10,
+) -> list[list[tuple[int, str]]]:
+    """Group errors within `gap` lines of each other into clusters.
+
+    When 20 errors are all in lines 14620-14630, they're one root cause.
+    Treating them as one cluster prevents the LLM from trying each line
+    separately with the same doomed fix.
+    """
+    if not errors:
+        return []
+    sorted_errs = sorted(errors, key=lambda e: e[0])
+    clusters: list[list[tuple[int, str]]] = [[sorted_errs[0]]]
+    for err in sorted_errs[1:]:
+        if err[0] - clusters[-1][-1][0] <= gap:
+            clusters[-1].append(err)
+        else:
+            clusters.append([err])
+    return clusters
+
+
 def _compile_and_fix(
     source_path: Path,
     phase: str,
@@ -373,16 +395,16 @@ def _compile_and_fix(
     max_fix_attempts: int = 10,
     baseline_errors: set[str] | None = None,
 ) -> list[Resolution]:
-    """Compile, fix errors ONE AT A TIME using LLM with agent-chosen context.
+    """Compile, fix errors using LLM with agent-chosen context.
 
-    Flow per attempt:
-    1. Compile and get ALL errors
-    2. Present top 15 errors to LLM, let it choose which to fix
-    3. LLM requests a code chunk (max 500 lines) around the chosen error
-    4. LLM returns fix as JSON
-    5. Apply fix, recompile, verify the specific error is gone
-    6. If error gone → record as verified resolution
-    7. If error persists or new errors → revert
+    Key improvements over naive one-at-a-time:
+    1. **Failed attempt memory**: The LLM sees what was already tried and
+       failed (line, error, attempted fix summary, why it was reverted).
+    2. **Error clustering**: Adjacent errors (within 10 lines) are grouped
+       as one root cause. Failing to fix any line in a cluster marks the
+       entire cluster as attempted.
+    3. **Conversation history**: The choose/fix prompts include failed
+       attempts so the LLM knows what NOT to repeat.
 
     Returns new resolutions added during this cycle.
     """
@@ -392,6 +414,9 @@ def _compile_and_fix(
     new_resolutions: list[Resolution] = []
     source_name = source_path.name
     failed_error_lines: set[int] = set()  # errors we already tried and failed
+
+    # Memory of failed attempts: (line, error_msg, fix_summary, reason)
+    failed_attempts: list[tuple[int, str, str, str]] = []
 
     for attempt in range(max_fix_attempts):
         rc, stderr = _cobc_syntax_check(source_path, copybook_dirs)
@@ -452,6 +477,25 @@ def _compile_and_fix(
             res_text = ("Prior verified resolutions (apply proactively):\n"
                         + "\n".join(f"- {s}" for s in res_summaries) + "\n\n")
 
+        # Build failed-attempt memory for the LLM
+        failed_text = ""
+        if failed_attempts:
+            recent_failed = failed_attempts[-10:]  # Last 10 to avoid prompt bloat
+            failed_lines = []
+            for fl, fe, fs, fr in recent_failed:
+                failed_lines.append(
+                    f"  - Line {fl}: {fe[:80]}\n"
+                    f"    Tried: {fs[:120]}\n"
+                    f"    Result: {fr}"
+                )
+            failed_text = (
+                "FAILED ATTEMPTS (do NOT repeat these — try a fundamentally different "
+                "approach, such as fixing the ROOT CAUSE which may be EARLIER in the "
+                "file, e.g. a missing period, unclosed SECTION, or malformed copybook "
+                "expansion):\n"
+                + "\n".join(failed_lines) + "\n\n"
+            )
+
         src_lines = source_path.read_text(errors="replace").splitlines(keepends=True)
         total_lines = len(src_lines)
 
@@ -459,12 +503,16 @@ def _compile_and_fix(
             f"You are fixing GnuCOBOL compilation errors in {source_name} "
             f"({total_lines} lines, phase: {phase}).\n\n"
             f"{res_text}"
+            f"{failed_text}"
             f"Current compilation errors ({n_errors} total, showing top 15):\n"
             f"{error_list}\n\n"
             f"Choose ONE error to fix. Respond with JSON:\n"
             f'{{"choose_error": {{"line": <line_number>, "context_start": <start>, "context_end": <end>}}}}\n\n'
             f"Where context_start/context_end define the code range you need to see "
-            f"(max {_MAX_CONTEXT_LINES} lines). Pick the error you're most confident you can fix."
+            f"(max {_MAX_CONTEXT_LINES} lines). Pick the error you're most confident "
+            f"you can fix. If many errors cluster around the same area, the ROOT CAUSE "
+            f"is likely BEFORE the first error — request context starting well before "
+            f"the error cluster."
         )
 
         try:
@@ -509,10 +557,28 @@ def _compile_and_fix(
             for i, line in enumerate(src_lines[ctx_start:ctx_end])
         )
 
+        # Include relevant failed attempts for this error's neighborhood
+        nearby_failed = [
+            (fl, fe, fs, fr) for fl, fe, fs, fr in failed_attempts
+            if abs(fl - chosen_line) < 50
+        ]
+        nearby_text = ""
+        if nearby_failed:
+            nf_lines = []
+            for fl, fe, fs, fr in nearby_failed[-5:]:
+                nf_lines.append(f"  - Line {fl}: tried {fs[:100]} → {fr}")
+            nearby_text = (
+                "\nPrevious failed fixes near this area (DO NOT repeat):\n"
+                + "\n".join(nf_lines) + "\n"
+                "Consider: the root cause may be EARLIER in the file "
+                "(missing period, unclosed statement, malformed copybook).\n\n"
+            )
+
         fix_prompt = (
             f"Fix this GnuCOBOL compilation error:\n"
             f"  Line {chosen_line}: {chosen_msg}\n\n"
             f"{res_text}"
+            f"{nearby_text}"
             f"Source context (lines {ctx_start+1}-{ctx_end}):\n"
             f"```cobol\n{numbered_context}\n```\n\n"
             f"Common fixes:\n"
@@ -520,6 +586,9 @@ def _compile_and_fix(
             f"- 'duplicate definition': comment the duplicate\n"
             f"- 'PICTURE clause required': add appropriate PIC clause\n"
             f"- 'unexpected ELSE/END-IF': fix IF nesting\n"
+            f"- 'unexpected Identifier, expecting SECTION or .': a previous "
+            f"line is missing a terminal period, or a copybook was inlined "
+            f"without proper section boundaries — look BEFORE the error\n"
             f"- Don't comment out data definitions other code references\n\n"
             f"Return ONLY fixed lines as flat JSON: {{\"<line_number>\": \"<fixed_content>\"}}\n"
             f"Do NOT wrap in outer keys. Only include lines that changed."
@@ -537,8 +606,15 @@ def _compile_and_fix(
         if not fixes:
             snippet = response2[:200].replace("\n", "\\n") if response2 else "(empty)"
             log.info("  LLM response not parsed: %s", snippet)
+            failed_attempts.append((
+                chosen_line, chosen_msg,
+                "LLM returned unparseable response",
+                "response not parsed as JSON",
+            ))
             failed_error_lines.add(chosen_line)
             continue
+
+        fix_summary = f"changed lines {sorted(fixes.keys())}"
 
         # --- Step 3: Apply, recompile, verify the specific error is gone ---
         snapshot = list(src_lines)
@@ -592,11 +668,43 @@ def _compile_and_fix(
 
         # Error still there or things got worse — revert
         source_path.write_text("".join(snapshot))
-        failed_error_lines.add(chosen_line)
-        log.info("  [%d/%d] ✗ Reverted (error %s, %d → %d errors)",
-                 attempt + 1, max_fix_attempts,
-                 "persists" if not error_gone else "gone but worse",
-                 n_errors, new_error_count)
+
+        revert_reason = (
+            f"error persists, {n_errors}→{new_error_count}"
+            if not error_gone else
+            f"error gone but worse ({n_errors}→{new_error_count})"
+        )
+
+        # Record failed attempt for LLM memory
+        failed_attempts.append((
+            chosen_line, chosen_msg, fix_summary, revert_reason,
+        ))
+
+        # Mark entire error cluster as failed — not just this one line
+        # This prevents trying adjacent lines with the same root cause
+        clusters = _cluster_errors(actionable)
+        for cluster in clusters:
+            cluster_lines = {ln for ln, _ in cluster}
+            if chosen_line in cluster_lines:
+                failed_error_lines.update(cluster_lines)
+                if len(cluster_lines) > 1:
+                    log.info("  [%d/%d] ✗ Reverted + marked cluster of %d lines "
+                             "(%s, %d → %d errors)",
+                             attempt + 1, max_fix_attempts, len(cluster_lines),
+                             "persists" if not error_gone else "gone but worse",
+                             n_errors, new_error_count)
+                else:
+                    log.info("  [%d/%d] ✗ Reverted (error %s, %d → %d errors)",
+                             attempt + 1, max_fix_attempts,
+                             "persists" if not error_gone else "gone but worse",
+                             n_errors, new_error_count)
+                break
+        else:
+            failed_error_lines.add(chosen_line)
+            log.info("  [%d/%d] ✗ Reverted (error %s, %d → %d errors)",
+                     attempt + 1, max_fix_attempts,
+                     "persists" if not error_gone else "gone but worse",
+                     n_errors, new_error_count)
 
     return new_resolutions
 

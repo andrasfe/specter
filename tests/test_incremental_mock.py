@@ -15,6 +15,7 @@ from specter.incremental_mock import (
     Resolution,
     _apply_preventive_fixes,
     _build_fix_prompt,
+    _cluster_errors,
     _compile_and_fix,
     _load_resolutions,
     _parse_errors,
@@ -109,6 +110,33 @@ class TestParseErrors:
         )
         errors = _parse_errors(stderr, "test.cbl")
         assert len(errors) == 1  # deduplicated by line
+
+    def test_cluster_errors_adjacent(self):
+        """Adjacent errors within gap are grouped into one cluster."""
+        errors = [
+            (100, "error A"),
+            (105, "error B"),
+            (108, "error C"),
+            (200, "error D"),
+        ]
+        clusters = _cluster_errors(errors, gap=10)
+        assert len(clusters) == 2
+        assert len(clusters[0]) == 3  # lines 100, 105, 108
+        assert len(clusters[1]) == 1  # line 200
+
+    def test_cluster_errors_all_separate(self):
+        errors = [(10, "a"), (100, "b"), (200, "c")]
+        clusters = _cluster_errors(errors, gap=10)
+        assert len(clusters) == 3
+
+    def test_cluster_errors_all_together(self):
+        errors = [(10, "a"), (12, "b"), (15, "c"), (18, "d")]
+        clusters = _cluster_errors(errors, gap=10)
+        assert len(clusters) == 1
+        assert len(clusters[0]) == 4
+
+    def test_cluster_errors_empty(self):
+        assert _cluster_errors([]) == []
 
 
 # ---------------------------------------------------------------------------

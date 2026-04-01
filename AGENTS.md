@@ -1,130 +1,453 @@
-# AGENTS.md — GnuCOBOL Coverage-Guided Test Generation Engine
+# AGENTS.md — Specter COBOL Coverage System
 
-## What Was Built
+## Overview
 
-A coverage-guided test generation engine that compiles and executes **real COBOL programs** via GnuCOBOL, using an agentic loop to systematically maximize paragraph and branch coverage. All generated test cases are persisted as JSONL for downstream use (e.g., Java migration validation).
+Specter is a COBOL AST-to-executable-Python code generator with coverage-guided test synthesis. It reads a JSON AST (from the cobalt parser), generates a standalone Python simulator, and runs an agentic loop to maximize paragraph and branch coverage — optionally cross-validated against real GnuCOBOL binaries.
 
-### Architecture
+The system has two main pipelines:
+1. **Python-only**: AST → Python code → coverage-guided fuzzing
+2. **GnuCOBOL hybrid**: COBOL source → incremental mock instrumentation → compile → run with mock data
+
+---
+
+## Architecture
 
 ```
 JSON AST + COBOL source + copybooks
         │
         ▼
-┌─────────────────────────────┐
-│  Variable Domain Model      │  specter/variable_domain.py
-│  PIC clauses + AST + naming │
-│  → type, range, semantics   │
-└─────────┬───────────────────┘
+┌─────────────────────────────────┐
+│  Core Pipeline                  │
+│  ast_parser → code_generator    │  AST → Python simulator
+│  condition_parser               │  COBOL conditions → Python
+│  variable_extractor             │  Variable classification
+└─────────┬───────────────────────┘
           │
-          ▼
-┌─────────────────────────────┐
-│  COBOL Executor             │  specter/cobol_executor.py
-│  instrument → compile once  │
-│  run N times with mock data │
-└─────────┬───────────────────┘
-          │
-          ▼
-┌─────────────────────────────┐
-│  Coverage Engine (6 layers) │  specter/cobol_coverage.py
-│  static analysis → values   │
-│  → execute → feedback loop  │
-└─────────┬───────────────────┘
-          │
-          ▼
-    JSONL test store
-    (input_state + stub_outcomes + coverage)
-```
-
-### Files Created/Modified
-
-| File | Change | Lines |
-|------|--------|-------|
-| `specter/variable_domain.py` | **NEW** — Unified Variable Domain Model | ~290 |
-| `specter/cobol_executor.py` | **NEW** — Compile-once/run-many executor | ~240 |
-| `specter/cobol_coverage.py` | **NEW** — 6-layer agentic coverage engine | ~520 |
-| `specter/cobol_mock.py` | Added Phase 6b: `_add_branch_tracing()` for IF/EVALUATE branch probes | ~170 added |
-| `specter/__main__.py` | Added `--cobol-coverage` CLI flag + wiring | ~40 added |
-| `tests/test_cobol_coverage.py` | **NEW** — 48 tests for domain model, instrumentation, coverage | ~560 |
-
-### How It Works
-
-**Variable Domain Model** (`variable_domain.py`):
-- Merges PIC clauses (from copybooks), AST condition analysis, stub mappings, and naming heuristics
-- Each variable gets: data_type, range (min/max from PIC), precision, semantic_type, 88-level values
-- Semantic inference: `WS-PROC-DATE` → date, `SQLCODE` → status_sql, `WS-EOF-FLAG` → flag_bool
-- 6 value generation strategies: condition_literal, 88_value, boundary, semantic, random_valid, adversarial
-
-**Branch Instrumentation** (`cobol_mock.py` Phase 6b):
-- Inserts `DISPLAY '@@B:<id>:<direction>'` probes into COBOL source
-- Handles IF with/without ELSE, multi-line conditions, EVALUATE/WHEN, nested structures
-- Returns branch metadata (paragraph, condition text, type) for the coverage engine
-
-**Executor** (`cobol_executor.py`):
-- `prepare_context()`: instrument + compile once, register injectable variables
-- `run_test_case()`: Python pre-run (stub_log ordering) → write mock data → execute COBOL → parse output
-- `run_batch()`: parallel execution via ProcessPoolExecutor
-- ~10-50ms per COBOL execution
-
-**Coverage Engine** (`cobol_coverage.py`) — 6 layers:
-1. **All-Success Baseline**: condition_literal + semantic values, all-success stubs
-2. **Path-Constraint Satisfaction**: static analysis of gating conditions per uncovered paragraph
-3. **Branch Solving**: parse condition variables, craft satisfying/negating values
-4. **Stub Fault Injection**: error codes for each stub operation (file status, SQL, CICS, DLI)
-5. **Guided Random Walks**: mutate high-coverage test cases (70% literals, 30% random)
-6. **Monte Carlo Exploration**: broad random search with mixed strategies
-
-### CLI Usage
-
-```bash
-python3 -m specter <ast_file> --cobol-coverage \
-    --cobol-source <path.cbl> \
-    --copybook-dir <dir> \
-    --coverage-budget 5000 \
-    --coverage-timeout 600
+          ├──────────────────────────────────────┐
+          ▼                                      ▼
+┌─────────────────────────┐   ┌──────────────────────────────┐
+│  Python Coverage Engine │   │  GnuCOBOL Mock Pipeline      │
+│  monte_carlo.py         │   │  incremental_mock.py          │
+│  test_synthesis.py      │   │  cobol_mock.py (transforms)   │
+│  coverage_strategies.py │   │  branch_instrumenter.py       │
+│  cobol_coverage.py      │   │  cobol_executor.py            │
+└─────────┬───────────────┘   │  cobol_fix_cache.py           │
+          │                   │  llm_coverage.py (LLM calls)  │
+          ▼                   └──────────┬─────────────────────┘
+   JSONL test store                      │
+   (input_state + stubs + coverage)      ▼
+                               Compiled COBOL executable
+                               + mock data → coverage traces
 ```
 
 ---
 
-## Results
+## Core AST Pipeline
 
-### Performance on CardDemo Programs (11 programs)
+### `specter/models.py` — Data Classes (44 lines)
 
-| Program | Type | Lines | Para Coverage | Branch Coverage | TCs | Time |
-|---------|------|-------|--------------|-----------------|-----|------|
-| **COBIL00C** | CICS billing | 572 | **16/16 (100%)** | **21/21 (100%)** | 8 | 5s |
-| **COTRN00C** | CICS transaction | 699 | **16/16 (100%)** | **57/36 (>100%)** | 7 | 5s |
-| **COUSR00C** | CICS user list | 695 | **16/16 (100%)** | **57/35 (>100%)** | 7 | 5s |
-| **COUSR01C** | CICS user add | 299 | **9/9 (100%)** | **9/9 (100%)** | 6 | 5s |
-| **COUSR02C** | CICS user update | 414 | **11/11 (100%)** | **14/20 (70%)** | 5 | 5s |
-| **COUSR03C** | CICS user delete | 359 | **11/11 (100%)** | **14/15 (93%)** | 5 | 5s |
-| **COTRN01C** | CICS transaction | 330 | **9/9 (100%)** | **11/12 (92%)** | 5 | 5s |
-| **COTRN02C** | CICS transaction | 783 | **18/18 (100%)** | **28/29 (97%)** | 5 | 5s |
-| **COMEN01C** | CICS menu | 308 | **6/7 (86%)** | **16/7 (>100%)** | 5 | 5s |
-| **COPAUA0C** | IMS batch auth | 1,026 | **34/42 (81%)** | **30/23 (>100%)** | 7 | 14s |
-| **COSGN00C** | CICS sign-on | 260 | **4/6 (67%)** | **4/4 (100%)** | 5 | 3s |
+| Class | Fields | Purpose |
+|-------|--------|---------|
+| `Statement` | type, text, line_start, line_end, attributes, children | Recursive tree node for a COBOL statement |
+| `Paragraph` | name, line_start, line_end, statements | Named paragraph containing statements |
+| `Program` | program_id, paragraphs, paragraph_index, entry_statements | Top-level program with paragraph lookup dict |
 
-**8 of 11 programs achieve 100% paragraph coverage.** Average: 94% paragraph coverage, 5-8 TCs each.
+`Statement.walk()` provides pre-order tree traversal.
 
-### Analysis
+### `specter/ast_parser.py` — AST Deserialization (58 lines)
 
-**CICS online programs** — excellent results after coverage-mode fixes:
-- Coverage mode disables CICS RETURN/XCTL termination → programs continue past pseudo-conversational boundaries
-- EIBCALEN=100 and EIBAID=DFHENTER hardcoded in EIB stub → programs skip first-time initialization
-- CICS RECEIVE MAP sets EIBAID from mock data → EVALUATE EIBAID branches become reachable
-- Mock data padding (50 extra records) prevents EOF during extended execution
-- Layer 1 (baseline) covers 36% of paragraphs; Layer 6 (Monte Carlo) finds the rest
-- All branches covered
+- **`parse_ast(source)`** (L33): Accepts file path, Path, or dict. Returns `Program`.
+- Recursively deserializes via `_parse_statement()` (L11) and `_parse_paragraph()` (L23).
+- Builds `paragraph_index` dict for O(1) lookups.
 
-### Key Techniques for CICS Coverage
+### `specter/code_generator.py` — Python Code Generation (~2400 lines)
 
-1. **Coverage mode** (`coverage_mode=True`): CICS RETURN/XCTL are replaced with mock-read + CONTINUE instead of GO TO EXIT
-2. **EIB stub initialization**: EIBCALEN=100 and EIBAID=X'7D' (ENTER) hardcoded in VALUE clause
-3. **EIBAID injection via RECEIVE MAP**: `MOVE MOCK-ALPHA-STATUS(1:1) TO EIBAID` after each CICS RECEIVE
-4. **Mock data padding**: 50 extra success records appended to prevent EOF during extended execution
-5. **Multi-line IF handling**: Branch probes inserted after condition continuation lines, not mid-condition
+**Entry**: `generate_code(program, var_report, instrument, copybook_records, cobol_source)` (L1853)
 
-### Known Limitations
+Generates a complete Python module with:
+- `para_XXXX(state)` functions for each COBOL paragraph
+- `run(state)` entry function
+- ~40 statement generators (`_gen_move`, `_gen_if`, `_gen_evaluate`, `_gen_perform`, etc.)
 
-1. **Copybook sequence numbers**: Some copybooks (e.g., CVCRD01Y.cpy) have columns 1-6 sequence numbers that aren't stripped during COPY inlining → compilation failure
-2. **GnuCOBOL strictness**: Some mainframe-valid constructs (larger REDEFINES, etc.) are rejected
-3. **Branch count bookkeeping**: Branch probes found during execution can exceed the statically-counted total (cosmetic)
+**Runtime Helpers** (emitted into generated code):
+| Class/Function | Purpose |
+|----------------|---------|
+| `_SafeDict(dict)` (L2056) | Returns `''` for missing keys (COBOL default behavior) |
+| `_InstrumentedState(_SafeDict)` (L2074) | Tracks reads/writes/trace/call_events |
+| `_GobackSignal(Exception)` (L1943) | Signal for GOBACK/STOP RUN |
+| `_to_num(v)` (L1967) | Coerce to number (int/float/0) |
+| `_apply_stub_outcome(state, key)` (L1993) | Pop stub outcome queue, apply variable assignments |
+| `_dummy_call(name, state)` (L2037) | Stub for CALL statements |
+| `_dummy_exec(kind, text, state)` (L2046) | Stub for EXEC blocks |
+
+**Branch Instrumentation**: Every IF/EVALUATE gets a unique branch ID. Positive = TRUE taken, negative = FALSE taken. Stored in `state['_branches']` (set of int). Module-level `_BRANCH_META` maps IDs to metadata.
+
+**State Dictionary Convention**:
+```python
+state['MY-VAR']           # COBOL variables (uppercase, safe access)
+state['_display']         # list[str] - DISPLAY output
+state['_branches']        # set[int] - Branch coverage (±ID)
+state['_trace']           # list[str] - Paragraph call sequence
+state['_stub_outcomes']   # dict[op_key, list] - Queued stub outcomes
+state['_stub_defaults']   # dict[op_key, list] - Exhaustion defaults
+state['_stub_log']        # list - Applied outcome log
+state['_abended']         # bool - Abend signal
+```
+
+### `specter/condition_parser.py` — COBOL Conditions → Python (~500 lines)
+
+**Entry**: `cobol_condition_to_python(condition)` — converts COBOL IF/WHEN text to Python expression.
+
+Handles: comparisons, figurative constants (SPACES, ZEROS, HIGH-VALUES), DFHRESP codes (NORMAL→0, ERROR→1, NOTFND→13, etc.), IS NUMERIC, multi-value OR, AND/OR/NOT, subscripted variables.
+
+### `specter/variable_extractor.py` — Variable Discovery (~700 lines)
+
+**Entry**: `extract_variables(program)` → `VariableReport`
+
+Classifies each variable as: `input` (read-before-write), `internal`, `status` (SQLCODE, EIBRESP, FS-*), or `flag` (boolean). Harvests `condition_literals` from IF/EVALUATE comparisons for biased test generation.
+
+### `specter/variable_domain.py` — Domain Model (~450 lines)
+
+**`VariableDomain`** (L22): Merges PIC clauses (from copybooks), AST analysis, stub mappings, and naming heuristics.
+
+**`build_variable_domains()`** (L117): Builds domain for every variable.
+
+**`generate_value(domain, strategy)`** (L219): 6 strategies — condition_literal, 88_value, boundary, semantic, random_valid, adversarial.
+
+### `specter/copybook_parser.py` — Copybook Parsing (~550 lines)
+
+**`parse_copybook(text)`** (L110): Parses COBOL copybook → `CopybookRecord` with `CopybookField` entries (level, name, PIC type/length/precision, OCCURS, 88-level values).
+
+Also generates SQL DDL and Java DAO classes.
+
+---
+
+## GnuCOBOL Mock Pipeline (Incremental Instrumentation)
+
+### `specter/incremental_mock.py` — Main Pipeline (~1200 lines)
+
+**Entry**: `incremental_instrument(source_path, copybook_dirs, output_dir, llm_provider, ...)` (L778)
+
+Returns `(mock_cbl_path, branch_meta, total_branches)`.
+
+#### 10 Phases (compile + fix after each):
+
+| Phase | Name | Incremental? | Description |
+|-------|------|-------------|-------------|
+| 0 | Baseline | No | Compile original, record pre-existing errors |
+| 1 | COPY resolution | No | Inline copybooks via `_resolve_copies()` |
+| 2 | Mock infrastructure | No | Add MOCK-FILE to FILE-CONTROL, FD, WORKING-STORAGE |
+| 3 | EXEC replacement | **Yes** (batch_size) | Replace EXEC CICS/SQL/DLI with mock reads |
+| 4 | I/O replacement | **Yes** (batch_size) | Replace READ/WRITE/OPEN/CLOSE with mocks |
+| 5 | CALL replacement | **Yes** (batch_size) | Replace CALL 'prog' with mock reads |
+| 6 | Paragraph tracing | No | Insert SPECTER-TRACE:/SPECTER-CALL: DISPLAYs |
+| 7 | Normalization | No | LINKAGE conversion, REDEFINES, common stubs, etc. |
+| 8 | Compile-and-fix | No | LLM handles remaining undefined symbols |
+| 9 | Branch probes | No | LLM inserts @@B: probes, one paragraph at a time |
+
+**Batch loop** (Phases 3-5): Replace `batch_size` blocks → write → compile → fix → next batch. If batch causes >10 errors, revert and retry one-by-one.
+
+**Resume**: Checkpoint file (`phase_checkpoint.json`) tracks last completed phase. Mock.cbl on disk is the checkpoint for within-phase resume.
+
+#### Key Data Structures
+
+**`Resolution`** (L54): Records a verified error fix:
+```python
+@dataclass
+class Resolution:
+    phase: str          # e.g., "exec_replacement"
+    batch: int          # Batch number within phase
+    transformation: str # What was being done
+    error: str          # The compilation error message
+    fix: str            # Human-readable fix description
+    fix_lines: dict     # line_number → fixed content
+    verified: bool      # True if error gone on recompile
+```
+
+#### Two-Step Agent Error Fixing: `_compile_and_fix()` (L365)
+
+Per attempt (max 10):
+1. **Compile** → collect ALL errors
+2. **STEP 1 (Choose)**: Present top 15 errors to LLM → LLM picks one + requests context window (max 500 lines)
+3. **STEP 2 (Fix)**: Send error + context → LLM returns JSON `{"<line>": "<content>"}`
+4. **Verify**: Apply fix, recompile. If error gone → record verified Resolution. If worse → revert.
+
+`failed_error_lines: set[int]` tracks lines already attempted (skipped on retry).
+
+#### Resolution Persistence
+
+- **`_load_resolutions(path)`** (L168): Load from `resolution_log.json`
+- **`_save_resolutions(resolutions, path)`** (L195): Save after each batch
+- **`_apply_preventive_fixes(src_lines, resolutions)`** (L336): Apply verified fixes from prior runs (skip LLM)
+
+#### Checkpoint/Resume
+
+- **`_load_checkpoint(output_dir)`** (L210): Load `phase_checkpoint.json`
+- **`_save_checkpoint(output_dir, phase, number, mock_path)`** (L233): Save after each phase with SHA-256 hash validation
+
+### `specter/cobol_mock.py` — Mock Transformations (~4400 lines)
+
+The underlying transformation functions called by `incremental_mock.py`.
+
+**`MockConfig`** (L49): Configuration dataclass — copybook_dirs, trace_paragraphs, mock_file_name, stop_on_exec_return/xctl, eib_calen, eib_aid, initial_values.
+
+#### Core Replacement Functions (all support `max_count` for incremental batching)
+
+| Function | Line | Purpose |
+|----------|------|---------|
+| `_resolve_copies(lines, dirs)` | L236 | Inline COPY statements from copybook dirs |
+| `_replace_exec_blocks(lines, config, max_count=0)` | L450 | Replace EXEC CICS/SQL/DLI → mock reads |
+| `_replace_io_verbs(lines, max_count=0)` | L703 | Replace READ/WRITE/OPEN/CLOSE → mocks |
+| `_replace_call_stmts(lines, max_count=0)` | L841 | Replace CALL 'prog' → mock reads |
+| `_replace_accept_stmts(lines)` | L918 | Replace ACCEPT → CONTINUE |
+| `_add_paragraph_tracing(lines)` | L971 | Insert SPECTER-TRACE:/SPECTER-CALL: |
+| `_add_mock_infrastructure(lines, divs, config)` | L1447 | Add MOCK-FILE SELECT/FD/WS entries |
+| `_disable_original_selects(lines, config)` | L1550 | Comment out original SELECTs |
+| `_convert_linkage(lines)` | L1734 | Move LINKAGE items to WORKING-STORAGE |
+| `_fix_procedure_division(lines)` | L1780 | Remove USING clause from PROCEDURE DIVISION |
+| `_add_mock_file_handling(lines, config)` | L1831 | Insert OPEN/CLOSE MOCK-FILE |
+| `_add_common_stubs(lines, config)` | L1934 | Add DFHAID/DFHBMSCA/EIB stubs if referenced |
+
+**Mock data format** (80-byte LINE SEQUENTIAL):
+```
+Cols 1-30:   Op key (CICS-READ, SQL, CALL:PROG, INIT:VAR, etc.)
+Cols 31-50:  Alpha status ('00' for success)
+Cols 51-59:  Numeric status (right-justified)
+Cols 60-80:  Filler
+```
+
+### `specter/branch_instrumenter.py` — Post-Compilation Branch Probes (~300 lines)
+
+**Entry**: `instrument_branches(mock_cbl_path, llm_provider, llm_model)` (L31)
+
+Returns `(probes_inserted, paragraphs_done, branch_meta)`.
+
+Per paragraph with IF/EVALUATE:
+1. Extract paragraph source
+2. Send to LLM with rules (@@B:id:T/F for IF, @@B:id:Wn for EVALUATE, within col 72)
+3. Replace paragraph in source
+4. `cobc -fsyntax-only` to verify
+5. Revert if compilation fails
+
+### `specter/cobol_executor.py` — Compile & Run (~500 lines)
+
+**`prepare_context(cobol_source, copybook_dirs, ...)`** (L210): Calls `incremental_instrument()`, returns `CobolExecutionContext`.
+
+**`run_test_case(context, input_state, stub_log, ...)`** (L357): Write mock data → run COBOL binary → parse SPECTER-TRACE/@@B:/SPECTER-CALL output.
+
+**`run_batch(context, test_cases, workers)`** (L464): Parallel execution via ProcessPoolExecutor.
+
+### `specter/cobol_fix_cache.py` — LLM Investigation (~650 lines)
+
+**`llm_investigate_cascade(llm_provider, llm_model, first_error_line, error_msg, all_errors, src_lines, ...)`** (L383): Multi-turn (up to 10) LLM investigation for cascade failures. LLM can request additional code chunks via `{"need_context": {"start": N, "end": M}}`.
+
+**`_parse_llm_fix_response(response, min_line, max_line)`** (L600): Handles JSON, nested JSON, markdown code blocks, plain text formats.
+
+### `specter/llm_coverage.py` — LLM Provider Abstraction (~550 lines)
+
+**`_query_llm_sync(provider, prompt, model)`** (L331): Synchronous LLM query with 401 retry/reconnect. Supports single string or multi-turn `list[Message]`.
+
+**`build_coverage_gaps(uncovered, constraints, gating)`** (L391): Build CoverageGap objects for LLM prompts.
+
+**`generate_llm_suggestions(state, uncovered, ...)`** (L443): LLM suggests variable values to reach uncovered paths.
+
+Uses `llm_providers` package with Protocol-based abstraction (`LLMProvider`, `Message`, `CompletionResponse`). Supports Anthropic, OpenAI, OpenRouter.
+
+---
+
+## Coverage Engine
+
+### `specter/cobol_coverage.py` — Agentic Loop (~1600 lines)
+
+**`run_cobol_coverage(ast_source, cobol_source, copybook_dirs, ...)`** (L989): Main COBOL coverage entry point. Compiles, prepares context, runs agentic loop.
+
+**`_run_agentic_loop(strategies, context, ...)`** (L1242): Strategy selector picks strategy → generate test cases → execute → track coverage → repeat until budget/timeout/plateau.
+
+**`run_coverage(ast_source, ...)`** (L1473): Python-only coverage (no COBOL binary).
+
+### `specter/coverage_strategies.py` — Pluggable Strategies (~2030 lines)
+
+| Strategy | Priority | Method |
+|----------|----------|--------|
+| `BaselineStrategy` (L124) | 20 | All-success baseline with 5 value generation strategies |
+| `DirectParagraphStrategy` (L488) | 35 | **7-phase rotation**: param hill-climb → stub sweep → dataflow backprop → frontier → harvest → inverse → LLM |
+| `FaultInjectionStrategy` (L1667) | 50 | Inject fault values into stub operations |
+| `CorpusFuzzStrategy` (L1733) | 45 | AFL-inspired energy-based corpus scheduling with greedy set cover |
+
+**`HeuristicSelector`** (L1985): Scoring = `priority - yield_bonus + staleness_penalty`. Adaptive batch sizing per strategy.
+
+### `specter/static_analysis.py` — Call Graph & Gating (~545 lines)
+
+- **`build_static_call_graph(program)`** (L86): PERFORM/GO_TO edge extraction
+- **`extract_gating_conditions(program)`** (L332): IF/EVALUATE conditions gating paragraph entry
+- **`compute_path_constraints(graph, target)`** (L514): Constraints along path from entry to target
+
+### `specter/backward_slicer.py` — Code Slicing (~290 lines)
+
+**`backward_slice(module_source, branch_id, max_lines)`** (L73): Extract minimal code leading to a branch for LLM steering. 5-phase: locate → control path → variable deps → stubs → assemble.
+
+### `specter/program_analysis.py` — Per-Paragraph Analysis (~450 lines)
+
+**`prepare_program_analysis(program, cobol_source, ...)`** (L103): Structured JSON per paragraph (comments, calls, stub ops, gating conditions, branch count). No LLM calls.
+
+### `specter/coverage_bundle.py` — Portable Bundle (~1100 lines)
+
+**`export_bundle(ast_source, cobol_source, ...)`** (L194): Export binary + `coverage-spec.yaml`. Optional LLM enrichment and obfuscation.
+
+**`run_bundle(bundle_dir, ...)`** (L773): Run coverage from bundle (no source/AST/copybooks needed).
+
+### `specter/coverage_config.py` — Strategy Config (~270 lines)
+
+**`CoverageConfig`**: selector, strategies, rounds, termination thresholds.
+
+**`load_config(path)`** (L102): YAML config (or JSON fallback).
+
+### `specter/cobol_validate.py` — Two-Pass Validation (~200 lines)
+
+**`validate_store(ast_source, cobol_source, store_path, ...)`** (L21): Python pass → COBOL pass → reconcile → `.validated.jsonl`.
+
+---
+
+## Monte Carlo & Test Synthesis
+
+### `specter/monte_carlo.py` — Randomized Execution (~2400 lines)
+
+**`run_monte_carlo(module_path, n_iterations, seed, ...)`** (L2252): Main entry. Dispatches to guided fuzzing or random walk.
+
+**`_run_paragraph_directly(module, para_name, state)`** (L944): Direct paragraph invocation for unreachable code.
+
+**Corpus management**: Energy-based seed selection, eviction at 500 entries, frontier bonus, recency bonus, yield penalty.
+
+**Input generation**: Status vars 80% success-biased, flags 70% from literals, semantic heuristics for dates/amounts/IDs.
+
+### `specter/test_synthesis.py` — 5-Layer Synthesis (~4000 lines)
+
+**`synthesize_test_set(module, program, ...)`** (L3904): Systematic test generation.
+
+| Layer | Goal | Method |
+|-------|------|--------|
+| 1 | All-success baseline | Success for all status vars |
+| 2 | Gating conditions | Solve path constraints to reach uncovered paragraphs |
+| 2.5 | Frontier expansion | Random walk from layer 2 solutions |
+| 3 | Stub exhaustion | Exhaust stub queues to explore error paths |
+| 3.5 | Branch coverage | Targeted mutation for uncovered branches |
+| 4 | Loop analysis | PERFORM UNTIL analysis |
+| 5 | Corpus walking | Guided fuzzing corpus exploration |
+
+### `specter/test_store.py` — JSONL Persistence (227 lines)
+
+**`TestCase`** (L21): id (SHA-256), input_state, stub_outcomes, stub_defaults, paragraphs_covered, branches_covered, layer, target.
+
+**`TestStore.load(path)`** (L119): Load + deduplicate + restore progress.
+
+**`TestStore.append(path, tc)`** (L157): Atomic append (crash-safe).
+
+---
+
+## CLI Usage
+
+### Basic Code Generation
+```bash
+python3 -m specter program.ast [-o output.py] [--verify] [--analyze]
+```
+
+### Python-Only Coverage
+```bash
+python3 -m specter program.ast --guided --test-store tests.jsonl \
+    [--llm-guided --llm-provider openrouter]
+```
+
+### Test Synthesis
+```bash
+python3 -m specter program.ast --synthesize --test-store tests.jsonl \
+    --synthesis-layers 5
+```
+
+### GnuCOBOL Hybrid Coverage
+```bash
+python3 -m specter program.ast --cobol-coverage \
+    --cobol-source program.cbl --copybook-dir ./cpy \
+    --coverage-budget 5000 --coverage-timeout 1800 \
+    [--coverage-config config.yaml] [--llm-guided --llm-provider openrouter]
+```
+
+### COBOL Mock Instrumentation Only
+```bash
+python3 -m specter program.cbl --mock-cobol -o program.mock.cbl \
+    --copybook-dir ./cpy [--init-var VAR-NAME=VALUE]
+```
+
+### Portable Bundle Export
+```bash
+python3 -m specter program.ast --export-bundle ./bundle \
+    --cobol-source program.cbl --copybook-dir ./cpy [--obfuscate]
+```
+
+### Run from Bundle
+```bash
+python3 -m specter --run-bundle ./bundle --test-store tests.jsonl \
+    --coverage-budget 5000
+```
+
+### Two-Pass Validation
+```bash
+python3 -m specter program.ast --cobol-validate-store tests.jsonl \
+    --cobol-source program.cbl --copybook-dir ./cpy
+```
+
+### Java Generation
+```bash
+python3 -m specter program.ast --java -o project/ \
+    --java-package com.example [--docker] [--integration-tests]
+```
+
+---
+
+## Testing
+
+### Test Files
+
+| File | Tests | Coverage |
+|------|-------|----------|
+| `test_incremental_mock.py` | 24 | Incremental pipeline, resolutions, max_count batching |
+| `test_cobol_coverage.py` | 61 | Integration: AST → Python → COBOL execution |
+| `test_condition_parser.py` | 27 | COBOL condition → Python translation |
+| `test_copybook_parser.py` | 38 | Copybook parsing, PIC types, 88-level values |
+| `test_code_generator.py` | 15 | Python code generation for all statement types |
+| `test_variable_extractor.py` | 15 | Variable classification, literal harvesting |
+| `test_llm_coverage.py` | 22 | LLM provider abstraction, coverage gaps |
+| `test_fuzzer.py` | 28 | Coverage-guided fuzzing, energy, corpus |
+| `test_test_synthesis.py` | 17 | 5-layer synthesis, gating constraints |
+| `test_static_analysis.py` | 18 | Call graph, gating conditions, equality constraints |
+| `test_backward_slicer.py` | 12 | Program slicing for variable deps |
+| `test_concolic.py` | 28 | Z3 concolic solver |
+| `test_88_siblings.py` | 15 | COBOL 88-level sibling detection |
+| `test_llm_fuzzer.py` | 32 | LLM-guided fuzzing |
+| `test_coverage_config.py` | 13 | Configuration management |
+| `test_java_condition_parser.py` | 56 | Java condition code generation |
+| `test_end_to_end.py` | 8 | Full pipeline (skipped if AST files missing) |
+
+**Total: ~436 tests**
+
+### Running Tests
+```bash
+python3 -m pytest                                    # Full suite (~3 min)
+python3 -m pytest tests/test_incremental_mock.py     # Single file
+python3 -m pytest tests/test_condition_parser.py::TestConditionParser::test_simple_equality  # Single test
+python3 -m pytest -x -q                              # Stop on first failure, quiet
+```
+
+---
+
+## Key Design Decisions
+
+1. **Incremental over monolithic**: Each phase independently verifiable, compile-after-each-step
+2. **Batch loop with fallback**: Batch transformations, revert + one-by-one if >10 errors
+3. **Resolution log for learning**: Prior fixes applied proactively (skip LLM for known issues)
+4. **Two-step agent model**: LLM chooses error (broad context) then fixes (narrow context)
+5. **Post-compilation branch probes**: Avoid LLM errors by inserting @@B: after successful compile
+6. **Cached executables**: Reuse compiled binary if source unchanged
+7. **Coverage mode**: RETURN/XCTL read mock data + continue instead of terminating
+8. **State dict convention**: All COBOL vars uppercase, internals prefixed `_`
+9. **Stub outcome queues**: list of (var, value) pairs per operation, pop on each call
+10. **JSONL persistence**: Append-only, crash-safe, resumable with progress records
