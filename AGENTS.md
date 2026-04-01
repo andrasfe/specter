@@ -124,9 +124,9 @@ Also generates SQL DDL and Java DAO classes.
 
 ## GnuCOBOL Mock Pipeline (Incremental Instrumentation)
 
-### `specter/incremental_mock.py` — Main Pipeline (~1200 lines)
+### `specter/incremental_mock.py` — Main Pipeline (~1600 lines)
 
-**Entry**: `incremental_instrument(source_path, copybook_dirs, output_dir, llm_provider, ...)` (L778)
+**Entry**: `incremental_instrument(source_path, copybook_dirs, output_dir, llm_provider, ...)`
 
 Returns `(mock_cbl_path, branch_meta, total_branches)`.
 
@@ -164,21 +164,41 @@ class Resolution:
     verified: bool      # True if error gone on recompile
 ```
 
-#### Two-Step Agent Error Fixing: `_compile_and_fix()` (L365)
+#### Smart Agent Error Fixing: `_compile_and_fix()` (L510)
 
-Per attempt (max 10):
-1. **Compile** → collect ALL errors
-2. **STEP 1 (Choose)**: Present top 15 errors to LLM → LLM picks one + requests context window (max 500 lines)
-3. **STEP 2 (Fix)**: Send error + context → LLM returns JSON `{"<line>": "<content>"}`
-4. **Verify**: Apply fix, recompile. If error gone → record verified Resolution. If worse → revert.
+Two modes, chosen automatically per attempt:
 
-`failed_error_lines: set[int]` tracks lines already attempted (skipped on retry).
+**Batch mode** (when 5+ errors share the same type, e.g., all "not defined"):
+- ALL similar errors presented in one prompt (up to 30)
+- LLM sees TWO context chunks: error area + WORKING-STORAGE tail
+- LLM adds all stubs at once instead of one at a time
+- Parse range is the entire file (stubs in WS, errors in PROCEDURE)
+
+**Single-error mode** (mixed error types):
+1. **Choose**: Present top 15 errors to LLM → LLM picks one + requests context (max 1000 lines)
+2. **Fix**: Send error + context → LLM returns JSON `{"<line>": "<content>"}`
+
+**Safeguards**:
+- **Quality gate**: Rejects fixes that are >50% commenting out code with no stubs added
+- **Failed-attempt memory**: LLM sees "WHAT WORKED" and "WHAT FAILED" sections with prior attempts from this cycle
+- **Error clustering**: Adjacent errors (within 10 lines) are treated as one root cause — failing one marks the whole cluster
+- **Relaxed verification**: Accept if total error count drops (not just the specific line)
+- **Audit log** (`fix_audit.log`): Every accepted fix logged with BEFORE/AFTER per line, tagged [COMMENTED OUT], [ADDED], or [MODIFIED]
+
+**Integrity check** (end of pipeline): Reports paragraph trace count, mock probe count, and comment ratio. Warns if >40% of lines are comments.
+
+#### Helper Functions
+
+- **`_cluster_errors(errors, gap=10)`**: Group adjacent errors as one root cause
+- **`_group_errors_by_type(errors)`**: Group by error type for batch fixing
+- **`_find_working_storage_range(src_lines)`**: Find WS boundaries for dual-context prompts
+- **`_audit_fix(audit_path, ...)`**: Write human-readable fix diff to audit log
 
 #### Resolution Persistence
 
 - **`_load_resolutions(path)`** (L168): Load from `resolution_log.json`
 - **`_save_resolutions(resolutions, path)`** (L195): Save after each batch
-- **`_apply_preventive_fixes(src_lines, resolutions)`** (L336): Apply verified fixes from prior runs (skip LLM)
+- **`_apply_preventive_fixes(src_lines, resolutions)`**: Apply verified fixes from prior runs (skip LLM)
 
 #### Checkpoint/Resume
 
