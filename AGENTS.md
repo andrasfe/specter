@@ -149,7 +149,7 @@ Returns `(mock_cbl_path, branch_meta, total_branches)`.
 
 **Sequential fix loop**: `_compile_and_fix` runs sequentially — compile, pick an error, fix it, compile, repeat — until errors reach 0 or stall (no error count decrease for 8 consecutive attempts). When all errors have been attempted, `failed_error_lines` resets for a fresh round with accumulated failed-attempt memory guiding the LLM toward different approaches. No artificial attempt cap, no gate loops between phases.
 
-**Resume**: Checkpoint file (`phase_checkpoint.json`) tracks last completed phase. Mock.cbl on disk is the checkpoint for within-phase resume.
+**Resume**: Checkpoint file (`phase_checkpoint.json`) tracks last completed phase. Each phase saves a sub-checkpoint after its transform but before compile-and-fix (e.g., `copy_resolution_transformed`). On restart, the transform is skipped and only compile-and-fix runs — preserving all LLM fixes from the interrupted run.
 
 #### Key Data Structures
 

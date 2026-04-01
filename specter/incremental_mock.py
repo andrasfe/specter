@@ -1263,12 +1263,19 @@ def incremental_instrument(
     # -----------------------------------------------------------------------
     # Phase 1: COPY resolution
     # -----------------------------------------------------------------------
+    cp_name = checkpoint.get("last_completed_phase", "")
     if start_phase <= 1:
-        log.info("Phase 1: COPY resolution")
-        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-        lines, desc = _phase_copy_resolution(lines, copybook_dirs)
-        mock_path.write_text("".join(lines))
-        log.info("  %s", desc)
+        # Only re-run the transform if not already done on a prior run
+        if cp_name != "copy_resolution_transformed":
+            log.info("Phase 1: COPY resolution")
+            lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+            lines, desc = _phase_copy_resolution(lines, copybook_dirs)
+            mock_path.write_text("".join(lines))
+            log.info("  %s", desc)
+            # Sub-checkpoint: transform done, compile-and-fix not yet
+            _save_checkpoint(output_dir, "copy_resolution_transformed", 0, mock_path)
+        else:
+            log.info("Phase 1: COPY resolution (transform done, resuming fixes)")
 
         new_res = _compile_and_fix(
             mock_path, "copy_resolution", 0, resolutions,
@@ -1286,12 +1293,17 @@ def incremental_instrument(
     # -----------------------------------------------------------------------
     # Phase 2: Mock infrastructure
     # -----------------------------------------------------------------------
+    cp_name = _load_checkpoint(output_dir).get("last_completed_phase", "")
     if start_phase <= 2:
-        log.info("Phase 2: Mock infrastructure")
-        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-        lines, desc = _phase_mock_infrastructure(lines, config)
-        mock_path.write_text("".join(lines))
-        log.info("  %s", desc)
+        if cp_name != "mock_infra_transformed":
+            log.info("Phase 2: Mock infrastructure")
+            lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+            lines, desc = _phase_mock_infrastructure(lines, config)
+            mock_path.write_text("".join(lines))
+            log.info("  %s", desc)
+            _save_checkpoint(output_dir, "mock_infra_transformed", 1, mock_path)
+        else:
+            log.info("Phase 2: Mock infrastructure (transform done, resuming fixes)")
 
         new_res = _compile_and_fix(
             mock_path, "mock_infrastructure", 0, resolutions,
@@ -1476,12 +1488,17 @@ def incremental_instrument(
     # -----------------------------------------------------------------------
     # Phase 6: Paragraph tracing
     # -----------------------------------------------------------------------
+    cp_name = _load_checkpoint(output_dir).get("last_completed_phase", "")
     if start_phase <= 6:
-        log.info("Phase 6: Paragraph tracing")
-        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-        lines, desc, total_paragraphs = _phase_paragraph_tracing(lines)
-        mock_path.write_text("".join(lines))
-        log.info("  %s", desc)
+        if cp_name != "para_tracing_transformed":
+            log.info("Phase 6: Paragraph tracing")
+            lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+            lines, desc, total_paragraphs = _phase_paragraph_tracing(lines)
+            mock_path.write_text("".join(lines))
+            log.info("  %s", desc)
+            _save_checkpoint(output_dir, "para_tracing_transformed", 5, mock_path)
+        else:
+            log.info("Phase 6: Paragraph tracing (transform done, resuming fixes)")
 
         new_res = _compile_and_fix(
             mock_path, "paragraph_tracing", 0, resolutions,
@@ -1499,12 +1516,17 @@ def incremental_instrument(
     # -----------------------------------------------------------------------
     # Phase 7: Normalization
     # -----------------------------------------------------------------------
+    cp_name = _load_checkpoint(output_dir).get("last_completed_phase", "")
     if start_phase <= 7:
-        log.info("Phase 7: Normalization")
-        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-        lines, desc = _phase_normalization(lines, config)
-        mock_path.write_text("".join(lines))
-        log.info("  %s", desc)
+        if cp_name != "normalization_transformed":
+            log.info("Phase 7: Normalization")
+            lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+            lines, desc = _phase_normalization(lines, config)
+            mock_path.write_text("".join(lines))
+            log.info("  %s", desc)
+            _save_checkpoint(output_dir, "normalization_transformed", 6, mock_path)
+        else:
+            log.info("Phase 7: Normalization (transform done, resuming fixes)")
 
         new_res = _compile_and_fix(
             mock_path, "normalization", 0, resolutions,
