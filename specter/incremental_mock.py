@@ -507,6 +507,28 @@ def _find_working_storage_range(src_lines: list[str]) -> tuple[int, int] | None:
     return None
 
 
+def _assert_clean(
+    source_path: Path,
+    phase_name: str,
+    copybook_dirs: list[Path] | None = None,
+    resolutions: list[Resolution] | None = None,
+    resolution_log_path: Path | None = None,
+) -> None:
+    """Raise RuntimeError if compilation errors remain after a phase.
+
+    Saves resolutions before raising so progress is not lost.
+    """
+    remaining = _count_current_errors(source_path, copybook_dirs)
+    if remaining > 0:
+        if resolutions and resolution_log_path:
+            _save_resolutions(resolutions, resolution_log_path)
+        raise RuntimeError(
+            f"{phase_name} stalled with {remaining} errors. "
+            f"Fix manually or delete phase_checkpoint.json to retry. "
+            f"Mock source: {source_path}"
+        )
+
+
 def _count_current_errors(
     source_path: Path,
     copybook_dirs: list[Path] | None = None,
@@ -1320,6 +1342,9 @@ def incremental_instrument(
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
+
+        _assert_clean(mock_path, "Phase 1 (COPY resolution)",
+                      copybook_dirs, resolutions, resolution_log_path)
         _save_checkpoint(output_dir, "copy_resolution", 1, mock_path)
     else:
         log.info("Phase 1: COPY resolution (skipped — resuming)")
@@ -1348,6 +1373,9 @@ def incremental_instrument(
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
+
+        _assert_clean(mock_path, "Phase 2 (mock infrastructure)",
+                      copybook_dirs, resolutions, resolution_log_path)
         _save_checkpoint(output_dir, "mock_infrastructure", 2, mock_path)
     else:
         log.info("Phase 2: Mock infrastructure (skipped — resuming)")
@@ -1402,6 +1430,8 @@ def incremental_instrument(
                         _save_resolutions(resolutions, resolution_log_path)
 
         log.info("  Phase 3 complete (%d batches)", batch_num)
+        _assert_clean(mock_path, "Phase 3 (EXEC replacement)",
+                      copybook_dirs, resolutions, resolution_log_path)
         _save_checkpoint(output_dir, "exec_replacement", 3, mock_path)
     else:
         log.info("Phase 3: EXEC replacement (skipped — resuming)")
@@ -1456,6 +1486,8 @@ def incremental_instrument(
                         _save_resolutions(resolutions, resolution_log_path)
 
         log.info("  Phase 4 complete (%d batches)", batch_num)
+        _assert_clean(mock_path, "Phase 4 (I/O replacement)",
+                      copybook_dirs, resolutions, resolution_log_path)
         _save_checkpoint(output_dir, "io_replacement", 4, mock_path)
     else:
         log.info("Phase 4: I/O replacement (skipped — resuming)")
@@ -1515,6 +1547,8 @@ def incremental_instrument(
         mock_path.write_text("".join(lines))
 
         log.info("  Phase 5 complete (%d batches)", batch_num)
+        _assert_clean(mock_path, "Phase 5 (CALL replacement)",
+                      copybook_dirs, resolutions, resolution_log_path)
         _save_checkpoint(output_dir, "call_replacement", 5, mock_path)
     else:
         log.info("Phase 5: CALL replacement (skipped — resuming)")
@@ -1543,6 +1577,8 @@ def incremental_instrument(
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
+        _assert_clean(mock_path, "Phase 6 (paragraph tracing)",
+                      copybook_dirs, resolutions, resolution_log_path)
         _save_checkpoint(output_dir, "paragraph_tracing", 6, mock_path)
     else:
         log.info("Phase 6: Paragraph tracing (skipped — resuming)")
@@ -1571,6 +1607,8 @@ def incremental_instrument(
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
+        _assert_clean(mock_path, "Phase 7 (normalization)",
+                      copybook_dirs, resolutions, resolution_log_path)
         _save_checkpoint(output_dir, "normalization", 7, mock_path)
     else:
         log.info("Phase 7: Normalization (skipped — resuming)")
@@ -1602,6 +1640,8 @@ def incremental_instrument(
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
+        _assert_clean(mock_path, "Phase 8 (compile fix)",
+                      copybook_dirs, resolutions, resolution_log_path)
         _save_checkpoint(output_dir, "compile_fix", 8, mock_path)
     else:
         log.info("Phase 8: Auto-stub (skipped — resuming)")
@@ -1630,6 +1670,8 @@ def incremental_instrument(
         )
         resolutions.extend(new_res)
         _save_resolutions(resolutions, resolution_log_path)
+        _assert_clean(mock_path, "Phase 9 (final fix)",
+                      copybook_dirs, resolutions, resolution_log_path)
         _save_checkpoint(output_dir, "gnucobol_fixups", 9, mock_path)
     else:
         log.info("GnuCOBOL fixups (skipped — resuming)")
