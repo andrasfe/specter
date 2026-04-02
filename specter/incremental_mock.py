@@ -339,8 +339,11 @@ def _load_checkpoint(output_dir: Path) -> dict:
             import hashlib
             actual_hash = hashlib.sha256(mock_path.read_bytes()).hexdigest()
             if actual_hash != data.get("mock_cbl_hash", ""):
-                log.warning("Checkpoint hash mismatch — starting fresh")
-                return {}
+                log.warning("Checkpoint hash mismatch — mock.cbl was modified "
+                            "(likely by interrupted compile-and-fix). "
+                            "Resuming from checkpoint anyway.")
+                # Update hash to current state so next save is consistent
+                data["mock_cbl_hash"] = actual_hash
         log.info("Resuming from phase %d (%s)",
                  data.get("last_completed_phase_number", -1),
                  data.get("last_completed_phase", "unknown"))
@@ -1188,6 +1191,10 @@ def _compile_and_fix(
                             source_path, copybook_dirs)
                         log.info("  Pre-fix: file stubs didn't help, keeping "
                                  "(no worse: %d errors)", len(errs_verify))
+
+    # Save checkpoint after pre-fix modifications so the hash stays in sync
+    # even if the process is interrupted during the LLM fix loop.
+    _save_progress()
 
     failed_error_lines: set[int] = set()
     # Fingerprints of fixes already tried — reject exact duplicates
