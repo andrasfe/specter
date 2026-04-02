@@ -1578,6 +1578,13 @@ def _add_mock_infrastructure(
     divisions = _find_divisions(result)
 
     # --- Add to WORKING-STORAGE ---
+    # Check which common stubs are already defined (from resolved copybooks)
+    source_upper = "".join(result).upper()
+    _already_has_sqlcode = bool(re.search(
+        r"^\s+\d{2}\s+SQLCODE\b", source_upper, re.MULTILINE))
+    _already_has_dibstat = bool(re.search(
+        r"^\s+\d{2}\s+DIBSTAT\b", source_upper, re.MULTILINE))
+
     ws_entries = [
         "\n",
         f"{_CMT} SPECTER MOCK INFRASTRUCTURE\n",
@@ -1588,11 +1595,17 @@ def _add_mock_infrastructure(
         f"{_B}05 MOCK-FILLER        PIC X(21).\n",
         f"{_A}01 MOCK-FILE-STATUS      PIC XX VALUE '00'.\n",
         "\n",
-        f"{_CMT} SPECTER COMMON STUBS\n",
-        f"{_A}01 DIBSTAT               PIC X(02) VALUE SPACES.\n",
-        f"{_A}01 SQLCODE               PIC S9(09) COMP VALUE 0.\n",
-        "\n",
     ]
+    # Only add common stubs if not already defined (avoids "ambiguous" errors)
+    stub_lines = []
+    if not _already_has_dibstat:
+        stub_lines.append(f"{_A}01 DIBSTAT               PIC X(02) VALUE SPACES.\n")
+    if not _already_has_sqlcode:
+        stub_lines.append(f"{_A}01 SQLCODE               PIC S9(09) COMP VALUE 0.\n")
+    if stub_lines:
+        ws_entries.append(f"{_CMT} SPECTER COMMON STUBS\n")
+        ws_entries.extend(stub_lines)
+        ws_entries.append("\n")
 
     # Find where to insert in WORKING-STORAGE
     ws_idx = divisions.get("working-storage")
@@ -1676,10 +1689,48 @@ def _disable_original_selects(lines: list[str], config: MockConfig) -> list[str]
     reference symbols from unavailable copybooks.  Instead of commenting them
     out (which orphans FD entries → "not defined"), replace with minimal
     dummy SELECTs that keep the file name valid for compilation.
+
+    Preserves INDEXED organization and RECORD KEY from the original SELECT
+    to avoid "KEY clause invalid" / "START not allowed on SEQUENTIAL" errors.
     """
     result: list[str] = []
     in_select = False
     select_file_name: str = ""
+    select_clause_text: str = ""  # accumulate full SELECT clause text
+
+    def _build_dummy_select(file_name: str, clause_text: str) -> list[str]:
+        """Build a dummy SELECT, preserving INDEXED org + RECORD KEY."""
+        clause_upper = clause_text.upper()
+        is_indexed = "INDEXED" in clause_upper or "RELATIVE" in clause_upper
+        record_key = ""
+        if is_indexed:
+            km = re.search(
+                r"RECORD\s+KEY\s+(?:IS\s+)?([A-Z0-9_-]+)",
+                clause_upper,
+            )
+            if km:
+                record_key = km.group(1)
+
+        dummy_lines = []
+        if is_indexed and record_key:
+            dummy_lines.append(
+                f"{_B}SELECT {file_name} ASSIGN TO\n"
+            )
+            dummy_lines.append(
+                f"{_CONT}'{file_name}'\n"
+            )
+            dummy_lines.append(
+                f"{_CONT}ORGANIZATION IS INDEXED\n"
+            )
+            dummy_lines.append(
+                f"{_CONT}RECORD KEY IS {record_key}.\n"
+            )
+        else:
+            dummy_lines.append(
+                f"{_B}SELECT {file_name}"
+                f" ASSIGN TO '{file_name}'.\n"
+            )
+        return dummy_lines
 
     for line in lines:
         content = _get_cobol_content(line)
@@ -1699,27 +1750,23 @@ def _disable_original_selects(lines: list[str], config: MockConfig) -> list[str]
             # Extract the file name — skip OPTIONAL keyword if present
             m = re.match(r"SELECT\s+(?:OPTIONAL\s+)?([A-Z0-9_-]+)", upper)
             select_file_name = m.group(1) if m else ""
+            select_clause_text = upper
             result.append(_comment_line(line))
             if upper.endswith("."):
                 in_select = False
-                # Replace with dummy SELECT
                 if select_file_name:
-                    result.append(
-                        f"{_B}SELECT {select_file_name}"
-                        f" ASSIGN TO '{select_file_name}'.\n"
-                    )
+                    result.extend(_build_dummy_select(
+                        select_file_name, select_clause_text))
             continue
 
         if in_select:
+            select_clause_text += " " + upper
             result.append(_comment_line(line))
             if upper.endswith("."):
                 in_select = False
-                # Replace with dummy SELECT
                 if select_file_name:
-                    result.append(
-                        f"{_B}SELECT {select_file_name}"
-                        f" ASSIGN TO '{select_file_name}'.\n"
-                    )
+                    result.extend(_build_dummy_select(
+                        select_file_name, select_clause_text))
             continue
 
         result.append(line)

@@ -61,8 +61,10 @@ ERROR PATTERNS AND FIXES:
 - 'syntax error, unexpected ASSIGN': Usually a malformed SELECT statement. The correct syntax is:
     SELECT file-name ASSIGN TO 'literal'.
   Check that the file name comes directly after SELECT (no stray keywords). If SELECT OPTIONAL was used, it must be: SELECT OPTIONAL file-name ASSIGN TO 'literal'.
-- 'X is ambiguous; needs qualification': X is defined in multiple records. Use 'X OF RECORD-NAME' to qualify, or comment out the duplicate 01-level definition.
-- 'duplicate definition': two definitions for same name. Comment out one with * in col 7.
+- 'X is ambiguous; needs qualification': X is defined in multiple records. Use 'X OF RECORD-NAME' to qualify, or remove the duplicate 01-level definition. Common case: SQLCODE is defined both by a copybook and a mock stub — remove the stub definition.
+- 'duplicate definition': two definitions for same name. Remove one of the duplicate definitions.
+- 'KEY clause invalid with this file type' / 'INVALID KEY clause invalid': the file's SELECT uses SEQUENTIAL organization but the code uses KEY clauses. Fix: change the SELECT to ORGANIZATION IS INDEXED with RECORD KEY IS <key-var>. Or remove the KEY/INVALID KEY clause from the offending statement.
+- 'START not allowed on SEQUENTIAL files': the file is SEQUENTIAL but code uses START. Fix: change the SELECT to ORGANIZATION IS INDEXED with RECORD KEY IS <key-var>.
 - 'PICTURE clause required': a group item (01/05) has no PIC and no subordinate items. Add PIC X(256) or add child 05 items.
 - 'unexpected Identifier, expecting SECTION or .': the PREVIOUS line is missing its terminal period, or content extends past col 72.
 - 'syntax error, unexpected .': a period is in the wrong place (e.g., inside an IF block). Remove it or add END-IF before it.
@@ -511,6 +513,12 @@ def _group_errors_by_type(
             key = "is not defined"
         elif "not a file name" in msg:
             key = "not a file name"
+        elif "ambiguous" in msg:
+            key = "ambiguous"
+        elif "KEY clause invalid" in msg or "INVALID KEY clause" in msg:
+            key = "KEY clause invalid"
+        elif "not allowed on SEQUENTIAL" in msg:
+            key = "not allowed on SEQUENTIAL"
         elif "syntax error" in msg:
             key = "syntax error"
         elif "PICTURE clause" in msg.upper():
