@@ -624,51 +624,76 @@ def _fix_missing_periods(
     errors: list[tuple[int, str]],
     src_lines: list[str],
 ) -> tuple[list[str], int]:
-    """Fix 'unexpected X, expecting SECTION or .' by adding missing period.
+    """Fix 'unexpected X, expecting SECTION or .' errors.
 
-    GnuCOBOL reports this when the PREVIOUS line is missing its terminal
-    period.  Find the nearest previous non-comment line and add a period.
+    Two root causes:
+    1. The previous line is missing its terminal period → add period.
+    2. A paragraph header was commented out but its body wasn't →
+       uncomment the paragraph header so the body has context.
     """
-    from .cobol_mock import _get_cobol_content
+    from .cobol_mock import _get_cobol_content, _CMT
 
-    need_period_before: set[int] = set()
+    need_fix: set[int] = set()
     for ln, msg in errors:
         if "expecting SECTION or" in msg and "unexpected" in msg:
-            need_period_before.add(ln)
+            need_fix.add(ln)
 
-    if not need_period_before:
+    if not need_fix:
         return src_lines, 0
 
     result = list(src_lines)
     fixed = 0
 
-    for err_ln in sorted(need_period_before):
-        # Find the previous non-comment, non-empty line
-        for prev_idx in range(err_ln - 2, max(err_ln - 20, -1), -1):
+    for err_ln in sorted(need_fix):
+        # Strategy 1: Check if a commented-out paragraph header left
+        # the error line orphaned (no paragraph context).
+        # Scan backward for a commented-out paragraph label.
+        found_commented_para = False
+        for prev_idx in range(err_ln - 2, max(err_ln - 30, -1), -1):
             if prev_idx < 0 or prev_idx >= len(result):
                 continue
             prev_line = result[prev_idx]
             if len(prev_line) <= 6:
                 continue
-            if prev_line[6] in ("*", "/"):
-                continue
-            content = _get_cobol_content(prev_line).rstrip()
+            # Skip blank/empty lines
+            content = prev_line[6:72] if len(prev_line) > 6 else ""
             if not content.strip():
                 continue
-            # Check if it already ends with a period
-            if content.rstrip().endswith("."):
-                break  # already has period — not a missing-period issue
-            # Add period before col 72
-            # Find the end of content (last non-space before col 72)
-            raw = prev_line.rstrip("\n\r")
-            if len(raw) > 72:
-                # Content past col 72 — add period at col 72
-                raw = raw[:71] + "." + raw[72:]
-            else:
-                raw = raw.rstrip() + "."
-            result[prev_idx] = raw + "\n"
-            fixed += 1
-            break
+            # If we hit an uncommented paragraph label, the error
+            # line IS inside a paragraph — not an orphaned-body issue
+            if prev_line[6] not in ("*", "/"):
+                upper = content.upper().strip()
+                if re.match(r"^[A-Z0-9][A-Z0-9_-]*\s*\.\s*$", upper):
+                    break  # has a valid paragraph context
+                # Check for missing period on this line
+                stripped = _get_cobol_content(prev_line).rstrip()
+                if stripped and not stripped.endswith("."):
+                    raw = prev_line.rstrip("\n\r")
+                    if len(raw) > 72:
+                        raw = raw[:71] + "." + raw[72:]
+                    else:
+                        raw = raw.rstrip() + "."
+                    result[prev_idx] = raw + "\n"
+                    fixed += 1
+                    found_commented_para = True  # treated as fixed
+                    break
+                break  # non-comment line with period — can't fix
+
+            # It's a comment line — check if it's a commented-out
+            # paragraph label (e.g., "*U-1-PRT-DIAGNOSTIC-REP.")
+            comment_content = content.lstrip("*").strip().upper()
+            if re.match(r"^[A-Z0-9][A-Z0-9_-]*\s*\.\s*$", comment_content):
+                # Uncomment the paragraph header
+                # Rebuild line with space in col 7 instead of *
+                new_line = prev_line[:6] + " " + prev_line[7:]
+                result[prev_idx] = new_line
+                fixed += 1
+                found_commented_para = True
+                log.info("  Pre-fix: uncommented paragraph header '%s' "
+                         "at line %d (orphaned body at line %d)",
+                         comment_content.rstrip(".").strip(),
+                         prev_idx + 1, err_ln)
+                break
 
     return result, fixed
 
