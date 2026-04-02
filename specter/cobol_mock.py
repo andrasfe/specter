@@ -915,6 +915,13 @@ def _replace_io_verbs(lines: list[str], max_count: int = 0) -> tuple[list[str], 
                     break
                 j += 1
 
+            # Check if the original block ended with a period
+            block_text_raw = "".join(
+                _get_cobol_content(bl) for bl in block
+            ).strip()
+            has_period = block_text_raw.endswith(".")
+            dot = "." if has_period else ""
+
             # Comment out original
             for bl in block:
                 result.append(_comment_line(bl))
@@ -954,8 +961,9 @@ def _replace_io_verbs(lines: list[str], max_count: int = 0) -> tuple[list[str], 
                     f"{_B}MOVE MOCK-ALPHA-STATUS TO {status_var}\n"
                 )
 
+            # Last line: DISPLAY status + preserve period from original block
             result.append(
-                f"{_B}DISPLAY 'SPECTER-STATUS:' MOCK-ALPHA-STATUS\n"
+                f"{_B}DISPLAY 'SPECTER-STATUS:' MOCK-ALPHA-STATUS{dot}\n"
             )
 
             count += 1
