@@ -69,7 +69,11 @@ ERROR PATTERNS AND FIXES:
 - 'redefinition of X': X is defined twice (two paragraph labels or two data items with the same name). Remove one of the duplicates.
 - 'X is not a field': X is used as a field reference but not defined as a subordinate item. Define it in WORKING-STORAGE with an appropriate PIC clause.
 - 'PICTURE clause required': a group item (01/05) has no PIC and no subordinate items. Add PIC X(256) or add child 05 items.
-- 'unexpected Identifier, expecting SECTION or .': the PREVIOUS line is missing its terminal period, or content extends past col 72.
+- 'unexpected X, expecting SECTION or .': Three possible root causes (check in order):
+  1. A paragraph header 10-50 lines BEFORE was commented out (* in col 7) but its body was not — the body code is orphaned. Fix: uncomment the paragraph header (change col 7 from * to space).
+  2. The PREVIOUS non-comment line is missing its terminal period. Fix: add a period.
+  3. Content extends past col 72 on a previous line. Fix: split the line.
+  Use {"need_context": {"start": N, "end": M}} to see lines BEFORE the error if needed.
 - 'syntax error, unexpected .': a period is in the wrong place (e.g., inside an IF block). Remove it or add END-IF before it.
 - 'unexpected ELSE/END-IF': mismatched IF/ELSE/END-IF. The IF block structure is broken.
 - 'invalid target for TALLYING/INSPECT': the target variable needs to be defined as numeric (PIC 9).
@@ -1673,7 +1677,9 @@ def _compile_and_fix(
                 f"Source context (lines {ctx_start+1}-{ctx_end}):\n"
                 f"```cobol\n{numbered_context}\n```\n\n"
                 f"{_COBOL_FIX_KNOWLEDGE}\n"
-                f"Return ONLY fixed lines as flat JSON: "
+                f"If you need to see additional lines to find the root cause, "
+                f"respond with: {{\"need_context\": {{\"start\": <line>, \"end\": <line>}}}}\n"
+                f"Otherwise return ONLY fixed lines as flat JSON: "
                 f"{{\"<line_number>\": \"<fixed_content>\"}}\n"
                 f"Do NOT wrap in outer keys. Only include lines that changed."
             )
@@ -1681,12 +1687,59 @@ def _compile_and_fix(
             targeted_lines = {chosen_line}
 
         # ===== Send fix prompt (shared by both modes) =====
-        try:
-            response2, _ = _query_llm_sync(llm_provider, fix_prompt, llm_model)
-        except Exception as exc:
-            log.warning("  LLM fix query failed: %s", exc)
-            for tl in targeted_lines:
-                failed_error_lines.add(tl)
+        # Multi-turn: allow LLM to request additional context up to 3 times
+        accumulated_context = ""
+        for _ctx_turn in range(4):  # max 3 context requests + 1 fix
+            try:
+                response2, _ = _query_llm_sync(llm_provider, fix_prompt, llm_model)
+            except Exception as exc:
+                log.warning("  LLM fix query failed: %s", exc)
+                for tl in targeted_lines:
+                    failed_error_lines.add(tl)
+                response2 = None
+                break
+
+            # Check if LLM requested more context
+            if response2 and not use_batch_mode and _ctx_turn < 3:
+                try:
+                    cleaned = re.sub(r"```\w*\n?", "", response2).strip()
+                    parsed_ctx = json.loads(cleaned)
+                    if "need_context" in parsed_ctx:
+                        nc = parsed_ctx["need_context"]
+                        nc_start = max(0, int(nc.get("start", 1)) - 1)
+                        nc_end = min(total_lines, int(nc.get("end", nc_start + 50)))
+                        if nc_end - nc_start > _MAX_CONTEXT_LINES:
+                            nc_end = nc_start + _MAX_CONTEXT_LINES
+                        extra_context = "\n".join(
+                            f"{nc_start + i + 1:5d}: {line.rstrip()}"
+                            for i, line in enumerate(src_lines[nc_start:nc_end])
+                        )
+                        accumulated_context += (
+                            f"\n\nAdditional context (lines {nc_start+1}-{nc_end}):\n"
+                            f"```cobol\n{extra_context}\n```"
+                        )
+                        log.info("  LLM requested context lines %d-%d",
+                                 nc_start + 1, nc_end)
+                        # Re-prompt with accumulated context
+                        fix_prompt = (
+                            f"Fix this GnuCOBOL compilation error:\n"
+                            f"  Line {chosen_line}: {chosen_msg}\n\n"
+                            f"{history_text}"
+                            f"{nearby_text}"
+                            f"Source context (lines {ctx_start+1}-{ctx_end}):\n"
+                            f"```cobol\n{numbered_context}\n```"
+                            f"{accumulated_context}\n\n"
+                            f"{_COBOL_FIX_KNOWLEDGE}\n"
+                            f"Now fix the error. Return ONLY fixed lines as flat JSON: "
+                            f"{{\"<line_number>\": \"<fixed_content>\"}}\n"
+                            f"Do NOT wrap in outer keys. Only include lines that changed."
+                        )
+                        continue
+                except (json.JSONDecodeError, TypeError, ValueError, KeyError):
+                    pass
+            break  # Got a fix response (not a context request)
+
+        if response2 is None:
             continue
 
         # Parse response — allow broader line range for batch mode (stubs
