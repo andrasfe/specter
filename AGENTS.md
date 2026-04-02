@@ -124,7 +124,7 @@ Also generates SQL DDL and Java DAO classes.
 
 ## GnuCOBOL Mock Pipeline (Incremental Instrumentation)
 
-### `specter/incremental_mock.py` — Main Pipeline (~1600 lines)
+### `specter/incremental_mock.py` — Main Pipeline (~2600 lines)
 
 **Entry**: `incremental_instrument(source_path, copybook_dirs, output_dir, llm_provider, ...)`
 
@@ -151,7 +151,7 @@ Returns `(mock_cbl_path, branch_meta, total_branches)`.
 
 **Hard phase gates**: Every phase calls `_assert_clean()` after compile-and-fix. If ANY errors remain, the pipeline raises `RuntimeError` — it will never proceed to the next phase with unresolved errors. The error propagates to the caller (not swallowed). The sub-checkpoint ensures restart resumes from compile-and-fix (not re-doing the transform).
 
-**Resume**: Checkpoint file (`phase_checkpoint.json`) tracks last completed phase. Each phase saves a sub-checkpoint after its transform but before compile-and-fix (e.g., `copy_resolution_transformed`). On restart, the transform is skipped and only compile-and-fix runs — preserving all LLM fixes from the interrupted run.
+**Resume**: Checkpoint file (`phase_checkpoint.json`) tracks last completed phase. Each phase saves a sub-checkpoint after its transform but before compile-and-fix (e.g., `copy_resolution_transformed`). On restart, the transform is skipped and only compile-and-fix runs — preserving all LLM fixes from the interrupted run. On hash mismatch (from interrupted compile-and-fix), warns and resumes instead of starting from scratch.
 
 #### Key Data Structures
 
@@ -168,19 +168,28 @@ class Resolution:
     verified: bool      # True if error gone on recompile
 ```
 
-#### Smart Agent Error Fixing: `_compile_and_fix()` (L510)
+#### Smart Agent Error Fixing: `_compile_and_fix()` (L980)
 
-Two modes, chosen automatically per attempt:
+**Deterministic pre-fixes** (run once before LLM loop — zero LLM cost):
+1. **Long lines**: Wrap lines extending past column 72 (silent truncation → "unexpected identifier")
+2. **Group item PIC**: Remove PIC from group items (IBM allows, GnuCOBOL rejects)
+3. **Redefinitions**: Comment out second definition of duplicate paragraphs/data items
+4. **Record stubs** (`_generate_record_stubs`): Analyze OF qualifiers to build parent-child record structures, infer PIC from usage patterns. Insert one at a time, verify each.
+5. **File stubs** (`_generate_file_stubs`): For "not a file name" errors, generate SELECT + FD stubs in FILE-CONTROL and FILE SECTION.
+
+**Two LLM modes**, chosen automatically per attempt:
 
 **Batch mode** (when 5+ errors share the same type, e.g., all "not defined"):
 - ALL similar errors presented in one prompt (up to 30)
-- LLM sees TWO context chunks: error area + WORKING-STORAGE tail
+- LLM sees TWO context chunks: error area + WORKING-STORAGE tail (for "not defined") or FILE-CONTROL + FILE SECTION (for "not a file name")
 - LLM adds all stubs at once instead of one at a time
 - Parse range is the entire file (stubs in WS, errors in PROCEDURE)
 
 **Single-error mode** (mixed error types):
 1. **Choose**: Present top 15 errors to LLM → LLM picks one + requests context (max 1000 lines)
 2. **Fix**: Send error + context → LLM returns JSON `{"<line>": "<content>"}`
+
+**Error grouping** (`_group_errors_by_type`): Groups errors by normalized type for batch mode. Known types: `is not defined`, `not a file name`, `not a procedure name`, `not a field`, `redefinition`, `ambiguous`, `KEY clause invalid`, `not allowed on SEQUENTIAL`, `syntax error`, `PICTURE clause`, `duplicate`.
 
 **Safeguards**:
 - **Quality gate**: Rejects fixes that are >50% commenting out code with no stubs added
@@ -189,12 +198,19 @@ Two modes, chosen automatically per attempt:
 - **Relaxed verification**: Accept if total error count drops (not just the specific line)
 - **Audit log** (`fix_audit.log`): Every accepted fix logged with BEFORE/AFTER per line, tagged [COMMENTED OUT], [ADDED], or [MODIFIED]
 
+**COBOL knowledge base** (`_COBOL_FIX_KNOWLEDGE`): ~90-line reference appended to every LLM prompt. Covers fixed-format rules (cols 1-72, Area A/B), error patterns with specific remediation, PIC clause inference rules, and hard constraints (never comment out referenced lines).
+
 **Integrity check** (end of pipeline): Reports paragraph trace count, mock probe count, and comment ratio. Warns if >40% of lines are comments.
 
 #### Helper Functions
 
-- **`_generate_record_stubs(errors, src_lines)`**: Deterministic pre-fix for "not defined" errors. Analyzes OF qualifiers to build parent-child record structures, infers PIC clauses from usage patterns (NUMERIC tests, subscripts, MOVE targets, name heuristics). Runs once before the LLM loop — no LLM cost.
-- **`_cluster_errors(errors, gap=10)`**: Group adjacent errors as one root cause
+- **`_generate_record_stubs(errors, src_lines)`**: Deterministic pre-fix for "not defined" errors
+- **`_generate_file_stubs(errors, src_lines)`**: Deterministic pre-fix for "not a file name" errors
+- **`_fix_redefinitions(errors, src_lines)`**: Deterministic pre-fix for "redefinition" errors
+- **`_fix_group_item_pic(errors, src_lines)`**: Deterministic pre-fix for group item PIC errors
+- **`_fix_long_lines(src_lines)`**: Wrap lines past col 72
+- **`_find_file_control_end(src_lines)`**: Find insertion point for SELECT stubs
+- **`_find_file_section_end(src_lines)`**: Find insertion point for FD stubs
 - **`_group_errors_by_type(errors)`**: Group by error type for batch fixing
 - **`_find_working_storage_range(src_lines)`**: Find WS boundaries for dual-context prompts
 - **`_audit_fix(audit_path, ...)`**: Write human-readable fix diff to audit log
@@ -210,11 +226,13 @@ Two modes, chosen automatically per attempt:
 - **`_load_checkpoint(output_dir)`** (L210): Load `phase_checkpoint.json`
 - **`_save_checkpoint(output_dir, phase, number, mock_path)`** (L233): Save after each phase with SHA-256 hash validation
 
-### `specter/cobol_mock.py` — Mock Transformations (~4400 lines)
+### `specter/cobol_mock.py` — Mock Transformations (~4600 lines)
 
 The underlying transformation functions called by `incremental_mock.py`.
 
-**`MockConfig`** (L49): Configuration dataclass — copybook_dirs, trace_paragraphs, mock_file_name, stop_on_exec_return/xctl, eib_calen, eib_aid, initial_values.
+**`_strip_cobc_metadata(name)`**: Strips GnuCOBOL compiler metadata (`(MAIN SECTION:TRUE)`, `IN RECORD`) from symbol names in error messages. Applied to all error extraction points.
+
+**`MockConfig`** (L62): Configuration dataclass — copybook_dirs, trace_paragraphs, mock_file_name, stop_on_exec_return/xctl, eib_calen, eib_aid, initial_values.
 
 #### Core Replacement Functions (all support `max_count` for incremental batching)
 
@@ -226,8 +244,8 @@ The underlying transformation functions called by `incremental_mock.py`.
 | `_replace_call_stmts(lines, max_count=0)` | L841 | Replace CALL 'prog' → mock reads |
 | `_replace_accept_stmts(lines)` | L918 | Replace ACCEPT → CONTINUE |
 | `_add_paragraph_tracing(lines)` | L971 | Insert SPECTER-TRACE:/SPECTER-CALL: |
-| `_add_mock_infrastructure(lines, divs, config)` | L1447 | Add MOCK-FILE SELECT/FD/WS entries |
-| `_disable_original_selects(lines, config)` | L1550 | Comment out original SELECTs |
+| `_add_mock_infrastructure(lines, divs, config)` | L1569 | Add MOCK-FILE SELECT/FD/WS entries (skips SQLCODE/DIBSTAT if already defined) |
+| `_disable_original_selects(lines, config)` | L1685 | Replace original SELECTs with dummy assigns (preserves INDEXED org + RECORD KEY) |
 | `_convert_linkage(lines)` | L1734 | Move LINKAGE items to WORKING-STORAGE |
 | `_fix_procedure_division(lines)` | L1780 | Remove USING clause from PROCEDURE DIVISION |
 | `_add_mock_file_handling(lines, config)` | L1831 | Insert OPEN/CLOSE MOCK-FILE |
