@@ -41,6 +41,20 @@ _CMT = "      *"       # Comment line prefix (col 7 = *)
 _COBC_SYNTAX_TIMEOUT = 90
 
 
+def _strip_cobc_metadata(name: str) -> str:
+    """Strip GnuCOBOL compiler metadata from symbol names.
+
+    GnuCOBOL appends qualifiers like '(MAIN SECTION:TRUE)' or
+    '(GOADCY00:)' to names in error messages.  Also handles
+    'FIELD IN RECORD' qualification.
+    """
+    # Strip parenthetical metadata: "1150-RC-EXIT (MAIN SECTION:TRUE)" → "1150-RC-EXIT"
+    name = re.sub(r"\s*\([^)]*\)\s*$", "", name)
+    # Strip IN/OF qualification: "FIELD IN RECORD" → "FIELD"
+    name = name.split(" IN ", 1)[0].split(" OF ", 1)[0]
+    return name.strip().upper()
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -2473,12 +2487,14 @@ def _auto_stub_undefined_with_cobc(
                 m_undef = re.search(r"'([^']+)'\s+is\s+not\s+defined", msg)
                 if m_undef:
                     raw_sym = m_undef.group(1)
+                    # Strip GnuCOBOL metadata before checking qualification
+                    raw_sym = _strip_cobc_metadata(raw_sym)
                     if " IN " in raw_sym:
                         # Qualified-name resolution failures are often
                         # line-local; do not wipe the entire paragraph.
                         procedure_single_comment_lines.add(ln)
                         continue
-                    sym = raw_sym.split(" IN ", 1)[0].strip().upper()
+                    sym = raw_sym
                     if not re.match(r"^[A-Z0-9-]+$", sym):
                         continue
                     line_txt = ""
@@ -2500,14 +2516,14 @@ def _auto_stub_undefined_with_cobc(
 
                 m_num = re.search(r"'([^']+)'\s+is\s+not\s+(?:a\s+numeric\s+or\s+numeric-edited\s+name|numeric)", msg)
                 if m_num:
-                    sym = m_num.group(1).split(" IN ", 1)[0].strip().upper()
+                    sym = _strip_cobc_metadata(m_num.group(1))
                     if re.match(r"^[A-Z0-9-]+$", sym):
                         numeric_names.add(sym)
                     continue
 
                 m_sub = re.search(r"'([^']+)'\s+requires\s+one\s+subscript", msg)
                 if m_sub:
-                    sym = m_sub.group(1).split(" IN ", 1)[0].strip().upper()
+                    sym = _strip_cobc_metadata(m_sub.group(1))
                     if re.match(r"^[A-Z0-9-]+$", sym):
                         multidim_names.add(sym)
                     continue
@@ -2600,7 +2616,10 @@ def _auto_stub_undefined_with_cobc(
                     )
 
                 # First, neutralize only paragraphs explicitly named by cobc.
-                final_bad_paras = set(re.findall(r"in paragraph '([^']+)'", stderr, re.IGNORECASE))
+                final_bad_paras = {
+                    _strip_cobc_metadata(p)
+                    for p in re.findall(r"in paragraph '([^']+)'", stderr, re.IGNORECASE)
+                }
                 if final_bad_paras:
                     tentative = _force_neutralize_paragraphs(current, {p.upper() for p in final_bad_paras})
                 else:
@@ -2613,7 +2632,7 @@ def _auto_stub_undefined_with_cobc(
                     m_undef = re.search(r"'([^']+)'\s+is\s+not\s+defined", msg)
                     if not m_undef:
                         continue
-                    sym = m_undef.group(1).split(" IN ", 1)[0].strip().upper()
+                    sym = _strip_cobc_metadata(m_undef.group(1))
                     if re.match(r"^[A-Z0-9-]+$", sym):
                         final_missing_para.add(sym)
                 if final_missing_para:
@@ -2874,7 +2893,10 @@ def _progressive_syntax_salvage(lines: list[str], max_rounds: int = 20) -> list[
         if not err_lines:
             return current
 
-        bad_paras = {p.upper() for p in re.findall(r"in paragraph '([^']+)'", stderr, re.IGNORECASE)}
+        bad_paras = {
+            _strip_cobc_metadata(p)
+            for p in re.findall(r"in paragraph '([^']+)'", stderr, re.IGNORECASE)
+        }
         if bad_paras:
             current = _force_neutralize_paragraphs(current, bad_paras)
 
