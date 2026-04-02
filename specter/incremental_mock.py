@@ -620,6 +620,59 @@ def _fix_redefinitions(
     return result, fixed
 
 
+def _fix_missing_periods(
+    errors: list[tuple[int, str]],
+    src_lines: list[str],
+) -> tuple[list[str], int]:
+    """Fix 'unexpected X, expecting SECTION or .' by adding missing period.
+
+    GnuCOBOL reports this when the PREVIOUS line is missing its terminal
+    period.  Find the nearest previous non-comment line and add a period.
+    """
+    from .cobol_mock import _get_cobol_content
+
+    need_period_before: set[int] = set()
+    for ln, msg in errors:
+        if "expecting SECTION or" in msg and "unexpected" in msg:
+            need_period_before.add(ln)
+
+    if not need_period_before:
+        return src_lines, 0
+
+    result = list(src_lines)
+    fixed = 0
+
+    for err_ln in sorted(need_period_before):
+        # Find the previous non-comment, non-empty line
+        for prev_idx in range(err_ln - 2, max(err_ln - 20, -1), -1):
+            if prev_idx < 0 or prev_idx >= len(result):
+                continue
+            prev_line = result[prev_idx]
+            if len(prev_line) <= 6:
+                continue
+            if prev_line[6] in ("*", "/"):
+                continue
+            content = _get_cobol_content(prev_line).rstrip()
+            if not content.strip():
+                continue
+            # Check if it already ends with a period
+            if content.rstrip().endswith("."):
+                break  # already has period — not a missing-period issue
+            # Add period before col 72
+            # Find the end of content (last non-space before col 72)
+            raw = prev_line.rstrip("\n\r")
+            if len(raw) > 72:
+                # Content past col 72 — add period at col 72
+                raw = raw[:71] + "." + raw[72:]
+            else:
+                raw = raw.rstrip() + "."
+            result[prev_idx] = raw + "\n"
+            fixed += 1
+            break
+
+    return result, fixed
+
+
 def _find_working_storage_range(src_lines: list[str]) -> tuple[int, int] | None:
     """Find the WORKING-STORAGE SECTION line range.
 
@@ -1109,6 +1162,19 @@ def _compile_and_fix(
             if n_red > 0:
                 source_path.write_text("".join(src_red))
                 log.info("  Pre-fix: commented out %d redefinitions", n_red)
+
+    # --- Pre-fix: fix "expecting SECTION or ." errors (missing periods) ---
+    rc_per, stderr_per = _cobc_syntax_check(source_path, copybook_dirs)
+    if rc_per != 0:
+        per_errors = _parse_errors(stderr_per, source_name)
+        missing_per = [(ln, msg) for ln, msg in per_errors
+                       if "expecting SECTION or" in msg]
+        if missing_per:
+            src_per = source_path.read_text(errors="replace").splitlines(keepends=True)
+            src_per, n_per = _fix_missing_periods(missing_per, src_per)
+            if n_per > 0:
+                source_path.write_text("".join(src_per))
+                log.info("  Pre-fix: added missing periods on %d lines", n_per)
 
     # --- Pre-fix: deterministic stub generation for "not defined" errors ---
     # Insert stubs ONE AT A TIME, verifying each. This way we keep stubs
