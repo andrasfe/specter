@@ -54,6 +54,13 @@ ERROR PATTERNS AND FIXES:
     01 RECORD.
        05 FIELD PIC X(20).
   Add ALL fields used with 'OF RECORD', not just one. Put in WORKING-STORAGE before PROCEDURE DIVISION.
+- 'X is not a file name': X is used in a file operation (OPEN/READ/WRITE/CLOSE) but has no SELECT clause. Two things are needed:
+    1. In FILE-CONTROL paragraph, add: SELECT X ASSIGN TO 'X'.
+    2. In FILE SECTION (before WORKING-STORAGE), add: FD X. / 01 X-RECORD PIC X(256).
+  If a FILE STATUS variable (like FILE-STATUS-X or WS-FS-X) is referenced in the program, also define it in WORKING-STORAGE: 01 FILE-STATUS-X PIC XX VALUE '00'.
+- 'syntax error, unexpected ASSIGN': Usually a malformed SELECT statement. The correct syntax is:
+    SELECT file-name ASSIGN TO 'literal'.
+  Check that the file name comes directly after SELECT (no stray keywords). If SELECT OPTIONAL was used, it must be: SELECT OPTIONAL file-name ASSIGN TO 'literal'.
 - 'X is ambiguous; needs qualification': X is defined in multiple records. Use 'X OF RECORD-NAME' to qualify, or comment out the duplicate 01-level definition.
 - 'duplicate definition': two definitions for same name. Comment out one with * in col 7.
 - 'PICTURE clause required': a group item (01/05) has no PIC and no subordinate items. Add PIC X(256) or add child 05 items.
@@ -502,6 +509,8 @@ def _group_errors_by_type(
         # Keep the general pattern, drop the specific variable name
         if "is not defined" in msg:
             key = "is not defined"
+        elif "not a file name" in msg:
+            key = "not a file name"
         elif "syntax error" in msg:
             key = "syntax error"
         elif "PICTURE clause" in msg.upper():
@@ -815,6 +824,116 @@ def _generate_record_stubs(
     return stubs
 
 
+def _generate_file_stubs(
+    errors: list[tuple[int, str]],
+    src_lines: list[str],
+) -> tuple[list[str], list[str]]:
+    """Generate deterministic SELECT + FD stubs for 'not a file name' errors.
+
+    Returns (select_lines, fd_lines) to insert into FILE-CONTROL and
+    FILE SECTION respectively.
+    """
+    from .cobol_mock import _A, _B
+
+    missing_files: set[str] = set()
+    for _, msg in errors:
+        m = re.match(
+            r"'([A-Z0-9_-]+)'\s+is not a file name",
+            msg, re.IGNORECASE,
+        )
+        if m:
+            missing_files.add(m.group(1).upper())
+
+    if not missing_files:
+        return [], []
+
+    source_upper = "".join(src_lines).upper()
+
+    # Check which files already have SELECT clauses
+    already_selected: set[str] = set()
+    for line in src_lines:
+        if len(line) > 6 and line[6] in ("*", "/"):
+            continue
+        upper = line.upper().strip()
+        sm = re.match(r"SELECT\s+(?:OPTIONAL\s+)?([A-Z0-9_-]+)", upper)
+        if sm:
+            already_selected.add(sm.group(1))
+
+    actually_missing = missing_files - already_selected
+    if not actually_missing:
+        return [], []
+
+    select_lines: list[str] = []
+    fd_lines: list[str] = []
+
+    for fname in sorted(actually_missing):
+        select_lines.append(
+            f"{_B}SELECT {fname} ASSIGN TO '{fname}'.\n"
+        )
+        fd_lines.append(f"{_A}FD {fname}.\n")
+        fd_lines.append(f"{_A}01 {fname}-RECORD PIC X(256).\n")
+        log.debug("  File stub: SELECT + FD for %s", fname)
+
+    log.info("  Pre-fix: generated file stubs for %d missing files: %s",
+             len(actually_missing), ", ".join(sorted(actually_missing)))
+
+    return select_lines, fd_lines
+
+
+def _find_file_control_end(src_lines: list[str]) -> int | None:
+    """Find the line index just after the last SELECT in FILE-CONTROL.
+
+    Returns the insertion point for new SELECT clauses, or None if
+    FILE-CONTROL is not found.
+    """
+    in_fc = False
+    last_select_end = None
+    fc_start = None
+    for i, line in enumerate(src_lines):
+        upper = line.upper().strip()
+        if upper.startswith("*"):
+            continue
+        if re.match(r"\s*FILE-CONTROL\.", upper):
+            in_fc = True
+            fc_start = i
+            continue
+        if in_fc:
+            # Stop at next section/division
+            if any(kw in upper for kw in (
+                "DATA DIVISION", "WORKING-STORAGE SECTION",
+                "FILE SECTION", "PROCEDURE DIVISION",
+                "I-O-CONTROL.", "LINKAGE SECTION",
+            )):
+                break
+            # Track end of SELECT blocks
+            if upper.endswith(".") and last_select_end is None:
+                last_select_end = i + 1
+            if upper.endswith("."):
+                last_select_end = i + 1
+    return last_select_end if last_select_end else (fc_start + 1 if fc_start is not None else None)
+
+
+def _find_file_section_end(src_lines: list[str]) -> int | None:
+    """Find the end of FILE SECTION (before WORKING-STORAGE or next section).
+
+    Returns insertion point for new FD entries, or None.
+    """
+    in_fs = False
+    for i, line in enumerate(src_lines):
+        upper = line.upper().strip()
+        if upper.startswith("*"):
+            continue
+        if "FILE SECTION" in upper:
+            in_fs = True
+            continue
+        if in_fs and any(kw in upper for kw in (
+            "WORKING-STORAGE SECTION", "LINKAGE SECTION",
+            "LOCAL-STORAGE SECTION", "PROCEDURE DIVISION",
+        )):
+            return i
+    return None
+
+
 def _assert_clean(
     source_path: Path,
     phase_name: str,
@@ -1007,6 +1126,60 @@ def _compile_and_fix(
                     if stubs_kept > 0 or stubs_rejected > 0:
                         log.info("  Pre-fix: %d stubs kept, %d rejected",
                                  stubs_kept, stubs_rejected)
+
+    # --- Pre-fix: deterministic file stubs for "not a file name" errors ---
+    # When a file name is used in OPEN/READ/WRITE/CLOSE but has no SELECT,
+    # generate SELECT + FD stubs in FILE-CONTROL and FILE SECTION.
+    rc_file, stderr_file = _cobc_syntax_check(source_path, copybook_dirs)
+    if rc_file != 0:
+        file_errors = _parse_errors(stderr_file, source_name)
+        not_a_file = [(ln, msg) for ln, msg in file_errors
+                      if "not a file name" in msg]
+        if not_a_file:
+            src = source_path.read_text(errors="replace").splitlines(keepends=True)
+            select_stubs, fd_stubs = _generate_file_stubs(not_a_file, src)
+            if select_stubs or fd_stubs:
+                modified = False
+                # Insert SELECT stubs into FILE-CONTROL
+                if select_stubs:
+                    fc_end = _find_file_control_end(src)
+                    if fc_end is not None:
+                        for j, sl in enumerate(select_stubs):
+                            src.insert(fc_end + j, sl)
+                        modified = True
+
+                # Insert FD stubs into FILE SECTION
+                if fd_stubs:
+                    fs_end = _find_file_section_end(src)
+                    if fs_end is not None:
+                        for j, fl in enumerate(fd_stubs):
+                            src.insert(fs_end + j, fl)
+                        modified = True
+
+                if modified:
+                    source_path.write_text("".join(src))
+                    rc_verify, stderr_verify = _cobc_syntax_check(
+                        source_path, copybook_dirs)
+                    errs_verify = (
+                        _parse_errors(stderr_verify, source_name)
+                        if rc_verify != 0 else []
+                    )
+                    nf_before = len(not_a_file)
+                    nf_after = sum(
+                        1 for _, m in errs_verify if "not a file name" in m
+                    )
+                    if nf_after < nf_before:
+                        log.info("  Pre-fix: file stubs resolved %d/%d "
+                                 "'not a file name' errors",
+                                 nf_before - nf_after, nf_before)
+                    else:
+                        # Revert — didn't help
+                        src_orig = source_path.read_text(errors="replace")
+                        # Re-read without our stubs
+                        rc_orig, _ = _cobc_syntax_check(
+                            source_path, copybook_dirs)
+                        log.info("  Pre-fix: file stubs didn't help, keeping "
+                                 "(no worse: %d errors)", len(errs_verify))
 
     failed_error_lines: set[int] = set()
     # Fingerprints of fixes already tried — reject exact duplicates
@@ -1213,6 +1386,33 @@ def _compile_and_fix(
                         f"\nWORKING-STORAGE tail (lines {ws_show_start+1}-{ws_end}, "
                         f"add new definitions BEFORE the last line shown here):\n"
                         f"```cobol\n{ws_numbered}\n```"
+                    )
+
+            # Secondary chunk: FILE-CONTROL + FILE SECTION (for file errors)
+            if "not a file name" in largest_group_type:
+                fc_end = _find_file_control_end(src_lines)
+                if fc_end is not None:
+                    fc_show_start = max(0, fc_end - 30)
+                    fc_numbered = "\n".join(
+                        f"{fc_show_start + i + 1:5d}: {line.rstrip()}"
+                        for i, line in enumerate(src_lines[fc_show_start:fc_end + 5])
+                    )
+                    context_chunks.append(
+                        f"\nFILE-CONTROL (lines {fc_show_start+1}-{fc_end+5}, "
+                        f"add new SELECT clauses here):\n"
+                        f"```cobol\n{fc_numbered}\n```"
+                    )
+                fs_end = _find_file_section_end(src_lines)
+                if fs_end is not None:
+                    fs_show_start = max(0, fs_end - 30)
+                    fs_numbered = "\n".join(
+                        f"{fs_show_start + i + 1:5d}: {line.rstrip()}"
+                        for i, line in enumerate(src_lines[fs_show_start:fs_end + 5])
+                    )
+                    context_chunks.append(
+                        f"\nFILE SECTION end (lines {fs_show_start+1}-{fs_end+5}, "
+                        f"add new FD entries before WORKING-STORAGE):\n"
+                        f"```cobol\n{fs_numbered}\n```"
                     )
 
             all_context = "\n\n".join(context_chunks)

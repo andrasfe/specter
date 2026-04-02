@@ -1696,8 +1696,8 @@ def _disable_original_selects(lines: list[str], config: MockConfig) -> list[str]
         )
         if not in_select and upper.startswith("SELECT ") and not keep_mock_select:
             in_select = True
-            # Extract the file name from SELECT <name>
-            m = re.match(r"SELECT\s+([A-Z0-9_-]+)", upper)
+            # Extract the file name — skip OPTIONAL keyword if present
+            m = re.match(r"SELECT\s+(?:OPTIONAL\s+)?([A-Z0-9_-]+)", upper)
             select_file_name = m.group(1) if m else ""
             result.append(_comment_line(line))
             if upper.endswith("."):
