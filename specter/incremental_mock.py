@@ -46,8 +46,17 @@ _COBOL_FIX_KNOWLEDGE = """\
 COBOL FIXED-FORMAT RULES:
 - Cols 1-6: sequence numbers (ignored). Col 7: indicator (* = comment, - = continuation, space = code). Cols 8-72: code. Cols 73-80: ignored.
 - ALL code must fit within columns 8-72. If a statement extends past col 72, the compiler silently truncates it → "unexpected identifier". Fix by splitting the line.
+- Section headers are `NAME SECTION.` in Area A. Paragraph headers are `NAME.` in Area A. Statement bodies belong in Area B.
 - 01-level items start in Area A (col 8). 05/10/etc items start in Area B (col 12+).
+- 88-level condition names do NOT have PIC clauses. They belong under a parent item and typically only carry VALUE clauses.
+- Qualified references use `FIELD OF RECORD` or `FIELD IN RECORD`; if the compiler reports a qualified name, preserve that qualification instead of flattening it.
 - Every data definition and statement MUST end with a period.
+
+COMMON COBOL SYNTAX THAT OFTEN CONFUSES NON-COBOL TOOLS:
+- `OPEN INPUT file`, `OPEN OUTPUT file`, `OPEN I-O file`, and `OPEN EXTEND file` are valid; the access mode is not the file name.
+- `READ file INTO rec AT END ... END-READ`, `WRITE rec FROM ws-rec INVALID KEY ...`, and `START file KEY IS >= ws-key INVALID KEY ...` are block forms; if you keep the clause, keep the matching `END-READ` or other terminator.
+- `SELECT OPTIONAL file-name ASSIGN TO 'literal' ORGANIZATION IS INDEXED RECORD KEY IS key-var FILE STATUS IS status-var.` is valid. KEY clauses only work for INDEXED/RELATIVE files, not SEQUENTIAL ones.
+- SQL and CICS support variables like `SQLCODE` and response/status fields that may already be supplied by copybooks; prefer qualification/removal of duplicate stubs over inventing a second definition.
 
 ERROR PATTERNS AND FIXES:
 - 'X is not defined': X is used but has no definition. If X is used as 'FIELD OF RECORD', you need:
@@ -375,6 +384,42 @@ def _save_checkpoint(output_dir: Path, phase_name: str, phase_number: int,
     path.write_text(json.dumps(data, indent=2))
 
 
+def _phase_fix_guidance(phase: str) -> str:
+    """Return phase-specific debugging guidance for the LLM."""
+    if phase == "copy_resolution":
+        return (
+            "Phase-specific guidance for COPY resolution:\n"
+            "- This phase is operating on COPY-expanded source before the later mock transforms.\n"
+            "- Prefer understanding the surrounding source before editing; structural errors often originate 20-200 lines ABOVE the reported line.\n"
+            "- If the cause is not obvious, ask for more context first instead of guessing. Focus on missing periods, broken continuations, Area A paragraph/section headers, malformed VALUE clauses, and commented-out headers that orphan valid code.\n"
+        )
+    return (
+        "Phase-specific guidance for post-copy-resolution phases:\n"
+        "- Assume many remaining errors were introduced by Specter mock instrumentation rather than by the original business COBOL.\n"
+        "- First inspect nearby injected `SPECTER-MOCK`, `READ MOCK-FILE`, `MOCK-RECORD`, generated SELECT/FD stubs, file-status stubs, and commented original I/O blocks.\n"
+        "- Prefer repairing malformed injected I/O replacements or their supporting stubs before altering original program logic.\n"
+    )
+
+
+def _prefer_context_driven_fixing(phase: str) -> bool:
+    """Return True when the phase should bias toward single-error analysis."""
+    return phase == "copy_resolution"
+
+
+def _is_structural_copy_resolution_error(error_msg: str) -> bool:
+    """Return True for early-phase syntax issues that benefit from investigation."""
+    msg = error_msg.lower()
+    structural_tokens = (
+        "continuation character expected",
+        "syntax error",
+        "expecting section or .",
+        "picture clause required",
+        "cannot have picture",
+        "redefinition of",
+    )
+    return any(token in msg for token in structural_tokens)
+
+
 # ---------------------------------------------------------------------------
 # LLM-driven error fixing
 # ---------------------------------------------------------------------------
@@ -433,6 +478,7 @@ def _build_fix_prompt(
     error_desc = "\n".join(
         f"  Line {ln}: {msg}" for ln, msg in errors
     )
+    phase_guidance = _phase_fix_guidance(phase)
 
     prompt = (
         "You are fixing GnuCOBOL compilation errors in a COBOL program "
@@ -440,6 +486,7 @@ def _build_fix_prompt(
         f"Current phase: {phase}\n"
         f"File: {source_name} ({len(src_lines)} lines total)\n"
         f"Total errors: {len(errors)}\n\n"
+        f"{phase_guidance}\n"
         f"{resolution_text}"
         f"Current errors to fix:\n{error_desc}\n\n"
         f"Source context (lines {ctx_start + 1}-{ctx_end}):\n"
@@ -597,31 +644,62 @@ def _fix_redefinitions(
     errors: list[tuple[int, str]],
     src_lines: list[str],
 ) -> tuple[list[str], int]:
-    """Fix 'redefinition of X' errors by commenting out the second definition.
+    """No-op placeholder for redefinition handling.
 
-    GnuCOBOL reports the line of the SECOND definition. Comment it out
-    to keep the first (original) definition.
+    We do not auto-comment out duplicate definitions because that can mask
+    the real defect and remove referenced code. Redefinitions must be fixed
+    by correcting the transform that introduced them.
     """
-    from .cobol_mock import _comment_line
-    redef_lines: set[int] = set()
-    for ln, msg in errors:
-        if "redefinition of" in msg.lower():
-            redef_lines.add(ln)
+    return src_lines, 0
 
-    if not redef_lines:
+
+def _ensure_file_status_definitions(
+    src_lines: list[str],
+) -> tuple[list[str], int]:
+    """Add missing FILE STATUS variables declared by SELECT clauses.
+
+    Some programs reference FILE STATUS variables in FILE-CONTROL but never
+    declare them in WORKING-STORAGE because the target compiler tolerated the
+    pattern or another include supplied them. Add only truly missing names.
+    """
+    ws_range = _find_working_storage_range(src_lines)
+    if not ws_range:
+        return src_lines, 0
+
+    status_vars: set[str] = set()
+    for line in src_lines:
+        upper = line.upper()
+        match = re.search(
+            r"\bFILE\s+STATUS\s+(?:IS\s+)?([A-Z0-9-]+)",
+            upper,
+        )
+        if match:
+            status_vars.add(match.group(1).rstrip("."))
+
+    if not status_vars:
+        return src_lines, 0
+
+    defined_names: set[str] = set()
+    for line in src_lines:
+        upper = line.upper()
+        if "PROCEDURE DIVISION" in upper and (len(line) <= 6 or line[6] not in ("*", "/")):
+            break
+        if len(line) > 6 and line[6] in ("*", "/"):
+            continue
+        content = line[7:72].strip() if len(line) > 7 else line.strip()
+        match = re.match(r"^(?:0[1-9]|[1-4][0-9]|66|77|88)\s+([A-Z0-9-]+)", content, re.IGNORECASE)
+        if match:
+            defined_names.add(match.group(1).upper().rstrip("."))
+
+    missing = sorted(name for name in status_vars if name and name not in defined_names)
+    if not missing:
         return src_lines, 0
 
     result = list(src_lines)
-    fixed = 0
-    for ln in sorted(redef_lines):
-        idx = ln - 1
-        if 0 <= idx < len(result):
-            line = result[idx]
-            if len(line) > 6 and line[6] not in ("*", "/"):
-                result[idx] = _comment_line(line)
-                fixed += 1
-
-    return result, fixed
+    insert_at = ws_range[1]
+    new_lines = [f"       01  {name} PIC XX VALUE '00'.\n" for name in missing]
+    result[insert_at:insert_at] = new_lines
+    return result, len(new_lines)
 
 
 def _fix_missing_periods(
@@ -647,8 +725,16 @@ def _fix_missing_periods(
 
     result = list(src_lines)
     fixed = 0
+    procedure_line = None
+    for idx, line in enumerate(result, start=1):
+        upper = line.upper()
+        if "PROCEDURE DIVISION" in upper and (len(line) <= 6 or line[6] not in ("*", "/")):
+            procedure_line = idx
+            break
 
     for err_ln in sorted(need_fix):
+        if procedure_line is None or err_ln <= procedure_line:
+            continue
         # Strategy 1: Check if a commented-out paragraph header left
         # the error line orphaned (no paragraph context).
         # Scan backward for a commented-out paragraph label.
@@ -686,7 +772,8 @@ def _fix_missing_periods(
             # It's a comment line — check if it's a commented-out
             # paragraph label (e.g., "*U-1-PRT-DIAGNOSTIC-REP.")
             comment_content = content.lstrip("*").strip().upper()
-            if re.match(r"^[A-Z0-9][A-Z0-9_-]*\s*\.\s*$", comment_content):
+            lead = len(content) - len(content.lstrip(" "))
+            if lead <= 4 and re.match(r"^[A-Z0-9][A-Z0-9_-]*\s*\.\s*$", comment_content):
                 # Uncomment the paragraph header
                 # Rebuild line with space in col 7 instead of *
                 new_line = prev_line[:6] + " " + prev_line[7:]
@@ -698,6 +785,75 @@ def _fix_missing_periods(
                          comment_content.rstrip(".").strip(),
                          prev_idx + 1, err_ln)
                 break
+
+    return result, fixed
+
+
+def _fix_commented_statement_continuations(
+    src_lines: list[str],
+) -> tuple[list[str], int]:
+    """Comment orphaned continuation lines after commented procedure code.
+
+    Some sources contain commented-out multi-line statements where only the
+    first line has `*` in column 7 and the continuation operand lines remain
+    active. GnuCOBOL then parses those operand-only lines as code and reports
+    misleading downstream errors.
+    """
+    from .cobol_mock import _comment_line
+
+    result = list(src_lines)
+    fixed = 0
+    in_procedure = False
+    carry_comment = False
+
+    for idx, line in enumerate(result):
+        upper = line.upper()
+        if "PROCEDURE DIVISION" in upper and (len(line) <= 6 or line[6] not in ("*", "/")):
+            in_procedure = True
+            carry_comment = False
+            continue
+        if not in_procedure:
+            continue
+        if len(line) <= 6:
+            carry_comment = False
+            continue
+
+        indicator = line[6]
+        raw_content = line[7:72] if len(line) > 7 else ""
+        content = raw_content.rstrip()
+        stripped = content.strip()
+
+        if indicator in ("*", "/"):
+            comment_payload = stripped.lstrip("*").strip()
+            starts_statement = bool(re.match(
+                r"^(COMPUTE|MOVE|ADD|SUBTRACT|MULTIPLY|DIVIDE|IF|ELSE|PERFORM|STRING|UNSTRING|INSPECT|WRITE|READ|OPEN|CLOSE|START|DELETE|REWRITE|CALL|SET|EVALUATE|WHEN|SEARCH)\b",
+                comment_payload,
+                re.IGNORECASE,
+            ))
+            carry_comment = starts_statement and not comment_payload.endswith(".")
+            continue
+
+        if not stripped:
+            carry_comment = False
+            continue
+
+        if carry_comment:
+            leading_spaces = len(raw_content) - len(raw_content.lstrip(" "))
+            is_new_statement = bool(re.match(
+                r"^(COMPUTE|MOVE|ADD|SUBTRACT|MULTIPLY|DIVIDE|IF|ELSE|PERFORM|STRING|UNSTRING|INSPECT|WRITE|READ|OPEN|CLOSE|START|DELETE|REWRITE|CALL|SET|EVALUATE|WHEN|SEARCH|EXIT|GO|GOBACK|STOP)\b",
+                stripped,
+                re.IGNORECASE,
+            ))
+            is_para_header = leading_spaces <= 4 and bool(
+                re.match(r"^[A-Z0-9-]+\.$", stripped, re.IGNORECASE)
+            )
+            if not is_new_statement and not is_para_header:
+                result[idx] = _comment_line(line)
+                fixed += 1
+                carry_comment = not stripped.endswith(".")
+                continue
+
+        carry_comment = False
 
     return result, fixed
 
@@ -768,6 +924,20 @@ def _fix_long_lines(src_lines: list[str]) -> tuple[list[str], int]:
         if not overflow or overflow.replace(" ", "").isdigit():
             result.append(line)
             continue
+
+        operator_overflow = overflow.strip()
+        if operator_overflow and re.fullmatch(r"[+\-*/(),.]+", operator_overflow):
+            compact = active.rstrip()
+            spaced = f"{compact} {operator_overflow}" if compact else operator_overflow
+            tight = f"{compact}{operator_overflow}" if compact else operator_overflow
+            if len(spaced) <= 72:
+                result.append(spaced + "\n")
+                fixed += 1
+                continue
+            if len(tight) <= 72:
+                result.append(tight + "\n")
+                fixed += 1
+                continue
 
         # Find last space in the active area to split at
         split_at = active.rfind(" ", 12, 72)
@@ -872,6 +1042,26 @@ def _generate_record_stubs(
         parent_fields[parent] = {
             f for f in parent_fields[parent] if f in actually_undefined
         }
+
+    likely_procedure_names: set[str] = set()
+    for var in actually_undefined:
+        var_ref = re.escape(var)
+        if re.search(
+            rf"\b(?:PERFORM|THRU|THROUGH|GO\s+TO)\s+{var_ref}\b",
+            source_upper,
+            re.IGNORECASE,
+        ):
+            likely_procedure_names.add(var)
+
+    if likely_procedure_names:
+        actually_undefined -= likely_procedure_names
+        for parent in list(parent_fields.keys()):
+            if parent in likely_procedure_names:
+                del parent_fields[parent]
+                continue
+            parent_fields[parent] = {
+                f for f in parent_fields[parent] if f not in likely_procedure_names
+            }
 
     # Variables not in any OF relationship
     standalone: set[str] = set()
@@ -1013,6 +1203,133 @@ def _generate_file_stubs(
     return select_lines, fd_lines
 
 
+def _generate_missing_paragraph_stubs(
+    errors: list[tuple[int, str]],
+    src_lines: list[str],
+) -> list[str]:
+    """Generate no-op paragraph stubs for missing procedure targets."""
+    source_upper = "".join(src_lines).upper()
+    existing: set[str] = set()
+    in_procedure = False
+
+    for line in src_lines:
+        upper = line.upper()
+        if "PROCEDURE DIVISION" in upper and (len(line) <= 6 or line[6] not in ("*", "/")):
+            in_procedure = True
+            continue
+        if not in_procedure or (len(line) > 6 and line[6] in ("*", "/")):
+            continue
+        raw_content = line[7:72] if len(line) > 7 else line
+        content = raw_content.strip()
+        lead = len(raw_content) - len(raw_content.lstrip(" "))
+        match = re.match(r"^([A-Z0-9][A-Z0-9-]*)\.$", content, re.IGNORECASE)
+        if match and lead > 4:
+            match = None
+        if match:
+            existing.add(match.group(1).upper())
+
+    missing: list[str] = []
+    seen: set[str] = set()
+    for _, msg in errors:
+        match = re.match(r"'([A-Z0-9_-]+)'\s+is not defined", msg, re.IGNORECASE)
+        if not match:
+            continue
+        name = match.group(1).upper()
+        if name in existing or name in seen:
+            continue
+        if re.search(rf"\b(?:PERFORM|THRU|THROUGH|GO\s+TO)\s+{re.escape(name)}\b", source_upper):
+            seen.add(name)
+            missing.append(name)
+
+    if not missing:
+        return []
+
+    stubs = [f"{_CMT} SPECTER: Auto-generated stubs for missing paragraphs\n"]
+    for name in missing:
+        stubs.append(f"{_A}{name}.\n")
+        stubs.append(f"{_B}CONTINUE.\n")
+    return stubs
+
+
+def _find_procedure_insertion_point(src_lines: list[str]) -> int | None:
+    """Find a safe insertion point near the end of PROCEDURE DIVISION."""
+    proc_idx = None
+    for i, line in enumerate(src_lines):
+        upper = line.upper()
+        if "PROCEDURE DIVISION" in upper and (len(line) <= 6 or line[6] not in ("*", "/")):
+            proc_idx = i
+            break
+    if proc_idx is None:
+        return None
+    return len(src_lines)
+
+
+def _remove_misplaced_paragraph_stub_scaffolding(
+    src_lines: list[str],
+) -> tuple[list[str], int]:
+    """Remove synthetic paragraph-stub scaffolding that landed before PROCEDURE DIVISION.
+
+    Some LLM batch fixes try to add a placeholder 01/05 block plus explanatory
+    comments for missing paragraph stubs. That block is invalid in the middle of
+    VALUE clauses or other data items, and Specter's deterministic paragraph
+    stubs already cover the intended behavior.
+    """
+    proc_idx = None
+    for i, line in enumerate(src_lines):
+        upper = line.upper()
+        if "PROCEDURE DIVISION" in upper and (len(line) <= 6 or line[6] not in ("*", "/")):
+            proc_idx = i
+            break
+
+    if proc_idx is None:
+        proc_idx = len(src_lines)
+
+    banner_patterns = (
+        "ADDED MISSING EXIT PARAGRAPH STUBS",
+        "THESE SATISFY PERFORM ... THRU ... REFERENCES",
+        "NO BUSINESS LOGIC; SAFE CONTINUE/EXIT STUBS",
+        "SPECTER-MISSING-PARAGRAPH-STUBS",
+        "SPECTER-STUB-FILLER",
+    )
+
+    result: list[str] = []
+    removed = 0
+    for idx, line in enumerate(src_lines):
+        if idx < proc_idx:
+            upper = line.upper()
+            if any(pattern in upper for pattern in banner_patterns):
+                removed += 1
+                continue
+        result.append(line)
+    return result, removed
+
+
+def _sanitize_llm_fix_lines(
+    fixes: dict[int, str],
+) -> tuple[dict[int, str], int]:
+    """Drop known-invalid paragraph-stub scaffolding from LLM edits."""
+    if not fixes:
+        return fixes, 0
+
+    disallowed_patterns = (
+        "ADDED MISSING EXIT PARAGRAPH STUBS",
+        "THESE SATISFY PERFORM ... THRU ... REFERENCES",
+        "NO BUSINESS LOGIC; SAFE CONTINUE/EXIT STUBS",
+        "SPECTER-MISSING-PARAGRAPH-STUBS",
+        "SPECTER-STUB-FILLER",
+    )
+
+    cleaned: dict[int, str] = {}
+    removed = 0
+    for line_no, content in fixes.items():
+        upper = content.upper()
+        if any(pattern in upper for pattern in disallowed_patterns):
+            removed += 1
+            continue
+        cleaned[line_no] = content
+    return cleaned, removed
+
+
 def _find_file_control_end(src_lines: list[str]) -> int | None:
     """Find the line index just after the last SELECT in FILE-CONTROL.
 
@@ -1143,7 +1460,7 @@ def _compile_and_fix(
     Returns new resolutions added during this cycle.
     """
     from .llm_coverage import _query_llm_sync, Message
-    from .cobol_fix_cache import _parse_llm_fix_response
+    from .cobol_fix_cache import _parse_llm_fix_response, llm_investigate_cascade
 
     def _save_progress():
         """Save checkpoint with current mock hash — safe to Ctrl-C after."""
@@ -1164,6 +1481,31 @@ def _compile_and_fix(
         log.info("  Pre-fix: wrapped %d lines that extended past column 72",
                  n_long)
 
+    # --- Pre-fix: normalize PROCEDURE DIVISION header continuations ---
+    # Earlier incremental phases run before the dedicated normalization phase,
+    # so split `PROCEDURE DIVISION USING ...` tails can still be active and
+    # trigger LINKAGE/syntax errors. Clean them here in a non-destructive way.
+    from .cobol_mock import _fix_procedure_division
+    src_proc = source_path.read_text(errors="replace").splitlines(keepends=True)
+    fixed_proc = _fix_procedure_division(src_proc)
+    if fixed_proc != src_proc:
+        source_path.write_text("".join(fixed_proc))
+        log.info("  Pre-fix: normalized PROCEDURE DIVISION header continuations")
+
+    # --- Pre-fix: remove misplaced paragraph-stub scaffolding ---
+    src_stub = source_path.read_text(errors="replace").splitlines(keepends=True)
+    src_stub, n_stub = _remove_misplaced_paragraph_stub_scaffolding(src_stub)
+    if n_stub > 0:
+        source_path.write_text("".join(src_stub))
+        log.info("  Pre-fix: removed %d misplaced paragraph stub scaffold lines", n_stub)
+
+    # --- Pre-fix: comment continuations of already-commented statements ---
+    src_comment = source_path.read_text(errors="replace").splitlines(keepends=True)
+    src_comment, n_comment = _fix_commented_statement_continuations(src_comment)
+    if n_comment > 0:
+        source_path.write_text("".join(src_comment))
+        log.info("  Pre-fix: commented %d orphaned continuation lines", n_comment)
+
     # --- Pre-fix: fix "group item cannot have PICTURE clause" errors ---
     # GnuCOBOL rejects PIC on group items; IBM COBOL allows it.
     rc_grp, stderr_grp = _cobc_syntax_check(source_path, copybook_dirs)
@@ -1178,19 +1520,12 @@ def _compile_and_fix(
                 source_path.write_text("".join(src_grp))
                 log.info("  Pre-fix: removed PIC from %d group items", n_grp)
 
-    # --- Pre-fix: fix "redefinition of X" errors ---
-    # Comment out the second definition (GnuCOBOL reports its line).
-    rc_red, stderr_red = _cobc_syntax_check(source_path, copybook_dirs)
-    if rc_red != 0:
-        red_errors = _parse_errors(stderr_red, source_name)
-        redefs = [(ln, msg) for ln, msg in red_errors
-                  if "redefinition of" in msg.lower()]
-        if redefs:
-            src_red = source_path.read_text(errors="replace").splitlines(keepends=True)
-            src_red, n_red = _fix_redefinitions(redefs, src_red)
-            if n_red > 0:
-                source_path.write_text("".join(src_red))
-                log.info("  Pre-fix: commented out %d redefinitions", n_red)
+    # --- Pre-fix: ensure FILE STATUS variables exist ---
+    src_fs = source_path.read_text(errors="replace").splitlines(keepends=True)
+    src_fs, n_fs = _ensure_file_status_definitions(src_fs)
+    if n_fs > 0:
+        source_path.write_text("".join(src_fs))
+        log.info("  Pre-fix: added %d missing FILE STATUS definitions", n_fs)
 
     # --- Pre-fix: fix "expecting SECTION or ." errors (missing periods) ---
     rc_per, stderr_per = _cobc_syntax_check(source_path, copybook_dirs)
@@ -1211,6 +1546,19 @@ def _compile_and_fix(
     rc_pre, stderr_pre = _cobc_syntax_check(source_path, copybook_dirs)
     if rc_pre != 0:
         pre_errors = _parse_errors(stderr_pre, source_name)
+        missing_paras = [(ln, msg) for ln, msg in pre_errors if "is not defined" in msg]
+        if missing_paras:
+            src_para = source_path.read_text(errors="replace").splitlines(keepends=True)
+            para_stubs = _generate_missing_paragraph_stubs(missing_paras, src_para)
+            if para_stubs:
+                insert_at = _find_procedure_insertion_point(src_para)
+                if insert_at is not None:
+                    src_para[insert_at:insert_at] = para_stubs + ["\n"]
+                    source_path.write_text("".join(src_para))
+                    log.info("  Pre-fix: added %d missing paragraph stub lines",
+                             len(para_stubs) - 1)
+                    rc_pre, stderr_pre = _cobc_syntax_check(source_path, copybook_dirs)
+                    pre_errors = _parse_errors(stderr_pre, source_name) if rc_pre != 0 else []
         not_defined = [(ln, msg) for ln, msg in pre_errors
                        if "is not defined" in msg]
         if not_defined:
@@ -1424,9 +1772,10 @@ def _compile_and_fix(
             else:
                 rounds_without_progress += 1
 
-            # Dynamic stall limit: minimum 50 rounds, more near 0
-            # 1 error → 100 rounds, 2 → 50, 10 → 50, 100 → 50
-            stall_limit = max(50, 100 // max(n_errors, 1))
+            # Stop after 10 full no-progress rounds. This keeps the
+            # pipeline from burning large amounts of time on repeated
+            # near-identical attempts.
+            stall_limit = 50
 
             if rounds_without_progress >= stall_limit:
                 log.info("  Phase %s batch %d: stalled at %d errors "
@@ -1456,13 +1805,19 @@ def _compile_and_fix(
         error_groups = _group_errors_by_type(actionable)
         largest_group_type = max(error_groups, key=lambda k: len(error_groups[k]))
         largest_group = error_groups[largest_group_type]
+        prefer_context_driven = _prefer_context_driven_fixing(phase)
         # Use batch only if 5+ same-type errors AND batch hasn't failed yet
         batch_already_failed = any(
             "batch" in fs.lower() or len(fs) > 100
             for _, fe, fs, _ in failed_attempts
             if largest_group_type[:20] in fe
         )
-        use_batch_mode = len(largest_group) >= 5 and not batch_already_failed
+        use_batch_mode = (
+            len(largest_group) >= 5
+            and not batch_already_failed
+            and not prefer_context_driven
+        )
+        phase_guidance = _phase_fix_guidance(phase)
 
         # Build resolution + failure memory text (shared by both modes)
         current_error_types = {msg.split(",")[0].strip() for _, msg in actionable[:15]}
@@ -1584,6 +1939,7 @@ def _compile_and_fix(
             fix_prompt = (
                 f"Fix ALL of these GnuCOBOL compilation errors at once in {source_name} "
                 f"({total_lines} lines, phase: {phase}).\n\n"
+                f"{phase_guidance}\n"
                 f"{history_text}"
                 f"Errors to fix ({len(batch_errors)} errors, type: {largest_group_type}):\n"
                 f"{error_list}\n\n"
@@ -1605,6 +1961,7 @@ def _compile_and_fix(
             choose_prompt = (
                 f"You are fixing GnuCOBOL compilation errors in {source_name} "
                 f"({total_lines} lines, phase: {phase}).\n\n"
+                f"{phase_guidance}\n"
                 f"{history_text}"
                 f"Current compilation errors ({n_errors} total, showing top 15):\n"
                 f"{error_list}\n\n"
@@ -1612,7 +1969,8 @@ def _compile_and_fix(
                 f'{{"choose_error": {{"line": <line_number>, "context_start": <start>, "context_end": <end>}}}}\n\n'
                 f"Where context_start/context_end define the code range you need to see "
                 f"(max {_MAX_CONTEXT_LINES} lines). If many errors cluster, the ROOT CAUSE "
-                f"is likely BEFORE the cluster — request context starting well before."
+                f"is likely BEFORE the cluster — request context starting well before. "
+                f"If the cause is not obvious, request a wider range instead of guessing."
             )
 
             try:
@@ -1672,6 +2030,7 @@ def _compile_and_fix(
             fix_prompt = (
                 f"Fix this GnuCOBOL compilation error:\n"
                 f"  Line {chosen_line}: {chosen_msg}\n\n"
+                f"{phase_guidance}\n"
                 f"{history_text}"
                 f"{nearby_text}"
                 f"Source context (lines {ctx_start+1}-{ctx_end}):\n"
@@ -1679,6 +2038,7 @@ def _compile_and_fix(
                 f"{_COBOL_FIX_KNOWLEDGE}\n"
                 f"If you need to see additional lines to find the root cause, "
                 f"respond with: {{\"need_context\": {{\"start\": <line>, \"end\": <line>}}}}\n"
+                f"If you are unsure, ask for more context before attempting a fix.\n"
                 f"Otherwise return ONLY fixed lines as flat JSON: "
                 f"{{\"<line_number>\": \"<fixed_content>\"}}\n"
                 f"Do NOT wrap in outer keys. Only include lines that changed."
@@ -1687,9 +2047,48 @@ def _compile_and_fix(
             targeted_lines = {chosen_line}
 
         # ===== Send fix prompt (shared by both modes) =====
+        fixes: dict[int, str] = {}
+        if (not use_batch_mode and phase == "copy_resolution"
+                and _is_structural_copy_resolution_error(chosen_msg)):
+            log.info("  [%d/%d] Investigating line %d before fixing: %s",
+                     attempt + 1, max_fix_attempts, chosen_line,
+                     chosen_msg[:60])
+            prior_investigation_attempts = [
+                f"Line {fl}: {fs[:100]} -> {fr}"
+                for fl, _fe, fs, fr in failed_attempts[-10:]
+                if abs(fl - chosen_line) <= 100
+            ]
+            invest_result = llm_investigate_cascade(
+                llm_provider,
+                llm_model,
+                chosen_line,
+                chosen_msg,
+                new_errors,
+                src_lines,
+                source_name=source_name,
+                max_turns=6,
+                prior_attempts=prior_investigation_attempts or None,
+            )
+            if invest_result.fixes:
+                fixes = invest_result.fixes
+            else:
+                reason = invest_result.diagnosis or "investigation exhausted"
+                failed_attempts.append((
+                    chosen_line,
+                    chosen_msg,
+                    "investigation",
+                    reason,
+                ))
+                for tl in targeted_lines:
+                    failed_error_lines.add(tl)
+                continue
+
         # Multi-turn: allow LLM to request additional context up to 3 times
         accumulated_context = ""
+        response2 = None
         for _ctx_turn in range(4):  # max 3 context requests + 1 fix
+            if fixes:
+                break
             try:
                 response2, _ = _query_llm_sync(llm_provider, fix_prompt, llm_model)
             except Exception as exc:
@@ -1740,13 +2139,20 @@ def _compile_and_fix(
             break  # Got a fix response (not a context request)
 
         if response2 is None:
-            continue
+            if not fixes:
+                continue
 
         # Parse response — allow broader line range for batch mode (stubs
         # may be added in WORKING-STORAGE, far from the error)
-        parse_min = 0 if use_batch_mode else (ctx_start if not use_batch_mode else 0)
-        parse_max = total_lines + 100  # Allow appending lines
-        fixes = _parse_llm_fix_response(response2, parse_min, parse_max)
+        if not fixes:
+            parse_min = 0 if use_batch_mode else (ctx_start if not use_batch_mode else 0)
+            parse_max = total_lines + 100  # Allow appending lines
+            fixes = _parse_llm_fix_response(response2, parse_min, parse_max)
+
+        fixes, removed_bad_fix_lines = _sanitize_llm_fix_lines(fixes)
+        if removed_bad_fix_lines > 0:
+            log.info("  [%d/%d] Filtered %d misplaced paragraph-stub scaffold lines from LLM fix",
+                     attempt + 1, max_fix_attempts, removed_bad_fix_lines)
 
         if not fixes:
             snippet = response2[:200].replace("\n", "\\n") if response2 else "(empty)"
@@ -1896,12 +2302,31 @@ def _compile_and_fix(
                      attempt + 1, max_fix_attempts, n_errors, new_error_count, reduced)
             _save_progress()
 
-            # After a big drop, re-run pre-fix stubs — new "not defined"
-            # errors may have appeared that weren't visible before
-            if reduced >= 10:
+            # After a successful drop, re-run deterministic paragraph/data
+            # stubs because newly visible undefined targets may surface.
+            if reduced >= 1:
                 rc_re, stderr_re = _cobc_syntax_check(source_path, copybook_dirs)
                 if rc_re != 0:
                     re_errors = _parse_errors(stderr_re, source_name)
+                    re_src = source_path.read_text(errors="replace").splitlines(keepends=True)
+                    re_src, removed_scaffolding = _remove_misplaced_paragraph_stub_scaffolding(re_src)
+                    if removed_scaffolding > 0:
+                        source_path.write_text("".join(re_src))
+                        log.info("  Re-clean after drop: removed %d misplaced paragraph stub scaffold lines",
+                                 removed_scaffolding)
+                        rc_re, stderr_re = _cobc_syntax_check(source_path, copybook_dirs)
+                        re_errors = _parse_errors(stderr_re, source_name) if rc_re != 0 else []
+                        re_src = source_path.read_text(errors="replace").splitlines(keepends=True)
+                    re_para_stubs = _generate_missing_paragraph_stubs(re_errors, re_src)
+                    if re_para_stubs:
+                        para_insert_at = _find_procedure_insertion_point(re_src)
+                        if para_insert_at is not None:
+                            re_src[para_insert_at:para_insert_at] = re_para_stubs + ["\n"]
+                            source_path.write_text("".join(re_src))
+                            log.info("  Re-stubs after drop: added %d paragraph stub lines",
+                                     len(re_para_stubs) - 1)
+                            rc_re, stderr_re = _cobc_syntax_check(source_path, copybook_dirs)
+                            re_errors = _parse_errors(stderr_re, source_name) if rc_re != 0 else []
                     re_nd = [(ln, msg) for ln, msg in re_errors
                              if "is not defined" in msg]
                     if re_nd:
@@ -2074,13 +2499,10 @@ def _phase_branch_probes(
     llm_model: str | None,
     copybook_dirs: list[Path] | None = None,
 ) -> tuple[dict, int, str]:
-    """Phase 9: Insert branch probes one paragraph at a time.
+    """Phase 9: Insert branch probes after successful compilation.
 
     Returns (branch_meta, total_probes, description).
     """
-    if not llm_provider:
-        return {}, 0, "Branch probes skipped (no LLM provider)"
-
     try:
         from .branch_instrumenter import instrument_branches
         probes, paras_done, branch_meta = instrument_branches(

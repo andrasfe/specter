@@ -496,6 +496,54 @@ def _normalize_copy_line(line: str) -> str:
     if not raw:
         return "\n"
 
+    stripped = raw.strip()
+    if stripped:
+        if stripped == "*" or not stripped.rstrip("*").strip():
+            return "      *\n"
+        if stripped.endswith("*") and set(stripped) <= {"*", "-", " "}:
+            return f"      * {stripped.rstrip('*').rstrip()}\n".rstrip() + "\n"
+        level_like = bool(re.match(r"^\d{1,2}\s+(?:[A-Z0-9][A-Z0-9-]*|FILLER)\b", stripped, re.IGNORECASE))
+        header_like = bool(re.match(
+            r"^(IDENTIFICATION|ENVIRONMENT|DATA|PROCEDURE)\s+DIVISION\b"
+            r"|^(WORKING-STORAGE|FILE|LINKAGE|LOCAL-STORAGE|INPUT-OUTPUT"
+            r"|CONFIGURATION|REPORT|SCREEN)\s+SECTION\b",
+            stripped,
+            re.IGNORECASE,
+        ))
+        trailing_comment_marker = stripped.endswith("*")
+        expression_like = bool(re.search(
+            r"(?:\b\d+\b|\b[A-Z0-9-]{2,}-[A-Z0-9-]+\b)\s+[-+*/=]\s+"
+            r"(?:\(|\b\d+\b|\b[A-Z0-9-]{2,}-[A-Z0-9-]+\b)",
+            stripped,
+            re.IGNORECASE,
+        )) or bool(re.search(
+            r"\b[A-Z0-9-]{2,}-[A-Z0-9-]+\b\s+[-+*/=]\s*$",
+            stripped,
+            re.IGNORECASE,
+        ))
+        prose_like = (
+            trailing_comment_marker
+            and not expression_like
+            and not level_like
+            and not header_like
+            and not stripped.startswith(("*", "/", "-"))
+        )
+        if prose_like:
+            comment_text = stripped.rstrip("*").rstrip()
+            if comment_text:
+                return f"      * {comment_text}\n"
+            return "      *\n"
+        level_match = re.match(
+            r"^(\d{1,2})\s+((?:[A-Z0-9][A-Z0-9-]*|FILLER)\b.*)$",
+            stripped,
+            re.IGNORECASE,
+        )
+        if level_match:
+            level = int(level_match.group(1))
+            remainder = level_match.group(2).rstrip()
+            prefix = _A if level in (1, 66, 77, 88) else _B
+            return f"{prefix}{level:02d} {remainder}\n"
+
     # Case 1: Already fixed-format (cols 1-6 blank, valid indicator in col 7)
     if len(raw) >= 7 and not raw[:6].strip() and raw[6] in (" ", "*", "/", "-", "D", "d"):
         return raw + "\n"
@@ -1243,6 +1291,7 @@ def _add_branch_tracing(
     result: list[str] = []
     branch_id = 0
     branch_meta: dict[str, dict] = {}
+    branch_directions: dict[str, set[str]] = {}
     in_procedure = False
     current_para = ""
     _stats: dict[str, int] = {}  # diagnostic counters
@@ -1337,6 +1386,17 @@ def _add_branch_tracing(
             # Check IF style BEFORE inserting any probes
             has_else, has_end_if = _scan_for_else(lines, i + 1)
 
+            # Some enterprise COBOL uses `ELSE IF ...` chains or starts the
+            # ELSE body on the same physical line (for example `ELSE DIVIDE ...
+            # GIVING ...`). Inserting a DISPLAY between those tokens splits a
+            # single COBOL sentence and breaks syntax, so skip such IFs.
+            if has_end_if and _has_inline_else_body(lines, i + 1):
+                log.debug("Branch tracing: skip IF at line %d (inline ELSE body): %s",
+                          i + 1, full_condition[:50])
+                _stats["skip_inline_else_body"] = _stats.get("skip_inline_else_body", 0) + 1
+                i = j
+                continue
+
             # Skip period-delimited IFs — inserting a DISPLAY between
             # the condition and body would break the sentence scope.
             if not has_end_if:
@@ -1357,11 +1417,13 @@ def _add_branch_tracing(
                 "condition": full_condition,
                 "type": "IF",
             }
+            branch_directions.setdefault(bid, set())
 
             # Insert the TRUE probe before the first body line
             result.append(
                 f"{_B}DISPLAY '@@B:{bid}:T'\n"
             )
+            branch_directions[bid].add("T")
             cond_vars = _extract_condition_vars(full_condition)
             vs = _gen_var_snapshot(bid, cond_vars)
             if vs:
@@ -1382,9 +1444,18 @@ def _add_branch_tracing(
             if id_stack:
                 bid = id_stack[-1]
                 result.append(line)
+                # Keep inline ELSE sentences intact, such as:
+                #   ELSE IF ...
+                #   ELSE DIVIDE ... GIVING ...
+                # Inserting DISPLAY between ELSE and that statement breaks
+                # COBOL syntax, so only instrument standalone ELSE lines.
+                if content != "ELSE":
+                    i += 1
+                    continue
                 result.append(
                     f"{_B}DISPLAY '@@B:{bid}:F'\n"
                 )
+                branch_directions.setdefault(bid, set()).add("F")
                 meta = branch_meta.get(bid, {})
                 cond_vars = _extract_condition_vars(meta.get("condition", ""))
                 vs = _gen_var_snapshot(bid, cond_vars)
@@ -1427,6 +1498,7 @@ def _add_branch_tracing(
                 "condition": subject,
                 "type": "EVALUATE",
             }
+            branch_directions.setdefault(bid, set())
             eval_stack.append((bid, 0))
             result.append(line)
             i += 1
@@ -1447,6 +1519,7 @@ def _add_branch_tracing(
             result.append(
                 f"{_B}DISPLAY '@@B:{base_bid}:{direction}'\n"
             )
+            branch_directions.setdefault(base_bid, set()).add(direction)
             meta = branch_meta.get(base_bid, {})
             cond_vars = _extract_condition_vars(meta.get("condition", ""))
             vs = _gen_var_snapshot(base_bid, cond_vars)
@@ -1467,13 +1540,8 @@ def _add_branch_tracing(
         result.append(line)
         i += 1
 
-    # Compute total directions: IFs have 2 (T/F), EVALUATEs have when_count
-    total_directions = 0
-    for meta in branch_meta.values():
-        if meta["type"] == "IF":
-            total_directions += 2
-        elif meta["type"] == "EVALUATE":
-            total_directions += meta.get("when_count", 1)
+    # Compute total directions from the probes that were actually inserted.
+    total_directions = sum(len(directions) for directions in branch_directions.values())
 
     log.info("Branch tracing stats: %s", _stats)
     return result, branch_meta, total_directions
@@ -1560,6 +1628,37 @@ def _scan_for_else(lines: list[str], start: int) -> tuple[bool, bool]:
         if _para_re.match(content):
             return False, False
     return False, False             # reached end, period-delimited
+
+
+def _has_inline_else_body(lines: list[str], start: int) -> bool:
+    """Return True if an ELSE branch starts its statement on the ELSE line.
+
+    Examples that should return True:
+    - `ELSE IF SOME-COND`
+    - `ELSE DIVIDE X BY Y`
+    - `ELSE MOVE A TO B`
+
+    These forms cannot safely receive an inserted DISPLAY between ELSE and the
+    statement without rewriting the original COBOL sentence.
+    """
+    depth = 1
+    for j in range(start, len(lines)):
+        line = lines[j]
+        content = _get_cobol_content(line).strip().upper() if len(line) > 7 else ""
+        if not content:
+            continue
+        if content.startswith("IF ") and not content.startswith("IF-"):
+            depth += 1
+            continue
+        if content.startswith("END-IF"):
+            depth -= 1
+            if depth == 0:
+                return False
+            continue
+        if depth == 1 and content.startswith("ELSE"):
+            tail = content[4:].strip()
+            return bool(tail)
+    return False
 
 
 # COBOL verbs / keywords that indicate the start of an IF body (not
@@ -1992,10 +2091,26 @@ def _fix_procedure_division(lines: list[str]) -> list[str]:
         r"^(\s+PROCEDURE\s+DIVISION)\s+USING\s+.*$",
         re.IGNORECASE,
     )
+    pd_plain_re = re.compile(
+        r"^\s*PROCEDURE\s+DIVISION\.?\s*$",
+        re.IGNORECASE,
+    )
     comm_re = re.compile(
         r"MOVE\s+DFHCOMMAREA\s*\(",
         re.IGNORECASE,
     )
+
+    def _is_proc_division_continuation(content: str) -> bool:
+        stripped = content.strip()
+        if not stripped:
+            return False
+        if re.match(
+            r"^(IF|ELSE|END-IF|MOVE|PERFORM|EVALUATE|DISPLAY|ADD|SUBTRACT|COMPUTE|GO|READ|WRITE|OPEN|CLOSE|CALL|EXEC|SET|INITIALIZE|STRING|UNSTRING|INSPECT|ACCEPT|STOP|GOBACK|EXIT|CONTINUE|SEARCH|DECLARATIVES|[A-Z0-9-]+\.)\b",
+            stripped,
+            re.IGNORECASE,
+        ):
+            return False
+        return bool(re.match(r"^(?:USING\s+)?[A-Z0-9-]+(?:\s+[A-Z0-9-]+)*\.?$", stripped, re.IGNORECASE))
 
     i = 0
     while i < len(lines):
@@ -2015,6 +2130,24 @@ def _fix_procedure_division(lines: list[str]) -> list[str]:
                     cont,
                     re.IGNORECASE,
                 ):
+                    break
+                result.append(_comment_line(lines[i]))
+                end_here = cont.endswith(".")
+                i += 1
+                if end_here:
+                    break
+            continue
+
+        if pd_plain_re.match(_get_cobol_content(line)):
+            result.append(line if line.endswith("\n") else line + "\n")
+            i += 1
+            while i < len(lines):
+                cont = _get_cobol_content(lines[i]).strip()
+                if not cont:
+                    result.append(_comment_line(lines[i]))
+                    i += 1
+                    continue
+                if not _is_proc_division_continuation(cont):
                     break
                 result.append(_comment_line(lines[i]))
                 end_here = cont.endswith(".")
@@ -2544,17 +2677,10 @@ def _auto_stub_undefined_with_cobc(
                 ) and (1 <= ln <= len(current)):
                     if "unexpected END-IF" in msg or "unexpected END-EVALUATE" in msg:
                         procedure_single_comment_lines.add(ln)
-                        continue
-                    para = _paragraph_for_line(current, ln)
-                    if para:
-                        bad_paragraphs.add(para)
                     continue
 
                 if "redefinition of" in msg and (1 <= ln <= len(current)):
                     procedure_single_comment_lines.add(ln)
-                    para = _paragraph_for_line(current, ln)
-                    if para:
-                        bad_paragraphs.add(para)
                     continue
 
                 # Only comment out data blocks that are structurally broken,
@@ -2586,19 +2712,12 @@ def _auto_stub_undefined_with_cobc(
             # Don't comment out named data items — they may be referenced
             # elsewhere. Let the compile loop handle genuine conflicts.
 
-            if bad_paragraphs:
-                current = _neutralize_paragraphs(current, bad_paragraphs)
-
-            if procedure_single_comment_lines:
-                current = _comment_specific_lines(current, procedure_single_comment_lines)
-
             # _cleanup_unbalanced_procedure DISABLED — it was commenting out
             # valid MOVE continuations, COMPUTE lines, and deeply-indented
             # identifiers. The compile loop handles genuine issues.
             # current = _cleanup_unbalanced_procedure(current)
             current = _normalize_subscript_forms(current)
             current = _normalize_paragraph_ellipsis(current)
-            current = _force_neutralize_paragraphs(current, bad_paragraphs)
 
     # Last resort path: first try targeted recovery from final diagnostics,
     # then fall back to hardened procedure only if still broken.
@@ -2623,15 +2742,7 @@ def _auto_stub_undefined_with_cobc(
                         allow_hardening_fallback=allow_hardening_fallback,
                     )
 
-                # First, neutralize only paragraphs explicitly named by cobc.
-                final_bad_paras = {
-                    _strip_cobc_metadata(p)
-                    for p in re.findall(r"in paragraph '([^']+)'", stderr, re.IGNORECASE)
-                }
-                if final_bad_paras:
-                    tentative = _force_neutralize_paragraphs(current, {p.upper() for p in final_bad_paras})
-                else:
-                    tentative = list(current)
+                tentative = list(current)
 
                 # Final-row recovery: inject paragraph stubs for unresolved
                 # label-like symbols before escalating to hardening.
@@ -2658,8 +2769,6 @@ def _auto_stub_undefined_with_cobc(
                     if m.group(1).isdigit()
                 }
                 tentative = _canonicalize_paragraph_header_lines(tentative, err_lines)
-                if err_lines:
-                    tentative = _comment_specific_lines(tentative, err_lines)
 
                 with tempfile.TemporaryDirectory(prefix="specter-mock-") as td2:
                     tmp_src2 = Path(td2) / "autocheck-targeted.cbl"
@@ -2680,59 +2789,13 @@ def _auto_stub_undefined_with_cobc(
                         allow_hardening_fallback=allow_hardening_fallback,
                     )
 
-                # Keep as much runnable logic as possible by progressively
-                # neutralizing exact cobc-reported error lines before giving up.
-                salvage = _progressive_syntax_salvage(tentative, max_rounds=80)
-                with tempfile.TemporaryDirectory(prefix="specter-mock-") as td3:
-                    tmp_src3 = Path(td3) / "autocheck-salvage.cbl"
-                    tmp_src3.write_text("".join(salvage))
-                    proc3 = subprocess.run(
-                        ["cobc", "-fsyntax-only", "-std=ibm", "-Wno-dialect", "-frelax-syntax-checks", "-frelax-level-hierarchy", str(tmp_src3)],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        timeout=syntax_timeout,
-                    )
-                if proc3.returncode == 0:
-                    return salvage
-                if _is_cobc_internal_abort((proc3.stderr or "") + "\n" + (proc3.stdout or "")):
-                    return _mitigate_cobc_internal_abort(
-                        salvage,
-                        (proc3.stderr or "") + "\n" + (proc3.stdout or ""),
-                        allow_hardening_fallback=allow_hardening_fallback,
-                    )
-
-                salvage2 = _progressive_syntax_salvage(current, max_rounds=180)
-                with tempfile.TemporaryDirectory(prefix="specter-mock-") as td4:
-                    tmp_src4 = Path(td4) / "autocheck-salvage2.cbl"
-                    tmp_src4.write_text("".join(salvage2))
-                    proc4 = subprocess.run(
-                        ["cobc", "-fsyntax-only", "-std=ibm", "-Wno-dialect", "-frelax-syntax-checks", "-frelax-level-hierarchy", str(tmp_src4)],
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        timeout=syntax_timeout,
-                    )
-                if proc4.returncode == 0:
-                    return salvage2
-                if _is_cobc_internal_abort((proc4.stderr or "") + "\n" + (proc4.stdout or "")):
-                    return _mitigate_cobc_internal_abort(
-                        salvage2,
-                        (proc4.stderr or "") + "\n" + (proc4.stdout or ""),
-                    )
-
                 _write_hardening_diagnostics(
-                    stage="post-salvage",
-                    diagnostics=(proc4.stderr or "") + "\n" + (proc4.stdout or ""),
+                    stage="post-targeted-recovery",
+                    diagnostics=(proc2.stderr or "") + "\n" + (proc2.stdout or ""),
                 )
-
-                if allow_hardening_fallback:
-                    return _hard_comment_procedure(current)
                 return current
     except Exception:
         _write_hardening_diagnostics(stage="exception", diagnostics="exception during auto-stub recovery")
-        if allow_hardening_fallback:
-            return _hard_comment_procedure(current)
         return current
 
     return current
@@ -2901,14 +2964,6 @@ def _progressive_syntax_salvage(lines: list[str], max_rounds: int = 20) -> list[
         if not err_lines:
             return current
 
-        bad_paras = {
-            _strip_cobc_metadata(p)
-            for p in re.findall(r"in paragraph '([^']+)'", stderr, re.IGNORECASE)
-        }
-        if bad_paras:
-            current = _force_neutralize_paragraphs(current, bad_paras)
-
-        current = _comment_exact_lines(current, err_lines)
         current = _cleanup_unbalanced_procedure(current)
 
     return current

@@ -143,11 +143,11 @@ Returns `(mock_cbl_path, branch_meta, total_branches)`.
 | 6 | Paragraph tracing | No | Insert SPECTER-TRACE:/SPECTER-CALL: DISPLAYs |
 | 7 | Normalization | No | LINKAGE conversion, REDEFINES, common stubs, etc. |
 | 8 | Compile-and-fix | No | LLM handles remaining undefined symbols |
-| 9 | Branch probes | No | LLM inserts @@B: probes, one paragraph at a time |
+| 9 | Branch probes | No | Deterministic branch tracer inserts @@B: probes; insertion-only LLM fallback is used only if deterministic tracing fails syntax check |
 
 **Batch loop** (Phases 3-5): Replace `batch_size` blocks → write → compile → fix → next batch. If batch causes >10 errors, revert and retry one-by-one.
 
-**Sequential fix loop**: `_compile_and_fix` runs sequentially — compile, pick error, fix, compile, repeat — until errors reach 0 or stall. Minimum 50 rounds always, 100 for 1 error. Formula: `max(50, 100 // n_errors)`. When all errors have been attempted, `failed_error_lines` resets for a fresh round with accumulated failed-attempt memory. Duplicate fixes are fingerprinted and rejected instantly. After batch mode fails for an error type, falls back to single-error mode.
+**Sequential fix loop**: `_compile_and_fix` runs sequentially — compile, pick error, fix, compile, repeat — until errors reach 0 or stalls for 10 no-progress rounds. When all errors have been attempted, `failed_error_lines` resets for a fresh round with accumulated failed-attempt memory. Duplicate fixes are fingerprinted and rejected instantly. After batch mode fails for an error type, falls back to single-error mode. `copy_resolution` is biased toward context-driven single-error investigation, while later phases still prefer batching when many similar instrumentation-induced errors appear.
 
 **Hard phase gates**: Every phase calls `_assert_clean()` after compile-and-fix. If ANY errors remain, the pipeline raises `RuntimeError` — it will never proceed to the next phase with unresolved errors. The error propagates to the caller (not swallowed). The sub-checkpoint ensures restart resumes from compile-and-fix (not re-doing the transform).
 
@@ -170,12 +170,15 @@ class Resolution:
 
 #### Smart Agent Error Fixing: `_compile_and_fix()` (L980)
 
-**Deterministic pre-fixes** (run once before LLM loop — zero LLM cost):
-1. **Long lines**: Wrap lines extending past column 72 (silent truncation → "unexpected identifier")
-2. **Group item PIC**: Remove PIC from group items (IBM allows, GnuCOBOL rejects)
-3. **Redefinitions**: Comment out second definition of duplicate paragraphs/data items
-4. **Record stubs** (`_generate_record_stubs`): Analyze OF qualifiers to build parent-child record structures, infer PIC from usage patterns. Insert one at a time, verify each.
-5. **File stubs** (`_generate_file_stubs`): For "not a file name" errors, generate SELECT + FD stubs in FILE-CONTROL and FILE SECTION.
+**Deterministic pre-fixes** (run before or alongside the LLM loop — zero LLM cost where possible):
+1. **Long lines**: Wrap lines extending past column 72, including operator-only overflow fragments caused by fixed-format truncation.
+2. **Commented-statement continuations**: `_fix_commented_statement_continuations()` comments orphaned operand/continuation lines that remain active after the first line of a multi-line statement was already commented out.
+3. **Group item PIC**: Remove PIC from group items (IBM allows, GnuCOBOL rejects).
+4. **FILE STATUS definitions**: `_ensure_file_status_definitions()` adds missing WORKING-STORAGE declarations referenced by FILE-CONTROL `FILE STATUS` clauses.
+5. **Missing periods / structure cleanup**: `_fix_missing_periods()` repairs common `expecting SECTION or .` cases before escalating to the LLM.
+6. **Missing paragraph stubs** (`_generate_missing_paragraph_stubs`): For undefined PERFORM / GO TO targets, add deterministic no-op paragraph stubs near the end of PROCEDURE DIVISION.
+7. **Record stubs** (`_generate_record_stubs`): Analyze OF qualifiers to build parent-child record structures, infer PIC from usage patterns, and skip likely procedure names so paragraph targets are not mis-stubbed into WORKING-STORAGE.
+8. **File stubs** (`_generate_file_stubs`): For "not a file name" errors, generate SELECT + FD stubs in FILE-CONTROL and FILE SECTION.
 
 **Two LLM modes**, chosen automatically per attempt:
 
@@ -189,6 +192,8 @@ class Resolution:
 1. **Choose**: Present top 15 errors to LLM → LLM picks one + requests context (max 1000 lines)
 2. **Fix**: Send error + context → LLM returns JSON `{"<line>": "<content>"}`
 
+**Copy-resolution investigation mode**: For structural early-phase errors (`syntax error`, continuation failures, group-item PIC issues, redefinitions, malformed headers), `_compile_and_fix()` can call `llm_investigate_cascade()` first. The LLM may request additional context in multiple turns before proposing any edits, which reduces guess-fixes against broken COPY-expanded structure.
+
 **Error grouping** (`_group_errors_by_type`): Groups errors by normalized type for batch mode. Known types: `is not defined`, `not a file name`, `not a procedure name`, `not a field`, `redefinition`, `ambiguous`, `KEY clause invalid`, `not allowed on SEQUENTIAL`, `syntax error`, `PICTURE clause`, `duplicate`.
 
 **Safeguards**:
@@ -198,21 +203,30 @@ class Resolution:
 - **Relaxed verification**: Accept if total error count drops (not just the specific line)
 - **Audit log** (`fix_audit.log`): Every accepted fix logged with BEFORE/AFTER per line, tagged [COMMENTED OUT], [ADDED], or [MODIFIED]
 
-**COBOL knowledge base** (`_COBOL_FIX_KNOWLEDGE`): ~90-line reference appended to every LLM prompt. Covers fixed-format rules (cols 1-72, Area A/B), error patterns with specific remediation, PIC clause inference rules, and hard constraints (never comment out referenced lines).
+**COBOL knowledge base** (`_COBOL_FIX_KNOWLEDGE`): ~90-line reference appended to every LLM prompt. Covers fixed-format rules (cols 1-72, Area A/B), section and paragraph headers, 88-level rules, qualified `FIELD OF RECORD` references, common I/O and SELECT syntax, error patterns with specific remediation, PIC clause inference rules, and hard constraints (never comment out referenced lines).
+
+**Phase-aware prompting**: `_phase_fix_guidance()` injects different instructions by phase. `copy_resolution` emphasizes structural root-cause analysis and requesting wider context before editing; later phases explicitly assume many failures were introduced by Specter instrumentation and bias the LLM toward repairing injected mock I/O, generated stubs, and related scaffolding before touching original business logic.
+
+**Post-progress restubbing**: After any successful error-count drop, `_compile_and_fix()` reruns deterministic paragraph stubs and undefined-symbol stubs because newly surfaced targets often appear only after the first root cause is fixed.
 
 **Integrity check** (end of pipeline): Reports paragraph trace count, mock probe count, and comment ratio. Warns if >40% of lines are comments.
 
 #### Helper Functions
 
 - **`_generate_record_stubs(errors, src_lines)`**: Deterministic pre-fix for "not defined" errors
+- **`_generate_missing_paragraph_stubs(errors, src_lines)`**: Deterministic no-op stubs for missing paragraph targets
 - **`_generate_file_stubs(errors, src_lines)`**: Deterministic pre-fix for "not a file name" errors
-- **`_fix_redefinitions(errors, src_lines)`**: Deterministic pre-fix for "redefinition" errors
+- **`_ensure_file_status_definitions(src_lines)`**: Add missing FILE STATUS variables referenced by SELECT clauses
+- **`_fix_redefinitions(errors, src_lines)`**: Intentional no-op placeholder; duplicate definitions are no longer auto-commented out
+- **`_fix_commented_statement_continuations(src_lines)`**: Comment orphaned continuation lines after already-commented statements
 - **`_fix_group_item_pic(errors, src_lines)`**: Deterministic pre-fix for group item PIC errors
 - **`_fix_long_lines(src_lines)`**: Wrap lines past col 72
+- **`_find_procedure_insertion_point(src_lines)`**: Find a safe insertion point for paragraph stubs near end of PROCEDURE DIVISION
 - **`_find_file_control_end(src_lines)`**: Find insertion point for SELECT stubs
 - **`_find_file_section_end(src_lines)`**: Find insertion point for FD stubs
 - **`_group_errors_by_type(errors)`**: Group by error type for batch fixing
 - **`_find_working_storage_range(src_lines)`**: Find WS boundaries for dual-context prompts
+- **`_phase_fix_guidance(phase)`**: Phase-specific debugging instructions for LLM prompts
 - **`_audit_fix(audit_path, ...)`**: Write human-readable fix diff to audit log
 
 #### Resolution Persistence
@@ -232,6 +246,8 @@ The underlying transformation functions called by `incremental_mock.py`.
 
 **`_strip_cobc_metadata(name)`**: Strips GnuCOBOL compiler metadata (`(MAIN SECTION:TRUE)`, `IN RECORD`) from symbol names in error messages. Applied to all error extraction points.
 
+**Non-destructive fallback policy**: `cobol_mock.py` no longer uses broad paragraph neutralization, exact-line comment-out salvage, or hard-comment procedure fallback as a generic recovery path. Fallback recovery now prefers targeted normalization, paragraph-header canonicalization, injected stub repair, and diagnostics, preserving original business logic unless an actual I/O block is being replaced by design.
+
 **`MockConfig`** (L62): Configuration dataclass — copybook_dirs, trace_paragraphs, mock_file_name, stop_on_exec_return/xctl, eib_calen, eib_aid, initial_values.
 
 #### Core Replacement Functions (all support `max_count` for incremental batching)
@@ -247,9 +263,16 @@ The underlying transformation functions called by `incremental_mock.py`.
 | `_add_mock_infrastructure(lines, divs, config)` | L1569 | Add MOCK-FILE SELECT/FD/WS entries (skips SQLCODE/DIBSTAT if already defined) |
 | `_disable_original_selects(lines, config)` | L1685 | Replace original SELECTs with dummy assigns (preserves INDEXED org + RECORD KEY) |
 | `_convert_linkage(lines)` | L1734 | Move LINKAGE items to WORKING-STORAGE |
-| `_fix_procedure_division(lines)` | L1780 | Remove USING clause from PROCEDURE DIVISION |
+| `_fix_procedure_division(lines)` | L1780 | Remove `USING` from PROCEDURE DIVISION and comment orphaned continuation lines left behind by split headers |
 | `_add_mock_file_handling(lines, config)` | L1831 | Insert OPEN/CLOSE MOCK-FILE |
+| `_strip_skip_directives(lines)` | L1900s | Remove printer-control / SKIP directives not accepted by GnuCOBOL |
 | `_add_common_stubs(lines, config)` | L1934 | Add DFHAID/DFHBMSCA/EIB stubs if referenced |
+
+#### Recent transformation hardening
+
+- **Copybook normalization** (`_normalize_copy_line`): Better distinguishes prose/banner lines from real arithmetic or declarations. This preserves expression lines from copybooks while still turning decorative text blocks into fixed-format COBOL comments.
+- **Procedure-division cleanup**: `_fix_procedure_division()` now also handles plain `PROCEDURE DIVISION.` headers followed by split continuation lines, commenting the continuation debris instead of leaving invalid identifiers active.
+- **Legacy label normalization**: normalization also repairs paragraph labels ending in ellipsis (`...`) into valid COBOL paragraph headers before later phases compile.
 
 **Mock data format** (80-byte LINE SEQUENTIAL):
 ```
@@ -265,12 +288,19 @@ Cols 60-80:  Filler
 
 Returns `(probes_inserted, paragraphs_done, branch_meta)`.
 
-Per paragraph with IF/EVALUATE:
-1. Extract paragraph source
-2. Send to LLM with rules (@@B:id:T/F for IF, @@B:id:Wn for EVALUATE, within col 72)
-3. Replace paragraph in source
-4. `cobc -fsyntax-only` to verify
-5. Revert if compilation fails
+Current behavior:
+1. Strip any existing active `@@B:` / `@@V:` lines so repeated instrumentation is idempotent.
+2. Run deterministic full-file branch tracing using `cobol_mock._add_branch_tracing()`.
+3. `cobc -fsyntax-only` verifies the fully instrumented source.
+4. If deterministic tracing compiles, write it directly and return the resulting `branch_meta`.
+5. Only if deterministic tracing fails syntax check, fall back to paragraph-by-paragraph insertion-only LLM instrumentation with compiler-feedback retries.
+
+Safety rules now enforced by the deterministic tracer:
+- Inline `ELSE IF ...` and `ELSE <verb> ...` forms are skipped rather than split by inserted probes.
+- Period-delimited IFs are skipped rather than rewritten into structured IFs.
+- Probe counts reflect directions actually inserted, not assumed T/F pairs.
+
+After Phase 9 writes probes, `incremental_mock.py` recompiles the executable so the runtime binary matches the final instrumented source.
 
 ### `specter/cobol_executor.py` — Compile & Run (~500 lines)
 

@@ -17,6 +17,8 @@ from specter.incremental_mock import (
     _build_fix_prompt,
     _cluster_errors,
     _compile_and_fix,
+    _fix_missing_periods,
+    _generate_missing_paragraph_stubs,
     _load_resolutions,
     _parse_errors,
     _save_resolutions,
@@ -203,6 +205,54 @@ class TestPreventiveFixes:
         ]
         result = _apply_preventive_fixes(lines, resolutions)
         assert result[0] == "line 0\n"  # unchanged
+
+
+class TestMissingParagraphStubs:
+    """Test deterministic paragraph stub generation."""
+
+    def test_continuation_line_is_not_treated_as_existing_paragraph(self):
+        lines = [
+            "       PROCEDURE DIVISION.\n",
+            "       MAIN-PARA.\n",
+            "           PERFORM PROCESS-DATE-RTN THRU\n",
+            "                   PROCESS-DATE-RTN-EXIT.\n",
+            "       PROCESS-DATE-RTN.\n",
+            "           CONTINUE.\n",
+            "      *PROCESS-DATE-RTN-EXIT.\n",
+            "      *    EXIT.\n",
+        ]
+
+        stubs = _generate_missing_paragraph_stubs(
+            [(4, "'PROCESS-DATE-RTN-EXIT' is not defined")],
+            lines,
+        )
+
+        assert any("PROCESS-DATE-RTN-EXIT." in line for line in stubs)
+
+
+class TestMissingPeriodsFixer:
+    """Test structural missing-period recovery."""
+
+    def test_does_not_uncomment_data_area_comment_as_paragraph(self):
+        lines = [
+            "       DATA DIVISION.\n",
+            "       WORKING-STORAGE SECTION.\n",
+            "      *U-10-MNVX-EXIT.\n",
+            "      *    EXIT.\n",
+            "       01  PCB-MASK-5.\n",
+            "           05 FIELD-1 PIC X(08).\n",
+            "       PROCEDURE DIVISION.\n",
+            "       MAIN-PARA.\n",
+            "           CONTINUE.\n",
+        ]
+
+        fixed, count = _fix_missing_periods(
+            [(5, "syntax error, unexpected Identifier, expecting SECTION or .")],
+            lines,
+        )
+
+        assert count == 0
+        assert fixed[2].startswith("      *U-10-MNVX-EXIT.")
 
 
 # ---------------------------------------------------------------------------
