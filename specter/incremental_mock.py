@@ -589,6 +589,37 @@ def _fix_group_item_pic(
     return result, fixed
 
 
+def _fix_redefinitions(
+    errors: list[tuple[int, str]],
+    src_lines: list[str],
+) -> tuple[list[str], int]:
+    """Fix 'redefinition of X' errors by commenting out the second definition.
+
+    GnuCOBOL reports the line of the SECOND definition. Comment it out
+    to keep the first (original) definition.
+    """
+    from .cobol_mock import _comment_line
+    redef_lines: set[int] = set()
+    for ln, msg in errors:
+        if "redefinition of" in msg.lower():
+            redef_lines.add(ln)
+
+    if not redef_lines:
+        return src_lines, 0
+
+    result = list(src_lines)
+    fixed = 0
+    for ln in sorted(redef_lines):
+        idx = ln - 1
+        if 0 <= idx < len(result):
+            line = result[idx]
+            if len(line) > 6 and line[6] not in ("*", "/"):
+                result[idx] = _comment_line(line)
+                fixed += 1
+
+    return result, fixed
+
+
 def _find_working_storage_range(src_lines: list[str]) -> tuple[int, int] | None:
     """Find the WORKING-STORAGE SECTION line range.
 
@@ -1064,6 +1095,20 @@ def _compile_and_fix(
             if n_grp > 0:
                 source_path.write_text("".join(src_grp))
                 log.info("  Pre-fix: removed PIC from %d group items", n_grp)
+
+    # --- Pre-fix: fix "redefinition of X" errors ---
+    # Comment out the second definition (GnuCOBOL reports its line).
+    rc_red, stderr_red = _cobc_syntax_check(source_path, copybook_dirs)
+    if rc_red != 0:
+        red_errors = _parse_errors(stderr_red, source_name)
+        redefs = [(ln, msg) for ln, msg in red_errors
+                  if "redefinition of" in msg.lower()]
+        if redefs:
+            src_red = source_path.read_text(errors="replace").splitlines(keepends=True)
+            src_red, n_red = _fix_redefinitions(redefs, src_red)
+            if n_red > 0:
+                source_path.write_text("".join(src_red))
+                log.info("  Pre-fix: commented out %d redefinitions", n_red)
 
     # --- Pre-fix: deterministic stub generation for "not defined" errors ---
     # Insert stubs ONE AT A TIME, verifying each. This way we keep stubs
