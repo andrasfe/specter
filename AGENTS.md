@@ -107,6 +107,10 @@ Handles: comparisons, figurative constants (SPACES, ZEROS, HIGH-VALUES), DFHRESP
 
 Classifies each variable as: `input` (read-before-write), `internal`, `status` (SQLCODE, EIBRESP, FS-*), or `flag` (boolean). Harvests `condition_literals` from IF/EVALUATE comparisons for biased test generation.
 
+**`_harvest_condition_literals(report, condition)`**: Parses `IF <var> op <literal>` style conditions (supports multi-value OR/AND lists, figurative constants, ordering comparisons with boundary expansion) and appends the literals to `condition_literals[var]`.
+
+**`_harvest_evaluate_when_literals(report, subject, evaluate_stmt)`**: Complements the IF-style harvester. Walks `WHEN` children of a single-subject EVALUATE and appends each bare WHEN literal (quoted string, numeric, figurative constant) to `condition_literals[subject]`. This is what lets `EVALUATE WS-FL-DD WHEN 'TRNXFILE' WHEN 'XREFFILE' …` seed `WS-FL-DD` with the exact entry-gate values so random fuzzing can actually reach the gated paragraphs. Multi-subject `ALSO` forms and `WHEN OTHER` are intentionally skipped.
+
 ### `specter/variable_domain.py` — Domain Model (~450 lines)
 
 **`VariableDomain`** (L22): Merges PIC clauses (from copybooks), AST analysis, stub mappings, and naming heuristics.
@@ -413,8 +417,8 @@ Phase-1 memory-guided persistence now runs as an additive layer in both COBOL an
 | `BaselineStrategy` (L124) | 20 | All-success baseline with 5 value generation strategies |
 | `DirectParagraphStrategy` (L488) | 35 | **7-phase rotation**: param hill-climb → stub sweep → dataflow backprop → frontier → harvest → inverse → LLM |
 | `TranscriptSearchStrategy` (L1897) | 40 | Mutates ordered READ transcripts with domain-aware payload assignments |
-| `FaultInjectionStrategy` (L1667) | 50 | Inject fault values into stub operations |
 | `CorpusFuzzStrategy` (L1733) | 45 | AFL-inspired energy-based corpus scheduling with greedy set cover |
+| `FaultInjectionStrategy` (L1885) | 50 | Stub fault injection across the full GnuCOBOL file-status, SQL, CICS, DLI, MQ and generic CALL return-code tables. Re-entrant per priority-branch target (not one-shot) and filters op keys by the current target's backward-slice allowlist when a `preferred_target_key` is set. Activates every 88-level sibling flag on stub-return variables. |
 
 **`HeuristicSelector`** (L1985): Scoring = `priority - yield_bonus + staleness_penalty`. Adaptive batch sizing per strategy.
 

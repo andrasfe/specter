@@ -269,6 +269,96 @@ def _harvest_condition_literals(
                         existing.add(boundary)
 
 
+def _harvest_evaluate_when_literals(
+    report: VariableReport, subject: str, evaluate_stmt: Statement,
+) -> None:
+    """Harvest literal values from all WHEN children of an EVALUATE statement
+    and add them to the subject variable's ``condition_literals``.
+
+    This complements ``_harvest_condition_literals`` which requires an explicit
+    comparison operator and therefore misses plain COBOL forms like
+    ``EVALUATE WS-FL-DD WHEN 'TRNXFILE' WHEN 'XREFFILE' ...``. Without this,
+    programs whose entry paragraph is gated on a literal EVALUATE never get
+    their subject seeded with the WHEN literals and random fuzzing cannot
+    reach the gated paragraphs.
+
+    Only simple single-subject EVALUATEs are handled. Multi-subject forms
+    like ``EVALUATE A ALSO B WHEN 'X' ALSO 'Y'`` are skipped in this pass.
+    """
+    if not subject:
+        return
+    subject_clean = _clean_var_name(subject.upper())
+    if not subject_clean or len(subject_clean) < 2:
+        return
+    # Skip multi-subject / expression forms — "A ALSO B", "FUNCTION …", etc.
+    if " " in subject_clean or subject_clean in _KEYWORDS:
+        return
+    if subject_clean in _FIGURATIVE_LITERALS:
+        return
+
+    # Pattern for a bare COBOL literal (quoted string, numeric, or figurative)
+    literal_re = re.compile(
+        r"'([^']*)'|\"([^\"]*)\"|(-?\d+\.\d+)|(-?\d+)|\b(SPACES?|ZEROS?|ZEROES|LOW-VALUES?|HIGH-VALUES?|QUOTES?|NULLS?)\b",
+        re.IGNORECASE,
+    )
+
+    def _parse_literal(token_text: str) -> list:
+        """Extract literal values from a WHEN clause fragment."""
+        out: list = []
+        for m in literal_re.finditer(token_text):
+            if m.group(1) is not None:
+                out.append(m.group(1))
+            elif m.group(2) is not None:
+                out.append(m.group(2))
+            elif m.group(3) is not None:
+                try:
+                    out.append(float(m.group(3)))
+                except ValueError:
+                    pass
+            elif m.group(4) is not None:
+                try:
+                    out.append(int(m.group(4)))
+                except ValueError:
+                    pass
+            elif m.group(5) is not None:
+                fig = m.group(5).upper()
+                if fig in _FIGURATIVE_LITERALS:
+                    out.append(_FIGURATIVE_LITERALS[fig])
+        return out
+
+    # Ensure the subject variable exists in the report so we have somewhere
+    # to hang the harvested literals.
+    if subject_clean not in report.variables:
+        report.variables[subject_clean] = VariableInfo(
+            name=subject_clean, first_access="read",
+        )
+    info = report.variables[subject_clean]
+    existing = set(info.condition_literals)
+
+    for child in evaluate_stmt.children:
+        if child.type != "WHEN":
+            continue
+        raw = (child.text or "").strip()
+        # Strip leading "WHEN" keyword
+        raw_upper = raw.upper()
+        if raw_upper.startswith("WHEN "):
+            raw = raw[5:]
+        elif raw_upper == "WHEN":
+            raw = ""
+        # Skip "WHEN OTHER" — no specific literal to harvest
+        if not raw or raw.strip().upper().startswith("OTHER"):
+            continue
+        # Skip multi-subject ALSO forms — out of scope for this pass
+        if " ALSO " in raw.upper():
+            continue
+
+        literals = _parse_literal(raw)
+        for lit in literals:
+            if lit not in existing:
+                info.condition_literals.append(lit)
+                existing.add(lit)
+
+
 def _walk_statement(report: VariableReport, stmt: Statement):
     """Process a single statement for variable extraction."""
     attrs = stmt.attributes
@@ -336,6 +426,10 @@ def _walk_statement(report: VariableReport, stmt: Statement):
         subject = attrs.get("subject", "")
         if subject and subject.upper() != "TRUE":
             _record_read(report, subject)
+            # Harvest WHEN literals into the subject variable's
+            # condition_literals so strategies can seed inputs that
+            # actually match the EVALUATE gate.
+            _harvest_evaluate_when_literals(report, subject, stmt)
 
     elif stype == "WHEN":
         # WHEN values may contain variable references

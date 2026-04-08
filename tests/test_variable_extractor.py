@@ -163,5 +163,106 @@ class TestExtractVariablesWithLiterals(unittest.TestCase):
         # That's expected — WHEN values are simple matches, not conditions.
 
 
+class TestEvaluateWhenLiteralHarvest(unittest.TestCase):
+    """Tests that EVALUATE WHEN clauses seed the subject var with literals."""
+
+    def _program_with_evaluate(self, subject: str, when_texts: list[str]) -> Program:
+        when_children = [
+            Statement(type="WHEN", text=text, line_start=i + 3,
+                      line_end=i + 3, attributes={}, children=[])
+            for i, text in enumerate(when_texts)
+        ]
+        evaluate_stmt = Statement(
+            type="EVALUATE",
+            text=f"EVALUATE {subject}",
+            line_start=2,
+            line_end=3 + len(when_texts),
+            attributes={"subject": subject},
+            children=when_children,
+        )
+        return Program(
+            program_id="TEST",
+            paragraphs=[
+                Paragraph(
+                    name="MAIN",
+                    line_start=1,
+                    line_end=3 + len(when_texts),
+                    statements=[evaluate_stmt],
+                )
+            ],
+        )
+
+    def test_string_literals_seed_subject(self):
+        prog = self._program_with_evaluate(
+            "WS-FL-DD",
+            [
+                "WHEN 'TRNXFILE'",
+                "WHEN 'XREFFILE'",
+                "WHEN 'CUSTFILE'",
+                "WHEN 'ACCTFILE'",
+                "WHEN 'READTRNX'",
+                "WHEN OTHER",
+            ],
+        )
+        report = extract_variables(prog)
+        lits = report.variables["WS-FL-DD"].condition_literals
+        for expected in ("TRNXFILE", "XREFFILE", "CUSTFILE", "ACCTFILE", "READTRNX"):
+            self.assertIn(expected, lits)
+
+    def test_numeric_literals_seed_subject(self):
+        prog = self._program_with_evaluate(
+            "WS-CODE",
+            ["WHEN 0", "WHEN 100", "WHEN -803"],
+        )
+        report = extract_variables(prog)
+        lits = report.variables["WS-CODE"].condition_literals
+        for expected in (0, 100, -803):
+            self.assertIn(expected, lits)
+
+    def test_when_other_is_skipped(self):
+        prog = self._program_with_evaluate(
+            "WS-FLAG",
+            ["WHEN 'A'", "WHEN OTHER"],
+        )
+        report = extract_variables(prog)
+        lits = report.variables["WS-FLAG"].condition_literals
+        self.assertIn("A", lits)
+        # "OTHER" must not leak in as a literal value.
+        self.assertNotIn("OTHER", lits)
+
+    def test_figurative_constant_harvested(self):
+        prog = self._program_with_evaluate(
+            "PCB-STATUS",
+            ["WHEN SPACES", "WHEN 'GE'"],
+        )
+        report = extract_variables(prog)
+        lits = report.variables["PCB-STATUS"].condition_literals
+        self.assertIn(" ", lits)   # SPACES → ' '
+        self.assertIn("GE", lits)
+
+    def test_evaluate_true_is_left_alone(self):
+        # EVALUATE TRUE … WHEN A = B is not seeded via this path;
+        # only literal-subject EVALUATEs populate the subject.
+        prog = self._program_with_evaluate(
+            "TRUE",
+            ["WHEN WS-FLAG = 'Y'"],
+        )
+        report = extract_variables(prog)
+        # Subject "TRUE" is filtered out upstream and never becomes a variable.
+        self.assertNotIn("TRUE", report.variables)
+
+    def test_multi_subject_also_is_skipped(self):
+        prog = self._program_with_evaluate(
+            "WS-A",
+            ["WHEN 'X' ALSO 'Y'", "WHEN 'M' ALSO 'N'"],
+        )
+        report = extract_variables(prog)
+        # ALSO-form WHENs are conservative-skipped so we do not accidentally
+        # bind both literals to the first subject.
+        lits = report.variables.get("WS-A", VariableInfo(name="WS-A")).condition_literals
+        self.assertNotIn("X", lits)
+        self.assertNotIn("Y", lits)
+
+
 if __name__ == "__main__":
     unittest.main()

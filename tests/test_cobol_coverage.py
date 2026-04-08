@@ -1223,6 +1223,99 @@ class TestStrategies:
         targets = [c[3] for c in cases]
         assert any("fault:" in t for t in targets)
 
+    def test_fault_injection_status_file_table_full(self):
+        """Expanded GnuCOBOL file status list — check the broader codes
+        that used to be truncated by the old ``fault_values[:5]`` slice."""
+        from specter.coverage_strategies import FaultInjectionStrategy
+        from specter.variable_domain import VariableDomain
+
+        s = FaultInjectionStrategy()
+        ctx = self._make_mock_ctx()
+        # Force semantic_type=status_file on WS-CODE so the domain table
+        # is chosen (rather than the generic default).
+        ctx.domains["WS-CODE"] = VariableDomain(
+            name="WS-CODE", data_type="alpha", max_length=2,
+            classification="status",
+            semantic_type="status_file",
+            condition_literals=[],
+        )
+        cov = self._make_mock_cov()
+        cases = list(s.generate_cases(ctx, cov, 1000))
+        emitted = {c[3].split("=", 1)[1] for c in cases if c[3].startswith("fault:")}
+        # The old table truncated to 5 entries and stopped at "47".
+        # The new table covers the full GnuCOBOL status list, so
+        # '22', '34', and '92' must now be emitted.
+        for expected in ("22", "34", "92"):
+            assert expected in emitted, f"expected {expected!r} in fault values, got {sorted(emitted)}"
+
+    def test_fault_injection_call_rc_fallback(self):
+        """CALL:<prog> ops must emit generic return-code values, not fall
+        through to the file-status default."""
+        from specter.coverage_strategies import FaultInjectionStrategy
+        from specter.cobol_coverage import CoverageState
+        from specter.variable_domain import VariableDomain
+
+        s = FaultInjectionStrategy()
+        ctx = self._make_mock_ctx()
+        # Override the stub mapping to a CALL op with a plain RC variable
+        # that has no semantic_type set.
+        ctx.stub_mapping = {"CALL:CBSTM03B": ["WS-M03B-RC"]}
+        ctx.domains["WS-M03B-RC"] = VariableDomain(
+            name="WS-M03B-RC", data_type="alpha", max_length=2,
+            classification="status",
+            semantic_type=None,
+            condition_literals=[],
+        )
+        cov = CoverageState(
+            total_paragraphs=5,
+            total_branches=10,
+            all_paragraphs={"MAIN-PARA"},
+            _stub_mapping={"CALL:CBSTM03B": ["WS-M03B-RC"]},
+        )
+        cases = list(s.generate_cases(ctx, cov, 1000))
+        emitted = {c[3].split("=", 1)[1] for c in cases if c[3].startswith("fault:")}
+        # Numeric return codes must be in the mix.
+        assert "0" in emitted or 0 in emitted or "00" in emitted
+        assert "4" in emitted or 4 in emitted or "04" in emitted
+        # Non-zero failure codes too.
+        assert any(v in emitted for v in ("8", 8, "08", "12", 12, "16", 16))
+        # And the string "99" sentinel.
+        assert "99" in emitted or 99 in emitted
+
+    def test_fault_injection_reentrant_per_target(self):
+        """should_run must stay True across distinct priority targets.
+
+        The old strategy set self._ran = True after one pass, so when the
+        selector later pinned a new priority branch the strategy was
+        locked out. Verify it now unlocks when preferred_target_key
+        changes."""
+        from specter.coverage_strategies import FaultInjectionStrategy
+        from specter.cobol_coverage import CoverageState
+
+        s = FaultInjectionStrategy()
+        cov = CoverageState(
+            total_paragraphs=5,
+            total_branches=10,
+            all_paragraphs={"MAIN-PARA"},
+            _stub_mapping={"READ:FILE1": ["WS-CODE"]},
+        )
+        ctx = self._make_mock_ctx()
+
+        # First pass, no specific target — should run and emit cases.
+        cov.preferred_target_key = None
+        assert s.should_run(cov, 0) is True
+        list(s.generate_cases(ctx, cov, 100))
+        # After the first pass, re-asking with the same target returns False.
+        assert s.should_run(cov, 1) is False
+
+        # Selector now pins a new priority target — the strategy must
+        # reopen and re-emit cases for that target.
+        cov.preferred_target_key = "branch:17:F"
+        assert s.should_run(cov, 2) is True
+        list(s.generate_cases(ctx, cov, 100))
+        assert s.should_run(cov, 3) is False
+
+
 class TestExecuteAndSaveAppends:
     """Test that _execute_and_save appends to cov.test_cases."""
 

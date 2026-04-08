@@ -1883,52 +1883,171 @@ class DirectParagraphStrategy(Strategy):
 
 
 class FaultInjectionStrategy(Strategy):
-    """Layer 4: Stub fault injection."""
+    """Stub fault injection.
+
+    Enumerates domain-aware fault values (file status, SQL codes, CICS
+    response codes, DLI status, MQ return codes, CALL return codes) across
+    every stub op key in the current program, and also activates every
+    88-level sibling flag on stub-return variables.
+
+    Historically this strategy was one-shot and truncated each fault table
+    to the first five values. That left most of the common GnuCOBOL file
+    status codes (``'22'``, ``'34'``, ``'46'``, ``'47'``, ``'92'`` ...)
+    and all CALL-return-code branches untouched, because:
+
+      * The outer ``should_run`` flipped to False after a single run, so
+        the strategy never revisited previously-attacked op keys even when
+        the selector picked a new priority target.
+      * The ``fault_values[:5]`` slice kept only the first handful of
+        codes per op, so most file-status error branches were never fired.
+      * ``op_key.startswith("CALL:")`` had no fallback table, so generic
+        program calls (anything not ``CALL:MQ``) fell through to the
+        file-status default and emitted the wrong kind of value.
+
+    The new behaviour:
+
+      * ``should_run`` stays True as long as there are remaining
+        ``(op_key, target_key)`` pairs we have not attacked yet, so each
+        time the selector picks a new priority branch the strategy gets
+        another chance at the op keys that influence it.
+      * The full GnuCOBOL file-status list, plus DLI/IMS, CICS, SQL, MQ,
+        and generic CALL return-code lists, are iterated without
+        truncation.
+      * When the selector has set a ``preferred_target_key``, the
+        strategy prefers op keys whose status variables overlap with the
+        target's backward-slice allowlist (``target_variable_allowlists``)
+        and falls back to full enumeration when no such allowlist exists.
+    """
 
     name = "fault_injection"
     priority = 50
 
+    # Full GnuCOBOL file status code list. The old set truncated at 5 entries
+    # which is why branches like ``IF STATUS = '22'`` or ``'34'`` were never
+    # covered on CardDemo batch programs.
+    _STATUS_FILE = [
+        "10", "22", "23", "34", "35", "37", "39", "41", "42", "43",
+        "44", "46", "47", "48", "49", "92",
+    ]
+    _STATUS_SQL = [0, 100, -803, -805, -904, -911]
+    _STATUS_CICS = [0, 12, 13, 16, 22, 27, 36, 44, 80, 82]
+    _DLI_FAULTS = ["GE", "GB", "II", "AI", "AJ", "AK", "AM"]
+    _MQ_RC = [0, 1, 2]
+    # Generic COBOL application CALL return codes, both numeric and string.
+    _CALL_RC_NUM = [0, 4, 8, 12, 16, 99]
+    _CALL_RC_STR = ["00", "04", "08", "12", "16", "99", "01", "02"]
+
     def __init__(self):
-        self._ran = False
+        # Track which (op_key, target_key) pairs we have already attacked
+        # in this session. A key of ``None`` means "no specific target".
+        self._attacked: set[tuple[str, str | None]] = set()
 
     def should_run(self, cov, round_num: int) -> bool:
-        return bool(cov._stub_mapping) and not self._ran
+        if not cov._stub_mapping:
+            return False
+        # Run once with no target, then re-run whenever a new priority
+        # target is set that we have not attacked yet.
+        target = getattr(cov, "preferred_target_key", None)
+        for op_key in cov._stub_mapping:
+            if (op_key, target) not in self._attacked:
+                return True
+        return False
+
+    def _fault_values_for(self, op_key: str, status_vars: list[str],
+                          ctx) -> list:
+        """Build the full list of fault values to try for a stub op key."""
+        values: list = []
+        seen: set = set()
+
+        def _push(v):
+            if v not in seen:
+                seen.add(v)
+                values.append(v)
+
+        # Domain-driven semantic types first.
+        for var in status_vars:
+            dom = ctx.domains.get(var)
+            if not dom:
+                continue
+            semantic = getattr(dom, "semantic_type", None)
+            if semantic == "status_file":
+                for v in self._STATUS_FILE:
+                    _push(v)
+            elif semantic == "status_sql":
+                for v in self._STATUS_SQL:
+                    _push(v)
+            elif semantic == "status_cics":
+                for v in self._STATUS_CICS:
+                    _push(v)
+
+        # DLI / IMS PCB status codes.
+        if op_key.startswith("DLI") or any("PCB" in v.upper() for v in status_vars):
+            for v in self._DLI_FAULTS:
+                _push(v)
+
+        # MQ-specific codes.
+        if op_key.startswith("CALL:MQ"):
+            for v in self._MQ_RC:
+                _push(v)
+
+        # Generic program-call return codes. Runs in addition to any
+        # semantic-type matches so char-form and int-form branches both
+        # get exercised.
+        if op_key.startswith("CALL:") and not op_key.startswith("CALL:MQ"):
+            for v in self._CALL_RC_NUM:
+                _push(v)
+            for v in self._CALL_RC_STR:
+                _push(v)
+
+        # Last-resort default: try the most common file-status error codes.
+        if not values:
+            for v in self._STATUS_FILE[:6]:
+                _push(v)
+
+        return values
+
+    def _relevant_to_target(self, ctx, status_vars: list[str]) -> bool:
+        """True if any of this op's status vars are in the current target's
+        backward-slice allowlist. Used to skip irrelevant op keys when the
+        selector has pinned a specific priority branch. Returns True when no
+        target is set or no allowlist is available (i.e. don't filter)."""
+        target = getattr(ctx, "current_target_key", None)
+        if not target:
+            return True
+        allowlists = getattr(ctx, "target_variable_allowlists", None) or {}
+        allowed = allowlists.get(target)
+        if not allowed:
+            return True
+        allowed_upper = {a.upper() for a in allowed}
+        return any(v.upper() in allowed_upper for v in status_vars)
 
     def generate_cases(self, ctx, cov, batch_size) -> Iterator[CaseT]:
         from .cobol_coverage import _build_fault_stubs, _build_input_state
 
+        # Read the current priority target from the coverage state and
+        # mirror it on the context so strategies that consult
+        # ctx.current_target_key see a consistent value.
+        target_key = getattr(cov, "preferred_target_key", None)
         prev_target_key = ctx.current_target_key
-        ctx.current_target_key = None
+        ctx.current_target_key = target_key
 
-        fault_tables = {
-            "status_file": ["10", "23", "35", "39", "46", "47"],
-            "status_sql": [0, 100, -803, -805, -904],
-            "status_cics": [0, 12, 13, 16, 22, 27],
-        }
-
-        # Get 88-level sibling info from context (set by coverage runner)
-        flag_88_added = getattr(ctx, 'flag_88_added', None) or set()
-        siblings_88 = getattr(ctx, 'siblings_88', None) or {}
+        flag_88_added = getattr(ctx, "flag_88_added", None) or set()
+        siblings_88 = getattr(ctx, "siblings_88", None) or {}
 
         try:
             for op_key, status_vars in ctx.stub_mapping.items():
-                fault_values: list = []
-                for var in status_vars:
-                    dom = ctx.domains.get(var)
-                    if dom:
-                        table = fault_tables.get(dom.semantic_type, [])
-                        fault_values.extend(table)
+                pair = (op_key, target_key)
+                if pair in self._attacked:
+                    continue
+                if not self._relevant_to_target(ctx, status_vars):
+                    # Mark attacked so we don't re-evaluate the same op key
+                    # repeatedly for this target.
+                    self._attacked.add(pair)
+                    continue
 
-                if op_key.startswith("DLI") or any("PCB" in v.upper() for v in status_vars):
-                    fault_values.extend(["GE", "GB", "II", "AI"])
+                fault_values = self._fault_values_for(op_key, status_vars, ctx)
 
-                if op_key.startswith("CALL:MQ"):
-                    fault_values.extend([0, 1, 2])  # MQCC-OK, WARNING, FAILED (int)
-
-                if not fault_values:
-                    fault_values = ["10", "23", "35"]
-
-                for fv in fault_values[:5]:
+                for fv in fault_values:
                     base = _build_input_state(
                         ctx.domains,
                         "semantic",
@@ -1943,7 +2062,7 @@ class FaultInjectionStrategy(Strategy):
                     )
                     yield base, fault_stubs, fault_defaults, f"fault:{op_key}={fv}"
 
-                # Also try 88-level flag faults: activate each sibling flag
+                # Also try 88-level flag faults: activate each sibling flag.
                 for var in status_vars:
                     var_upper = var.upper()
                     if var_upper in flag_88_added:
@@ -1961,7 +2080,7 @@ class FaultInjectionStrategy(Strategy):
                         )
                         yield base, fault_stubs, fault_defaults, f"fault-88:{op_key}={var}"
 
-            self._ran = True
+                self._attacked.add(pair)
         finally:
             ctx.current_target_key = prev_target_key
 
