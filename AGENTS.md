@@ -202,11 +202,12 @@ class Resolution:
 **Error grouping** (`_group_errors_by_type`): Groups errors by normalized type for batch mode. Known types: `is not defined`, `not a file name`, `not a procedure name`, `not a field`, `redefinition`, `ambiguous`, `KEY clause invalid`, `not allowed on SEQUENTIAL`, `syntax error`, `PICTURE clause`, `duplicate`.
 
 **Safeguards**:
-- **Quality gate**: Rejects fixes that are >50% commenting out code with no stubs added
-- **Failed-attempt memory**: LLM sees "WHAT WORKED" and "WHAT FAILED" sections with prior attempts from this cycle
-- **Error clustering**: Adjacent errors (within 10 lines) are treated as one root cause — failing one marks the whole cluster
-- **Relaxed verification**: Accept if total error count drops (not just the specific line)
-- **Audit log** (`fix_audit.log`): Every accepted fix logged with BEFORE/AFTER per line, tagged [COMMENTED OUT], [ADDED], or [MODIFIED]
+- **Rule-based quality gate**: Cheap pre-filter that rejects fixes which are >50% commenting out code with no stubs added.
+- **Scribe / challenger LLM review** (`specter/llm_review.py`): After the rule-based gate accepts a proposal, a second LLM call (the *challenger*) is asked to verify the fix is non-destructive against an explicit rubric (commenting out referenced lines, renaming undefined symbols, narrowing PIC clauses, mid-paragraph GOBACK/EXIT, replaced business statements, ...). The challenger returns `{"verdict": "accept" | "reject", "reason": "...", "severity": "high" | "low"}`. On `reject` the scribe is re-prompted with the reviewer's reason appended and tries again, up to `_LLM_REVIEW_MAX_REVISIONS = 3` revisions per error attempt before the proposal is recorded as failed. On `unknown` (reviewer outage / parse failure / kill switch active) the proposal passes through unblocked. Worst-case cost is 4 scribe calls + 4 reviewer calls per error attempt; most attempts pass on the first review. Bypassed via `--no-llm-review` CLI flag or `SPECTER_LLM_REVIEW=0` env var.
+- **Failed-attempt memory**: LLM sees "WHAT WORKED" and "WHAT FAILED" sections with prior attempts from this cycle (now also includes reviewer-blocked attempts).
+- **Error clustering**: Adjacent errors (within 10 lines) are treated as one root cause — failing one marks the whole cluster.
+- **Relaxed verification**: Accept if total error count drops (not just the specific line).
+- **Audit log** (`fix_audit.log`): Every accepted fix logged with BEFORE/AFTER per line, tagged [COMMENTED OUT], [ADDED], or [MODIFIED].
 
 **COBOL knowledge base** (`_COBOL_FIX_KNOWLEDGE`): ~90-line reference appended to every LLM prompt. Covers fixed-format rules (cols 1-72, Area A/B), section and paragraph headers, 88-level rules, qualified `FIELD OF RECORD` references, common I/O and SELECT syntax, error patterns with specific remediation, PIC clause inference rules, and hard constraints (never comment out referenced lines).
 

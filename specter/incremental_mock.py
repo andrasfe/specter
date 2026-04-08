@@ -536,6 +536,28 @@ def _apply_preventive_fixes(
 
 _MAX_CONTEXT_LINES = 1000  # max lines sent to LLM per error (was 500)
 
+# Maximum number of scribe revisions allowed when the LLM challenger
+# (specter/llm_review.py) rejects a proposed fix as destructive. The
+# scribe gets up to this many additional attempts to address the
+# reviewer's comments before the fix is recorded as failed and the
+# outer fix loop moves on. Worst case is (1 + _LLM_REVIEW_MAX_REVISIONS)
+# scribe calls and (_LLM_REVIEW_MAX_REVISIONS + 1) reviewer calls per
+# error attempt — i.e. 4 + 4 = 8 LLM calls at the cap.
+_LLM_REVIEW_MAX_REVISIONS = 3
+
+
+def _format_rejected_proposal(fixes: dict[int, str]) -> str:
+    """Render a fix dict for inclusion in a scribe revision prompt."""
+    if not fixes:
+        return "  (empty proposal)\n"
+    out: list[str] = []
+    for ln in sorted(fixes.keys())[:20]:
+        text = fixes[ln].rstrip("\n")
+        out.append(f"  {ln:5d}: {text}")
+    if len(fixes) > 20:
+        out.append(f"  ... ({len(fixes) - 20} more lines)")
+    return "\n".join(out) + "\n"
+
 
 def _cluster_errors(
     errors: list[tuple[int, str]],
@@ -2318,6 +2340,143 @@ def _compile_and_fix(
                 for tl in targeted_lines:
                     failed_error_lines.add(tl)
                 continue
+
+        # ===== LLM challenger review (scribe → challenger → revise) =====
+        # The rule-based gate above only catches the obvious comment-out
+        # anti-pattern. The challenger reads the proposed fix and rejects
+        # subtler destructive moves (rename to mask undefined, narrowed
+        # PIC clause, mid-paragraph GOBACK, replaced MOVE, ...). On reject
+        # we re-prompt the scribe with the reviewer's reason and try again
+        # up to _LLM_REVIEW_MAX_REVISIONS times before giving up. The
+        # reviewer is bypassed entirely when SPECTER_LLM_REVIEW=0 or no
+        # LLM provider is configured (e.g. offline mode).
+        from .llm_review import review_fix as _llm_review_fix, review_enabled
+
+        review_blocked = False
+        review_block_reason = ""
+        if llm_provider is not None and review_enabled():
+            review_label = (
+                f"batch:{largest_group_type[:30]}"
+                if use_batch_mode
+                else f"line:{chosen_line}"
+            )
+            error_summary = (
+                largest_group_type if use_batch_mode else chosen_msg
+            )
+            scribe_attempt = 0
+            while True:
+                verdict = _llm_review_fix(
+                    llm_provider=llm_provider,
+                    llm_model=llm_model,
+                    error_summary=error_summary,
+                    src_lines=src_lines,
+                    fixes=fixes,
+                    fix_kind="compile_fix",
+                    audit_label=f"{review_label} rev={scribe_attempt}",
+                )
+                if verdict.verdict == "accept":
+                    break
+                if verdict.verdict == "unknown":
+                    # Reviewer could not run / could not parse — pass through
+                    # so a transient reviewer outage never blocks the loop.
+                    break
+
+                # Reviewer rejected. Decide whether to revise or abandon.
+                if verdict.severity == "low":
+                    # Borderline reject — abandon this proposal but do not
+                    # waste more LLM calls trying to revise it.
+                    review_blocked = True
+                    review_block_reason = (
+                        f"REVIEWER REJECTED (low-severity, abandoned): "
+                        f"{verdict.reason}"
+                    )
+                    break
+                if scribe_attempt >= _LLM_REVIEW_MAX_REVISIONS:
+                    review_blocked = True
+                    review_block_reason = (
+                        f"REVIEWER REJECTED after "
+                        f"{_LLM_REVIEW_MAX_REVISIONS} revisions: "
+                        f"{verdict.reason}"
+                    )
+                    break
+
+                # Revise: re-call the scribe with the reviewer's comment.
+                log.info(
+                    "  [%d/%d] Reviewer rejected fix (rev %d): %s — re-prompting scribe",
+                    attempt + 1, max_fix_attempts, scribe_attempt + 1,
+                    verdict.reason[:120],
+                )
+                scribe_attempt += 1
+                review_extra = (
+                    "\n\nA reviewer rejected the previous proposal:\n"
+                    + _format_rejected_proposal(fixes)
+                    + f"\nReviewer's reason: {verdict.reason}\n"
+                    + "Address the reviewer's concern and propose a "
+                    + "DIFFERENT, non-destructive fix. Do not comment out "
+                    + "active code, do not rename undefined symbols, do "
+                    + "not insert GOBACK/EXIT to short-circuit logic, do "
+                    + "not narrow PIC clauses to mask precision errors.\n"
+                )
+                revise_prompt = fix_prompt + review_extra
+                try:
+                    revised_response, _ = _query_llm_sync(
+                        llm_provider, revise_prompt, llm_model,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "  Scribe revision query failed: %s", exc,
+                    )
+                    review_blocked = True
+                    review_block_reason = (
+                        f"REVIEWER REJECTED, scribe revision failed: {exc}"
+                    )
+                    break
+
+                revised_fixes = _parse_llm_fix_response(
+                    revised_response,
+                    0 if use_batch_mode else ctx_start,
+                    total_lines + 100,
+                )
+                revised_fixes, _ = _sanitize_llm_fix_lines(revised_fixes)
+
+                if not revised_fixes:
+                    review_blocked = True
+                    review_block_reason = (
+                        "REVIEWER REJECTED and scribe revision was empty"
+                    )
+                    break
+
+                # Treat the revised proposal as the new candidate. Update
+                # the fingerprint set so we don't loop on identical
+                # revisions.
+                revised_fingerprint = "|".join(
+                    f"{ln}:{revised_fixes[ln].strip()}"
+                    for ln in sorted(revised_fixes.keys())
+                )
+                if revised_fingerprint in tried_fix_fingerprints:
+                    review_blocked = True
+                    review_block_reason = (
+                        "REVIEWER REJECTED and revised proposal duplicates "
+                        "an earlier failed attempt"
+                    )
+                    break
+                tried_fix_fingerprints.add(revised_fingerprint)
+                fixes = revised_fixes
+
+        if review_blocked:
+            log.warning(
+                "  [%d/%d] ✗ Skipped: %s",
+                attempt + 1, max_fix_attempts, review_block_reason[:200],
+            )
+            failed_attempts.append((
+                next(iter(targeted_lines)),
+                largest_group_type if use_batch_mode else chosen_msg,
+                fix_summary,
+                review_block_reason,
+            ))
+            for tl in targeted_lines:
+                failed_error_lines.add(tl)
+            continue
 
         # ===== Apply, recompile, verify =====
         snapshot = list(src_lines)

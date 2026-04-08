@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -178,6 +179,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Random walk rounds per LLM suggestion to maximize coverage (default: 100)",
     )
     parser.add_argument(
+        "--no-llm-review",
+        action="store_true",
+        help=("Disable the LLM challenger that validates each scribe-proposed "
+              "compile-fix as non-destructive (also controllable via "
+              "SPECTER_LLM_REVIEW=0)."),
+    )
+    parser.add_argument(
         "--concolic",
         action="store_true",
         help="Use Z3 concolic engine to solve for uncovered branches (requires z3-solver, implies --guided)",
@@ -345,6 +353,14 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+
+    # --no-llm-review: disable the scribe/challenger validation step in the
+    # COBOL compile-and-fix loop. The kill switch is read by
+    # specter.llm_review.review_enabled() via the SPECTER_LLM_REVIEW env var,
+    # so we just set the env var here. Existing env var values win — only
+    # set when the user passed the CLI flag.
+    if args.no_llm_review:
+        os.environ["SPECTER_LLM_REVIEW"] = "0"
 
     # --extract-tests: standalone operation, no AST needed
     if args.extract_tests:
