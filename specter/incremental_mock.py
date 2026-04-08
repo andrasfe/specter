@@ -26,6 +26,9 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .persistence_utils import atomic_write_json
+from .run_manifest import ensure_manifest, record_phase_checkpoint
+
 log = logging.getLogger(__name__)
 
 # Fixed-format COBOL column constants (mirrored from cobol_mock)
@@ -272,7 +275,7 @@ def _save_resolutions(resolutions: list[Resolution], path: Path) -> None:
         "saved_at": datetime.now(timezone.utc).isoformat(),
         "resolutions": [asdict(r) for r in resolutions],
     }
-    path.write_text(json.dumps(data, indent=2, default=str))
+    atomic_write_json(path, data, indent=2)
 
 
 def _audit_fix(
@@ -381,7 +384,9 @@ def _save_checkpoint(output_dir: Path, phase_name: str, phase_number: int,
         "mock_cbl_hash": hashlib.sha256(mock_path.read_bytes()).hexdigest(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    path.write_text(json.dumps(data, indent=2))
+    atomic_write_json(path, data, indent=2)
+    # Mirror checkpoint state into the run manifest for easier resume auditing.
+    record_phase_checkpoint(output_dir, phase_name, phase_number, mock_path)
 
 
 def _phase_fix_guidance(phase: str) -> str:
@@ -666,15 +671,57 @@ def _ensure_file_status_definitions(
     if not ws_range:
         return src_lines, 0
 
+    # Only scan FILE STATUS references that are ACTUAL SELECT-clause
+    # declarations. We must avoid:
+    #   1. Commented-out lines (e.g. original SELECTs disabled by
+    #      _disable_original_selects).
+    #   2. String literals inside DISPLAY/MOVE statements like
+    #      `DISPLAY 'FILE STATUS IS: NNNN' IO-STATUS`, which the plain
+    #      regex used to misparse as capturing `IS` as the status var.
+    #   3. COBOL reserved words (IS, IN, OF, TO, BY, OR, ...)
+    #      accidentally captured when the surrounding text doesn't
+    #      actually name a status variable.
+    _reserved = {
+        "IS", "IN", "OF", "TO", "BY", "OR", "AS", "AT", "ON", "NO",
+        "AND", "NOT", "ARE", "THE", "FOR", "USING", "STATUS", "FILE",
+    }
+
+    def _strip_literals(text: str) -> str:
+        # Replace quoted string literals with spaces of the same length so
+        # regex matches outside the literals still align column-wise.
+        out = []
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            if ch in ("'", '"'):
+                quote = ch
+                out.append(" ")
+                i += 1
+                while i < len(text) and text[i] != quote:
+                    out.append(" ")
+                    i += 1
+                if i < len(text):
+                    out.append(" ")
+                    i += 1
+            else:
+                out.append(ch)
+                i += 1
+        return "".join(out)
+
     status_vars: set[str] = set()
     for line in src_lines:
-        upper = line.upper()
+        if len(line) > 6 and line[6] in ("*", "/"):
+            continue
+        scrubbed = _strip_literals(line).upper()
         match = re.search(
-            r"\bFILE\s+STATUS\s+(?:IS\s+)?([A-Z0-9-]+)",
-            upper,
+            r"\bFILE\s+STATUS\s+(?:IS\s+)?([A-Z][A-Z0-9-]*)",
+            scrubbed,
         )
         if match:
-            status_vars.add(match.group(1).rstrip("."))
+            name = match.group(1).rstrip(".")
+            if name in _reserved:
+                continue
+            status_vars.add(name)
 
     if not status_vars:
         return src_lines, 0
@@ -1290,6 +1337,9 @@ def _remove_misplaced_paragraph_stub_scaffolding(
         "NO BUSINESS LOGIC; SAFE CONTINUE/EXIT STUBS",
         "SPECTER-MISSING-PARAGRAPH-STUBS",
         "SPECTER-STUB-FILLER",
+        "UNDEFINED-PARAGRAPH-STUB",
+        "WS-UNDEFINED-PARAGRAPH-STUBS",
+        "WS-UNDEFINED-PARAGRAPH-FILLER",
     )
 
     result: list[str] = []
@@ -1317,6 +1367,9 @@ def _sanitize_llm_fix_lines(
         "NO BUSINESS LOGIC; SAFE CONTINUE/EXIT STUBS",
         "SPECTER-MISSING-PARAGRAPH-STUBS",
         "SPECTER-STUB-FILLER",
+        "UNDEFINED-PARAGRAPH-STUB",
+        "WS-UNDEFINED-PARAGRAPH-STUBS",
+        "WS-UNDEFINED-PARAGRAPH-FILLER",
     )
 
     cleaned: dict[int, str] = {}
@@ -1736,6 +1789,35 @@ def _compile_and_fix(
         else:
             new_errors = errors
 
+        # Deterministic rescue for newly surfaced missing paragraph targets.
+        # These can appear late in a batch without reducing total error count,
+        # which means the existing post-progress restub hook may never run.
+        src_now = source_path.read_text(errors="replace").splitlines(keepends=True)
+        loop_para_stubs = _generate_missing_paragraph_stubs(new_errors, src_now)
+        if loop_para_stubs:
+            insert_at = _find_procedure_insertion_point(src_now)
+            if insert_at is not None:
+                trial_src = list(src_now)
+                trial_src[insert_at:insert_at] = loop_para_stubs + ["\n"]
+                source_path.write_text("".join(trial_src))
+                rc_trial, stderr_trial = _cobc_syntax_check(source_path, copybook_dirs)
+                trial_errors = _parse_errors(stderr_trial, source_name) if rc_trial != 0 else []
+                if baseline_errors:
+                    trial_new_errors = [
+                        (ln, msg) for ln, msg in trial_errors if msg not in baseline_errors
+                    ]
+                else:
+                    trial_new_errors = trial_errors
+
+                if rc_trial == 0 or len(trial_new_errors) < len(new_errors):
+                    log.info("  Pre-fix (loop): added %d paragraph stub lines",
+                             len(loop_para_stubs) - 1)
+                    _save_progress()
+                    continue
+
+                # Revert deterministic stubs if they do not improve errors.
+                source_path.write_text("".join(src_now))
+
         n_errors = len(new_errors)
 
         # Permanently skip lines reverted too many times — BUT only if
@@ -1772,9 +1854,8 @@ def _compile_and_fix(
             else:
                 rounds_without_progress += 1
 
-            # Stop after 10 full no-progress rounds. This keeps the
-            # pipeline from burning large amounts of time on repeated
-            # near-identical attempts.
+            # Stop after 50 full no-progress rounds. This gives stubborn
+            # late-phase compiler errors more room for broader exploration.
             stall_limit = 50
 
             if rounds_without_progress >= stall_limit:
@@ -2546,6 +2627,7 @@ def incremental_instrument(
     coverage_mode: bool = False,
     allow_hardening_fallback: bool = True,
     initial_values: dict[str, str] | None = None,
+    payload_variables: dict[str, str] | None = None,
     stop_on_exec_return: bool = True,
     stop_on_exec_xctl: bool = True,
     eib_calen: int = 0,
@@ -2569,6 +2651,7 @@ def incremental_instrument(
         coverage_mode: If True, configure for deep coverage exploration.
         allow_hardening_fallback: Allow hardening fallback in auto-stub.
         initial_values: Variable name -> value pairs for INIT record injection.
+        payload_variables: Variable name -> type pairs for SET record replay.
         stop_on_exec_return: If True, EXEC CICS RETURN terminates the program.
         stop_on_exec_xctl: If True, EXEC CICS XCTL terminates the program.
         eib_calen: Initial EIBCALEN value.
@@ -2584,6 +2667,9 @@ def incremental_instrument(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Keep a resumable manifest with input hashes and latest phase metadata.
+    ensure_manifest(output_dir, source_path, copybook_dirs)
+
     if resolution_log_path is None:
         resolution_log_path = output_dir / "resolution_log.json"
 
@@ -2596,6 +2682,7 @@ def incremental_instrument(
         copybook_dirs=list(copybook_dirs),
         trace_paragraphs=True,
         initial_values=initial_values or {},
+        payload_variables=payload_variables or {},
         stop_on_exec_return=stop_on_exec_return,
         stop_on_exec_xctl=stop_on_exec_xctl,
         eib_calen=eib_calen,

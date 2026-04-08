@@ -1,282 +1,108 @@
 # Specter
 
-COBOL AST-to-executable code generator. Takes a JSON AST (from an external COBOL parser) and produces either a standalone Python module or a complete Maven Java project that replicates the original program's behavior.
+Specter automatically generates test suites for COBOL programs. Give it a COBOL program and it figures out what inputs are needed to exercise every branch — including the tricky ones behind CICS calls, SQL queries, and external file I/O.
 
-## Usage
+## The Problem It Solves
 
-```bash
-# AST → Python
-specter program.ast -o program.py
+COBOL programs are full of external interactions (database reads, CICS transactions, file I/O) that testing normally requires a full mainframe environment to exercise. Specter mocks all of that out, letting you run the program as pure Python, and then systematically finds the input combinations that maximize branch coverage.
 
-# AST → Java (Maven project with unit tests)
-specter program.ast --java --test-store tests.jsonl -o output/
+## How It Works
 
-# AST → Java with Docker + integration tests
-specter program.ast --java --test-store tests.jsonl \
-  --docker --integration-tests --copybook-dir ./cpy -o output/
+1. **Parse** — A JSON AST from your COBOL parser describes the program structure.
+2. **Generate** — Specter converts the AST to a Python simulator: each COBOL paragraph becomes a Python function, all state lives in a flat dict, and every external call (CICS/SQL/CALL) becomes a stub that reads scripted responses from a queue.
+3. **Cover** — An agentic loop drives four coverage strategies against the simulator, collecting test cases in a JSONL store.
+4. **Validate** *(optional)* — Each discovered test case is replayed through a real GnuCOBOL binary compiled with mock instrumentation, confirming the coverage holds on the actual runtime.
 
-# Build and run the Java project
-cd output/ProgramName/
-mvn install                          # compile + unit tests
-docker compose up                    # PostgreSQL + ActiveMQ + app
+```
+COBOL AST → Python simulator → coverage loop → tests.jsonl → GnuCOBOL validation
 ```
 
-## What It Generates
-
-**Python mode** (`specter program.ast`): A single `.py` file where each COBOL paragraph becomes a function, all state lives in a flat dict, and the `run()` function is the entry point. No dependencies.
-
-**Java mode** (`--java`): A Maven project with section-grouped paragraph classes, a stub executor framework for external operations (CICS/SQL/DLI/MQ), JUnit 5 parameterized tests, and optionally Mockito integration tests + Docker deployment with PostgreSQL and ActiveMQ Artemis.
-
-See [JAVAGEN.md](JAVAGEN.md) for full details on the Java generation approach, testing methodology, and Docker deployment.
-
-## Test Synthesis
-
-Specter generates test cases targeting maximum branch coverage using four strategies:
-
-- **DirectParagraphStrategy** — The main workhorse (~71% of test cases). Invokes each COBOL paragraph directly via the generated Python module, rotating through 7 phases: parameter hill-climbing, stub fault sweeps, dataflow backpropagation, frontier expansion, rainbow-table harvest, inverse function synthesis, and chain constraint solving for EVALUATE chains.
-- **CorpusFuzzStrategy** — AFL-inspired coverage-guided fuzzing with energy-based corpus scheduling. Maintains a deduplicated corpus of test cases selected for branch-coverage uniqueness, mutates seeds via a power schedule that favours rare-branch coverage.
-- **BaselineStrategy** — One-shot: generates 5 base cases across value strategies (condition_literal, semantic, boundary, random_valid, 88_value).
-- **FaultInjectionStrategy** — One-shot: sweeps stub operations with domain-aware fault values (DLI status codes, MQ completion codes, file status codes).
-
-**Results on CardDemo COPAUA0C**: 91/92 Python branches (98.9%), 20/20 test cases validated against GnuCOBOL (100% pass rate, 17/27 COBOL branches confirmed).
-
-### Quick start
+## Quick Start
 
 ```bash
-# Recommended — LLM seeds provide initial diversity, strategies do the rest
+# Most programs: run with LLM seeds for better initial diversity
 specter program.ast --synthesize \
   --cobol-source program.cbl --copybook-dir ./cpy \
   --test-store tests.jsonl \
   --llm-provider openrouter --llm-model gemini-3-flash
 
-# For large programs (1000+ paragraphs)
-specter program.ast --synthesize \
-  --cobol-source program.cbl --copybook-dir ./cpy \
-  --test-store tests.jsonl \
-  --llm-provider openrouter --llm-model gemini-3-flash \
-  --coverage-budget 50000 --coverage-timeout 3600 --coverage-batch-size 500
-
-# Without LLM (algorithmic-only — still effective on smaller programs)
+# Without LLM (algorithmic only — works well on smaller programs)
 specter program.ast --synthesize \
   --cobol-source program.cbl --copybook-dir ./cpy \
   --test-store tests.jsonl
 
-# Validate against real COBOL (requires GnuCOBOL)
+# Validate results against a real GnuCOBOL binary
 specter program.ast --cobol-validate-store tests.jsonl \
   --cobol-source program.cbl --copybook-dir ./cpy
 ```
 
-The LLM generates initial seed test states from program analysis — these provide the starting diversity that corpus fuzzing and direct paragraph strategies then amplify through mutation and hill-climbing. On large programs, LLM seeds are critical for breaking past the entry-path bottleneck. Seeds are cached and support incremental resume after interruption.
+Each entry in `tests.jsonl` is a complete execution recipe: initial variable values + a scripted sequence of stub responses for every external call the program makes.
 
-### Portable coverage bundle (`--export-bundle` / `--run-bundle`)
+## Coverage Strategies
 
-Two-phase workflow for cross-machine coverage. Export on a machine with source + LLM, run on any same-platform machine with just the bundle:
+Four strategies run in rotation, managed by a heuristic selector that favours whichever is currently producing new coverage:
 
-```bash
-# Phase 1: Export (source machine — needs AST, COBOL, copybooks, optionally LLM)
-specter program.ast --export-bundle ./bundle/ \
-  --cobol-source program.cbl --copybook-dir ./cpy \
-  --llm-provider openrouter
+| Strategy | What it does |
+|----------|-------------|
+| **DirectParagraph** | Targets each uncovered paragraph directly. Rotates through hill-climbing, stub fault sweeps, dataflow backpropagation, frontier expansion, and LLM-guided mutation. |
+| **CorpusFuzz** | AFL-style fuzzing. Keeps a corpus of branch-unique test cases and mutates the most promising seeds using a coverage-weighted power schedule. |
+| **Baseline** | One-shot: generates a handful of representative cases using condition literals, 88-level values, and boundary inputs. |
+| **FaultInjection** | One-shot: systematically injects domain-specific fault codes (DLI, MQ, file status) into stub responses to explore error paths. |
 
-# Phase 2: Run (any machine — only needs GnuCOBOL runtime + the bundle)
-specter --run-bundle ./bundle/ \
-  --test-store results.jsonl \
-  --coverage-budget 10000 --coverage-timeout 3600
-```
+**Typical results**: branch coverage in the 90%+ range on real-world programs, with every accepted test case cross-validated against a GnuCOBOL binary.
 
-The bundle contains the compiled COBOL binary and a `coverage-spec.yaml` with all variable domains, stub operations, 88-level siblings, MQ constants, and LLM-generated business scenarios. During export, the LLM analyzes the COBOL source to produce per-variable hints and 10-15 test scenarios that are baked into the spec — the run phase benefits from LLM intelligence without needing an LLM connection.
+## Output Modes
 
-### GnuCOBOL hybrid mode (`--cobol-coverage`)
+**Test store** (`--synthesize`): The primary output. A JSONL file where each line is a test case with its coverage metadata. Crash-safe and resumable — interrupted runs continue from where they left off.
 
-Needs AST + COBOL source + copybook directories. Instruments and compiles real COBOL, then cross-validates with the Python simulation:
+**Java project** (`--java`): A Maven project with JUnit 5 parameterized tests generated from the test store. Each COBOL paragraph maps to a Java class; stubs use a queue-based executor framework that mirrors the Python simulation.
 
 ```bash
-# Full pipeline: AST + COBOL source + copybooks
-specter COACTUPC.cbl.ast --cobol-coverage \
-  --cobol-source COACTUPC.cbl \
-  --copybook-dir ./copybooks \
-  --test-store tests.jsonl \
-  --coverage-budget 5000 \
-  --coverage-timeout 300 \
-  --coverage-batch-size 500
+specter program.ast --java --test-store tests.jsonl -o output/
+cd output/ProgramName/ && mvn install
 ```
 
-### Using test stores for Java generation
+**COBOL mock** (`--mock-cobol`): Instrument a COBOL source file for standalone GnuCOBOL execution without any supporting infrastructure, reading mock data from a flat file.
 
 ```bash
-# Generate test store, then build Java project from it
-specter COACTUPC.cbl.ast --synthesize --test-store tests.jsonl
-specter COACTUPC.cbl.ast --java --test-store tests.jsonl -o output/
-
-# Multi-program: synthesize + generate Java project with per-program tests
-specter --multi --java --synthesize \
-  COSGN00C.cbl.ast COMEN01C.cbl.ast COACTUPC.cbl.ast \
-  -o carddemo/ \
-  --analysis-output carddemo/test-data \
-  --coverage-timeout 300
-
-# Exclude sensitive values from generated test data
-specter --multi --java --synthesize \
-  *.ast -o output/ --exclude-values excluded.txt
+specter program.cbl --mock-cobol --copybook-dir ./cpy -o program.mock.cbl
+cobc -x -o program.mock program.mock.cbl && ./program.mock
 ```
 
-Each test case is a complete execution spec: input variables + mock orchestration for all external interactions (SQL results, CICS EIBRESP codes, file status codes). Multi-program synthesis generates per-program JSONL test stores, a combined `tests.catalog.md`, and JUnit 5 parameterized test classes.
-
-### Strategy configuration
-
-The coverage engine supports 4 pluggable strategies. By default, a heuristic selector picks strategies based on yield history. You can override this with a YAML config file:
+**Portable bundle** (`--export-bundle` / `--run-bundle`): Export a self-contained bundle (compiled binary + variable domain spec) from a machine with source access. Run it on any machine with GnuCOBOL, no source required.
 
 ```bash
-specter COPAUA0C.cbl.ast --cobol-coverage \
-  --cobol-source COPAUA0C.cbl --copybook-dir ./cpy \
-  --coverage-config pipeline.yaml
+specter program.ast --export-bundle ./bundle/ --cobol-source program.cbl --copybook-dir ./cpy
+specter --run-bundle ./bundle/ --test-store results.jsonl --coverage-budget 10000
 ```
 
-**Explicit rounds** — define the exact strategy sequence:
+## Tuning
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--coverage-budget N` | 5000 | Max test cases |
+| `--coverage-timeout N` | 600 | Max seconds |
+| `--coverage-batch-size N` | 200 | Cases per strategy round |
+| `--coverage-config PATH` | — | YAML pipeline config |
+
+You can pin the exact strategy sequence or let the selector decide:
 
 ```yaml
-rounds:
-  - strategy: baseline
-    batch_size: 500
-  - strategy: direct_paragraph
-    batch_size: 5000
-  - strategy: corpus_fuzz
-    batch_size: 2000
-  - strategy: fault_injection
-    batch_size: 500
-loop_from: 1
+# examples/coverage-config.yaml
+selector: heuristic
+strategies: [baseline, direct_paragraph, corpus_fuzz, fault_injection]
 termination:
   max_stale_rounds: 10
   plateau_branch_pct: 0.8
 ```
 
-**Selector-driven** — list which strategies are available, let the selector pick:
-
-```yaml
-selector: heuristic
-strategies:
-  - baseline
-  - direct_paragraph
-  - corpus_fuzz
-  - fault_injection
-```
-
-Available strategies: `baseline`, `direct_paragraph`, `corpus_fuzz`, `fault_injection`.
-
-**Seed generation** — control how LLM initial seeds are generated:
-
-```yaml
-seed_generation:
-  paragraphs_per_batch: 5    # fewer paragraphs = more focused seeds (default: 10)
-  seeds_per_batch: 12        # more seeds per LLM call (default: 8)
-  cache: false               # regenerate seeds instead of using cache
-```
-
-For large programs (1000+ paragraphs), smaller `paragraphs_per_batch` with higher `seeds_per_batch` produces better coverage.
-
-**COBOL validation** — automatically validate Python-discovered test cases against the real COBOL binary after synthesis:
-
-```yaml
-validation:
-  enabled: true
-  timeout_per_case: 30
-```
-
-This compiles the COBOL once, runs each test case through the binary, and outputs a `*.validated.jsonl` with only confirmed coverage. Can also be run standalone:
-
-```bash
-specter program.ast --cobol-validate-store tests.jsonl \
-  --cobol-source program.cbl --copybook-dir ./cpy
-```
-
-See `examples/coverage-config.yaml` for a fully commented example.
-
-### Tuning parameters
-
-| Flag | Default | Effect |
-|------|---------|--------|
-| `--coverage-budget N` | 5000 | Max test cases to generate |
-| `--coverage-timeout N` | 600 | Max seconds |
-| `--coverage-batch-size N` | 200 | Cases per strategy round (DirectParagraph gets 25x this) |
-| `--coverage-rounds N` | 0 (unlimited) | Max strategy rounds |
-| `--coverage-config PATH` | — | YAML config for strategy pipeline |
-| `--coverage-execution-timeout N` | 900 | Per-test COBOL execution timeout (seconds) |
-| `--export-bundle DIR` | — | Export portable bundle (binary + spec) |
-| `--run-bundle DIR` | — | Run coverage from exported bundle |
-| `--cobol-validate-store JSONL` | — | Validate test store against compiled COBOL |
-
-Higher `--coverage-batch-size` means more hill-climbing trials per paragraph per round. Values of 200-500 work well; the engine scales automatically.
-
-## Analysis Modes
-
-```bash
-specter program.ast --analyze                  # dynamic analysis (100 iterations)
-specter program.ast --guided -m 10000          # coverage-guided fuzzing
-specter program.ast --concolic -m 10000        # Z3 constraint solving
-specter program.ast --llm-guided -m 20000      # LLM-steered adaptive fuzzing
-specter program.ast --diagram                  # Mermaid execution diagrams
-```
-
-## COBOL Mock Execution
-
-```bash
-# Instrument COBOL source for standalone GnuCOBOL execution
-specter program.cbl --mock-cobol --copybook-dir ./cpy -o program.mock.cbl
-cobc -x -o program.mock program.mock.cbl
-./program.mock
-```
-
-Replaces all EXEC CICS/SQL/DLI blocks, file I/O, and CALL statements with reads from a sequential mock data file. Adds paragraph-level tracing via DISPLAY.
-
-### AWS CardDemo example
-
-Using the [AWS Mainframe Modernization CardDemo](https://github.com/aws-samples/aws-mainframe-modernization-carddemo) sample application:
-
-```bash
-# 1. Clone CardDemo alongside specter
-git clone https://github.com/aws-samples/aws-mainframe-modernization-carddemo
-
-# 2. Generate instrumented mock + compile + run coverage
-specter aws-mainframe-modernization-carddemo/app/cbl/COPAUA0C.cbl.ast \
-    --cobol-coverage \
-    --cobol-source aws-mainframe-modernization-carddemo/app/cbl/COPAUA0C.cbl \
-    --copybook-dir aws-mainframe-modernization-carddemo/app/cpy \
-    --test-store reports/COPAUA0C_tests.jsonl \
-    --coverage-budget 5000
-
-# 3. The compiled binary and instrumented source are in:
-#    aws-mainframe-modernization-carddemo/app/cbl/.specter_build_COPAUA0C/
-#      COPAUA0C           <- compiled executable
-#      COPAUA0C.mock.cbl  <- instrumented COBOL source
-```
-
-The instrumented `.mock.cbl` emits trace output when executed:
-- `SPECTER-TRACE:<PARAGRAPH>` — paragraph entry
-- `@@B:<id>:<T|F|W1|WO>` — branch probe (IF/EVALUATE direction taken)
-- `SPECTER-CALL:FROM=<caller>:TO=<callee>` — call chain (PERFORM targets)
-- `@@V:<id>:<var>=<val>` — variable snapshot at branch decision points
-- `SPECTER-MOCK:<operation>` — mock operation (CICS/SQL/DLI/CALL)
-
-## Branch Coverage Features
-
-Specter includes several codegen and coverage engine features that maximize branch reachability:
-
-- **EVALUATE :F probes** — Each WHEN clause gets both a True (matched) and False (not matched) branch ID, making EVALUATE coverage work like IF coverage.
-- **Chain constraint solver** — For EVALUATE chains where reaching the Nth clause requires all prior clauses to be false, automatically computes the compound state (e.g., `DECLINE-AUTH=True + INSUFFICIENT-FUND=False + ACCOUNT-CLOSED=True`).
-- **88-level mutual exclusivity** — `SET X TO TRUE` clears sibling 88-level flags. Siblings are discovered from copybook records, inline COBOL source scanning, and a FOUND/NFOUND naming heuristic.
-- **MQ-aware stubs** — IBM MQ constants (MQCC-OK=0, MQCC-FAILED=2, etc.) are injected into the execution state so comparisons like `WS-COMPCODE = MQCC-OK` work correctly with integer types.
-- **AFL-inspired corpus fuzzing** — Maintains a deduplicated corpus of branch-coverage-unique test cases, mutates seeds via a power schedule favouring rare-branch coverage, with 60% targeted mutations on uncovered branch conditions.
-- **Value harvesting** — Successful test case values are automatically propagated across all strategies via `dom.condition_literals`, so values discovered by one strategy benefit all others.
-- **Backward slicer** — Extracts the minimal code path from paragraph entry to each uncovered branch for LLM prompt context.
-- **Boolean condition hints** — Variables appearing in `EVALUATE WHEN TRUE` as standalone conditions automatically get `True`/`False` added to their domain.
-- **COBOL validation** — Two-pass workflow: fast Python synthesis followed by COBOL binary validation. 100% of generated test cases validated on CardDemo COPAUA0C.
-
 ## Requirements
 
-- Python 3.10+
-- No external dependencies for core functionality
-- Optional: `PyYAML` for `--coverage-config` YAML support (JSON fallback works without it)
-- Optional: `z3-solver` for `--concolic` mode
-- Optional: Java 17+ and Maven 3.9+ for `--java` mode
-- Optional: GnuCOBOL for `--mock-cobol` mode
-- Optional: Docker for containerized deployment
+- Python 3.10+, no external runtime dependencies
+- Optional: `PyYAML` for YAML config support
+- Optional: `z3-solver` for concolic mode
+- Optional: GnuCOBOL for mock compilation and validation
+- Optional: Java 17+ and Maven 3.9+ for Java project generation
+- Optional: Docker for containerized Java deployment
+
+See [JAVAGEN.md](JAVAGEN.md) for Java generation details and [AGENTS.md](AGENTS.md) for the full architecture reference.

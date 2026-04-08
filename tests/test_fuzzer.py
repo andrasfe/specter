@@ -15,6 +15,7 @@ from specter.monte_carlo import (
     _fingerprint_state,
     _generate_all_success_state,
     _generate_all_success_stubs,
+    _generate_random_state,
     _generate_directed_input,
     _generate_random_value,
     _generate_stub_outcomes,
@@ -26,6 +27,7 @@ from specter.monte_carlo import (
     _update_energy,
     run_monte_carlo,
 )
+from specter.variable_domain import VariableDomain
 from specter.static_analysis import (
     GatingCondition,
     PathConstraints,
@@ -209,6 +211,35 @@ class TestMutation(unittest.TestCase):
         rng = random.Random(42)
         values = [_generate_random_value("X", info, rng) for _ in range(100)]
         self.assertIn("MAGIC", values)
+
+    def test_generate_random_state_uses_jit_for_input_fields(self):
+        class StubJITInference:
+            def generate_value(self, var_name, domain, strategy, rng, **kwargs):
+                return "CA"
+
+            def infer_profile(self, var_name, domain, **kwargs):
+                return None
+
+        report = VariableReport()
+        report.variables = {
+            "WS-STATE": VariableInfo(name="WS-STATE", classification="input"),
+        }
+        rng = random.Random(42)
+        state = _generate_random_state(
+            report,
+            rng,
+            domains={
+                "WS-STATE": VariableDomain(
+                    name="WS-STATE",
+                    classification="input",
+                    data_type="alpha",
+                    max_length=2,
+                ),
+            },
+            jit_inference=StubJITInference(),
+            semantic_profiles={},
+        )
+        self.assertEqual(state["WS-STATE"], "CA")
 
 
 class TestGuidedIntegration(unittest.TestCase):

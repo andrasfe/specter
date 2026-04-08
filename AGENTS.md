@@ -31,8 +31,9 @@ JSON AST + COBOL source + copybooks
 │  test_synthesis.py      │   │  cobol_mock.py (transforms)   │
 │  coverage_strategies.py │   │  branch_instrumenter.py       │
 │  cobol_coverage.py      │   │  cobol_executor.py            │
-└─────────┬───────────────┘   │  cobol_fix_cache.py           │
-          │                   │  llm_coverage.py (LLM calls)  │
+│  jit_value_inference.py │   │  cobol_fix_cache.py           │
+└─────────┬───────────────┘   │  llm_coverage.py (LLM calls)  │
+       │                   │  llm_test_states.py           │
           ▼                   └──────────┬─────────────────────┘
    JSONL test store                      │
    (input_state + stubs + coverage)      ▼
@@ -112,7 +113,7 @@ Classifies each variable as: `input` (read-before-write), `internal`, `status` (
 
 **`build_variable_domains()`** (L117): Builds domain for every variable.
 
-**`generate_value(domain, strategy)`** (L219): 6 strategies — condition_literal, 88_value, boundary, semantic, random_valid, adversarial.
+**`generate_value(domain, strategy)`** (L219): 6 strategies — condition_literal, 88_value, boundary, semantic, random_valid, adversarial. In current coverage flows, `semantic` is usually attempted first through `jit_value_inference.py`; `generate_value()` remains the deterministic fallback.
 
 ### `specter/copybook_parser.py` — Copybook Parsing (~550 lines)
 
@@ -147,7 +148,7 @@ Returns `(mock_cbl_path, branch_meta, total_branches)`.
 
 **Batch loop** (Phases 3-5): Replace `batch_size` blocks → write → compile → fix → next batch. If batch causes >10 errors, revert and retry one-by-one.
 
-**Sequential fix loop**: `_compile_and_fix` runs sequentially — compile, pick error, fix, compile, repeat — until errors reach 0 or stalls for 10 no-progress rounds. When all errors have been attempted, `failed_error_lines` resets for a fresh round with accumulated failed-attempt memory. Duplicate fixes are fingerprinted and rejected instantly. After batch mode fails for an error type, falls back to single-error mode. `copy_resolution` is biased toward context-driven single-error investigation, while later phases still prefer batching when many similar instrumentation-induced errors appear.
+**Sequential fix loop**: `_compile_and_fix` runs sequentially — compile, pick error, fix, compile, repeat — until errors reach 0 or stalls for 50 no-progress rounds. When all errors have been attempted, `failed_error_lines` resets for a fresh round with accumulated failed-attempt memory. Duplicate fixes are fingerprinted and rejected instantly. After batch mode fails for an error type, falls back to single-error mode. `copy_resolution` is biased toward context-driven single-error investigation, while later phases still prefer batching when many similar instrumentation-induced errors appear.
 
 **Hard phase gates**: Every phase calls `_assert_clean()` after compile-and-fix. If ANY errors remain, the pipeline raises `RuntimeError` — it will never proceed to the next phase with unresolved errors. The error propagates to the caller (not swallowed). The sub-checkpoint ensures restart resumes from compile-and-fix (not re-doing the transform).
 
@@ -209,6 +210,8 @@ class Resolution:
 
 **Post-progress restubbing**: After any successful error-count drop, `_compile_and_fix()` reruns deterministic paragraph stubs and undefined-symbol stubs because newly surfaced targets often appear only after the first root cause is fixed.
 
+**In-loop paragraph restubbing**: `_compile_and_fix()` also performs a deterministic paragraph-stub pass on each loop iteration (before LLM fixing) and keeps the insertion only when error count improves. This catches late-batch `'<PARA-EXIT>' is not defined` cases (including double-hyphen legacy labels) even when no prior LLM fix reduced total errors.
+
 **Integrity check** (end of pipeline): Reports paragraph trace count, mock probe count, and comment ratio. Warns if >40% of lines are comments.
 
 #### Helper Functions
@@ -239,6 +242,7 @@ class Resolution:
 
 - **`_load_checkpoint(output_dir)`** (L210): Load `phase_checkpoint.json`
 - **`_save_checkpoint(output_dir, phase, number, mock_path)`** (L233): Save after each phase with SHA-256 hash validation
+- **Run manifest mirror**: checkpoint progress is also mirrored into `.specter_run_manifest.json` via `run_manifest.record_phase_checkpoint(...)` for easier resume auditing.
 
 ### `specter/cobol_mock.py` — Mock Transformations (~4600 lines)
 
@@ -248,7 +252,7 @@ The underlying transformation functions called by `incremental_mock.py`.
 
 **Non-destructive fallback policy**: `cobol_mock.py` no longer uses broad paragraph neutralization, exact-line comment-out salvage, or hard-comment procedure fallback as a generic recovery path. Fallback recovery now prefers targeted normalization, paragraph-header canonicalization, injected stub repair, and diagnostics, preserving original business logic unless an actual I/O block is being replaced by design.
 
-**`MockConfig`** (L62): Configuration dataclass — copybook_dirs, trace_paragraphs, mock_file_name, stop_on_exec_return/xctl, eib_calen, eib_aid, initial_values.
+**`MockConfig`** (L62): Configuration dataclass — copybook_dirs, trace_paragraphs, mock_file_name, stop_on_exec_return/xctl, eib_calen, eib_aid, initial_values, payload_variables.
 
 #### Core Replacement Functions (all support `max_count` for incremental batching)
 
@@ -281,6 +285,11 @@ Cols 31-50:  Alpha status ('00' for success)
 Cols 51-59:  Numeric status (right-justified)
 Cols 60-80:  Filler
 ```
+
+Payload continuation records:
+- Primary operation records may be followed by `SET:<var>` records.
+- Instrumented COBOL applies these through `SPECTER-NEXT-MOCK-RECORD` + `SPECTER-APPLY-MOCK-PAYLOAD` paragraphs.
+- This enables transcript-style variable payload replay for READ/CALL/EXEC/I-O replacements.
 
 ### `specter/branch_instrumenter.py` — Post-Compilation Branch Probes (~300 lines)
 
@@ -326,38 +335,113 @@ After Phase 9 writes probes, `incremental_mock.py` recompiles the executable so 
 
 Uses `llm_providers` package with Protocol-based abstraction (`LLMProvider`, `Message`, `CompletionResponse`). Supports Anthropic, OpenAI, OpenRouter.
 
+### `specter/llm_test_states.py` — COBOL Comment & Seed Extraction (~650 lines)
+
+**`extract_paragraph_comments(program, source_lines)`** (L60): Extracts nearby COBOL comments keyed by paragraph name.
+
+Used by `cobol_coverage.py`, `program_analysis.py`, and JIT value inference so prompts can include local business-language hints instead of relying only on field names and literals.
+
+### `specter/jit_value_inference.py` — Lazy Semantic Value Inference (~360 lines)
+
+Shared on-demand LLM inference service used by both COBOL coverage and Monte Carlo fuzzing. It replaces eager startup-wide semantic inference on active paths with just-in-time profile generation plus cache reuse.
+
+**`JITValueInferenceService`**: Main service class.
+
+Key methods:
+- **`infer_profile(var_name, domain, *, target_paragraph, op_key, comment_hints, allowed_variables, target_key)`**: Two-layer gating before any LLM call: (1) if `require_target_paragraph_context` is True and `target_paragraph` is absent, increments `skipped_untargeted` and returns `None`; (2) if `allowed_variables` is non-empty and `var_name` is not in it, increments `skipped_out_of_scope` and returns `None`. On pass, builds a prompt, queries the LLM, parses a `SemanticProfile`, and caches by variable/domain/paragraph/comment context.
+- **`generate_value(var_name, domain, strategy, rng, *, allowed_variables, target_key, ...)`**: Returns a semantic candidate only for `strategy == "semantic"`; passes through the scope parameters to `infer_profile`; returns `None` so callers can fall back to deterministic generation otherwise.
+- **`snapshot_metrics()`**: Returns `requests`, `cache_hits`, `cache_misses`, `skipped_untargeted`, `skipped_out_of_scope`, `cache_hit_pct`, `llm_successes`, `llm_failures`, `avg_latency_ms`.
+- **`_emit_periodic_summary()`**: Logs `skip_u` and `skip_scope` counters alongside hit/miss rates. Fires every `summary_every_requests` events or `summary_interval_sec` seconds.
+
+Gating flags:
+- **`require_target_paragraph_context`** (default `True`): Skip any call without an explicit target paragraph. Controlled by `JITLoggingConfig.require_target_paragraph_context`.
+- **`allowed_variables`** (per-call set): Caller passes a pre-computed per-target allowlist; variables outside it are skipped as out-of-scope.
+
+Prompt inputs:
+- variable name and classification
+- PIC/domain facts (`data_type`, length, precision, signedness, ranges)
+- harvested condition literals and 88-level values
+- target paragraph / stub operation context
+- nearby paragraph comments from `llm_test_states.extract_paragraph_comments()`
+
+Cache model:
+- In-memory cache keyed by `_cache_key(...)` (SHA-256 of all inputs)
+- Optional persistent JSON cache on disk
+- `cache_hits` / `cache_misses` / `skipped_untargeted` / `skipped_out_of_scope` counters
+
+This module reuses `SemanticProfile`, `_parse_semantic_profiles`, and `generate_value_from_profile` from `llm_fuzzer.py` rather than introducing a second semantic-profile format.
+
+### `specter/llm_fuzzer.py` — LLM-Guided Input Mutation (~600 lines)
+
+Contains the semantic-profile schema and adaptive mutation helpers used by Monte Carlo guidance.
+
+Core pieces:
+- **`SemanticProfile`**: Structured semantic description (`description`, `valid_values`, `value_range`, `format_pattern`, `related_variables`).
+- **`_parse_semantic_profiles(response_text)`**: Parses JSON-ish LLM responses into `SemanticProfile` objects.
+- **`generate_value_from_profile(profile, rng)`**: Lightweight sampling helper used by both guided fuzzing and JIT inference fallback.
+- **`apply_strategy_to_state(...)`**: Now accepts `jit_inference` and `domains`; semantic mutations try the shared JIT service first, then fall back to cached `semantic_profiles`.
+
+Legacy note: `infer_variable_semantics()` still exists as the older eager bootstrap path, but the active COBOL coverage and guided Monte Carlo flows now use `jit_value_inference.py` instead.
+
 ---
 
 ## Coverage Engine
 
-### `specter/cobol_coverage.py` — Agentic Loop (~1600 lines)
+### `specter/cobol_coverage.py` — Agentic Loop (~2200 lines)
 
-**`run_cobol_coverage(ast_source, cobol_source, copybook_dirs, ...)`** (L989): Main COBOL coverage entry point. Compiles, prepares context, runs agentic loop.
+**`run_cobol_coverage(ast_source, cobol_source, copybook_dirs, ...)`** (L989): Main COBOL coverage entry point. Compiles, prepares context, extracts paragraph comments, builds a shared `JITValueInferenceService`, builds per-target variable allowlists, and runs the agentic loop.
+
+Important helpers:
+- **`_build_input_state(...)`**: Generates baseline input state from variable domains. Semantic generation now consults the shared JIT service first, then falls back to `generate_value()`.
+- **`extract_paragraph_comments(...)` integration**: COBOL source comments are harvested once and threaded into `StrategyContext` so paragraph-targeted semantic prompts can use nearby business hints.
+- **`_build_target_variable_allowlists(module, branch_meta, gating_conds, stub_mapping, *, include_gates, include_slice)`** (L520): Builds a `dict[str, set[str]]` keyed by `"para:<para_name>"`. For each paragraph in `branch_meta`, combines: gating variables from `extract_gating_variables_for_target`, stub-return variables from `stub_mapping`, and backward-slice variables from `slice_variable_names` (both ± branch IDs). Result is attached to `StrategyContext.target_variable_allowlists` and drives per-call JIT scope filtering. Controlled by `jit_scope_policy` (see `JITLoggingConfig`).
+- **`_jit_status_suffix()`**: Emits the JIT metrics banner appended to coverage log lines. Format: `[JIT reqs={n} hit={pct:.1f}% skip_u={n} skip_scope={n} ok={n} fail={n} avg={ms:.0f}ms]`.
 
 **`_run_agentic_loop(strategies, context, ...)`** (L1242): Strategy selector picks strategy → generate test cases → execute → track coverage → repeat until budget/timeout/plateau.
 
 **`run_coverage(ast_source, ...)`** (L1473): Python-only coverage (no COBOL binary).
 
-### `specter/coverage_strategies.py` — Pluggable Strategies (~2030 lines)
+Phase-1 memory-guided persistence now runs as an additive layer in both COBOL and Python-only coverage entry points:
+- Load memory state from a run-local directory derived from test-store stem (e.g., `tests.jsonl` → `tests_memory/`).
+- Track successful coverage-producing states and per-target attempt metadata during `_execute_and_save(...)`.
+- Checkpoint memory state at end-of-round and finalization so interrupted runs can resume with retained context.
+
+### `specter/coverage_strategies.py` — Pluggable Strategies (~2170 lines)
 
 | Strategy | Priority | Method |
 |----------|----------|--------|
 | `BaselineStrategy` (L124) | 20 | All-success baseline with 5 value generation strategies |
 | `DirectParagraphStrategy` (L488) | 35 | **7-phase rotation**: param hill-climb → stub sweep → dataflow backprop → frontier → harvest → inverse → LLM |
+| `TranscriptSearchStrategy` (L1897) | 40 | Mutates ordered READ transcripts with domain-aware payload assignments |
 | `FaultInjectionStrategy` (L1667) | 50 | Inject fault values into stub operations |
 | `CorpusFuzzStrategy` (L1733) | 45 | AFL-inspired energy-based corpus scheduling with greedy set cover |
 
 **`HeuristicSelector`** (L1985): Scoring = `priority - yield_bonus + staleness_penalty`. Adaptive batch sizing per strategy.
 
-### `specter/static_analysis.py` — Call Graph & Gating (~545 lines)
+**`StrategyContext`** now carries:
+- `domains`: variable domain map
+- `jit_inference`: shared `JITValueInferenceService`
+- `paragraph_comments`: extracted COBOL comments by paragraph
+- `payload_candidates`: per-op payload candidate map used by transcript search
+- `target_variable_allowlists: dict[str, set[str]]`: per-target JIT variable scope (keyed `"para:<name>"`; built by `_build_target_variable_allowlists`)
+- `current_target_key: str | None`: set by each strategy to the active per-target key before generating domain values
+- `preferred_target_key: str | None`: round-level branch preference (e.g., `branch:17:F`) to focus direct rounds
+- `memory_store`, `memory_state`: optional memory persistence handles
+
+Semantic value generation inside baseline, direct-paragraph, and transcript-driven strategies is funneled through `_generate_domain_value(...)`, which resolves the active allowlist from `current_target_key`, passes `allowed_variables` and `target_key` to the JIT service, and falls back to deterministic domain generation when JIT returns `None`.
+
+### `specter/static_analysis.py` — Call Graph & Gating (~560 lines)
 
 - **`build_static_call_graph(program)`** (L86): PERFORM/GO_TO edge extraction
 - **`extract_gating_conditions(program)`** (L332): IF/EVALUATE conditions gating paragraph entry
 - **`compute_path_constraints(graph, target)`** (L514): Constraints along path from entry to target
+- **`extract_gating_variables_for_target(gating_conditions, target)`** (L532): Returns the set of normalized variable names that gate entry to `target` (sourced from `extract_gating_conditions` output). Used by `_build_target_variable_allowlists` to seed per-target JIT scope.
 
-### `specter/backward_slicer.py` — Code Slicing (~290 lines)
+### `specter/backward_slicer.py` — Code Slicing (~390 lines)
 
 **`backward_slice(module_source, branch_id, max_lines)`** (L73): Extract minimal code leading to a branch for LLM steering. 5-phase: locate → control path → variable deps → stubs → assemble.
+
+**`slice_variable_names(module_source, target_bid)`** (L354): Lightweight variant that returns only the set of state variable names (uppercase) referenced by the backward slice for a given branch ID. Both the positive (`+bid`) and negative (`-bid`) directions are called by `_build_target_variable_allowlists` to gather T- and F-arm dependencies.
 
 ### `specter/program_analysis.py` — Per-Paragraph Analysis (~450 lines)
 
@@ -369,11 +453,21 @@ Uses `llm_providers` package with Protocol-based abstraction (`LLMProvider`, `Me
 
 **`run_bundle(bundle_dir, ...)`** (L773): Run coverage from bundle (no source/AST/copybooks needed).
 
-### `specter/coverage_config.py` — Strategy Config (~270 lines)
+### `specter/coverage_config.py` — Strategy Config (~290 lines)
 
 **`CoverageConfig`**: selector, strategies, rounds, termination thresholds.
 
 **`load_config(path)`** (L102): YAML config (or JSON fallback).
+
+**`JITLoggingConfig`**: Controls JIT observability and scope filtering:
+| Field | Default | Purpose |
+|-------|---------|--------|
+| `enabled` | `True` | Emit periodic JIT status lines |
+| `periodic_interval_ms` | 10000 | Minimum ms between status lines |
+| `summary_every_requests` | 50 | Also emit after N events regardless of time |
+| `debug_min_interval_ms` | 100 | Minimum ms between DEBUG-level per-call logs |
+| `require_target_paragraph_context` | `True` | Skip JIT when no target paragraph supplied |
+| `jit_scope_policy` | `"target_gates_plus_slice"` | Variable-level scope filter: `all` (no filtering), `target_gates_only` (gating vars only), `target_gates_plus_slice` (gating + backward-slice vars) |
 
 ### `specter/cobol_validate.py` — Two-Pass Validation (~200 lines)
 
@@ -391,7 +485,11 @@ Uses `llm_providers` package with Protocol-based abstraction (`LLMProvider`, `Me
 
 **Corpus management**: Energy-based seed selection, eviction at 500 entries, frontier bonus, recency bonus, yield penalty.
 
-**Input generation**: Status vars 80% success-biased, flags 70% from literals, semantic heuristics for dates/amounts/IDs.
+**Input generation**:
+- Status vars remain 80% success-biased.
+- Flags and inputs still prefer harvested literals when available.
+- Guided semantic generation now uses a shared `JITValueInferenceService` plus `build_variable_domains(...)` so values are inferred lazily per variable/target paragraph instead of eagerly for the whole session.
+- When JIT inference succeeds, inferred profiles are also cached into the Monte Carlo semantic-profile store for reuse by later strategy mutations.
 
 ### `specter/test_synthesis.py` — 5-Layer Synthesis (~4000 lines)
 
@@ -414,6 +512,43 @@ Uses `llm_providers` package with Protocol-based abstraction (`LLMProvider`, `Me
 **`TestStore.load(path)`** (L119): Load + deduplicate + restore progress.
 
 **`TestStore.append(path, tc)`** (L157): Atomic append (crash-safe).
+
+### `specter/memory_models.py` — Memory-Guided State Schema (~240 lines)
+
+Additive persisted schema for memory-guided loop state:
+- `SuccessState`: coverage-producing test input/stub snapshot
+- `FailureFragment`: no-gain fragment (schema ready)
+- `TargetStatus`: per-target attempts/nearest-hit/solved metadata
+- `StrategyStats`: per-strategy yield counters
+- `APIBudgetLedger`: persisted API usage counters
+- `MemoryState`: top-level aggregate with `meta`
+
+### `specter/memory_store.py` — Crash-Safe Memory Persistence (~170 lines)
+
+Run-local memory storage with atomic writes:
+- `derive_memory_dir(store_path)`: deterministic memory directory from JSONL stem
+- `MemoryStore.load_state()` / `save_state()`: resilient state load/save
+- `append_success()` / `append_failure()` / `upsert_target_status()` / `upsert_strategy_stats()` / `update_api_ledger()`
+- `checkpoint(...)`: writes round/final progress markers into memory `meta`
+- `prune_state(...)`: bounded retention for successes/failures
+
+### `specter/persistence_utils.py` — Atomic File I/O Helpers
+
+Shared persistence primitives for crash-safe writes:
+- `atomic_write_text(...)`
+- `atomic_write_json(...)`
+- `append_line_with_fsync(...)`
+
+Used by test-store appends, memory checkpoints, resolution/checkpoint writes, and JIT cache persistence.
+
+### `specter/run_manifest.py` — Run Metadata Manifest
+
+Tracks source hash, copybook roots, and latest phase/checkpoint state in `.specter_run_manifest.json`.
+
+Key functions:
+- `ensure_manifest(...)`
+- `record_phase_checkpoint(...)`
+- `load_manifest(...)` / `save_manifest(...)`
 
 ---
 
@@ -441,8 +576,11 @@ python3 -m specter program.ast --synthesize --test-store tests.jsonl \
 python3 -m specter program.ast --cobol-coverage \
     --cobol-source program.cbl --copybook-dir ./cpy \
     --coverage-budget 5000 --coverage-timeout 1800 \
-    [--coverage-config config.yaml] [--llm-guided --llm-provider openrouter]
+    [--coverage-config config.yaml] [--llm-guided --llm-provider openrouter] \
+    [--debug]
 ```
+
+The `--debug` flag enables `logging.DEBUG` on the root logger for the coverage run, which surfaces per-call JIT gate decisions (untargeted / out-of-scope / cache-hit / cache-miss) and per-round strategy details.
 
 ### COBOL Mock Instrumentation Only
 ```bash
@@ -483,7 +621,7 @@ python3 -m specter program.ast --java -o project/ \
 | File | Tests | Coverage |
 |------|-------|----------|
 | `test_incremental_mock.py` | 24 | Incremental pipeline, resolutions, max_count batching |
-| `test_cobol_coverage.py` | 61 | Integration: AST → Python → COBOL execution |
+| `test_cobol_coverage.py` | 81 | Integration: AST → Python → COBOL execution, JIT scope/gating, allowlist building |
 | `test_condition_parser.py` | 27 | COBOL condition → Python translation |
 | `test_copybook_parser.py` | 38 | Copybook parsing, PIC types, 88-level values |
 | `test_code_generator.py` | 15 | Python code generation for all statement types |
@@ -499,8 +637,9 @@ python3 -m specter program.ast --java -o project/ \
 | `test_coverage_config.py` | 13 | Configuration management |
 | `test_java_condition_parser.py` | 56 | Java condition code generation |
 | `test_end_to_end.py` | 8 | Full pipeline (skipped if AST files missing) |
+| `test_memory_store.py` | 3 | Memory persistence: derive_memory_dir, round-trip save/load, prune+checkpoint |
 
-**Total: ~436 tests**
+**Total: ~459 tests**
 
 ### Running Tests
 ```bash
@@ -524,3 +663,4 @@ python3 -m pytest -x -q                              # Stop on first failure, qu
 8. **State dict convention**: All COBOL vars uppercase, internals prefixed `_`
 9. **Stub outcome queues**: list of (var, value) pairs per operation, pop on each call
 10. **JSONL persistence**: Append-only, crash-safe, resumable with progress records
+11. **JIT scope restriction**: JIT LLM calls are allowed only when a concrete target paragraph is known AND the variable is within the per-target allowlist (gating vars ∪ backward-slice vars ∪ stub-return vars). This eliminates low-signal "Target paragraph: none" prompts and keeps semantic inference tightly coupled to the currently blocked coverage target.

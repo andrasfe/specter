@@ -349,3 +349,32 @@ def _assemble_slice(
         prev_idx = idx
 
     return "\n".join(output)
+
+
+def slice_variable_names(module_source: str, target_bid: int) -> set[str]:
+    """Return state variable names relevant to a target branch backward slice."""
+    lines = module_source.splitlines()
+    target_line_idx, func_start, func_end = _find_branch_location(lines, target_bid)
+    if target_line_idx is None:
+        return set()
+
+    func_lines = lines[func_start:func_end + 1]
+    target_offset = target_line_idx - func_start
+
+    path_lines = _find_control_path(func_lines, target_offset)
+    condition_vars = _extract_condition_vars(func_lines, target_offset)
+    dep_lines = _backward_trace(func_lines, target_offset, condition_vars)
+    stub_lines = _find_relevant_stubs(func_lines, target_offset, condition_vars)
+
+    keep = set(path_lines) | set(dep_lines) | set(stub_lines)
+    keep.add(target_offset)
+
+    vars_out: set[str] = set(condition_vars)
+    for idx in keep:
+        if idx < 0 or idx >= len(func_lines):
+            continue
+        line = func_lines[idx]
+        vars_out.update(_vars_read(line))
+        vars_out.update(_vars_written(line))
+
+    return {v.upper() for v in vars_out if v}

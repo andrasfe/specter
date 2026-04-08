@@ -17,6 +17,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .persistence_utils import append_line_with_fsync
+
 
 @dataclass
 class TestCase:
@@ -159,8 +161,7 @@ class TestStore:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(_tc_to_dict(tc), default=str)
-        with open(path, "a") as f:
-            f.write(line + "\n")
+        append_line_with_fsync(path, line + "\n")
 
     @staticmethod
     def append_progress(path: str | Path, record: dict) -> None:
@@ -168,8 +169,7 @@ class TestStore:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, default=str)
-        with open(path, "a") as f:
-            f.write(line + "\n")
+        append_line_with_fsync(path, line + "\n")
 
     @staticmethod
     def replay(

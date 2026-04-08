@@ -10,9 +10,12 @@ Takes a COBOL source file and produces a modified version that:
 7. Resolves COPY statements from provided copybook directories
 
 Mock data file format (line-sequential, 80 chars/record):
-  Cols 1-30:  operation key (e.g., 'CICS-READ', 'SQL', 'DLI-GU')
-  Cols 31-50: alphanumeric status value
-  Cols 51-80: reserved / numeric status value
+    Cols 1-30:  operation key (e.g., 'CICS-READ', 'SQL', 'DLI-GU')
+    Cols 31-50: alphanumeric status value
+    Cols 51-80: reserved / numeric status value
+
+Primary records may be followed by ``SET:<var>`` continuation records that
+carry additional variable assignments for the same external operation.
 
 The mock file is read sequentially — one record per external operation
 in execution order, matching _apply_stub_outcome's FIFO semantics.
@@ -69,6 +72,7 @@ class MockConfig:
     stop_on_exec_return: bool = True  # EXEC CICS RETURN → STOP RUN
     stop_on_exec_xctl: bool = True   # EXEC CICS XCTL → STOP RUN
     initial_values: dict[str, str] = field(default_factory=dict)  # var→value MOVEs after OPEN
+    payload_variables: dict[str, str] = field(default_factory=dict)  # var→("alpha"|"numeric") for SET replay
     eib_calen: int = 0                # Initial EIBCALEN VALUE in EIB stub
     eib_aid: str = "SPACES"           # Initial EIBAID VALUE in EIB stub (hex literal or SPACES)
 
@@ -733,13 +737,14 @@ def _mock_cics(
         else:
             # Coverage mode: read mock data and continue instead of terminating
             lines.append(f"{_B}DISPLAY 'SPECTER-MOCK:CICS-RETURN'\n")
-            lines.append(f"{_B}READ MOCK-FILE INTO MOCK-RECORD\n")
-            lines.append(f"{_CONT}AT END\n")
-            lines.append(f"{_CONT}  MOVE '00' TO MOCK-ALPHA-STATUS\n")
-            lines.append(f"{_CONT}  MOVE 0 TO MOCK-NUM-STATUS\n")
-            lines.append(f"{_B}END-READ\n")
+            lines.append(f"{_B}PERFORM SPECTER-NEXT-MOCK-RECORD\n")
+            lines.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
+            lines.append(f"{_CONT}MOVE '00' TO MOCK-ALPHA-STATUS\n")
+            lines.append(f"{_CONT}MOVE 0 TO MOCK-NUM-STATUS\n")
+            lines.append(f"{_B}END-IF\n")
             if resp_var:
                 lines.append(f"{_B}MOVE MOCK-NUM-STATUS TO {resp_var}\n")
+            lines.append(f"{_B}PERFORM SPECTER-APPLY-MOCK-PAYLOAD\n")
             lines.append(f"{_B}CONTINUE{dot}\n")
             return lines
     elif re.search(r"\bXCTL\b", block_text):
@@ -752,13 +757,14 @@ def _mock_cics(
         else:
             # Coverage mode: read mock data and continue
             lines.append(f"{_B}DISPLAY 'SPECTER-MOCK:CICS-XCTL:{prog}'\n")
-            lines.append(f"{_B}READ MOCK-FILE INTO MOCK-RECORD\n")
-            lines.append(f"{_CONT}AT END\n")
-            lines.append(f"{_CONT}  MOVE '00' TO MOCK-ALPHA-STATUS\n")
-            lines.append(f"{_CONT}  MOVE 0 TO MOCK-NUM-STATUS\n")
-            lines.append(f"{_B}END-READ\n")
+            lines.append(f"{_B}PERFORM SPECTER-NEXT-MOCK-RECORD\n")
+            lines.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
+            lines.append(f"{_CONT}MOVE '00' TO MOCK-ALPHA-STATUS\n")
+            lines.append(f"{_CONT}MOVE 0 TO MOCK-NUM-STATUS\n")
+            lines.append(f"{_B}END-IF\n")
             if resp_var:
                 lines.append(f"{_B}MOVE MOCK-NUM-STATUS TO {resp_var}\n")
+            lines.append(f"{_B}PERFORM SPECTER-APPLY-MOCK-PAYLOAD\n")
             lines.append(f"{_B}CONTINUE{dot}\n")
             return lines
     elif re.search(r"\bSYNCPOINT\b", block_text):
@@ -779,11 +785,11 @@ def _mock_cics(
             break
 
     lines.append(f"{_B}DISPLAY 'SPECTER-MOCK:{op}'\n")
-    lines.append(f"{_B}READ MOCK-FILE INTO MOCK-RECORD\n")
-    lines.append(f"{_CONT}AT END\n")
-    lines.append(f"{_CONT}  MOVE '00' TO MOCK-ALPHA-STATUS\n")
-    lines.append(f"{_CONT}  MOVE 0 TO MOCK-NUM-STATUS\n")
-    lines.append(f"{_B}END-READ\n")
+    lines.append(f"{_B}PERFORM SPECTER-NEXT-MOCK-RECORD\n")
+    lines.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
+    lines.append(f"{_CONT}MOVE '00' TO MOCK-ALPHA-STATUS\n")
+    lines.append(f"{_CONT}MOVE 0 TO MOCK-NUM-STATUS\n")
+    lines.append(f"{_B}END-IF\n")
 
     # CICS RECEIVE MAP: set EIBAID from mock alpha status so that
     # downstream EVALUATE EIBAID branches become reachable.
@@ -793,13 +799,10 @@ def _mock_cics(
     if resp_var:
         lines.append(f"{_B}MOVE MOCK-NUM-STATUS TO {resp_var}\n")
     if resp2_var:
-        lines.append(f"{_B}MOVE 0 TO {resp2_var}{dot}\n")
-    elif resp_var:
-        # Add period to last MOVE if needed
-        lines[-1] = lines[-1].rstrip("\n") + dot + "\n" if dot else lines[-1]
-    elif dot:
-        # No RESP vars — add period to END-READ
-        lines[-1] = lines[-1].rstrip("\n").rstrip() + dot + "\n"
+        lines.append(f"{_B}MOVE 0 TO {resp2_var}\n")
+    lines.append(f"{_B}PERFORM SPECTER-APPLY-MOCK-PAYLOAD\n")
+    if dot:
+        lines[-1] = lines[-1].rstrip("\n") + dot + "\n"
 
     return lines
 
@@ -823,11 +826,12 @@ def _mock_sql(block_text: str, ind: str, has_period: bool = False) -> list[str]:
         return lines
 
     lines.append(f"{_B}DISPLAY 'SPECTER-MOCK:{op}'\n")
-    lines.append(f"{_B}READ MOCK-FILE INTO MOCK-RECORD\n")
-    lines.append(f"{_CONT}AT END\n")
-    lines.append(f"{_CONT}  MOVE '00' TO MOCK-ALPHA-STATUS\n")
-    lines.append(f"{_CONT}  MOVE 0 TO MOCK-NUM-STATUS\n")
-    lines.append(f"{_B}END-READ\n")
+    lines.append(f"{_B}PERFORM SPECTER-NEXT-MOCK-RECORD\n")
+    lines.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
+    lines.append(f"{_CONT}MOVE '00' TO MOCK-ALPHA-STATUS\n")
+    lines.append(f"{_CONT}MOVE 0 TO MOCK-NUM-STATUS\n")
+    lines.append(f"{_B}END-IF\n")
+    lines.append(f"{_B}PERFORM SPECTER-APPLY-MOCK-PAYLOAD\n")
     lines.append(f"{_B}MOVE MOCK-NUM-STATUS TO SQLCODE{dot}\n")
 
     return lines
@@ -851,11 +855,12 @@ def _mock_dli(block_text: str, ind: str, has_period: bool = False) -> list[str]:
         return lines
 
     lines.append(f"{_B}DISPLAY 'SPECTER-MOCK:{op}'\n")
-    lines.append(f"{_B}READ MOCK-FILE INTO MOCK-RECORD\n")
-    lines.append(f"{_CONT}AT END\n")
-    lines.append(f"{_CONT}  MOVE '  ' TO MOCK-ALPHA-STATUS\n")
-    lines.append(f"{_CONT}  MOVE 0 TO MOCK-NUM-STATUS\n")
-    lines.append(f"{_B}END-READ\n")
+    lines.append(f"{_B}PERFORM SPECTER-NEXT-MOCK-RECORD\n")
+    lines.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
+    lines.append(f"{_CONT}MOVE '  ' TO MOCK-ALPHA-STATUS\n")
+    lines.append(f"{_CONT}MOVE 0 TO MOCK-NUM-STATUS\n")
+    lines.append(f"{_B}END-IF\n")
+    lines.append(f"{_B}PERFORM SPECTER-APPLY-MOCK-PAYLOAD\n")
     lines.append(f"{_B}MOVE MOCK-ALPHA-STATUS TO DIBSTAT{dot}\n")
 
     return lines
@@ -869,13 +874,30 @@ def _extract_file_status_map(lines: list[str]) -> dict[str, str]:
     """Extract FILE STATUS IS <var> from SELECT clauses.
 
     Returns a dict mapping file name to status variable name.
+
+    Skips commented lines so the non-greedy SELECT...FILE STATUS match
+    cannot span across an earlier SELECT's commented-out body and pick
+    up a FILE STATUS clause that belongs to a different file.
     """
     status_map: dict[str, str] = {}
-    # Join all lines in FILE-CONTROL to parse multi-line SELECT statements
-    text = "".join(lines).upper()
+    # Reconstruct text from non-comment content only. COBOL fixed-format
+    # comments have '*' or '/' in column 7 (index 6).
+    non_comment_lines: list[str] = []
+    for line in lines:
+        if len(line) > 6 and line[6] in ("*", "/"):
+            # Replace comment body with a blank line so line numbers/
+            # regex boundaries behave predictably.
+            non_comment_lines.append("\n")
+        else:
+            non_comment_lines.append(line)
+    text = "".join(non_comment_lines).upper()
     # Match: SELECT <file> ASSIGN TO ... FILE STATUS IS <var>
+    # Use a negative lookahead to prevent .*? from consuming another
+    # SELECT clause.
     for m in re.finditer(
-        r"SELECT\s+([A-Z0-9_-]+).*?FILE\s+STATUS\s+(?:IS\s+)?([A-Z0-9_-]+)",
+        r"SELECT\s+([A-Z0-9_-]+)"
+        r"(?:(?!\bSELECT\b).)*?"
+        r"\bFILE\s+STATUS\s+(?:IS\s+)?([A-Z0-9_-]+)",
         text, re.DOTALL,
     ):
         fname = m.group(1).strip()
@@ -976,11 +998,19 @@ def _replace_io_verbs(lines: list[str], max_count: int = 0) -> tuple[list[str], 
 
             # Insert mock
             result.append(f"{_B}DISPLAY 'SPECTER-MOCK:{op_key}'\n")
-            result.append(f"{_B}READ MOCK-FILE INTO MOCK-RECORD\n")
-            result.append(f"{_CONT}AT END\n")
-            result.append(f"{_CONT}  MOVE '00' TO MOCK-ALPHA-STATUS\n")
-            result.append(f"{_CONT}  MOVE 0 TO MOCK-NUM-STATUS\n")
-            result.append(f"{_B}END-READ\n")
+            result.append(f"{_B}PERFORM SPECTER-NEXT-MOCK-RECORD\n")
+            result.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
+            # For sequential READs, exhausting the mock queue should surface
+            # as a real end-of-file ('10') to the program — otherwise a
+            # PERFORM UNTIL <eof-flag> loop will never terminate. Other
+            # verbs (OPEN/CLOSE/WRITE/REWRITE/DELETE/START) default to '00'.
+            if verb in ("READ",):
+                result.append(f"{_CONT}MOVE '10' TO MOCK-ALPHA-STATUS\n")
+                result.append(f"{_CONT}MOVE 10 TO MOCK-NUM-STATUS\n")
+            else:
+                result.append(f"{_CONT}MOVE '00' TO MOCK-ALPHA-STATUS\n")
+                result.append(f"{_CONT}MOVE 0 TO MOCK-NUM-STATUS\n")
+            result.append(f"{_B}END-IF\n")
 
             # Move mock status to the actual file status variable so that
             # 88-level conditions (WS-FILE-OK, WS-FILE-EOF) evaluate correctly.
@@ -1008,6 +1038,8 @@ def _replace_io_verbs(lines: list[str], max_count: int = 0) -> tuple[list[str], 
                 result.append(
                     f"{_B}MOVE MOCK-ALPHA-STATUS TO {status_var}\n"
                 )
+
+            result.append(f"{_B}PERFORM SPECTER-APPLY-MOCK-PAYLOAD\n")
 
             # Last line: DISPLAY status + preserve period from original block
             result.append(
@@ -1089,10 +1121,11 @@ def _replace_call_stmts(lines: list[str], max_count: int = 0) -> tuple[list[str]
                 result.append(_comment_line(bl))
 
             result.append(f"{_B}DISPLAY 'SPECTER-MOCK:CALL:{prog}'\n")
-            result.append(f"{_B}READ MOCK-FILE INTO MOCK-RECORD\n")
-            result.append(f"{_CONT}AT END\n")
-            result.append(f"{_CONT}  MOVE 0 TO MOCK-NUM-STATUS\n")
-            result.append(f"{_B}END-READ\n")
+            result.append(f"{_B}PERFORM SPECTER-NEXT-MOCK-RECORD\n")
+            result.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
+            result.append(f"{_CONT}MOVE 0 TO MOCK-NUM-STATUS\n")
+            result.append(f"{_B}END-IF\n")
+            result.append(f"{_B}PERFORM SPECTER-APPLY-MOCK-PAYLOAD\n")
             result.append(f"{_B}MOVE MOCK-NUM-STATUS TO RETURN-CODE{dot}\n")
 
             count += 1
@@ -1714,6 +1747,13 @@ def _add_mock_infrastructure(
         f"{_B}05 MOCK-ALPHA-STATUS  PIC X(20).\n",
         f"{_B}05 MOCK-NUM-STATUS    PIC S9(09).\n",
         f"{_B}05 MOCK-FILLER        PIC X(21).\n",
+        f"{_A}01 MOCK-PENDING-RECORD.\n",
+        f"{_B}05 MOCK-PENDING-OP-KEY       PIC X(30).\n",
+        f"{_B}05 MOCK-PENDING-ALPHA-STATUS PIC X(20).\n",
+        f"{_B}05 MOCK-PENDING-NUM-STATUS   PIC S9(09).\n",
+        f"{_B}05 MOCK-PENDING-FILLER       PIC X(21).\n",
+        f"{_A}01 MOCK-PENDING-FLAG     PIC X VALUE 'N'.\n",
+        f"{_A}01 MOCK-EOF-FLAG         PIC X VALUE 'N'.\n",
         f"{_A}01 MOCK-FILE-STATUS      PIC XX VALUE '00'.\n",
         "\n",
     ]
@@ -1820,7 +1860,7 @@ def _disable_original_selects(lines: list[str], config: MockConfig) -> list[str]
     select_clause_text: str = ""  # accumulate full SELECT clause text
 
     def _build_dummy_select(file_name: str, clause_text: str) -> list[str]:
-        """Build a dummy SELECT, preserving INDEXED org + RECORD KEY."""
+        """Build a dummy SELECT, preserving INDEXED org + RECORD KEY + FILE STATUS."""
         clause_upper = clause_text.upper()
         is_indexed = "INDEXED" in clause_upper or "RELATIVE" in clause_upper
         record_key = ""
@@ -1831,6 +1871,17 @@ def _disable_original_selects(lines: list[str], config: MockConfig) -> list[str]
             )
             if km:
                 record_key = km.group(1)
+
+        # Preserve FILE STATUS clause so the mock I/O replacement can
+        # still find the original status variable name via
+        # _extract_file_status_map (which filters out comment lines).
+        file_status = ""
+        fs_match = re.search(
+            r"\bFILE\s+STATUS\s+(?:IS\s+)?([A-Z][A-Z0-9_-]*)",
+            clause_upper,
+        )
+        if fs_match:
+            file_status = fs_match.group(1)
 
         dummy_lines = []
         if is_indexed and record_key:
@@ -1843,14 +1894,33 @@ def _disable_original_selects(lines: list[str], config: MockConfig) -> list[str]
             dummy_lines.append(
                 f"{_CONT}ORGANIZATION IS INDEXED\n"
             )
-            dummy_lines.append(
-                f"{_CONT}RECORD KEY IS {record_key}.\n"
-            )
+            if file_status:
+                dummy_lines.append(
+                    f"{_CONT}RECORD KEY IS {record_key}\n"
+                )
+                dummy_lines.append(
+                    f"{_CONT}FILE STATUS IS {file_status}.\n"
+                )
+            else:
+                dummy_lines.append(
+                    f"{_CONT}RECORD KEY IS {record_key}.\n"
+                )
         else:
-            dummy_lines.append(
-                f"{_B}SELECT {file_name}"
-                f" ASSIGN TO '{file_name}'.\n"
-            )
+            if file_status:
+                dummy_lines.append(
+                    f"{_B}SELECT {file_name} ASSIGN TO\n"
+                )
+                dummy_lines.append(
+                    f"{_CONT}'{file_name}'\n"
+                )
+                dummy_lines.append(
+                    f"{_CONT}FILE STATUS IS {file_status}.\n"
+                )
+            else:
+                dummy_lines.append(
+                    f"{_B}SELECT {file_name}"
+                    f" ASSIGN TO '{file_name}'.\n"
+                )
         return dummy_lines
 
     for line in lines:
@@ -2104,8 +2174,18 @@ def _fix_procedure_division(lines: list[str]) -> list[str]:
         stripped = content.strip()
         if not stripped:
             return False
+        # Paragraph or section headers like "MAIN-PARA." or "FOO SECTION."
+        # sitting immediately after PROCEDURE DIVISION are never USING-clause
+        # continuations — never comment them out. The previous regex tried
+        # to express this via `|[A-Z0-9-]+\.)\b`, but \b after a period at
+        # end-of-line fails to match, so bare paragraph headers fell
+        # through to the final return True path and got commented out.
+        if re.match(r"^[A-Z0-9][A-Z0-9_-]*\s*\.\s*$", stripped, re.IGNORECASE):
+            return False
+        if re.match(r"^[A-Z0-9][A-Z0-9_-]*\s+SECTION\s*\.\s*$", stripped, re.IGNORECASE):
+            return False
         if re.match(
-            r"^(IF|ELSE|END-IF|MOVE|PERFORM|EVALUATE|DISPLAY|ADD|SUBTRACT|COMPUTE|GO|READ|WRITE|OPEN|CLOSE|CALL|EXEC|SET|INITIALIZE|STRING|UNSTRING|INSPECT|ACCEPT|STOP|GOBACK|EXIT|CONTINUE|SEARCH|DECLARATIVES|[A-Z0-9-]+\.)\b",
+            r"^(IF|ELSE|END-IF|MOVE|PERFORM|EVALUATE|DISPLAY|ADD|SUBTRACT|COMPUTE|GO|READ|WRITE|OPEN|CLOSE|CALL|EXEC|SET|INITIALIZE|STRING|UNSTRING|INSPECT|ACCEPT|STOP|GOBACK|EXIT|CONTINUE|SEARCH|DECLARATIVES)\b",
             stripped,
             re.IGNORECASE,
         ):
@@ -2169,43 +2249,145 @@ def _fix_procedure_division(lines: list[str]) -> list[str]:
 # Phase 10: Add mock file open/close
 # ---------------------------------------------------------------------------
 
+def _strip_stub_paragraph(lines: list[str], name: str) -> list[str]:
+    """Remove a no-op stub paragraph body so the real impl can be appended.
+
+    The compile-and-fix loop can inject `NAME. CONTINUE.` style stubs for
+    paragraphs that earlier phases reference via PERFORM. When the real
+    implementation is about to be appended by _add_mock_file_handling, any
+    existing stub body must be removed first or COBOL will see duplicate
+    paragraph definitions / a no-op shadowing the real one.
+
+    Removes the paragraph header line and contiguous body lines until
+    the next paragraph header, section, or end of source. Also removes
+    the immediately-preceding comment lines that look like stub banners.
+    """
+    label = f"{name}."
+    header_re = re.compile(r"^\s{7}[A-Z0-9][A-Z0-9_-]*\s*\.\s*$", re.IGNORECASE)
+    out: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        content = _get_cobol_content(line).upper().strip()
+        if content == label:
+            # Look back and drop preceding stub-banner comments.
+            while out:
+                prev_upper = _get_cobol_content(out[-1]).upper()
+                if (
+                    "AUTO-GENERATED STUBS" in prev_upper
+                    or "AUTO PARAGRAPH STUBS" in prev_upper
+                    or "COBC-UNDEFINED PARAGRAPH STUBS" in prev_upper
+                ):
+                    out.pop()
+                    continue
+                if not _get_cobol_content(out[-1]).strip():
+                    out.pop()
+                    continue
+                break
+            # Advance past the body of this paragraph until we hit the
+            # next paragraph header, section, or the procedure boundary.
+            i += 1
+            while i < n:
+                cur = lines[i]
+                cur_content = _get_cobol_content(cur).strip()
+                if not cur_content:
+                    i += 1
+                    continue
+                if len(cur) > 6 and cur[6] in ("*", "/"):
+                    i += 1
+                    continue
+                if header_re.match(cur) or re.match(
+                    r"^\s{7}[A-Z0-9][A-Z0-9_-]*\s+SECTION\s*\.\s*$",
+                    cur,
+                    re.IGNORECASE,
+                ):
+                    break
+                if "PROCEDURE DIVISION" in cur_content.upper() or "DATA DIVISION" in cur_content.upper():
+                    break
+                i += 1
+            continue
+        out.append(line)
+        i += 1
+    return out
+
+
 def _add_mock_file_handling(
     lines: list[str],
     config: MockConfig,
 ) -> list[str]:
     """Add OPEN/CLOSE for mock file around main logic."""
+    # Earlier phases (EXEC/IO/CALL replacement) emit
+    # PERFORM SPECTER-NEXT-MOCK-RECORD / SPECTER-APPLY-MOCK-PAYLOAD before
+    # this function runs. If a compile-and-fix cycle ran in between, it
+    # may have synthesised a no-op "NAME. CONTINUE." stub for those
+    # paragraphs. We must strip any such stub here so the real
+    # implementation added below wins — otherwise the program will call
+    # a no-op that neither reads the mock file nor sets MOCK-EOF-FLAG,
+    # and PERFORM UNTIL <eof> loops will spin forever.
+    lines = _strip_stub_paragraph(lines, "SPECTER-NEXT-MOCK-RECORD")
+    lines = _strip_stub_paragraph(lines, "SPECTER-APPLY-MOCK-PAYLOAD")
+    lines = _strip_stub_paragraph(lines, "SPECTER-READ-INIT-VARS")
+
+    source_upper = "".join(lines).upper()
+    has_open_input_mock = "OPEN INPUT MOCK-FILE" in source_upper
+
+    def _has_paragraph(name: str) -> bool:
+        label = f"{name}."
+        for existing in lines:
+            content = _get_cobol_content(existing).upper().strip()
+            if content == label:
+                return True
+        return False
+
+    has_exit_para = _has_paragraph("SPECTER-EXIT-PARA")
+    has_read_init = _has_paragraph("SPECTER-READ-INIT-VARS")
+    has_next_record = _has_paragraph("SPECTER-NEXT-MOCK-RECORD")
+    has_apply_payload = _has_paragraph("SPECTER-APPLY-MOCK-PAYLOAD")
+
     result: list[str] = []
     proc_found = False
-    first_para_found = False
+    proc_header_done = False
+
+    def _inject_open_block() -> list[str]:
+        """Lines to inject immediately after the PROCEDURE DIVISION header.
+
+        OPEN must be period-terminated because the next line may be a
+        paragraph header and COBOL would otherwise parse the paragraph
+        label as a file name continuation of the OPEN.
+        """
+        block: list[str] = []
+        if not has_open_input_mock:
+            block.append(f"{_B}OPEN INPUT MOCK-FILE.\n")
+        if config.initial_values and not has_read_init and not has_open_input_mock:
+            block.append(f"{_B}PERFORM SPECTER-READ-INIT-VARS.\n")
+        return block
 
     for i, line in enumerate(lines):
-        upper = line.upper().strip()
+        content = _get_cobol_content(line)
+        upper = content.upper().strip()
 
-        if "PROCEDURE DIVISION" in upper and not upper.startswith("*"):
+        # Detect start of PROCEDURE DIVISION
+        if not proc_found and "PROCEDURE DIVISION" in upper and not content.lstrip().startswith("*"):
             proc_found = True
             result.append(line)
+            # If the header ends with a period on this line (e.g.
+            # "PROCEDURE DIVISION." or "PROCEDURE DIVISION USING X."),
+            # the header is already closed — inject OPEN right now.
+            if upper.rstrip().endswith("."):
+                result.extend(_inject_open_block())
+                proc_header_done = True
             continue
 
-        # Insert OPEN after first paragraph name
-        if proc_found and not first_para_found:
-            para_m = re.match(
-                r"^(\s{7})([A-Z0-9][A-Z0-9_-]*)\s*\.\s*$",
-                line, re.IGNORECASE,
-            )
-            if para_m:
-                first_para_found = True
-                result.append(line)
-                result.append(
-                    f"{_B}OPEN INPUT MOCK-FILE\n"
-                )
-                # Read initial variable values from mock file
-                # Records with op-key starting with INIT: are consumed
-                # and used to set variables before main logic runs.
-                if config.initial_values:
-                    result.append(
-                        f"{_B}PERFORM SPECTER-READ-INIT-VARS\n"
-                    )
-                continue
+        # Still inside a multi-line PROCEDURE DIVISION header (e.g.
+        # "PROCEDURE DIVISION\n    USING DFHCOMMAREA.\n"). Wait for the
+        # period that terminates the header, then inject OPEN.
+        if proc_found and not proc_header_done:
+            result.append(line)
+            if upper.rstrip().endswith("."):
+                result.extend(_inject_open_block())
+                proc_header_done = True
+            continue
 
         result.append(line)
 
@@ -2230,21 +2412,22 @@ def _add_mock_file_handling(
 
     # Append SPECTER-EXIT-PARA at the very end — target for GO TO
     # from mocked CICS RETURN/XCTL blocks
-    final.append(f"\n")
-    final.append(f"{_CMT} SPECTER: exit paragraph for CICS RETURN/XCTL\n")
-    final.append(f"{_A}SPECTER-EXIT-PARA.\n")
-    final.append(f"{_B}CLOSE MOCK-FILE\n")
-    final.append(f"{_B}STOP RUN.\n")
+    if not has_exit_para:
+        final.append(f"\n")
+        final.append(f"{_CMT} SPECTER: exit paragraph for CICS RETURN/XCTL\n")
+        final.append(f"{_A}SPECTER-EXIT-PARA.\n")
+        final.append(f"{_B}CLOSE MOCK-FILE\n")
+        final.append(f"{_B}STOP RUN.\n")
 
     # Append init-vars reader paragraph if initial values are configured
-    if config.initial_values:
+    if config.initial_values and not has_read_init:
         final.append(f"\n")
         final.append(f"{_CMT} SPECTER: read init records from mock file\n")
         final.append(f"{_A}SPECTER-READ-INIT-VARS.\n")
-        final.append(f"{_B}READ MOCK-FILE INTO MOCK-RECORD\n")
-        final.append(f"{_CONT}AT END\n")
-        final.append(f"{_CONT}  GO TO SPECTER-INIT-DONE\n")
-        final.append(f"{_B}END-READ\n")
+        final.append(f"{_B}PERFORM SPECTER-NEXT-MOCK-RECORD\n")
+        final.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
+        final.append(f"{_CONT}GO TO SPECTER-INIT-DONE\n")
+        final.append(f"{_B}END-IF\n")
         final.append(f"{_B}IF MOCK-OP-KEY(1:5) = 'INIT:'\n")
         # Evaluate variable name (cols 6-30 of op-key) and set value
         final.append(f"{_B}  EVALUATE MOCK-OP-KEY(6:25)\n")
@@ -2262,7 +2445,61 @@ def _add_mock_file_handling(
         final.append(f"{_B}  END-EVALUATE\n")
         final.append(f"{_B}  GO TO SPECTER-READ-INIT-VARS\n")
         final.append(f"{_B}END-IF.\n")
+        final.append(f"{_B}MOVE MOCK-RECORD TO MOCK-PENDING-RECORD\n")
+        final.append(f"{_B}MOVE 'Y' TO MOCK-PENDING-FLAG.\n")
         final.append(f"{_A}SPECTER-INIT-DONE.\n")
+        final.append(f"{_B}CONTINUE.\n")
+
+    if not has_next_record:
+        final.append(f"\n")
+        final.append(f"{_CMT} SPECTER: read the next mock record, honoring pending payload data\n")
+        final.append(f"{_A}SPECTER-NEXT-MOCK-RECORD.\n")
+        final.append(f"{_B}IF MOCK-PENDING-FLAG = 'Y'\n")
+        final.append(f"{_B}  MOVE MOCK-PENDING-RECORD TO MOCK-RECORD\n")
+        final.append(f"{_B}  MOVE 'N' TO MOCK-PENDING-FLAG\n")
+        final.append(f"{_B}  MOVE 'N' TO MOCK-EOF-FLAG\n")
+        final.append(f"{_B}ELSE\n")
+        final.append(f"{_B}  MOVE 'N' TO MOCK-EOF-FLAG\n")
+        final.append(f"{_B}  READ MOCK-FILE INTO MOCK-RECORD\n")
+        final.append(f"{_CONT}AT END\n")
+        final.append(f"{_CONT}  MOVE 'Y' TO MOCK-EOF-FLAG\n")
+        final.append(f"{_CONT}  MOVE SPACES TO MOCK-OP-KEY\n")
+        final.append(f"{_CONT}  MOVE SPACES TO MOCK-ALPHA-STATUS\n")
+        final.append(f"{_CONT}  MOVE 0 TO MOCK-NUM-STATUS\n")
+        final.append(f"{_B}  END-READ\n")
+        final.append(f"{_B}END-IF.\n")
+
+    if not has_apply_payload:
+        final.append(f"\n")
+        final.append(f"{_CMT} SPECTER: apply trailing SET:<var> payload records for the current mock op\n")
+        final.append(f"{_A}SPECTER-APPLY-MOCK-PAYLOAD.\n")
+        final.append(f"{_B}PERFORM SPECTER-NEXT-MOCK-RECORD\n")
+        final.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
+        final.append(f"{_CONT}GO TO SPECTER-PAYLOAD-DONE\n")
+        final.append(f"{_B}END-IF\n")
+        final.append(f"{_B}IF MOCK-OP-KEY(1:4) = 'SET:'\n")
+        if config.payload_variables:
+            final.append(f"{_B}  EVALUATE MOCK-OP-KEY(5:26)\n")
+            for var, kind in config.payload_variables.items():
+                padded = f"{var:<26}"
+                final.append(f"{_B}    WHEN '{padded}'\n")
+                if kind == "numeric":
+                    final.append(f"{_B}      MOVE MOCK-NUM-STATUS TO {var}\n")
+                else:
+                    final.append(f"{_B}      MOVE MOCK-ALPHA-STATUS TO {var}\n")
+            final.append(f"{_B}    WHEN OTHER\n")
+            final.append(f"{_B}      CONTINUE\n")
+            final.append(f"{_B}  END-EVALUATE\n")
+        else:
+            # No payload variables configured — consume the SET: record
+            # without dispatching. GnuCOBOL rejects EVALUATE with only a
+            # WHEN OTHER clause, so we can't emit an empty EVALUATE.
+            final.append(f"{_B}  CONTINUE\n")
+        final.append(f"{_B}  GO TO SPECTER-APPLY-MOCK-PAYLOAD\n")
+        final.append(f"{_B}END-IF\n")
+        final.append(f"{_B}MOVE MOCK-RECORD TO MOCK-PENDING-RECORD\n")
+        final.append(f"{_B}MOVE 'Y' TO MOCK-PENDING-FLAG.\n")
+        final.append(f"{_A}SPECTER-PAYLOAD-DONE.\n")
         final.append(f"{_B}CONTINUE.\n")
 
     return final
@@ -3658,6 +3895,54 @@ def _comment_line(line: str) -> str:
     return line[:6] + "*" + line[7:]
 
 
+def _coerce_mock_numeric(value: object) -> int:
+    """Best-effort integer coercion for the mock numeric field."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    if not text:
+        return 0
+    if re.fullmatch(r"[+-]?\d+(?:\.\d+)?", text):
+        return int(float(text))
+    return 0
+
+
+def _format_mock_record(op_key: str, alpha_status: object = "", num_status: object = 0) -> str:
+    """Format one fixed-width mock record."""
+    alpha = str(alpha_status)[:20]
+    num = _coerce_mock_numeric(num_status)
+    record = f"{op_key[:30]:<30}{alpha:<20}{num:>9}"
+    return f"{record:<80}"[:80]
+
+
+def _encode_mock_entry(entry: object) -> tuple[str, int, list[str]]:
+    """Encode one stub entry into a primary record summary plus SET records."""
+    alpha_status = ""
+    num_status = 0
+    payload_records: list[str] = []
+
+    if isinstance(entry, list):
+        pairs = entry
+    elif isinstance(entry, tuple) and len(entry) == 2:
+        pairs = [entry]
+    else:
+        pairs = []
+
+    for pair in pairs:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            continue
+        var, val = pair
+        alpha_status = str(val)
+        num_status = _coerce_mock_numeric(val)
+        payload_records.append(
+            _format_mock_record(f"SET:{str(var).upper():<26}", alpha_status, num_status)
+        )
+
+    return alpha_status, num_status, payload_records
+
+
 # ---------------------------------------------------------------------------
 # Mock data generation from test cases
 # ---------------------------------------------------------------------------
@@ -3676,10 +3961,9 @@ def generate_init_records(initial_values: dict[str, str]) -> str:
             num = int(val)
         except (ValueError, TypeError):
             num = 0
-        record = f"{op_key:<30}{alpha:<20}{num:>9}"
-        records.append(f"{record:<80}"[:80])
+        records.append(_format_mock_record(op_key, alpha, num))
     # Sentinel: non-INIT record to stop the init loop
-    records.append(f"{'END-INIT':<30}{'':<20}{0:>9}"[:80])
+    records.append(_format_mock_record("END-INIT"))
     return "\n".join(records)
 
 
@@ -3710,49 +3994,17 @@ def generate_mock_data(
     # grouped by operation key.
     for op_key, queue in test_case.stub_outcomes.items():
         for entry in queue:
-            alpha_status = ""
-            num_status = 0
-
-            if isinstance(entry, list):
-                for pair in entry:
-                    if isinstance(pair, (list, tuple)) and len(pair) == 2:
-                        var, val = pair
-                        if isinstance(val, (int, float)):
-                            num_status = int(val)
-                            alpha_status = str(int(val))
-                        else:
-                            alpha_status = str(val)
-                            try:
-                                num_status = int(val)
-                            except (ValueError, TypeError):
-                                num_status = 0
-
-            record = f"{op_key:<30}{alpha_status:<20}{num_status:>9}"
-            # Pad/truncate to 80 chars
-            record = f"{record:<80}"[:80]
-            records.append(record)
+            alpha_status, num_status, payload_records = _encode_mock_entry(entry)
+            records.append(_format_mock_record(op_key, alpha_status, num_status))
+            records.extend(payload_records)
 
     # Add defaults as extra records (will be consumed if queue is exhausted)
     if hasattr(test_case, "stub_defaults") and test_case.stub_defaults:
         for op_key, default in test_case.stub_defaults.items():
             for _ in range(10):  # repeat defaults
-                alpha_status = ""
-                num_status = 0
-                if isinstance(default, list):
-                    for pair in default:
-                        if isinstance(pair, (list, tuple)) and len(pair) == 2:
-                            var, val = pair
-                            if isinstance(val, (int, float)):
-                                num_status = int(val)
-                                alpha_status = str(int(val))
-                            else:
-                                alpha_status = str(val)
-                                try:
-                                    num_status = int(val)
-                                except (ValueError, TypeError):
-                                    num_status = 0
-                record = f"{op_key:<30}{alpha_status:<20}{num_status:>9}"
-                records.append(f"{record:<80}"[:80])
+                alpha_status, num_status, payload_records = _encode_mock_entry(default)
+                records.append(_format_mock_record(op_key, alpha_status, num_status))
+                records.extend(payload_records)
 
     return "\n".join(records) + "\n" if records else "\n"
 
@@ -3766,23 +4018,9 @@ def generate_mock_data_ordered(stub_log: list[tuple[str, list]]) -> str:
     """
     records: list[str] = []
     for op_key, entry in stub_log:
-        alpha_status = ""
-        num_status = 0
-        if isinstance(entry, list):
-            for pair in entry:
-                if isinstance(pair, (list, tuple)) and len(pair) == 2:
-                    var, val = pair
-                    if isinstance(val, (int, float)):
-                        num_status = int(val)
-                        alpha_status = str(int(val))
-                    else:
-                        alpha_status = str(val)
-                        try:
-                            num_status = int(val)
-                        except (ValueError, TypeError):
-                            num_status = 0
-        record = f"{op_key:<30}{alpha_status:<20}{num_status:>9}"
-        records.append(f"{record:<80}"[:80])
+        alpha_status, num_status, payload_records = _encode_mock_entry(entry)
+        records.append(_format_mock_record(op_key, alpha_status, num_status))
+        records.extend(payload_records)
     return "\n".join(records) + "\n" if records else "\n"
 
 

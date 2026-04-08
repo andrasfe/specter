@@ -21,9 +21,11 @@ from specter.incremental_mock import (
     _generate_missing_paragraph_stubs,
     _load_resolutions,
     _parse_errors,
+    _remove_misplaced_paragraph_stub_scaffolding,
     _save_resolutions,
     incremental_instrument,
 )
+from specter.cobol_mock import MockConfig, instrument_cobol
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +231,24 @@ class TestMissingParagraphStubs:
 
         assert any("PROCESS-DATE-RTN-EXIT." in line for line in stubs)
 
+    def test_generates_stub_for_double_hyphen_exit_name(self):
+        lines = [
+            "       PROCEDURE DIVISION.\n",
+            "       MAIN-PARA.\n",
+            "           PERFORM R--1DE2 THRU R--1DE2X.\n",
+            "       R--1DE2.\n",
+            "           CONTINUE.\n",
+            "      *R--1DE2X.\n",
+            "      *    EXIT.\n",
+        ]
+
+        stubs = _generate_missing_paragraph_stubs(
+            [(3, "'R--1DE2X' is not defined")],
+            lines,
+        )
+
+        assert any("R--1DE2X." in line for line in stubs)
+
 
 class TestMissingPeriodsFixer:
     """Test structural missing-period recovery."""
@@ -253,6 +273,91 @@ class TestMissingPeriodsFixer:
 
         assert count == 0
         assert fixed[2].startswith("      *U-10-MNVX-EXIT.")
+
+
+class TestMisplacedParagraphStubScaffolding:
+    """Test cleanup of invalid paragraph-stub scaffolding in data areas."""
+
+    def test_removes_ws_undefined_stub_block_before_procedure(self):
+        lines = [
+            "       DATA DIVISION.\n",
+            "       WORKING-STORAGE SECTION.\n",
+            "       88 SOME-FLAG VALUE 'Y'.\n",
+            "       01 WS-UNDEFINED-PARAGRAPH-STUBS.\n",
+            "           05 WS-UNDEFINED-PARAGRAPH-FILLER PIC X VALUE SPACE.\n",
+            "       88 SOME-OTHER VALUE 'N'.\n",
+            "       PROCEDURE DIVISION.\n",
+            "       MAIN-PARA.\n",
+            "           CONTINUE.\n",
+        ]
+
+        cleaned, removed = _remove_misplaced_paragraph_stub_scaffolding(lines)
+
+        assert removed == 2
+        assert all("WS-UNDEFINED-PARAGRAPH-STUB" not in line for line in cleaned)
+
+
+class TestPayloadMockReplay:
+    """Test generated COBOL support for SET: continuation records."""
+
+    def test_instrumented_source_contains_payload_helpers(self, tmp_path):
+        src = tmp_path / "TEST.cbl"
+        src.write_text(
+            "".join([
+                "       IDENTIFICATION DIVISION.\n",
+                "       PROGRAM-ID. TEST.\n",
+                "       DATA DIVISION.\n",
+                "       WORKING-STORAGE SECTION.\n",
+                "       01 WS-NAME PIC X(10).\n",
+                "       PROCEDURE DIVISION.\n",
+                "       MAIN-PARA.\n",
+                "           CALL 'SUBPGM'.\n",
+                "           STOP RUN.\n",
+            ])
+        )
+
+        result = instrument_cobol(
+            src,
+            MockConfig(payload_variables={"RETURN-CODE": "numeric", "WS-NAME": "alpha"}),
+        )
+
+        assert "SPECTER-NEXT-MOCK-RECORD." in result.source
+        assert "SPECTER-APPLY-MOCK-PAYLOAD." in result.source
+        assert "PERFORM SPECTER-APPLY-MOCK-PAYLOAD" in result.source
+        assert "WHEN 'RETURN-CODE               '" in result.source
+        assert "WHEN 'WS-NAME                   '" in result.source
+
+    def test_mock_support_paragraphs_are_idempotent(self, tmp_path):
+        src = tmp_path / "TEST_IDEMPOTENT.cbl"
+        src.write_text(
+            "".join([
+                "       IDENTIFICATION DIVISION.\n",
+                "       PROGRAM-ID. TEST.\n",
+                "       DATA DIVISION.\n",
+                "       WORKING-STORAGE SECTION.\n",
+                "       01 WS-NAME PIC X(10).\n",
+                "       PROCEDURE DIVISION.\n",
+                "       MAIN-PARA.\n",
+                "           CALL 'SUBPGM'.\n",
+                "           STOP RUN.\n",
+            ])
+        )
+
+        first = instrument_cobol(
+            src,
+            MockConfig(payload_variables={"WS-NAME": "alpha"}),
+        )
+        reinstrumented = tmp_path / "TEST_IDEMPOTENT_REINSTRUMENTED.cbl"
+        reinstrumented.write_text(first.source)
+
+        second = instrument_cobol(
+            reinstrumented,
+            MockConfig(payload_variables={"WS-NAME": "alpha"}),
+        )
+
+        assert second.source.count("SPECTER-NEXT-MOCK-RECORD.") == 1
+        assert second.source.count("SPECTER-APPLY-MOCK-PAYLOAD.") == 1
+        assert second.source.count("SPECTER-EXIT-PARA.") == 1
 
 
 # ---------------------------------------------------------------------------

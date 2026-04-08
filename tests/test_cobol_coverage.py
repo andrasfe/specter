@@ -14,16 +14,32 @@ from unittest import mock
 import pytest
 
 from specter.copybook_parser import CopybookField, CopybookRecord
+from specter.coverage_strategies import StrategyContext, TranscriptSearchStrategy
+from specter.jit_value_inference import JITValueInferenceService
 from specter.variable_domain import (
     VariableDomain,
+    build_payload_value_candidates,
     build_variable_domains,
     format_value_for_cobol,
     generate_value,
     load_copybooks,
+    payload_kind_for_domain,
     _compute_range,
     _infer_semantic_type,
 )
 from specter.variable_extractor import VariableInfo, VariableReport
+from specter.cobol_coverage import (
+    CoverageState,
+    _best_cobol_seed_input,
+    _build_target_variable_allowlists,
+    _canonical_target_key,
+    _build_input_state,
+    _build_transcript_payload_candidates,
+    _jit_status_suffix,
+    _project_cobol_replay_input,
+    _select_priority_branch_target,
+)
+from specter.static_analysis import GatingCondition
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +273,17 @@ class TestGenerateValue:
         val = generate_value(d, "semantic", rng)
         assert val in ["00", "10", "23", "35", "39", "41", "46", "47"]
 
+    def test_build_payload_value_candidates_prefers_literals(self):
+        """Payload candidates should preserve literals before generated fallbacks."""
+        d = self._make_alpha_domain(
+            condition_literals=["AA", "BB"],
+            valid_88_values={"OK": "00"},
+            semantic_type="identifier",
+        )
+        vals = build_payload_value_candidates(d, limit=5, rng=random.Random(1))
+        assert vals[:3] == ["AA", "BB", "00"]
+        assert len(vals) <= 5
+
     def test_adversarial_numeric(self):
         """adversarial returns edge cases."""
         d = self._make_numeric_domain()
@@ -275,6 +302,96 @@ class TestGenerateValue:
         assert isinstance(val, (int, float))
 
 
+class TestTranscriptPayloadSearch:
+    """Tests for transcript payload helper derivation and mutation strategy."""
+
+    def test_build_transcript_payload_candidates_focuses_read_ops(self):
+        domains = {
+            "WS-CODE": VariableDomain(
+                name="WS-CODE",
+                data_type="alpha",
+                max_length=4,
+                condition_literals=["AA", "BB"],
+                classification="input",
+                semantic_type="identifier",
+            ),
+            "READ-STATUS": VariableDomain(
+                name="READ-STATUS",
+                data_type="alpha",
+                max_length=2,
+                classification="status",
+                semantic_type="status_file",
+            ),
+        }
+
+        payload_variables, payload_candidates = _build_transcript_payload_candidates(
+            domains,
+            {
+                "READ:INFILE": ["READ-STATUS"],
+                "WRITE:OUTFILE": ["READ-STATUS"],
+            },
+            ["WS-CODE"],
+        )
+
+        assert payload_kind_for_domain(domains["WS-CODE"]) == "alpha"
+        assert payload_variables["WS-CODE"] == "alpha"
+        assert payload_variables["READ-STATUS"] == "alpha"
+        assert "READ:INFILE" in payload_candidates
+        assert "WRITE:OUTFILE" not in payload_candidates
+        assert payload_candidates["READ:INFILE"]["WS-CODE"][:2] == ["AA", "BB"]
+
+    def test_transcript_search_strategy_appends_payload_to_read_entries(self):
+        domains = {
+            "WS-CODE": VariableDomain(
+                name="WS-CODE",
+                data_type="alpha",
+                max_length=4,
+                condition_literals=["AA"],
+                classification="input",
+                semantic_type="identifier",
+            ),
+            "READ-STATUS": VariableDomain(
+                name="READ-STATUS",
+                data_type="alpha",
+                max_length=2,
+                classification="status",
+                semantic_type="status_file",
+            ),
+        }
+        ctx = StrategyContext(
+            module=mock.Mock(),
+            context=None,
+            domains=domains,
+            stub_mapping={"READ:INFILE": ["READ-STATUS"]},
+            call_graph=mock.Mock(),
+            gating_conds={},
+            var_report=VariableReport(variables={}),
+            program=mock.Mock(),
+            all_paragraphs=set(),
+            success_stubs={
+                "READ:INFILE": [
+                    [("READ-STATUS", "00")],
+                    [("READ-STATUS", "00")],
+                    [("READ-STATUS", "10")],
+                ],
+            },
+            success_defaults={"READ:INFILE": [("READ-STATUS", "10")]},
+            rng=random.Random(1),
+            store_path=Path("/tmp/transcript-search.jsonl"),
+            payload_candidates={"READ:INFILE": {"WS-CODE": ["AA"]}},
+        )
+
+        strategy = TranscriptSearchStrategy()
+        cases = list(strategy.generate_cases(ctx, CoverageState(), 1))
+
+        assert len(cases) == 1
+        _, stubs, defaults, target = cases[0]
+        assert ("WS-CODE", "AA  ") in stubs["READ:INFILE"][0]
+        assert ("WS-CODE", "AA  ") in stubs["READ:INFILE"][1]
+        assert defaults["READ:INFILE"] == [("READ-STATUS", "10")]
+        assert target.startswith("transcript:READ:INFILE:WS-CODE=")
+
+
 class TestFormatValue:
     """Tests for format_value_for_cobol()."""
 
@@ -289,6 +406,362 @@ class TestFormatValue:
     def test_numeric_decimal(self):
         d = VariableDomain(name="A", data_type="packed", max_length=5, precision=2)
         assert format_value_for_cobol(d, 123.45) == "123.45"
+
+    def test_numeric_blank_string_maps_to_zero(self):
+        d = VariableDomain(name="N", data_type="numeric", max_length=5, precision=0)
+        assert format_value_for_cobol(d, "") == "0"
+
+    def test_numeric_blank_string_with_precision_maps_to_zero(self):
+        d = VariableDomain(name="A", data_type="packed", max_length=5, precision=2)
+        assert format_value_for_cobol(d, "   ") == "0.00"
+
+    def test_numeric_y_string_maps_to_one(self):
+        d = VariableDomain(name="N", data_type="numeric", max_length=1, precision=0)
+        assert format_value_for_cobol(d, "Y") == "1"
+
+    def test_numeric_n_string_maps_to_zero(self):
+        d = VariableDomain(name="N", data_type="numeric", max_length=1, precision=0)
+        assert format_value_for_cobol(d, "N") == "0"
+
+    def test_numeric_flag_semantic_uses_numeric_values(self):
+        d = VariableDomain(
+            name="FLAG", data_type="numeric", max_length=1, precision=0,
+            semantic_type="flag_bool",
+        )
+        rng = random.Random(42)
+        for _ in range(20):
+            assert generate_value(d, "semantic", rng) in [0, 1]
+
+
+class TestJITValueInference:
+    def test_service_caches_profiles(self, monkeypatch):
+        calls = []
+
+        def fake_query(provider, prompt, model):
+            calls.append((provider, model))
+            return (
+                json.dumps([
+                    {
+                        "variable": "WS-AGE",
+                        "data_type": "counter",
+                        "description": "Customer age",
+                        "valid_values": [18, 35, 65],
+                    }
+                ]),
+                42,
+            )
+
+        monkeypatch.setattr("specter.jit_value_inference._query_llm_sync", fake_query)
+
+        service = JITValueInferenceService(provider=object(), model="test-model")
+        domain = VariableDomain(
+            name="WS-AGE",
+            data_type="numeric",
+            max_length=3,
+            classification="input",
+            min_value=0,
+            max_value=120,
+        )
+
+        first = service.generate_value(
+            "WS-AGE", domain, "semantic", random.Random(1), target_paragraph="PARA-1"
+        )
+        second = service.generate_value(
+            "WS-AGE", domain, "semantic", random.Random(2), target_paragraph="PARA-1"
+        )
+
+        assert first in [18, 35, 65]
+        assert second in [18, 35, 65]
+        assert len(calls) == 1
+        assert service.cache_hits == 1
+
+    def test_service_skips_untargeted_requests(self, monkeypatch):
+        calls = []
+
+        def fake_query(provider, prompt, model):
+            calls.append((provider, prompt, model))
+            return ("[]", 0)
+
+        monkeypatch.setattr("specter.jit_value_inference._query_llm_sync", fake_query)
+
+        service = JITValueInferenceService(provider=object(), model="test-model")
+        domain = VariableDomain(
+            name="WS-CODE",
+            data_type="alpha",
+            max_length=4,
+            classification="input",
+        )
+
+        value = service.generate_value("WS-CODE", domain, "semantic", random.Random(1))
+
+        assert value is None
+        assert calls == []
+        assert service.skipped_untargeted == 1
+        assert service.cache_misses == 0
+
+    def test_service_skips_out_of_scope_requests(self, monkeypatch):
+        calls = []
+
+        def fake_query(provider, prompt, model):
+            calls.append((provider, prompt, model))
+            return ("[]", 0)
+
+        monkeypatch.setattr("specter.jit_value_inference._query_llm_sync", fake_query)
+
+        service = JITValueInferenceService(provider=object(), model="test-model")
+        domain = VariableDomain(
+            name="WS-CODE",
+            data_type="alpha",
+            max_length=4,
+            classification="input",
+        )
+
+        value = service.generate_value(
+            "WS-CODE",
+            domain,
+            "semantic",
+            random.Random(1),
+            target_paragraph="PARA-1",
+            allowed_variables={"OTHER-VAR"},
+            target_key="para:PARA-1",
+        )
+
+        assert value is None
+        assert calls == []
+        assert service.skipped_out_of_scope == 1
+        assert service.cache_misses == 0
+
+    def test_build_input_state_uses_jit_semantic_values(self):
+        class StubService:
+            def generate_value(self, var_name, domain, strategy, rng, **kwargs):
+                if var_name == "WS-STATE" and strategy == "semantic":
+                    return "CA"
+                return None
+
+        domains = {
+            "WS-STATE": VariableDomain(
+                name="WS-STATE",
+                data_type="alpha",
+                max_length=2,
+                classification="input",
+            ),
+            "SQLCODE": VariableDomain(
+                name="SQLCODE",
+                data_type="numeric",
+                max_length=4,
+                classification="status",
+                set_by_stub="SQL",
+            ),
+        }
+
+        state = _build_input_state(
+            domains,
+            "semantic",
+            random.Random(1),
+            jit_inference=StubService(),
+        )
+
+        assert state["WS-STATE"] == "CA"
+        assert "SQLCODE" not in state
+
+    def test_service_falls_back_when_llm_fails(self, monkeypatch):
+        def fake_query(provider, prompt, model):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr("specter.jit_value_inference._query_llm_sync", fake_query)
+
+        service = JITValueInferenceService(provider=object(), model="test-model")
+        domain = VariableDomain(
+            name="WS-FLAG",
+            data_type="alpha",
+            max_length=1,
+            classification="flag",
+            semantic_type="flag_bool",
+        )
+
+        assert service.generate_value(
+            "WS-FLAG", domain, "semantic", random.Random(1), target_paragraph="PARA-1"
+        ) is None
+
+    def test_service_exposes_metrics_snapshot(self, monkeypatch):
+        def fake_query(provider, prompt, model):
+            return (
+                json.dumps([
+                    {
+                        "variable": "WS-COUNT",
+                        "data_type": "counter",
+                        "description": "Counter",
+                        "valid_values": [1, 2, 3],
+                    }
+                ]),
+                12,
+            )
+
+        monkeypatch.setattr("specter.jit_value_inference._query_llm_sync", fake_query)
+        service = JITValueInferenceService(provider=object(), model="test-model")
+        domain = VariableDomain(
+            name="WS-COUNT",
+            data_type="numeric",
+            max_length=3,
+            classification="input",
+            min_value=0,
+            max_value=999,
+        )
+
+        _ = service.generate_value(
+            "WS-COUNT", domain, "semantic", random.Random(1), target_paragraph="PARA-1"
+        )
+        _ = service.generate_value(
+            "WS-COUNT", domain, "semantic", random.Random(2), target_paragraph="PARA-1"
+        )
+        _ = service.generate_value("WS-COUNT", domain, "semantic", random.Random(3))
+        snap = service.snapshot_metrics()
+
+        assert snap["requests"] == 3
+        assert snap["cache_hits"] == 1
+        assert snap["cache_misses"] == 1
+        assert snap["skipped_untargeted"] == 1
+        assert snap["skipped_out_of_scope"] == 0
+        assert snap["llm_successes"] == 1
+        assert snap["llm_failures"] == 0
+
+    def test_service_emits_periodic_jit_status(self, monkeypatch, caplog):
+        import logging
+
+        def fake_query(provider, prompt, model):
+            return (
+                json.dumps([
+                    {
+                        "variable": "WS-RATE",
+                        "data_type": "rate",
+                        "description": "Rate",
+                        "valid_values": [5, 10],
+                    }
+                ]),
+                11,
+            )
+
+        monkeypatch.setattr("specter.jit_value_inference._query_llm_sync", fake_query)
+        service = JITValueInferenceService(provider=object(), model="test-model")
+        service.summary_every_requests = 1
+        service.summary_interval_sec = 0.0
+
+        domain = VariableDomain(
+            name="WS-RATE",
+            data_type="numeric",
+            max_length=3,
+            classification="input",
+            min_value=0,
+            max_value=100,
+        )
+
+        with caplog.at_level(logging.INFO, logger="specter.jit_value_inference"):
+            _ = service.generate_value(
+                "WS-RATE", domain, "semantic", random.Random(1), target_paragraph="PARA-1"
+            )
+            _ = service.generate_value("WS-RATE", domain, "semantic", random.Random(2))
+
+        assert any("JIT status:" in rec.message for rec in caplog.records)
+        assert any("skip_u=1" in rec.message for rec in caplog.records)
+
+    def test_jit_status_suffix_from_snapshot(self):
+        class StubJit:
+            def snapshot_metrics(self):
+                return {
+                    "requests": 12,
+                    "cache_hit_pct": 75.0,
+                    "skipped_untargeted": 2,
+                    "skipped_out_of_scope": 3,
+                    "llm_successes": 3,
+                    "llm_failures": 1,
+                    "avg_latency_ms": 41.0,
+                }
+
+        class Ctx:
+            jit_inference = StubJit()
+
+        suffix = _jit_status_suffix(Ctx(), enabled=True)
+        assert "JIT reqs=12" in suffix
+        assert "hit=75.0%" in suffix
+        assert "skip_u=2" in suffix
+        assert "skip_scope=3" in suffix
+        assert "ok=3" in suffix
+
+    def test_build_target_variable_allowlists_gating_and_stubs(self):
+        class DummyModule:
+            pass
+
+        branch_meta = {
+            "1": {"paragraph": "PARA-A", "condition": "WS-FLAG = 'Y'"},
+        }
+        gating = {
+            "PARA-A": [GatingCondition(variable="WS-GATE", values=["Y"], negated=False)],
+        }
+        stubs = {
+            "CALL:EXT": ["SQLCODE"],
+        }
+
+        allowlists = _build_target_variable_allowlists(
+            DummyModule,
+            branch_meta,
+            gating,
+            stubs,
+            include_gates=True,
+            include_slice=False,
+        )
+
+        assert "para:PARA-A" in allowlists
+        assert "WS-GATE" in allowlists["para:PARA-A"]
+        assert "SQLCODE" in allowlists["para:PARA-A"]
+        assert "branch:1:T" in allowlists
+        assert "branch:1:F" in allowlists
+        assert "WS-GATE" in allowlists["branch:1:T"]
+        assert "SQLCODE" in allowlists["branch:1:F"]
+
+
+class TestCobolReplayHelpers:
+    """Tests for direct-paragraph COBOL replay helper logic."""
+
+    def test_best_cobol_seed_input_skips_direct_py_cases(self):
+        cov = CoverageState(test_cases=[
+            {
+                "target": "direct:PARA-A",
+                "input_state": {"A": "1"},
+                "paragraphs_hit": ["P1", "P2", "P3"],
+                "branches_hit": ["py:1:T"],
+            },
+            {
+                "target": "baseline",
+                "input_state": {"B": "2"},
+                "paragraphs_hit": ["P1", "P2"],
+                "branches_hit": [],
+            },
+            {
+                "target": "fault",
+                "input_state": {"C": "3"},
+                "paragraphs_hit": ["P1", "P2", "P3", "P4"],
+                "branches_hit": ["12:T"],
+            },
+        ])
+
+        assert _best_cobol_seed_input(cov) == {"C": "3"}
+
+    def test_project_cobol_replay_input_filters_and_overlays_seed(self):
+        projected = _project_cobol_replay_input(
+            {
+                "KEEP-ME": "7",
+                "DROP-ME": "9",
+                "_TRACE": "x",
+            },
+            ["SEED-VAR", "KEEP-ME"],
+            seed_state={"SEED-VAR": "1", "OTHER": "2"},
+        )
+
+        assert projected == {
+            "SEED-VAR": "1",
+            "OTHER": "2",
+            "KEEP-ME": "7",
+        }
 
 
 class TestComputeRange:
@@ -523,10 +996,32 @@ class TestMockDataGeneration:
         ]
         data = generate_mock_data_ordered(stub_log)
         lines = data.strip().split("\n")
-        assert len(lines) == 3
+        assert len(lines) == 6
         assert lines[0].startswith("READ:INFILE1")
-        assert lines[1].startswith("DLI-ISRT")
-        assert lines[2].startswith("READ:INFILE1")
+        assert lines[1].startswith("SET:FILE-STATUS")
+        assert lines[2].startswith("DLI-ISRT")
+        assert lines[3].startswith("SET:PCB-STATUS")
+        assert lines[4].startswith("READ:INFILE1")
+        assert lines[5].startswith("SET:FILE-STATUS")
+
+    def test_mock_data_ordered_preserves_payload_assignments(self):
+        from specter.cobol_mock import generate_mock_data_ordered
+
+        stub_log = [
+            (
+                "SQL-FETCH",
+                [("SQLCODE", 100), ("WS-CUST-NAME", "ALPHA"), ("RETURN-CODE", 7)],
+            ),
+        ]
+
+        data = generate_mock_data_ordered(stub_log)
+        lines = data.strip().split("\n")
+        assert len(lines) == 4
+        assert lines[0].startswith("SQL-FETCH")
+        assert lines[1].startswith("SET:SQLCODE")
+        assert lines[2].startswith("SET:WS-CUST-NAME")
+        assert lines[3].startswith("SET:RETURN-CODE")
+        assert "ALPHA" in lines[2]
 
 
 # ---------------------------------------------------------------------------
@@ -1059,6 +1554,105 @@ class TestBranchProbing:
         result = _best_probed_state_for_para(ctx, "TEST-PARA")
         assert result is not None
         assert result["WS-CODE"] == "00"  # from the higher-hit-count result
+
+    def test_baseline_strategy_restores_target_key(self):
+        from specter.coverage_strategies import BaselineStrategy
+
+        mod = _make_probe_module()
+        ctx = _make_probe_ctx(mod)
+        cov = CoverageState(
+            total_paragraphs=1,
+            total_branches=4,
+            all_paragraphs={"TEST-PARA"},
+            _stub_mapping={},
+        )
+        ctx.current_target_key = "seed:key"
+
+        strat = BaselineStrategy()
+        list(strat.generate_cases(ctx, cov, batch_size=10))
+
+        assert ctx.current_target_key == "seed:key"
+
+    def test_direct_strategy_sets_and_restores_target_key(self):
+        from specter.coverage_strategies import DirectParagraphStrategy
+
+        mod = _make_probe_module()
+        ctx = _make_probe_ctx(mod)
+        cov = CoverageState(
+            total_paragraphs=1,
+            total_branches=4,
+            all_paragraphs={"TEST-PARA"},
+            _stub_mapping={},
+        )
+        cov.paragraphs_hit.add("TEST-PARA")
+        ctx.current_target_key = "seed:key"
+
+        strat = DirectParagraphStrategy()
+        gen = strat.generate_cases(ctx, cov, batch_size=1)
+        _ = next(gen)
+
+        assert ctx.current_target_key in {"branch:1:T", "branch:1:F", "branch:2:T", "branch:2:F"}
+
+        gen.close()
+        assert ctx.current_target_key == "seed:key"
+
+    def test_canonical_target_key_normalizes_branch_and_paragraph_targets(self):
+        assert _canonical_target_key("direct:PARA-1|df:17:F:0") == "branch:17:F"
+        assert _canonical_target_key("direct:PARA-1|frontier:23:T") == "branch:23:T"
+        assert _canonical_target_key("direct:PARA-1|p:4") == "para:PARA-1"
+
+    def test_select_priority_branch_target_prefers_low_attempt_unsolved(self):
+        from specter.memory_models import MemoryState, TargetStatus
+
+        mod = _make_probe_module()
+        ctx = _make_probe_ctx(mod)
+        ctx.memory_state = MemoryState(
+            targets={
+                "branch:1:T": TargetStatus(attempts=4, solved=False, nearest_branch_hits=3),
+                "branch:1:F": TargetStatus(attempts=1, solved=False, nearest_branch_hits=2),
+                "branch:2:T": TargetStatus(attempts=2, solved=True, nearest_branch_hits=4),
+            }
+        )
+
+        cov = CoverageState(
+            total_paragraphs=1,
+            total_branches=4,
+            all_paragraphs={"TEST-PARA"},
+            _stub_mapping={},
+        )
+        cov.branches_hit.add("2:F")
+
+        chosen = _select_priority_branch_target(ctx, cov)
+        assert chosen == "branch:1:F"
+
+    def test_direct_strategy_respects_preferred_branch_target(self):
+        from specter.coverage_strategies import DirectParagraphStrategy
+
+        mod = _make_probe_module()
+        ctx = _make_probe_ctx(mod)
+        ctx.preferred_target_key = "branch:1:T"
+        cov = CoverageState(
+            total_paragraphs=1,
+            total_branches=4,
+            all_paragraphs={"TEST-PARA"},
+            _stub_mapping={},
+        )
+        cov.paragraphs_hit.add("TEST-PARA")
+
+        strat = DirectParagraphStrategy()
+        cases = []
+        gen = strat.generate_cases(ctx, cov, batch_size=5)
+        for _ in range(3):
+            try:
+                cases.append(next(gen))
+            except StopIteration:
+                break
+        gen.close()
+
+        assert cases
+        for _state, _stubs, _defaults, target in cases:
+            if "|df:" in target or "|frontier:" in target or "|inv:" in target or "|chain" in target:
+                assert ":1:T" in target or "|chain:1" in target
 
 
 class TestHeuristicSelector:

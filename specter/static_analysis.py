@@ -529,6 +529,19 @@ def compute_path_constraints(
     return PathConstraints(target=target, path=path, constraints=constraints)
 
 
+def extract_gating_variables_for_target(
+    gating_conditions: dict[str, list[GatingCondition]],
+    target: str,
+) -> set[str]:
+    """Return normalized variable names that gate entry to *target*."""
+    out: set[str] = set()
+    for cond in gating_conditions.get(target, []):
+        name = str(getattr(cond, "variable", "") or "").strip().upper()
+        if name:
+            out.add(name)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Equality constraint extraction
 # ---------------------------------------------------------------------------

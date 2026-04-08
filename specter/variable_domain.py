@@ -216,6 +216,78 @@ _CICS_STATUS_CODES = [0, 12, 13, 16, 22, 26, 27, 70, 84]
 _DLI_STATUS_CODES = ["  ", "II", "GE", "GB", "GG", "AI"]
 
 
+def _append_unique_candidate(
+    values: list[str | int | float],
+    seen: set[tuple[str, str]],
+    value: str | int | float,
+) -> None:
+    key = (type(value).__name__, str(value))
+    if key in seen:
+        return
+    seen.add(key)
+    values.append(value)
+
+
+def payload_kind_for_domain(domain: VariableDomain | None) -> str:
+    """Return the transcript payload encoding kind for a variable domain."""
+    if domain and domain.data_type not in {"alpha", "group", "unknown"}:
+        return "numeric"
+    return "alpha"
+
+
+def build_payload_value_candidates(
+    domain: VariableDomain,
+    limit: int = 8,
+    rng: random.Random | None = None,
+) -> list[str | int | float]:
+    """Build a compact, domain-aware payload candidate list for transcript search."""
+    if rng is None:
+        rng = random.Random(0)
+
+    values: list[str | int | float] = []
+    seen: set[tuple[str, str]] = set()
+
+    for literal in domain.condition_literals:
+        _append_unique_candidate(values, seen, literal)
+
+    for literal in domain.valid_88_values.values():
+        _append_unique_candidate(values, seen, literal)
+
+    for strategy in ("semantic", "boundary", "adversarial", "random_valid"):
+        try:
+            candidate = generate_value(domain, strategy, rng)
+        except Exception:
+            continue
+        _append_unique_candidate(values, seen, candidate)
+
+    if not values and payload_kind_for_domain(domain) == "alpha":
+        _append_unique_candidate(values, seen, "")
+        _append_unique_candidate(values, seen, "X" * max(1, min(domain.max_length, 4)))
+
+    return values[:limit]
+
+
+def _coerce_numeric_value(value: str | int | float, precision: int) -> int | float:
+    """Coerce mixed generator outputs into a numeric COBOL-compatible value."""
+    if isinstance(value, (int, float)):
+        return value
+
+    text = str(value).strip()
+    if not text:
+        return 0.0 if precision > 0 else 0
+
+    upper = text.upper()
+    if upper in {"Y", "YES", "TRUE", "T", "ON"}:
+        return 1.0 if precision > 0 else 1
+    if upper in {"N", "NO", "FALSE", "F", "OFF"}:
+        return 0.0 if precision > 0 else 0
+
+    try:
+        return float(text) if precision > 0 else int(float(text))
+    except ValueError:
+        return 0.0 if precision > 0 else 0
+
+
 def generate_value(
     domain: VariableDomain,
     strategy: str,
@@ -321,6 +393,10 @@ def _generate_semantic(domain: VariableDomain, rng: random.Random) -> str | int 
     if sem == "flag_bool":
         if domain.valid_88_values:
             return rng.choice(list(domain.valid_88_values.values()))
+        if domain.condition_literals:
+            return rng.choice(domain.condition_literals)
+        if domain.data_type not in ("alpha", "unknown"):
+            return rng.choice([0, 1])
         return rng.choice(["Y", "N"])
 
     # generic — fall through to random_valid
@@ -380,6 +456,7 @@ def format_value_for_cobol(domain: VariableDomain, value: str | int | float) -> 
         return s
 
     # Numeric: format appropriately
+    value = _coerce_numeric_value(value, domain.precision)
     if domain.precision > 0:
         return f"{float(value):.{domain.precision}f}"
-    return str(int(value)) if isinstance(value, (int, float)) else str(value)
+    return str(int(value))

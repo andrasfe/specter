@@ -453,6 +453,44 @@ def generate_value_from_profile(
         return rng.choice(["", " ", "TEST", "A"])
 
 
+def _maybe_generate_jit_value(
+    var_name: str,
+    memory: SessionMemory,
+    rng: random.Random,
+    *,
+    jit_inference=None,
+    domains: dict[str, Any] | None = None,
+    target_paragraph: str | None = None,
+) -> Any | None:
+    """Try lazy JIT semantic inference before falling back to cached profiles."""
+    if jit_inference is None or not domains:
+        return None
+
+    domain = domains.get(var_name.upper())
+    if domain is None:
+        return None
+
+    value = jit_inference.generate_value(
+        var_name.upper(),
+        domain,
+        "semantic",
+        rng,
+        target_paragraph=target_paragraph,
+    )
+    if value is None:
+        return None
+
+    if var_name.upper() not in memory.semantic_profiles:
+        profile = jit_inference.infer_profile(
+            var_name.upper(),
+            domain,
+            target_paragraph=target_paragraph,
+        )
+        if profile is not None:
+            memory.semantic_profiles[var_name.upper()] = profile
+    return value
+
+
 def apply_strategy_to_state(
     decision: StrategyDecision,
     base_state: dict,
@@ -460,6 +498,8 @@ def apply_strategy_to_state(
     memory: SessionMemory,
     rng: random.Random,
     fuzzer_corpus: list | None = None,
+    jit_inference=None,
+    domains: dict[str, Any] | None = None,
 ) -> dict:
     """Apply a strategy decision to generate an input state.
 
@@ -471,6 +511,17 @@ def apply_strategy_to_state(
     if decision.strategy == "random_exploration":
         # Use semantic profiles for all variables
         for name in var_report.variables:
+            jit_value = _maybe_generate_jit_value(
+                name,
+                memory,
+                rng,
+                jit_inference=jit_inference,
+                domains=domains,
+                target_paragraph=decision.target_paragraph,
+            )
+            if jit_value is not None:
+                state[name] = jit_value
+                continue
             profile = memory.semantic_profiles.get(name)
             if profile:
                 state[name] = generate_value_from_profile(profile, rng)
@@ -481,6 +532,17 @@ def apply_strategy_to_state(
         for var_name in targets[:1]:
             if var_name in decision.focus_values:
                 state[var_name] = rng.choice(decision.focus_values[var_name])
+                continue
+            jit_value = _maybe_generate_jit_value(
+                var_name,
+                memory,
+                rng,
+                jit_inference=jit_inference,
+                domains=domains,
+                target_paragraph=decision.target_paragraph,
+            )
+            if jit_value is not None:
+                state[var_name] = jit_value
             elif var_name in memory.semantic_profiles:
                 state[var_name] = generate_value_from_profile(
                     memory.semantic_profiles[var_name], rng)
@@ -525,9 +587,20 @@ def apply_strategy_to_state(
             focus = error_entry.get("focus_variables", [])
             if focus:
                 var_name = rng.choice(focus)
-                profile = memory.semantic_profiles.get(var_name)
-                if profile:
-                    state[var_name] = generate_value_from_profile(profile, rng)
+                jit_value = _maybe_generate_jit_value(
+                    var_name,
+                    memory,
+                    rng,
+                    jit_inference=jit_inference,
+                    domains=domains,
+                    target_paragraph=decision.target_paragraph,
+                )
+                if jit_value is not None:
+                    state[var_name] = jit_value
+                else:
+                    profile = memory.semantic_profiles.get(var_name)
+                    if profile:
+                        state[var_name] = generate_value_from_profile(profile, rng)
 
     # For directed_walk and stub_outcome_variation, the caller handles
     # these specially via existing infrastructure (path constraints, stub gen).

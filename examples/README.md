@@ -1,17 +1,21 @@
 # How to run examples
 
+Replace `$PROG` below with your program name, and point the copybook and source
+paths at your own COBOL sources.
+
 ## 1. Instrument COBOL source for mock execution
 
-Requires the [CardDemo](https://github.com/aws-samples/aws-mainframe-modernization-carddemo) repo cloned alongside this one.
-
 ```sh
-specter ../aws-mainframe-modernization-carddemo/app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl --copybook-dir ../aws-mainframe-modernization-carddemo/app/app-authorization-ims-db2-mq/cpy --copybook-dir ../aws-mainframe-modernization-carddemo/app/app-authorization-ims-db2-mq/cpy-bms -o ./examples/COPAUA0C.mock.cbl
+specter path/to/$PROG.cbl \
+  --copybook-dir path/to/cpy \
+  --copybook-dir path/to/cpy-bms \
+  -o ./examples/$PROG.mock.cbl
 ```
 
 ## 2. Compile mock with GnuCOBOL
 
 ```sh
-cobc -x -o examples/COPAUA0C.mock ./examples/COPAUA0C.mock.cbl
+cobc -x -o examples/$PROG.mock ./examples/$PROG.mock.cbl
 ```
 
 ## 3. Generate Python + COBOL-first synthesis
@@ -19,7 +23,12 @@ cobc -x -o examples/COPAUA0C.mock ./examples/COPAUA0C.mock.cbl
 Synthesis generates candidate inputs using Python (fast, in-process), then validates each candidate against the compiled COBOL binary. **COBOL coverage drives acceptance** — a test case is only accepted if it adds new COBOL paragraph coverage and Python DISPLAY output matches COBOL.
 
 ```sh
-specter examples/COPAUA0C.cbl.ast -o examples/COPAUA0C.py --synthesize --test-store examples/tests.jsonl --exclude-values examples/exclude.txt --cobol-validate examples/COPAUA0C.mock
+specter examples/$PROG.cbl.ast \
+  -o examples/$PROG.py \
+  --synthesize \
+  --test-store examples/tests.jsonl \
+  --exclude-values examples/exclude.txt \
+  --cobol-validate examples/$PROG.mock
 ```
 
 ## 4. COBOL-first comparison
@@ -27,7 +36,7 @@ specter examples/COPAUA0C.cbl.ast -o examples/COPAUA0C.py --synthesize --test-st
 Runs each test case through the compiled COBOL mock (ground truth), then checks that the generated Python produces identical DISPLAY output.
 
 ```sh
-python3 examples/run_mock.py examples/COPAUA0C.mock examples/COPAUA0C.py examples/tests.jsonl
+python3 examples/run_mock.py examples/$PROG.mock examples/$PROG.py examples/tests.jsonl
 ```
 
 ## 5. Generate Java project
@@ -35,10 +44,13 @@ python3 examples/run_mock.py examples/COPAUA0C.mock examples/COPAUA0C.py example
 Generates a Maven project with one Paragraph subclass per COBOL paragraph, runtime support classes, and JUnit 5 integration tests from the test store.
 
 ```sh
-specter examples/COPAUA0C.cbl.ast --java --test-store examples/tests.jsonl -o examples/COPAUA0C/COPAUA0C.py
+specter examples/$PROG.cbl.ast \
+  --java \
+  --test-store examples/tests.jsonl \
+  -o examples/$PROG/
 ```
 
-The project is created at `examples/COPAUA0C/COPAUA0C/` with:
+The project is created at `examples/$PROG/$PROG/` with:
 - `src/main/java/` — generated paragraph classes + runtime (ProgramState, CobolRuntime, etc.)
 - `src/test/java/` — parameterized JUnit 5 tests (one per test store entry)
 - `src/test/resources/test_store.jsonl` — test data copied from synthesis output
@@ -47,14 +59,14 @@ The project is created at `examples/COPAUA0C/COPAUA0C/` with:
 ## 6. Build and test Java project
 
 ```sh
-cd examples/COPAUA0C/COPAUA0C
+cd examples/$PROG/$PROG
 mvn test
 ```
 
 Or without Maven (manual compile + JUnit console launcher):
 
 ```sh
-cd examples/COPAUA0C/COPAUA0C
+cd examples/$PROG/$PROG
 find src/main -name "*.java" | xargs javac -cp "lib/*" -d out/main
 find src/test -name "*.java" | xargs javac -cp "lib/*:out/main" -d out/test
 cp src/test/resources/test_store.jsonl out/test/

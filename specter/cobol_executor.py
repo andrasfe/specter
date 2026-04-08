@@ -213,6 +213,7 @@ def prepare_context(
     enable_branch_tracing: bool = True,
     work_dir: str | Path | None = None,
     injectable_vars: list[str] | None = None,
+    payload_variables: dict[str, str] | None = None,
     coverage_mode: bool = False,
     allow_hardening_fallback: bool = True,
     llm_provider=None,
@@ -251,40 +252,41 @@ def prepare_context(
     if executable_path.exists() and instrumented_path.exists():
         # Verify the binary is newer than the source
         if executable_path.stat().st_mtime >= cobol_source.stat().st_mtime:
-            log.info("Using cached compiled COBOL: %s", executable_path)
-            # Read branch metadata from the instrumented source
             source_text = instrumented_path.read_text()
-            hardened_mode = "SPECTER-HARDENED-ENTRY" in source_text
-            branch_meta: dict = {}
-            total_branches = 0
-            total_paragraphs = 0
-            if enable_branch_tracing:
-                # Count @@B: probes already in the source (from LLM or rule-based insertion)
-                import re as _re
-                _para_re = _re.compile(r"^\s{7}([A-Z0-9][A-Z0-9_-]*)\s*\.\s*$", _re.IGNORECASE)
-                current_para = ""
-                for line in source_text.splitlines():
-                    m_para = _para_re.match(line)
-                    if m_para:
-                        current_para = m_para.group(1).upper()
-                    m_probe = _re.search(r"@@B:(\d+):(T|F|W\d+)", line)
-                    if m_probe and not (len(line) > 6 and line[6] in ("*", "/")):
-                        bid = m_probe.group(1)
-                        total_branches += 1
-                        if bid not in branch_meta:
-                            branch_meta[bid] = {"paragraph": current_para}
-            # Count paragraph traces
-            total_paragraphs = source_text.count("SPECTER-TRACE:")
-            return CobolExecutionContext(
-                executable_path=executable_path,
-                instrumented_source_path=instrumented_path,
-                branch_meta=branch_meta,
-                injectable_vars=[],
-                total_paragraphs=total_paragraphs,
-                total_branches=total_branches,
-                hardened_mode=hardened_mode,
-                coverage_mode=coverage_mode,
-            )
+            if payload_variables and "SPECTER-APPLY-MOCK-PAYLOAD" not in source_text:
+                log.info("Cached compiled COBOL is missing payload helpers; rebuilding")
+            else:
+                log.info("Using cached compiled COBOL: %s", executable_path)
+                hardened_mode = "SPECTER-HARDENED-ENTRY" in source_text
+                branch_meta: dict = {}
+                total_branches = 0
+                total_paragraphs = 0
+                if enable_branch_tracing:
+                    # Count @@B: probes already in the source (from LLM or rule-based insertion)
+                    import re as _re
+                    _para_re = _re.compile(r"^\s{7}([A-Z0-9][A-Z0-9_-]*)\s*\.\s*$", _re.IGNORECASE)
+                    current_para = ""
+                    for line in source_text.splitlines():
+                        m_para = _para_re.match(line)
+                        if m_para:
+                            current_para = m_para.group(1).upper()
+                        m_probe = _re.search(r"@@B:(\d+):(T|F|W\d+)", line)
+                        if m_probe and not (len(line) > 6 and line[6] in ("*", "/")):
+                            bid = m_probe.group(1)
+                            total_branches += 1
+                            if bid not in branch_meta:
+                                branch_meta[bid] = {"paragraph": current_para}
+                total_paragraphs = source_text.count("SPECTER-TRACE:")
+                return CobolExecutionContext(
+                    executable_path=executable_path,
+                    instrumented_source_path=instrumented_path,
+                    branch_meta=branch_meta,
+                    injectable_vars=list(injectable_vars or []),
+                    total_paragraphs=total_paragraphs,
+                    total_branches=total_branches,
+                    hardened_mode=hardened_mode,
+                    coverage_mode=coverage_mode,
+                )
 
     # No pre-clean — the incremental pipeline handles errors via LLM.
     # Pre-clean regex (column truncation, VALUES ARE, P.I.C.) created as
@@ -320,6 +322,7 @@ def prepare_context(
         coverage_mode=coverage_mode,
         allow_hardening_fallback=allow_hardening_fallback,
         initial_values=init_values,
+        payload_variables=payload_variables,
         stop_on_exec_return=not coverage_mode,
         stop_on_exec_xctl=not coverage_mode,
         eib_calen=100 if coverage_mode else 0,
@@ -342,7 +345,7 @@ def prepare_context(
         executable_path=executable_path,
         instrumented_source_path=instrumented_path,
         branch_meta=branch_meta,
-        injectable_vars=[],  # populated by caller from domain model
+        injectable_vars=list(injectable_vars or []),
         total_paragraphs=total_paragraphs,
         total_branches=total_branches,
         hardened_mode=hardened_mode,

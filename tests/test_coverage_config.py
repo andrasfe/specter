@@ -21,6 +21,11 @@ class TestLoadConfig:
         assert cfg.default_batch_size == 200
         assert cfg.rounds is None
         assert cfg.strategies is None
+        assert cfg.jit_logging.enabled is True
+        assert cfg.jit_logging.periodic_interval_ms == 10000
+        assert cfg.jit_logging.summary_every_requests == 50
+        assert cfg.jit_logging.require_target_paragraph_context is True
+        assert cfg.jit_logging.jit_scope_policy == "target_gates_plus_slice"
 
     def test_nonexistent_file_returns_defaults(self):
         cfg = load_config("/nonexistent/config.yaml")
@@ -36,6 +41,14 @@ class TestLoadConfig:
                 "max_stale_rounds": 5,
                 "plateau_para_pct": 0.95,
             },
+            "jit_logging": {
+                "enabled": False,
+                "periodic_interval_ms": 3000,
+                "summary_every_requests": 20,
+                "debug_min_interval_ms": 250,
+                "require_target_paragraph_context": False,
+                "jit_scope_policy": "all",
+            },
         }
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump(data, f)
@@ -50,6 +63,12 @@ class TestLoadConfig:
         assert cfg.termination.max_stale_rounds == 5
         assert cfg.termination.plateau_para_pct == 0.95
         assert cfg.termination.plateau_branch_pct == 0.8  # default
+        assert cfg.jit_logging.enabled is False
+        assert cfg.jit_logging.periodic_interval_ms == 3000
+        assert cfg.jit_logging.summary_every_requests == 20
+        assert cfg.jit_logging.debug_min_interval_ms == 250
+        assert cfg.jit_logging.require_target_paragraph_context is False
+        assert cfg.jit_logging.jit_scope_policy == "all"
 
     def test_yaml_config(self):
         yaml_text = """\
@@ -67,6 +86,13 @@ loop_from: 1
 strategy_params:
   llm_runtime:
     max_calls: 10
+jit_logging:
+    enabled: false
+    periodic_interval_ms: 5000
+    summary_every_requests: 15
+    debug_min_interval_ms: 200
+    require_target_paragraph_context: false
+    jit_scope_policy: target_gates_only
 termination:
   max_stale_rounds: 15
   extended_stale_limit: 50
@@ -93,6 +119,12 @@ termination:
         assert cfg.strategy_params["llm_runtime"]["max_calls"] == 10
         assert cfg.termination.max_stale_rounds == 15
         assert cfg.termination.extended_stale_limit == 50
+        assert cfg.jit_logging.enabled is False
+        assert cfg.jit_logging.periodic_interval_ms == 5000
+        assert cfg.jit_logging.summary_every_requests == 15
+        assert cfg.jit_logging.debug_min_interval_ms == 200
+        assert cfg.jit_logging.require_target_paragraph_context is False
+        assert cfg.jit_logging.jit_scope_policy == "target_gates_only"
 
 
 class TestBuildStrategies:

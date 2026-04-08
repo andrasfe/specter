@@ -7,16 +7,13 @@ coverage** is achieved.
 ## Quick Start
 
 ```bash
-cd ~/specter
+# 1. Generate the AST with your COBOL parser of choice.
+#    Specter reads the JSON AST format produced by cobalt.
 
-# 1. Generate the AST (requires cobalt from war_rig)
-cd ~/war_rig && uv run cobalt \
-  <COBOL_SOURCE> \
-  --copybook-dir <COPYBOOK_DIR> \
-  -o <AST_OUTPUT>
+# 2. Edit the variables block at the top of cobol-coverage-loop.md
+#    (PROGRAM_ID, AST_FILE, COBOL_SOURCE, COPYBOOK_DIRS, ...).
 
-# 2. Launch the Ralph Loop
-cd ~/specter
+# 3. Launch the loop
 /ralph-loop "$(cat ralph-loops/cobol-coverage-loop.md)" \
   --max-iterations 30 \
   --completion-promise "COVERAGE 98 PERCENT REACHED"
@@ -27,36 +24,17 @@ cd ~/specter
 Edit the **variables block** at the top of `cobol-coverage-loop.md` before launching.
 All paths are configurable:
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `PROGRAM_ID` | COBOL program name | `CBPAUP0C` |
-| `AST_FILE` | Path to generated .ast | `/tmp/CBPAUP0C.ast` |
-| `COBOL_SOURCE` | Path to .cbl source | `~/war_rig/.../cbl/CBPAUP0C.cbl` |
-| `COPYBOOK_DIRS` | Copybook directories | `~/war_rig/.../cpy ~/war_rig/.../app/cpy` |
-| `TEST_STORE` | Output .jsonl path | `/tmp/specter_cov/CBPAUP0C_testset.jsonl` |
-| `COVERAGE_BUDGET` | Max test cases | `5000` |
-| `COVERAGE_TIMEOUT` | Max seconds | `300` |
-| `COVERAGE_BATCH_SIZE` | Cases per round | `500` |
-| `TARGET_COVERAGE` | Target % (para & branch) | `98` |
-
-## Example: CBPAUP0C (Batch IMS — Delete Expired Authorizations)
-
-```bash
-# Generate AST
-cd ~/war_rig && uv run cobalt \
-  ~/war_rig/aws-mainframe-modernization-carddemo/app/app-authorization-ims-db2-mq/cbl/CBPAUP0C.cbl \
-  --copybook-dir ~/war_rig/aws-mainframe-modernization-carddemo/app/app-authorization-ims-db2-mq/cpy \
-  --copybook-dir ~/war_rig/aws-mainframe-modernization-carddemo/app/cpy \
-  -o /tmp/CBPAUP0C.ast
-
-# Launch loop (edit cobol-coverage-loop.md first if paths differ)
-cd ~/specter
-/ralph-loop "$(cat ralph-loops/cobol-coverage-loop.md)" \
-  --max-iterations 30 \
-  --completion-promise "COVERAGE 98 PERCENT REACHED"
-```
-
-**Baseline:** 12/17 paragraphs (70.6%), 12/41 branches (29.3%)
+| Variable | Description |
+|----------|-------------|
+| `PROGRAM_ID` | COBOL program name |
+| `AST_FILE` | Path to generated `.ast` file |
+| `COBOL_SOURCE` | Path to `.cbl` source |
+| `COPYBOOK_DIRS` | Space-separated list of copybook directories |
+| `TEST_STORE` | Output `.jsonl` path |
+| `COVERAGE_BUDGET` | Max test cases |
+| `COVERAGE_TIMEOUT` | Max seconds |
+| `COVERAGE_BATCH_SIZE` | Cases per round |
+| `TARGET_COVERAGE` | Target % (paragraphs and branches) |
 
 ## How It Works
 
@@ -82,10 +60,3 @@ Typical fixes target:
 - `specter/variable_domain.py` — Value domain models
 - `specter/static_analysis.py` — Branch/paragraph reachability
 
-## Programs Tested
-
-| Program | Type | Paragraphs | Branches | Baseline |
-|---------|------|------------|----------|----------|
-| CBPAUP0C | Batch IMS | 17 | 41 | 70.6% / 29.3% |
-| PAUDBLOD | Batch DB Load | 17 | 0 | 100% / N/A |
-| CBEXPORT | Batch Export | 21 | 32 | 81.0% / 59.4% |

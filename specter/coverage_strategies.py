@@ -19,6 +19,7 @@ from .models import Program
 from .static_analysis import StaticCallGraph
 from .variable_domain import (
     VariableDomain,
+    build_payload_value_candidates,
     format_value_for_cobol,
     generate_value,
 )
@@ -55,9 +56,140 @@ class StrategyContext:
     cobol_source_path: Path | None = None
     llm_provider: object | None = None
     llm_model: str | None = None
+    jit_inference: object | None = None
+    paragraph_comments: dict[str, list[str]] = field(default_factory=dict)
     siblings_88: dict[str, set[str]] = field(default_factory=dict)
     flag_88_added: set[str] = field(default_factory=set)
+    payload_candidates: dict[str, dict[str, list]] = field(default_factory=dict)
     probe_cache: dict = field(default_factory=dict)  # para → list[BranchProbeResult]
+    target_variable_allowlists: dict[str, set[str]] = field(default_factory=dict)
+    current_target_key: str | None = None
+    preferred_target_key: str | None = None
+    memory_store: object | None = None
+    memory_state: object | None = None
+
+
+def _generate_domain_value(
+    ctx: StrategyContext,
+    var_name: str,
+    dom: VariableDomain,
+    strategy: str,
+    target_paragraph: str | None = None,
+) -> str | int | float:
+    comment_hints = ctx.paragraph_comments.get(target_paragraph, []) if target_paragraph else []
+    if ctx.jit_inference is not None:
+        target_key = ctx.current_target_key
+        if not target_key and target_paragraph:
+            target_key = f"para:{target_paragraph}"
+        allowed_vars = None
+        if target_key:
+            allowed_vars = ctx.target_variable_allowlists.get(target_key)
+
+        before_hits = int(getattr(ctx.jit_inference, "cache_hits", 0) or 0)
+        before_misses = int(getattr(ctx.jit_inference, "cache_misses", 0) or 0)
+        before_skip_untargeted = int(getattr(ctx.jit_inference, "skipped_untargeted", 0) or 0)
+        before_skip_scope = int(getattr(ctx.jit_inference, "skipped_out_of_scope", 0) or 0)
+        inferred = ctx.jit_inference.generate_value(
+            var_name,
+            dom,
+            strategy,
+            ctx.rng,
+            target_paragraph=target_paragraph,
+            comment_hints=comment_hints,
+            op_key=dom.set_by_stub,
+            allowed_variables=allowed_vars,
+            target_key=target_key,
+        )
+        if inferred is not None:
+            if log.isEnabledFor(logging.DEBUG):
+                debug_counter = int(getattr(ctx, "_jit_debug_counter", 0) or 0) + 1
+                setattr(ctx, "_jit_debug_counter", debug_counter)
+                if debug_counter % 25 == 0:
+                    req_delta = (
+                        int(getattr(ctx.jit_inference, "cache_hits", 0) or 0)
+                        + int(getattr(ctx.jit_inference, "cache_misses", 0) or 0)
+                        + int(getattr(ctx.jit_inference, "skipped_untargeted", 0) or 0)
+                        + int(getattr(ctx.jit_inference, "skipped_out_of_scope", 0) or 0)
+                        - (before_hits + before_misses)
+                        - (before_skip_untargeted + before_skip_scope)
+                    )
+                    log.debug(
+                        "JIT value var=%s strategy=%s para=%s value=%s req_delta=%d",
+                        var_name,
+                        strategy,
+                        target_paragraph or "none",
+                        inferred,
+                        req_delta,
+                    )
+            return inferred
+        if log.isEnabledFor(logging.DEBUG):
+            debug_counter = int(getattr(ctx, "_jit_debug_counter", 0) or 0) + 1
+            setattr(ctx, "_jit_debug_counter", debug_counter)
+            if debug_counter % 25 == 0:
+                req_delta = (
+                    int(getattr(ctx.jit_inference, "cache_hits", 0) or 0)
+                    + int(getattr(ctx.jit_inference, "cache_misses", 0) or 0)
+                    + int(getattr(ctx.jit_inference, "skipped_untargeted", 0) or 0)
+                    + int(getattr(ctx.jit_inference, "skipped_out_of_scope", 0) or 0)
+                    - (before_hits + before_misses)
+                    - (before_skip_untargeted + before_skip_scope)
+                )
+                log.debug(
+                    "JIT fallback var=%s strategy=%s para=%s req_delta=%d",
+                    var_name,
+                    strategy,
+                    target_paragraph or "none",
+                    req_delta,
+                )
+    return generate_value(dom, strategy, ctx.rng)
+
+
+def _set_target_key_for_paragraph(ctx: StrategyContext, paragraph: str | None) -> None:
+    """Set active target key for paragraph-scoped generation paths."""
+    if paragraph:
+        ctx.current_target_key = f"para:{paragraph}"
+    else:
+        ctx.current_target_key = None
+
+
+def _set_target_key_for_branch(
+    ctx: StrategyContext,
+    branch_id: int | str | None,
+    direction: str,
+    *,
+    paragraph_fallback: str | None = None,
+) -> None:
+    """Set active target key for branch-scoped generation paths."""
+    try:
+        bid = int(branch_id) if branch_id is not None else None
+    except (TypeError, ValueError):
+        bid = None
+
+    d = str(direction or "").strip().upper()
+    if bid is not None and d in {"T", "F"}:
+        ctx.current_target_key = f"branch:{bid}:{d}"
+        return
+
+    _set_target_key_for_paragraph(ctx, paragraph_fallback)
+
+
+def _matches_preferred_branch_target(
+    ctx: StrategyContext,
+    branch_id: int | str | None,
+    direction: str,
+) -> bool:
+    """Return whether a candidate branch matches the round's preferred target."""
+    preferred = str(getattr(ctx, "preferred_target_key", "") or "").strip().lower()
+    if not preferred or not preferred.startswith("branch:"):
+        return True
+
+    try:
+        bid = int(branch_id)
+    except (TypeError, ValueError):
+        return True
+
+    d = str(direction or "").strip().upper()
+    return preferred == f"branch:{bid}:{d}".lower()
 
 
 @dataclass
@@ -137,20 +269,37 @@ class BaselineStrategy(Strategy):
         from .cobol_coverage import _build_input_state
 
         self._ran = True
+        prev_target_key = ctx.current_target_key
+        ctx.current_target_key = None
 
-        # Phase 1: one case per value-generation strategy
-        strategies = ["condition_literal", "semantic", "random_valid", "88_value", "boundary"]
-        for strat in strategies:
-            input_state = _build_input_state(ctx.domains, strat, ctx.rng)
-            yield input_state, ctx.success_stubs, ctx.success_defaults, "baseline"
+        try:
+            # Phase 1: one case per value-generation strategy
+            strategies = ["condition_literal", "semantic", "random_valid", "88_value", "boundary"]
+            for strat in strategies:
+                input_state = _build_input_state(
+                    ctx.domains,
+                    strat,
+                    ctx.rng,
+                    jit_inference=ctx.jit_inference,
+                    paragraph_comments=ctx.paragraph_comments,
+                )
+                yield input_state, ctx.success_stubs, ctx.success_defaults, "baseline"
 
-        # Phase 2: condition_literal values per input variable
-        for name, dom in ctx.domains.items():
-            if dom.condition_literals and dom.classification == "input":
-                for lit in dom.condition_literals[:3]:
-                    base = _build_input_state(ctx.domains, "semantic", ctx.rng)
-                    base[name] = format_value_for_cobol(dom, lit)
-                    yield base, ctx.success_stubs, ctx.success_defaults, f"lit:{name}"
+            # Phase 2: condition_literal values per input variable
+            for name, dom in ctx.domains.items():
+                if dom.condition_literals and dom.classification == "input":
+                    for lit in dom.condition_literals[:3]:
+                        base = _build_input_state(
+                            ctx.domains,
+                            "semantic",
+                            ctx.rng,
+                            jit_inference=ctx.jit_inference,
+                            paragraph_comments=ctx.paragraph_comments,
+                        )
+                        base[name] = format_value_for_cobol(dom, lit)
+                        yield base, ctx.success_stubs, ctx.success_defaults, f"lit:{name}"
+        finally:
+            ctx.current_target_key = prev_target_key
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +336,14 @@ def _probe_branches_for_paragraph(
 
     if not uncovered:
         return []
+
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug(
+            "probe_start para=%s uncovered=%d max_probes=%d",
+            para,
+            len(uncovered),
+            max_probes,
+        )
 
     # 2. Build probe-value grid from condition variables
     probe_vars: dict[str, list] = {}
@@ -352,6 +509,15 @@ def _probe_branches_for_paragraph(
             discriminating_vars=disc_vars,
             discriminating_stubs=disc_stubs,
         ))
+    if log.isEnabledFor(logging.DEBUG):
+        total_hits = sum(r.hit_count for r in results)
+        log.debug(
+            "probe_end para=%s uncovered=%d probes=%d hits=%d",
+            para,
+            len(uncovered),
+            total_probes,
+            total_hits,
+        )
     return results
 
 
@@ -663,6 +829,7 @@ class DirectParagraphStrategy(Strategy):
         for para in sorted_paras:
             if yielded >= batch_size:
                 break
+            _set_target_key_for_paragraph(ctx, para)
             # Prefer probing-discovered state as base (empirically better)
             probed = _best_probed_state_for_para(ctx, para)
             tc = self._best_tc_for_para(cov, para)
@@ -692,7 +859,7 @@ class DirectParagraphStrategy(Strategy):
                         dom = ctx.domains.get(var)
                         if dom:
                             strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
-                            state[var] = generate_value(dom, strat, ctx.rng)
+                            state[var] = _generate_domain_value(ctx, var, dom, strat, para)
                         else:
                             info = ctx.var_report.variables.get(var)
                             if info and info.classification == "flag":
@@ -710,7 +877,7 @@ class DirectParagraphStrategy(Strategy):
                         dom = ctx.domains.get(v)
                         if dom:
                             strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
-                            state[v] = generate_value(dom, strat, ctx.rng)
+                            state[v] = _generate_domain_value(ctx, v, dom, strat, para)
                         else:
                             dv = ds.get(v)
                             if isinstance(dv, int):
@@ -749,6 +916,7 @@ class DirectParagraphStrategy(Strategy):
         for para in sorted_paras:
             if yielded >= batch_size:
                 break
+            _set_target_key_for_paragraph(ctx, para)
             tc = self._best_tc_for_para(cov, para)
             base_state = dict(tc.get("input_state", {})) if tc else {}
 
@@ -791,6 +959,7 @@ class DirectParagraphStrategy(Strategy):
         for para in sorted_paras:
             if yielded >= batch_size:
                 break
+            _set_target_key_for_paragraph(ctx, para)
 
             # Extract dataflow for this paragraph (cached)
             if para not in df_cache:
@@ -807,9 +976,17 @@ class DirectParagraphStrategy(Strategy):
                 if meta.get("paragraph") != para:
                     continue
                 for direction in ("T", "F"):
+                    if not _matches_preferred_branch_target(ctx, bid, direction):
+                        continue
                     bkey = f"{bid}:{direction}"
                     if bkey in cov.branches_hit:
                         continue
+                    _set_target_key_for_branch(
+                        ctx,
+                        bid,
+                        direction,
+                        paragraph_fallback=para,
+                    )
                     if yielded >= batch_size:
                         break
 
@@ -937,6 +1114,14 @@ class DirectParagraphStrategy(Strategy):
         for bid, direction, bpara, target_para in frontier:
             if yielded >= batch_size:
                 break
+            if not _matches_preferred_branch_target(ctx, bid, direction):
+                continue
+            _set_target_key_for_branch(
+                ctx,
+                bid,
+                direction,
+                paragraph_fallback=bpara,
+            )
 
             meta = branch_meta.get(bid, {})
             condition = meta.get("condition", "")
@@ -1057,6 +1242,7 @@ class DirectParagraphStrategy(Strategy):
         for para in sorted_paras:
             if yielded >= batch_size:
                 break
+            _set_target_key_for_paragraph(ctx, para)
 
             # Collect what we need: uncovered branch conditions in this para
             needs: list[tuple[str, str, list, bool]] = []  # (bkey, var, vals, want_match)
@@ -1064,6 +1250,8 @@ class DirectParagraphStrategy(Strategy):
                 if meta.get("paragraph") != para:
                     continue
                 for direction in ("T", "F"):
+                    if not _matches_preferred_branch_target(ctx, bid, direction):
+                        continue
                     bkey = f"{bid}:{direction}"
                     if bkey in cov.branches_hit:
                         continue
@@ -1108,7 +1296,7 @@ class DirectParagraphStrategy(Strategy):
                         dom = ctx.domains.get(var)
                         if dom:
                             strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
-                            state[var] = generate_value(dom, strat, ctx.rng)
+                            state[var] = _generate_domain_value(ctx, var, dom, strat, para)
                         else:
                             info = ctx.var_report.variables.get(var)
                             if info and info.classification == "flag":
@@ -1126,7 +1314,7 @@ class DirectParagraphStrategy(Strategy):
                         dom = ctx.domains.get(v)
                         if dom:
                             strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
-                            state[v] = generate_value(dom, strat, ctx.rng)
+                            state[v] = _generate_domain_value(ctx, v, dom, strat, para)
                         else:
                             dv = ds.get(v)
                             if isinstance(dv, int):
@@ -1222,6 +1410,7 @@ class DirectParagraphStrategy(Strategy):
         for para in sorted_paras:
             if yielded >= batch_size:
                 break
+            _set_target_key_for_paragraph(ctx, para)
 
             # Get paragraph source
             func_name = "para_" + re.sub(
@@ -1268,6 +1457,12 @@ class DirectParagraphStrategy(Strategy):
                     bkey = f"{bid}:{direction}"
                     if bkey in cov.branches_hit:
                         continue
+                    _set_target_key_for_branch(
+                        ctx,
+                        bid,
+                        direction,
+                        paragraph_fallback=para,
+                    )
                     if yielded >= batch_size:
                         break
 
@@ -1458,6 +1653,7 @@ class DirectParagraphStrategy(Strategy):
         if ctx.module is None:
             return
 
+        from .cobol_coverage import _MQ_CONSTANTS
         from .monte_carlo import _run_paragraph_directly
 
         default_state_fn = getattr(ctx.module, "_default_state", None)
@@ -1480,6 +1676,7 @@ class DirectParagraphStrategy(Strategy):
             eval_groups.setdefault(para, []).append((bid, "T", meta))
 
         for para, branches in eval_groups.items():
+            _set_target_key_for_paragraph(ctx, para)
             # Find uncovered T-direction branches in this EVALUATE
             uncovered_bids = []
             covered_bids = []
@@ -1500,6 +1697,14 @@ class DirectParagraphStrategy(Strategy):
             for target_bid, target_meta in uncovered_bids:
                 if yielded >= batch_size:
                     return
+                if not _matches_preferred_branch_target(ctx, target_bid, "T"):
+                    continue
+                _set_target_key_for_branch(
+                    ctx,
+                    target_bid,
+                    "T",
+                    paragraph_fallback=para,
+                )
 
                 cond = target_meta.get("condition", "")
                 state = dict(ds)
@@ -1536,7 +1741,6 @@ class DirectParagraphStrategy(Strategy):
                                 state[gating_cond] = True
 
                 # Inject MQ constants
-                from .cobol_coverage import _MQ_CONSTANTS
                 for name, value in _MQ_CONSTANTS.items():
                     if name.upper() in ds:
                         state[name.upper()] = value
@@ -1570,10 +1774,19 @@ class DirectParagraphStrategy(Strategy):
             if meta.get("type") != "IF":
                 continue
             para = meta.get("paragraph", "")
+            _set_target_key_for_paragraph(ctx, para)
             for direction in ("T", "F"):
+                if not _matches_preferred_branch_target(ctx, bid, direction):
+                    continue
                 bkey = f"{bid}:{direction}"
                 if bkey in cov.branches_hit:
                     continue
+                _set_target_key_for_branch(
+                    ctx,
+                    bid,
+                    direction,
+                    paragraph_fallback=para,
+                )
                 cond = meta.get("condition", "").strip()
                 if not cond:
                     continue
@@ -1635,33 +1848,38 @@ class DirectParagraphStrategy(Strategy):
         if not branch_meta:
             return
 
-        n_phases = 7
-        phase = self._round % n_phases
-        # Run chain constraint solver on first round (phase 0) to hit
-        # compound-state branches early, then rotate normally
-        if self._round == 0:
-            yield from self._chain_constraint_round(ctx, cov, batch_size, branch_meta)
-        elif phase == 0:
-            yield from self._param_round(ctx, cov, batch_size, branch_meta)
-        elif phase == 1:
-            if ctx.stub_mapping:
-                yield from self._stub_round(ctx, cov, batch_size, branch_meta)
+        prev_target_key = ctx.current_target_key
+
+        try:
+            n_phases = 7
+            phase = self._round % n_phases
+            # Run chain constraint solver on first round (phase 0) to hit
+            # compound-state branches early, then rotate normally
+            if self._round == 0:
+                yield from self._chain_constraint_round(ctx, cov, batch_size, branch_meta)
+            elif phase == 0:
+                yield from self._param_round(ctx, cov, batch_size, branch_meta)
+            elif phase == 1:
+                if ctx.stub_mapping:
+                    yield from self._stub_round(ctx, cov, batch_size, branch_meta)
+                else:
+                    yield from self._param_round(ctx, cov, batch_size, branch_meta)
+            elif phase == 2:
+                yield from self._dataflow_round(ctx, cov, batch_size, branch_meta)
+            elif phase == 3:
+                yield from self._frontier_round(ctx, cov, batch_size, branch_meta)
+            elif phase == 4:
+                yield from self._harvest_round(ctx, cov, batch_size, branch_meta)
+            elif phase == 5:
+                yield from self._inverse_round(ctx, cov, batch_size, branch_meta)
+            elif phase == 6:
+                yield from self._chain_constraint_round(ctx, cov, batch_size, branch_meta)
             else:
                 yield from self._param_round(ctx, cov, batch_size, branch_meta)
-        elif phase == 2:
-            yield from self._dataflow_round(ctx, cov, batch_size, branch_meta)
-        elif phase == 3:
-            yield from self._frontier_round(ctx, cov, batch_size, branch_meta)
-        elif phase == 4:
-            yield from self._harvest_round(ctx, cov, batch_size, branch_meta)
-        elif phase == 5:
-            yield from self._inverse_round(ctx, cov, batch_size, branch_meta)
-        elif phase == 6:
-            yield from self._chain_constraint_round(ctx, cov, batch_size, branch_meta)
-        else:
-            yield from self._param_round(ctx, cov, batch_size, branch_meta)
 
-        self._round += 1
+            self._round += 1
+        finally:
+            ctx.current_target_key = prev_target_key
 
 
 class FaultInjectionStrategy(Strategy):
@@ -1679,6 +1897,9 @@ class FaultInjectionStrategy(Strategy):
     def generate_cases(self, ctx, cov, batch_size) -> Iterator[CaseT]:
         from .cobol_coverage import _build_fault_stubs, _build_input_state
 
+        prev_target_key = ctx.current_target_key
+        ctx.current_target_key = None
+
         fault_tables = {
             "status_file": ["10", "23", "35", "39", "46", "47"],
             "status_sql": [0, 100, -803, -805, -904],
@@ -1689,45 +1910,151 @@ class FaultInjectionStrategy(Strategy):
         flag_88_added = getattr(ctx, 'flag_88_added', None) or set()
         siblings_88 = getattr(ctx, 'siblings_88', None) or {}
 
-        for op_key, status_vars in ctx.stub_mapping.items():
-            fault_values: list = []
-            for var in status_vars:
-                dom = ctx.domains.get(var)
-                if dom:
-                    table = fault_tables.get(dom.semantic_type, [])
-                    fault_values.extend(table)
+        try:
+            for op_key, status_vars in ctx.stub_mapping.items():
+                fault_values: list = []
+                for var in status_vars:
+                    dom = ctx.domains.get(var)
+                    if dom:
+                        table = fault_tables.get(dom.semantic_type, [])
+                        fault_values.extend(table)
 
-            if op_key.startswith("DLI") or any("PCB" in v.upper() for v in status_vars):
-                fault_values.extend(["GE", "GB", "II", "AI"])
+                if op_key.startswith("DLI") or any("PCB" in v.upper() for v in status_vars):
+                    fault_values.extend(["GE", "GB", "II", "AI"])
 
-            if op_key.startswith("CALL:MQ"):
-                fault_values.extend([0, 1, 2])  # MQCC-OK, WARNING, FAILED (int)
+                if op_key.startswith("CALL:MQ"):
+                    fault_values.extend([0, 1, 2])  # MQCC-OK, WARNING, FAILED (int)
 
-            if not fault_values:
-                fault_values = ["10", "23", "35"]
+                if not fault_values:
+                    fault_values = ["10", "23", "35"]
 
-            for fv in fault_values[:5]:
-                base = _build_input_state(ctx.domains, "semantic", ctx.rng)
-                fault_stubs, fault_defaults = _build_fault_stubs(
-                    ctx.stub_mapping, ctx.domains,
-                    target_op=op_key, fault_value=fv, rng=ctx.rng,
-                    flag_88_added=flag_88_added, siblings_88=siblings_88,
-                )
-                yield base, fault_stubs, fault_defaults, f"fault:{op_key}={fv}"
-
-            # Also try 88-level flag faults: activate each sibling flag
-            for var in status_vars:
-                var_upper = var.upper()
-                if var_upper in flag_88_added:
-                    base = _build_input_state(ctx.domains, "semantic", ctx.rng)
+                for fv in fault_values[:5]:
+                    base = _build_input_state(
+                        ctx.domains,
+                        "semantic",
+                        ctx.rng,
+                        jit_inference=ctx.jit_inference,
+                        paragraph_comments=ctx.paragraph_comments,
+                    )
                     fault_stubs, fault_defaults = _build_fault_stubs(
                         ctx.stub_mapping, ctx.domains,
-                        target_op=op_key, fault_value=var_upper, rng=ctx.rng,
+                        target_op=op_key, fault_value=fv, rng=ctx.rng,
                         flag_88_added=flag_88_added, siblings_88=siblings_88,
                     )
-                    yield base, fault_stubs, fault_defaults, f"fault-88:{op_key}={var}"
+                    yield base, fault_stubs, fault_defaults, f"fault:{op_key}={fv}"
+
+                # Also try 88-level flag faults: activate each sibling flag
+                for var in status_vars:
+                    var_upper = var.upper()
+                    if var_upper in flag_88_added:
+                        base = _build_input_state(
+                            ctx.domains,
+                            "semantic",
+                            ctx.rng,
+                            jit_inference=ctx.jit_inference,
+                            paragraph_comments=ctx.paragraph_comments,
+                        )
+                        fault_stubs, fault_defaults = _build_fault_stubs(
+                            ctx.stub_mapping, ctx.domains,
+                            target_op=op_key, fault_value=var_upper, rng=ctx.rng,
+                            flag_88_added=flag_88_added, siblings_88=siblings_88,
+                        )
+                        yield base, fault_stubs, fault_defaults, f"fault-88:{op_key}={var}"
+
+            self._ran = True
+        finally:
+            ctx.current_target_key = prev_target_key
+
+
+class TranscriptSearchStrategy(Strategy):
+    """Mutate ordered READ transcripts with domain-aware payload assignments."""
+
+    name = "transcript_search"
+    priority = 40
+
+    def __init__(self):
+        self._ran = False
+
+    def should_run(self, cov, round_num: int) -> bool:
+        return not self._ran
+
+    def generate_cases(self, ctx, cov, batch_size) -> Iterator[CaseT]:
+        from .cobol_coverage import _build_input_state
 
         self._ran = True
+        yielded = 0
+        payload_candidates = getattr(ctx, "payload_candidates", {}) or {}
+        prev_target_key = ctx.current_target_key
+        ctx.current_target_key = None
+
+        try:
+            for op_key, var_map in payload_candidates.items():
+                if yielded >= batch_size:
+                    break
+                if not op_key.startswith("READ:"):
+                    continue
+                if op_key not in ctx.success_stubs:
+                    continue
+
+                for var_name, candidates in var_map.items():
+                    if yielded >= batch_size:
+                        break
+
+                    domain = ctx.domains.get(var_name)
+                    values = list(candidates) if candidates else []
+                    if not values and domain is not None:
+                        values = build_payload_value_candidates(domain, rng=ctx.rng)
+
+                    for raw_value in values[:4]:
+                        if yielded >= batch_size:
+                            break
+
+                        state = _build_input_state(
+                            ctx.domains,
+                            "semantic",
+                            ctx.rng,
+                            jit_inference=ctx.jit_inference,
+                            paragraph_comments=ctx.paragraph_comments,
+                        )
+                        encoded_value = (
+                            format_value_for_cobol(domain, raw_value)
+                            if domain is not None else raw_value
+                        )
+
+                        stubs = {
+                            name: [list(entry) for entry in entries]
+                            for name, entries in ctx.success_stubs.items()
+                        }
+                        defaults = {
+                            name: list(entry) if isinstance(entry, list) else entry
+                            for name, entry in ctx.success_defaults.items()
+                        }
+
+                        mutated_entries: list[list] = []
+                        for idx, entry in enumerate(stubs.get(op_key, [])):
+                            current = list(entry)
+                            if idx < 2 and not any(name == var_name for name, _ in current):
+                                current.append((var_name, encoded_value))
+                            mutated_entries.append(current)
+
+                        if not mutated_entries:
+                            mutated_entries = [[(var_name, encoded_value)]]
+                        elif not any(
+                            any(name == var_name for name, _ in entry)
+                            for entry in mutated_entries[:2]
+                        ):
+                            mutated_entries[0].append((var_name, encoded_value))
+
+                        stubs[op_key] = mutated_entries
+                        yield (
+                            state,
+                            stubs,
+                            defaults,
+                            f"transcript:{op_key}:{var_name}={encoded_value}",
+                        )
+                        yielded += 1
+        finally:
+            ctx.current_target_key = prev_target_key
 
 
 class CorpusFuzzStrategy(Strategy):
@@ -1822,107 +2149,113 @@ class CorpusFuzzStrategy(Strategy):
     def generate_cases(self, ctx, cov, batch_size) -> Iterator[CaseT]:
         from .cobol_coverage import _build_fault_stubs
 
-        if not self._initialized or len(cov.test_cases) > len(self._corpus) * 2:
-            self._initialize_corpus(cov, ctx)
+        prev_target_key = ctx.current_target_key
+        ctx.current_target_key = None
 
-        if not self._corpus:
-            return
+        try:
+            if not self._initialized or len(cov.test_cases) > len(self._corpus) * 2:
+                self._initialize_corpus(cov, ctx)
 
-        input_vars = [
-            name for name, dom in ctx.domains.items()
-            if dom.classification in ("input", "flag") and not dom.set_by_stub
-        ]
-        if not input_vars:
-            return
+            if not self._corpus:
+                return
 
-        # v1: simple uncovered-branch list (no difficulty scoring)
-        easy_branches = [
-            (f"{bid}:{d}", 0)
-            for bid in ctx.branch_meta
-            for d in ("T", "F")
-            if f"{bid}:{d}" not in cov.branches_hit
-        ]
+            input_vars = [
+                name for name, dom in ctx.domains.items()
+                if dom.classification in ("input", "flag") and not dom.set_by_stub
+            ]
+            if not input_vars:
+                return
 
-        # Collect condition variables from uncovered branches
-        priority_vars: dict[str, list] = {}
-        for bkey, _ in easy_branches[:20]:
-            bid_str = bkey.split(":")[0]
-            try:
-                bid = int(bid_str)
-            except ValueError:
-                continue
-            meta = ctx.branch_meta.get(bid, {})
-            cond = meta.get("condition", "")
-            if cond:
-                for var_name in set(re.findall(r"\b([A-Z][A-Z0-9_-]+)\b", cond)):
-                    if var_name in ctx.domains and var_name not in priority_vars:
-                        dom = ctx.domains[var_name]
-                        vals = list(dom.condition_literals or [])
-                        priority_vars[var_name] = vals
+            # v1: simple uncovered-branch list (no difficulty scoring)
+            easy_branches = [
+                (f"{bid}:{d}", 0)
+                for bid in ctx.branch_meta
+                for d in ("T", "F")
+                if f"{bid}:{d}" not in cov.branches_hit
+            ]
 
-        for iteration in range(batch_size):
-            idx, seed_tc = self._select_seed(ctx.rng)
-            self._mutations_done[idx] = self._mutations_done[idx] + 1
+            # Collect condition variables from uncovered branches
+            priority_vars: dict[str, list] = {}
+            for bkey, _ in easy_branches[:20]:
+                bid_str = bkey.split(":")[0]
+                try:
+                    bid = int(bid_str)
+                except ValueError:
+                    continue
+                meta = ctx.branch_meta.get(bid, {})
+                cond = meta.get("condition", "")
+                if cond:
+                    for var_name in set(re.findall(r"\b([A-Z][A-Z0-9_-]+)\b", cond)):
+                        if var_name in ctx.domains and var_name not in priority_vars:
+                            dom = ctx.domains[var_name]
+                            vals = list(dom.condition_literals or [])
+                            priority_vars[var_name] = vals
 
-            base_state = dict(seed_tc.get("input_state", {}))
-            mutated = dict(base_state)
+            for iteration in range(batch_size):
+                idx, seed_tc = self._select_seed(ctx.rng)
+                self._mutations_done[idx] = self._mutations_done[idx] + 1
 
-            n_mutations = ctx.rng.randint(1, min(5, len(input_vars)))
+                base_state = dict(seed_tc.get("input_state", {}))
+                mutated = dict(base_state)
 
-            # 60% targeted: mutate priority variables
-            if ctx.rng.random() < 0.6 and priority_vars:
-                vars_to_mutate = ctx.rng.sample(
-                    list(priority_vars.keys()),
-                    min(n_mutations, len(priority_vars)),
-                )
-                for var_name in vars_to_mutate:
-                    dom = ctx.domains.get(var_name)
-                    if not dom:
-                        continue
-                    vals = priority_vars[var_name]
-                    if ctx.rng.random() < 0.5 and vals:
-                        mutated[var_name] = format_value_for_cobol(dom, ctx.rng.choice(vals))
-                    else:
-                        strat = ctx.rng.choice(["boundary", "random_valid", "condition_literal"])
+                n_mutations = ctx.rng.randint(1, min(5, len(input_vars)))
+
+                # 60% targeted: mutate priority variables
+                if ctx.rng.random() < 0.6 and priority_vars:
+                    vars_to_mutate = ctx.rng.sample(
+                        list(priority_vars.keys()),
+                        min(n_mutations, len(priority_vars)),
+                    )
+                    for var_name in vars_to_mutate:
+                        dom = ctx.domains.get(var_name)
+                        if not dom:
+                            continue
+                        vals = priority_vars[var_name]
+                        if ctx.rng.random() < 0.5 and vals:
+                            mutated[var_name] = format_value_for_cobol(dom, ctx.rng.choice(vals))
+                        else:
+                            strat = ctx.rng.choice(["boundary", "random_valid", "condition_literal"])
+                            mutated[var_name] = format_value_for_cobol(
+                                dom, generate_value(dom, strat, ctx.rng),
+                            )
+                else:
+                    # 40% random mutation
+                    vars_to_mutate = ctx.rng.sample(
+                        input_vars, min(n_mutations, len(input_vars)),
+                    )
+                    for var_name in vars_to_mutate:
+                        dom = ctx.domains.get(var_name)
+                        if not dom:
+                            continue
+                        if ctx.rng.random() < 0.7 and (dom.condition_literals or dom.valid_88_values):
+                            strat = "condition_literal" if dom.condition_literals else "88_value"
+                        else:
+                            strat = "random_valid"
                         mutated[var_name] = format_value_for_cobol(
                             dom, generate_value(dom, strat, ctx.rng),
                         )
-            else:
-                # 40% random mutation
-                vars_to_mutate = ctx.rng.sample(
-                    input_vars, min(n_mutations, len(input_vars)),
-                )
-                for var_name in vars_to_mutate:
-                    dom = ctx.domains.get(var_name)
-                    if not dom:
-                        continue
-                    if ctx.rng.random() < 0.7 and (dom.condition_literals or dom.valid_88_values):
-                        strat = "condition_literal" if dom.condition_literals else "88_value"
-                    else:
-                        strat = "random_valid"
-                    mutated[var_name] = format_value_for_cobol(
-                        dom, generate_value(dom, strat, ctx.rng),
+
+                # Stub mutation: 40% chance
+                if ctx.rng.random() < 0.4 and ctx.stub_mapping:
+                    op_key = ctx.rng.choice(list(ctx.stub_mapping.keys()))
+                    stubs, defaults = _build_fault_stubs(
+                        ctx.stub_mapping, ctx.domains,
+                        target_op=op_key, rng=ctx.rng,
                     )
+                else:
+                    # Inherit stubs from seed TC
+                    stubs = dict(ctx.success_stubs)
+                    defaults = dict(ctx.success_defaults)
+                    if seed_tc.get("stub_outcomes"):
+                        for entry in seed_tc["stub_outcomes"]:
+                            if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                                op, entries = entry
+                                stubs[op] = [entries] * 50
+                                defaults[op] = entries
 
-            # Stub mutation: 40% chance
-            if ctx.rng.random() < 0.4 and ctx.stub_mapping:
-                op_key = ctx.rng.choice(list(ctx.stub_mapping.keys()))
-                stubs, defaults = _build_fault_stubs(
-                    ctx.stub_mapping, ctx.domains,
-                    target_op=op_key, rng=ctx.rng,
-                )
-            else:
-                # Inherit stubs from seed TC
-                stubs = dict(ctx.success_stubs)
-                defaults = dict(ctx.success_defaults)
-                if seed_tc.get("stub_outcomes"):
-                    for entry in seed_tc["stub_outcomes"]:
-                        if isinstance(entry, (list, tuple)) and len(entry) == 2:
-                            op, entries = entry
-                            stubs[op] = [entries] * 50
-                            defaults[op] = entries
-
-            yield mutated, stubs, defaults, f"fuzz:{idx}"
+                yield mutated, stubs, defaults, f"fuzz:{idx}"
+        finally:
+            ctx.current_target_key = prev_target_key
 
 
 # ---------------------------------------------------------------------------

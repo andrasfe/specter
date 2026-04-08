@@ -338,6 +338,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Obfuscate all names in exported bundle for IP protection (with --export-bundle)",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug-level logging (shows paragraph/field targeting details)",
+    )
 
     args = parser.parse_args(argv)
 
@@ -348,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
     # --run-bundle: standalone operation, no AST needed
     if args.run_bundle:
         logging.basicConfig(
-            level=logging.INFO,
+            level=logging.DEBUG if args.debug else logging.INFO,
             format="%(asctime)s %(levelname)-7s %(message)s",
             datefmt="%H:%M:%S",
             stream=sys.stderr,
@@ -430,7 +435,7 @@ def main(argv: list[str] | None = None) -> int:
             import tempfile
 
             logging.basicConfig(
-                level=logging.INFO,
+                level=logging.DEBUG if args.debug else logging.INFO,
                 format="%(asctime)s %(levelname)-7s %(message)s",
                 datefmt="%H:%M:%S",
                 stream=sys.stderr,
@@ -631,7 +636,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         logging.basicConfig(
-            level=logging.INFO,
+            level=logging.DEBUG if args.debug else logging.INFO,
             format="%(asctime)s %(levelname)-7s %(message)s",
             datefmt="%H:%M:%S",
             stream=sys.stderr,
@@ -684,7 +689,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         logging.basicConfig(
-            level=logging.INFO,
+            level=logging.DEBUG if args.debug else logging.INFO,
             format="%(asctime)s %(levelname)-7s %(message)s",
             datefmt="%H:%M:%S",
             stream=sys.stderr,
@@ -716,7 +721,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         logging.basicConfig(
-            level=logging.INFO,
+            level=logging.DEBUG if args.debug else logging.INFO,
             format="%(asctime)s %(levelname)-7s %(message)s",
             datefmt="%H:%M:%S",
             stream=sys.stderr,
@@ -808,7 +813,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         logging.basicConfig(
-            level=logging.INFO,
+            level=logging.DEBUG if args.debug else logging.INFO,
             format="%(asctime)s %(levelname)-7s %(message)s",
             datefmt="%H:%M:%S",
             stream=sys.stderr,
@@ -846,7 +851,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.concolic:
         args.guided = True
         logging.basicConfig(
-            level=logging.INFO,
+            level=logging.DEBUG if args.debug else logging.INFO,
             format="%(asctime)s %(levelname)-7s %(message)s",
             datefmt="%H:%M:%S",
             stream=sys.stderr,

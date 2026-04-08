@@ -82,6 +82,18 @@ class ValidationConfig:
 
 
 @dataclass
+class JITLoggingConfig:
+    """Configuration for JIT observability in coverage logs."""
+
+    enabled: bool = True
+    periodic_interval_ms: int = 10000
+    summary_every_requests: int = 50
+    debug_min_interval_ms: int = 100
+    require_target_paragraph_context: bool = True
+    jit_scope_policy: str = "target_gates_plus_slice"
+
+
+@dataclass
 class CoverageConfig:
     """Top-level coverage configuration."""
 
@@ -90,6 +102,7 @@ class CoverageConfig:
     termination: TerminationConfig = field(default_factory=TerminationConfig)
     seed_generation: SeedConfig = field(default_factory=SeedConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
+    jit_logging: JITLoggingConfig = field(default_factory=JITLoggingConfig)
     strategies: list[str] | None = None
     rounds: list[RoundConfig] | None = None
     loop_from: int = 0
@@ -162,6 +175,20 @@ def _build_config(data: dict) -> CoverageConfig:
         timeout_per_case=int(val_data.get("timeout_per_case", 30)),
     )
 
+    jit_data = data.get("jit_logging", {})
+    jit_logging = JITLoggingConfig(
+        enabled=bool(jit_data.get("enabled", True)),
+        periodic_interval_ms=int(jit_data.get("periodic_interval_ms", 10000)),
+        summary_every_requests=int(jit_data.get("summary_every_requests", 50)),
+        debug_min_interval_ms=int(jit_data.get("debug_min_interval_ms", 100)),
+        require_target_paragraph_context=bool(
+            jit_data.get("require_target_paragraph_context", True)
+        ),
+        jit_scope_policy=str(
+            jit_data.get("jit_scope_policy", "target_gates_plus_slice")
+        ),
+    )
+
     rounds = None
     raw_rounds = data.get("rounds")
     if isinstance(raw_rounds, list):
@@ -185,6 +212,7 @@ def _build_config(data: dict) -> CoverageConfig:
         termination=termination,
         seed_generation=seed_generation,
         validation=validation,
+        jit_logging=jit_logging,
         strategies=strategies,
         rounds=rounds,
         loop_from=int(data.get("loop_from", 0)),
@@ -206,11 +234,13 @@ def _get_strategy_registry() -> dict[str, Any]:
         CorpusFuzzStrategy,
         DirectParagraphStrategy,
         FaultInjectionStrategy,
+        TranscriptSearchStrategy,
     )
 
     return {
         "baseline": lambda **kw: BaselineStrategy(),
         "direct_paragraph": lambda **kw: DirectParagraphStrategy(),
+        "transcript_search": lambda **kw: TranscriptSearchStrategy(),
         "corpus_fuzz": lambda **kw: CorpusFuzzStrategy(),
         "fault_injection": lambda **kw: FaultInjectionStrategy(),
     }
@@ -238,7 +268,7 @@ def build_strategies(
     else:
         # Default set
         names = [
-            "baseline", "direct_paragraph", "corpus_fuzz", "fault_injection",
+            "baseline", "direct_paragraph", "transcript_search", "corpus_fuzz", "fault_injection",
         ]
 
     strategies = []

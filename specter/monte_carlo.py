@@ -16,6 +16,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .jit_value_inference import JITValueInferenceService
+from .variable_domain import build_variable_domains
+
 _logger = logging.getLogger(__name__)
 
 
@@ -106,7 +109,15 @@ _STATUS_VALUES = {
 }
 
 
-def _generate_random_state(var_report, rng: random.Random) -> dict:
+def _generate_random_state(
+    var_report,
+    rng: random.Random,
+    *,
+    domains=None,
+    jit_inference=None,
+    target_paragraph: str | None = None,
+    semantic_profiles: dict | None = None,
+) -> dict:
     """Generate a randomized initial state based on variable classification."""
     state = {}
 
@@ -151,12 +162,54 @@ def _generate_random_state(var_report, rng: random.Random) -> dict:
                 state[name] = rng.choice([" ", "00", "10"])
 
         elif info.classification == "flag":
+            if jit_inference is not None and domains is not None:
+                domain = domains.get(upper)
+                if domain is not None:
+                    jit_value = jit_inference.generate_value(
+                        upper,
+                        domain,
+                        "semantic",
+                        rng,
+                        target_paragraph=target_paragraph,
+                    )
+                    if jit_value is not None:
+                        state[name] = jit_value
+                        if semantic_profiles is not None and upper not in semantic_profiles:
+                            profile = jit_inference.infer_profile(
+                                upper,
+                                domain,
+                                target_paragraph=target_paragraph,
+                            )
+                            if profile is not None:
+                                semantic_profiles[upper] = profile
+                        continue
             if harvested and rng.random() < 0.7:
                 state[name] = rng.choice(harvested)
             else:
                 state[name] = rng.choice([True, False])
 
         elif info.classification == "input":
+            if jit_inference is not None and domains is not None:
+                domain = domains.get(upper)
+                if domain is not None:
+                    jit_value = jit_inference.generate_value(
+                        upper,
+                        domain,
+                        "semantic",
+                        rng,
+                        target_paragraph=target_paragraph,
+                    )
+                    if jit_value is not None:
+                        state[name] = jit_value
+                        if semantic_profiles is not None and upper not in semantic_profiles:
+                            profile = jit_inference.infer_profile(
+                                upper,
+                                domain,
+                                target_paragraph=target_paragraph,
+                            )
+                            if profile is not None:
+                                semantic_profiles[upper] = profile
+                        continue
             if harvested and rng.random() < 0.7:
                 state[name] = rng.choice(harvested)
             # Heuristic: check name patterns
@@ -761,6 +814,9 @@ def _generate_directed_input(
     stub_mapping: dict[str, list[str]] | None,
     rng: random.Random,
     fuzzer: _FuzzerState,
+    domains=None,
+    jit_inference=None,
+    semantic_profiles: dict | None = None,
 ) -> tuple[dict, dict | None]:
     """Generate an input state directed toward reaching a specific target paragraph.
 
@@ -784,7 +840,14 @@ def _generate_directed_input(
     if best_entry is not None:
         state = dict(best_entry.input_state)
     elif var_report is not None:
-        state = _generate_random_state(var_report, rng)
+        state = _generate_random_state(
+            var_report,
+            rng,
+            domains=domains,
+            jit_inference=jit_inference,
+            target_paragraph=target,
+            semantic_profiles=semantic_profiles,
+        )
     else:
         state = {}
 
@@ -1111,24 +1174,29 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
     _decision_edge_start = 0
     _decision_errors = 0
     _last_coverage_for_milestone = 0
+    _variable_domains = None
+    _jit_inference = None
     if llm_provider is not None:
         from .llm_coverage import LLMCoverageState
         _llm_state = LLMCoverageState()
 
         # Initialize LLM-guided fuzzer with variable semantics inference
         from .llm_fuzzer import (
-            SessionMemory, infer_variable_semantics,
+            SessionMemory,
             should_consult_llm, get_strategy_decision,
             apply_strategy_to_state, record_strategy_result,
             record_error, record_coverage_checkpoint,
         )
         _session_memory = SessionMemory()
         if var_report is not None:
-            profiles = infer_variable_semantics(
-                llm_provider, var_report, model=llm_model,
+            _variable_domains = build_variable_domains(
+                var_report,
+                stub_mapping=stub_mapping or {},
             )
-            _session_memory.semantic_profiles = profiles
-            _session_memory.llm_calls += 1
+            _jit_inference = JITValueInferenceService(
+                llm_provider,
+                model=llm_model,
+            )
 
     # Build gating value pool: maps variable -> set of values needed in gating conditions.
     # Used by the gating-targeted mutation strategy without modifying condition_literals.
@@ -1519,6 +1587,8 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
             input_state = apply_strategy_to_state(
                 _active_decision, base, var_report, _session_memory, rng,
                 fuzzer_corpus=fuzzer.corpus,
+                jit_inference=_jit_inference,
+                domains=_variable_domains,
             )
             if stub_mapping:
                 stub_out = _generate_stub_outcomes(stub_mapping, var_report, rng)
@@ -1540,7 +1610,14 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                     stub_out = _generate_all_success_stubs(
                         stub_mapping, var_report)
             elif var_report is not None:
-                input_state = _generate_random_state(var_report, rng)
+                input_state = _generate_random_state(
+                    var_report,
+                    rng,
+                    domains=_variable_domains,
+                    jit_inference=_jit_inference,
+                    semantic_profiles=(_session_memory.semantic_profiles
+                                       if _session_memory is not None else None),
+                )
                 if stub_mapping:
                     stub_out = _generate_stub_outcomes(stub_mapping, var_report, rng)
             else:
@@ -1680,6 +1757,10 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
                                 input_state, stub_out = _generate_directed_input(
                                     directed_target, pc, var_report,
                                     stub_mapping, rng, fuzzer,
+                                    domains=_variable_domains,
+                                    jit_inference=_jit_inference,
+                                    semantic_profiles=(_session_memory.semantic_profiles
+                                                       if _session_memory is not None else None),
                                 )
                             else:
                                 # No path constraints — use random state
@@ -1935,6 +2016,10 @@ def _run_guided(module, n_iterations: int, seed: int, var_report,
             # Build directed input from path constraints
             base_state, _ = _generate_directed_input(
                 target_para, pc, var_report, stub_mapping, _sweep_rng, fuzzer,
+                domains=_variable_domains,
+                jit_inference=_jit_inference,
+                semantic_profiles=(_session_memory.semantic_profiles
+                                   if _session_memory is not None else None),
             )
             # Generate ALL-ERROR stub outcomes: every operation fails
             error_stubs: dict[str, list] = {}

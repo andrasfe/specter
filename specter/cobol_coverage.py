@@ -10,6 +10,7 @@ store for downstream use.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import random
@@ -24,6 +25,7 @@ from .cobol_executor import (
     prepare_context,
     run_test_case,
 )
+from .backward_slicer import slice_variable_names
 from .cobol_mock import generate_mock_data_ordered
 from .coverage_strategies import (
     BaselineStrategy,
@@ -34,10 +36,16 @@ from .coverage_strategies import (
     Strategy,
     StrategyContext,
     StrategyYield,
+    TranscriptSearchStrategy,
 )
+from .jit_value_inference import JITValueInferenceService
+from .llm_test_states import extract_paragraph_comments
+from .memory_models import APIBudgetLedger, StrategyStats as PersistedStrategyStats, SuccessState
+from .memory_store import MemoryStore, derive_memory_dir
 from .models import Program
 from .static_analysis import (
     StaticCallGraph,
+    extract_gating_variables_for_target,
     build_static_call_graph,
     compute_path_constraints,
     extract_gating_conditions,
@@ -46,10 +54,12 @@ from .static_analysis import (
 )
 from .variable_domain import (
     VariableDomain,
+    build_payload_value_candidates,
     build_variable_domains,
     format_value_for_cobol,
     generate_value,
     load_copybooks,
+    payload_kind_for_domain,
     _FILE_STATUS_CODES,
     _SQL_STATUS_CODES,
     _CICS_STATUS_CODES,
@@ -278,6 +288,195 @@ def load_existing_coverage(store_path: Path) -> tuple[list[dict], set[str], set[
     return test_cases, paras, branches
 
 
+def _counted_branches_for_mode(branches_hit: set[str], cobol_mode: bool) -> set[str]:
+    """Return the branch set that should count toward reported coverage."""
+    if cobol_mode:
+        return {b for b in branches_hit if not b.startswith("py:")}
+    return branches_hit
+
+
+def _extract_branch_target_from_label(target: str) -> tuple[int, str] | None:
+    """Extract ``(branch_id, direction)`` from a strategy target label."""
+    text = str(target or "").strip()
+    if not text:
+        return None
+
+    direct_payload = text
+    if text.startswith("direct:"):
+        direct_payload = text[7:]
+        if "|" in direct_payload:
+            _, direct_payload = direct_payload.split("|", 1)
+        else:
+            direct_payload = ""
+
+    m = re.search(r"(?:^|:)\s*(\d+)\s*:\s*([TF])(?:\b|:|$)", direct_payload, re.IGNORECASE)
+    if not m:
+        m = re.search(r"^branch\s*:\s*(\d+)\s*:\s*([TF])$", text, re.IGNORECASE)
+    if not m:
+        return None
+
+    try:
+        bid = int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    return bid, m.group(2).upper()
+
+
+def _canonical_target_key(target: str) -> str:
+    """Normalize a raw strategy target label into a stable memory key."""
+    text = str(target or "").strip()
+    if not text:
+        return "none"
+
+    branch = _extract_branch_target_from_label(text)
+    if branch is not None:
+        bid, direction = branch
+        return f"branch:{bid}:{direction}"
+
+    if text.startswith("direct:"):
+        para = text[7:].split("|", 1)[0].strip()
+        if para:
+            return f"para:{para}"
+    return text
+
+
+def _best_memory_seed_input(
+    memory_state,
+    target_key: str,
+) -> dict[str, object]:
+    """Pick the strongest prior successful input for a canonical target key."""
+    if memory_state is None:
+        return {}
+
+    successes = list(getattr(memory_state, "successes", []) or [])
+    if not successes:
+        return {}
+
+    exact: list[dict[str, object]] = []
+    para_fallback: list[dict[str, object]] = []
+    want_para = None
+    if target_key.startswith("branch:"):
+        branch_id = target_key.split(":", 2)[1]
+        status = getattr(memory_state, "targets", {}).get(target_key)
+        if status is not None and getattr(status, "last_error", "") == "":
+            # keep exact-first; status lookup is just for future extension
+            pass
+        for success in successes:
+            skey = _canonical_target_key(getattr(success, "target", ""))
+            if skey == target_key:
+                exact.append({
+                    "input_state": dict(getattr(success, "input_state", {}) or {}),
+                    "paragraphs_hit": list(getattr(success, "paragraphs_hit", []) or []),
+                    "branches_hit": list(getattr(success, "branches_hit", []) or []),
+                })
+                continue
+            if skey.startswith("para:") and any(
+                str(b).startswith(f"{branch_id}:") for b in (getattr(success, "branches_hit", []) or [])
+            ):
+                para_fallback.append({
+                    "input_state": dict(getattr(success, "input_state", {}) or {}),
+                    "paragraphs_hit": list(getattr(success, "paragraphs_hit", []) or []),
+                    "branches_hit": list(getattr(success, "branches_hit", []) or []),
+                })
+    else:
+        want_para = target_key if target_key.startswith("para:") else None
+        for success in successes:
+            skey = _canonical_target_key(getattr(success, "target", ""))
+            if skey == target_key:
+                exact.append({
+                    "input_state": dict(getattr(success, "input_state", {}) or {}),
+                    "paragraphs_hit": list(getattr(success, "paragraphs_hit", []) or []),
+                    "branches_hit": list(getattr(success, "branches_hit", []) or []),
+                })
+
+    candidates = exact or para_fallback
+    if not candidates and want_para is None:
+        return {}
+    if not candidates and want_para is not None:
+        return {}
+
+    best = max(
+        candidates,
+        key=lambda tc: (
+            len(tc.get("paragraphs_hit", [])),
+            len(tc.get("branches_hit", [])),
+        ),
+    )
+    return dict(best.get("input_state", {}))
+
+
+def _select_priority_branch_target(ctx: StrategyContext, cov: CoverageState) -> str | None:
+    """Choose the next branch target key using uncovered set + memory status."""
+    if not getattr(ctx, "branch_meta", None):
+        return None
+
+    memory_state = getattr(ctx, "memory_state", None)
+    target_status = getattr(memory_state, "targets", {}) if memory_state is not None else {}
+    scored: list[tuple[int, int, int, str]] = []
+
+    for raw_bid in ctx.branch_meta:
+        try:
+            bid = int(raw_bid)
+        except (TypeError, ValueError):
+            continue
+        for direction in ("T", "F"):
+            hit_key = f"{bid}:{direction}"
+            if hit_key in cov.branches_hit:
+                continue
+            tkey = f"branch:{bid}:{direction}"
+            status = target_status.get(tkey)
+            solved = int(bool(getattr(status, "solved", False))) if status else 0
+            attempts = int(getattr(status, "attempts", 0) or 0) if status else 0
+            nearest = int(getattr(status, "nearest_branch_hits", 0) or 0) if status else 0
+            scored.append((solved, attempts, -nearest, tkey))
+
+    if not scored:
+        return None
+    scored.sort()
+    return scored[0][3]
+
+
+def _best_cobol_seed_input(cov: CoverageState) -> dict[str, object]:
+    """Pick the best previously saved full-program COBOL seed state."""
+    candidates = [
+        tc for tc in cov.test_cases
+        if tc.get("input_state")
+        and not str(tc.get("target", "")).startswith("direct:")
+        and not any(str(b).startswith("py:") for b in tc.get("branches_hit", []))
+    ]
+    if not candidates:
+        return {}
+    best = max(
+        candidates,
+        key=lambda tc: (
+            len(tc.get("paragraphs_hit", [])),
+            len(tc.get("branches_hit", [])),
+        ),
+    )
+    return dict(best.get("input_state", {}))
+
+
+def _project_cobol_replay_input(
+    input_state: dict[str, object],
+    injectable_vars: list[str],
+    seed_state: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Project a Python direct-execution state down to COBOL entry inputs."""
+    allowed = {name.upper() for name in injectable_vars}
+    projected = {
+        name: value
+        for name, value in input_state.items()
+        if isinstance(name, str)
+        and not name.startswith("_")
+        and name.upper() in allowed
+    }
+    if seed_state:
+        merged = dict(seed_state)
+        merged.update(projected)
+        return merged
+    return projected
+
+
 # ---------------------------------------------------------------------------
 # Python pre-run (for stub_log ordering)
 # ---------------------------------------------------------------------------
@@ -410,6 +609,9 @@ def _build_input_state(
     rng: random.Random,
     overrides: dict | None = None,
     mq_overrides: dict | None = None,
+    jit_inference: object | None = None,
+    target_paragraph: str | None = None,
+    paragraph_comments: dict[str, list[str]] | None = None,
 ) -> dict[str, object]:
     """Build an input state dict using the domain model."""
     state: dict[str, object] = {}
@@ -418,7 +620,22 @@ def _build_input_state(
             continue
         if dom.set_by_stub:
             continue  # stub-controlled, not input
-        val = generate_value(dom, strategy, rng)
+        val = None
+        if jit_inference is not None:
+            comment_hints = []
+            if paragraph_comments and target_paragraph:
+                comment_hints = paragraph_comments.get(target_paragraph, [])
+            val = jit_inference.generate_value(
+                name,
+                dom,
+                strategy,
+                rng,
+                target_paragraph=target_paragraph,
+                comment_hints=comment_hints,
+                op_key=dom.set_by_stub,
+            )
+        if val is None:
+            val = generate_value(dom, strategy, rng)
         state[name] = format_value_for_cobol(dom, val)
 
     # CICS-aware defaults: ensure key EIB fields enable deeper execution
@@ -439,6 +656,87 @@ def _build_input_state(
     if overrides:
         state.update(overrides)
     return state
+
+
+def _build_target_variable_allowlists(
+    module: object,
+    branch_meta: dict,
+    gating_conds: dict[str, list],
+    stub_mapping: dict[str, list[str]],
+    *,
+    include_gates: bool,
+    include_slice: bool,
+) -> dict[str, set[str]]:
+    """Build per-target variable allowlists keyed by paragraph and branch.
+
+    Keys include:
+    - ``para:<paragraph>`` (fallback/default scope)
+    - ``branch:<bid>:T`` and ``branch:<bid>:F`` when branch id is known
+    """
+    if not branch_meta:
+        return {}
+
+    out: dict[str, set[str]] = {}
+    module_source = ""
+    if include_slice:
+        try:
+            module_source = inspect.getsource(module)
+        except Exception:
+            module_source = ""
+
+    stub_vars: set[str] = set()
+    for vars_for_op in stub_mapping.values():
+        for var in vars_for_op:
+            name = str(var or "").strip().upper()
+            if name:
+                stub_vars.add(name)
+
+    for bid, meta in branch_meta.items():
+        para = str(meta.get("paragraph", "") or "").strip()
+        if not para:
+            continue
+        key = f"para:{para}"
+        allowed = out.setdefault(key, set())
+
+        if include_gates:
+            allowed.update(extract_gating_variables_for_target(gating_conds, para))
+        if stub_vars:
+            allowed.update(stub_vars)
+
+        if include_slice and module_source:
+            try:
+                bid_int = int(bid)
+            except (TypeError, ValueError):
+                bid_int = None
+            if bid_int is not None:
+                t_slice = slice_variable_names(module_source, bid_int)
+                f_slice = slice_variable_names(module_source, -bid_int)
+
+                allowed.update(t_slice)
+                allowed.update(f_slice)
+
+                key_t = f"branch:{bid_int}:T"
+                key_f = f"branch:{bid_int}:F"
+
+                branch_t = out.setdefault(key_t, set())
+                branch_f = out.setdefault(key_f, set())
+
+                branch_t.update(allowed)
+                branch_f.update(allowed)
+                branch_t.update(t_slice)
+                branch_f.update(f_slice)
+        else:
+            try:
+                bid_int = int(bid)
+            except (TypeError, ValueError):
+                bid_int = None
+            if bid_int is not None:
+                key_t = f"branch:{bid_int}:T"
+                key_f = f"branch:{bid_int}:F"
+                out.setdefault(key_t, set()).update(allowed)
+                out.setdefault(key_f, set()).update(allowed)
+
+    return out
 
 
 def _extract_88_siblings_from_source(cobol_source: str | Path) -> dict[str, set[str]]:
@@ -697,6 +995,66 @@ def _build_fault_stubs(
     return outcomes, defaults
 
 
+def _build_transcript_payload_candidates(
+    domains: dict[str, VariableDomain],
+    stub_mapping: dict[str, list[str]],
+    injectable_vars: list[str],
+    *,
+    max_vars_per_op: int = 6,
+    max_values_per_var: int = 5,
+) -> tuple[dict[str, str], dict[str, dict[str, list[str | int | float]]]]:
+    """Build payload type metadata and focused transcript mutation candidates."""
+    payload_variables: dict[str, str] = {}
+    payload_candidates: dict[str, dict[str, list[str | int | float]]] = {}
+
+    for name in injectable_vars:
+        payload_variables[name] = payload_kind_for_domain(domains.get(name))
+    for status_vars in stub_mapping.values():
+        for name in status_vars:
+            payload_variables[name] = payload_kind_for_domain(domains.get(name))
+
+    scored_candidates: list[tuple[int, str, list[str | int | float]]] = []
+    for name in injectable_vars:
+        domain = domains.get(name)
+        if not domain:
+            continue
+        values = build_payload_value_candidates(
+            domain,
+            limit=max_values_per_var,
+        )
+        if not values:
+            continue
+        score = 0
+        if domain.condition_literals:
+            score += 4
+        if domain.valid_88_values:
+            score += 3
+        if domain.semantic_type != "generic":
+            score += 2
+        if domain.classification == "flag":
+            score += 1
+        scored_candidates.append((score, name, values))
+
+    scored_candidates.sort(key=lambda item: (-item[0], item[1]))
+
+    for op_key in sorted(stub_mapping):
+        if not op_key.startswith("READ:"):
+            continue
+        op_candidates: dict[str, list[str | int | float]] = {}
+        for _, name, values in scored_candidates[:max_vars_per_op]:
+            op_candidates[name] = list(values)
+            payload_variables.setdefault(name, payload_kind_for_domain(domains.get(name)))
+        if op_candidates:
+            payload_candidates[op_key] = op_candidates
+
+    payload_variables.setdefault("RETURN-CODE", "numeric")
+    payload_variables.setdefault("SQLCODE", "numeric")
+    payload_variables.setdefault("DIBSTAT", "alpha")
+    payload_variables.setdefault("EIBAID", "alpha")
+
+    return payload_variables, payload_candidates
+
+
 # ---------------------------------------------------------------------------
 # Stub matching helper
 # ---------------------------------------------------------------------------
@@ -806,6 +1164,17 @@ def _execute_and_save(
     direct_para = None
     if target.startswith("direct:"):
         direct_para = target[7:].split("|", 1)[0]
+    canonical_target = _canonical_target_key(target)
+
+    # Memory-guided seed reuse: prefill candidate input with the strongest
+    # prior winner for this canonical target, while preserving current overrides.
+    memory_seed = _best_memory_seed_input(getattr(ctx, "memory_state", None), canonical_target)
+    if memory_seed:
+        merged_input = dict(memory_seed)
+        merged_input.update(input_state)
+        input_state = merged_input
+
+    cobol_mode = ctx.context is not None
 
     if ctx.context is not None:
         if direct_para:
@@ -819,20 +1188,62 @@ def _execute_and_save(
             stub_log = []
 
             # Replay through COBOL if Python found new py: branches.
-            # This lets COBOL discover the same branches from MAIN-PARA.
+            # Project the direct-execution state down to entry-safe injected
+            # variables so COBOL replays are not polluted by Python locals.
             py_new = {b for b in result.branches_hit if b.startswith("py:")} - cov.branches_hit
-            if py_new and len(py_new) >= 2:
-                cobol_stub_log = _python_pre_run(ctx.module, input_state, stub_outcomes, stub_defaults)
+            if py_new:
+                seed_state = _best_memory_seed_input(getattr(ctx, "memory_state", None), canonical_target)
+                if not seed_state:
+                    seed_state = _best_cobol_seed_input(cov)
+                replay_states: list[dict[str, object]] = []
+                seeded_state = _project_cobol_replay_input(
+                    input_state,
+                    ctx.context.injectable_vars,
+                    seed_state=seed_state,
+                )
+                raw_projected_state = _project_cobol_replay_input(
+                    input_state,
+                    ctx.context.injectable_vars,
+                )
+                if seeded_state:
+                    replay_states.append(seeded_state)
+                if raw_projected_state and raw_projected_state != seeded_state:
+                    replay_states.append(raw_projected_state)
+
+                replay_stub_variants: list[tuple[dict | None, dict | None]] = [
+                    (stub_outcomes, stub_defaults),
+                ]
+                if stub_outcomes != ctx.success_stubs or stub_defaults != ctx.success_defaults:
+                    replay_stub_variants.append((ctx.success_stubs, ctx.success_defaults))
+
                 exec_timeout = int(getattr(ctx, "execution_timeout", 120))
-                cobol_result = run_test_case(ctx.context, input_state, cobol_stub_log, timeout=exec_timeout)
-                if not cobol_result.error:
-                    cobol_new = cobol_result.branches_hit - cov.branches_hit
-                    if cobol_new:
-                        # Merge COBOL results into the Python result
-                        result.branches_hit.update(cobol_result.branches_hit)
+                remaining_timeout = int(getattr(ctx, "_remaining_timeout", exec_timeout))
+                effective_timeout = max(1, min(exec_timeout, remaining_timeout))
+
+                for replay_state in replay_states[:2]:
+                    for replay_stubs, replay_defaults in replay_stub_variants[:2]:
+                        cobol_stub_log = _python_pre_run(
+                            ctx.module,
+                            replay_state,
+                            replay_stubs,
+                            replay_defaults,
+                        )
+                        cobol_result = run_test_case(
+                            ctx.context,
+                            replay_state,
+                            cobol_stub_log,
+                            timeout=effective_timeout,
+                        )
+                        if cobol_result.error:
+                            continue
                         result.paragraphs_hit = list(dict.fromkeys(
                             result.paragraphs_hit + cobol_result.paragraphs_hit
                         ))
+                        result.branches_hit.update(cobol_result.branches_hit)
+                        if cobol_result.branches_hit:
+                            break
+                    if any(not b.startswith("py:") for b in result.branches_hit):
+                        break
         else:
             # Full program: pre-run Python for stub ordering, then COBOL
             strict_mode = bool(getattr(ctx, "strict_branch_coverage", False))
@@ -879,6 +1290,33 @@ def _execute_and_save(
                 len(result.branches_hit),
                 f" error={result.error}" if result.error else "",
             )
+            # Debug: show concrete paragraph/branch details and input fields
+            if log.isEnabledFor(logging.DEBUG):
+                paras_list = sorted(result.paragraphs_hit)[:5]  # Show first 5
+                branches_list = sorted(str(b) for b in result.branches_hit)[:5]
+                log.debug(
+                    "    paragraphs hit: %s%s",
+                    ", ".join(paras_list),
+                    " ..." if len(result.paragraphs_hit) > 5 else "",
+                )
+                if branches_list:
+                    log.debug(
+                        "    branches hit: %s%s",
+                        ", ".join(branches_list),
+                        " ..." if len(result.branches_hit) > 5 else "",
+                    )
+                # Show input fields with non-default/non-empty values
+                nontrivial_inputs = {
+                    k: v for k, v in input_state.items()
+                    if not k.startswith("_") and v and v not in ("", "0", 0, False)
+                }
+                if nontrivial_inputs:
+                    sample_fields = sorted(nontrivial_inputs.items())[:8]
+                    log.debug(
+                        "    input fields: %s%s",
+                        ", ".join(f"{k}={repr(v)}" for k, v in sample_fields),
+                        " ..." if len(nontrivial_inputs) > 8 else "",
+                    )
     else:
         # Python-only execution path
         result = _python_execute(
@@ -888,6 +1326,21 @@ def _execute_and_save(
         stub_log = []
 
     if result.error:
+        memory_store = getattr(ctx, "memory_store", None)
+        memory_state = getattr(ctx, "memory_state", None)
+        if memory_store is not None and memory_state is not None:
+            try:
+                memory_store.upsert_target_status(
+                    memory_state,
+                    canonical_target,
+                    attempts_delta=1,
+                    solved=False,
+                    last_error=result.error,
+                    nearest_paragraph_hits=len(result.paragraphs_hit),
+                    nearest_branch_hits=len(result.branches_hit),
+                )
+            except Exception as exc:
+                log.debug("Memory target update failed: %s", exc)
         if "timed out" in result.error.lower():
             cov.consecutive_timeouts += 1
         else:
@@ -910,6 +1363,14 @@ def _execute_and_save(
     new_paras = result_ast_paras - cov.paragraphs_hit
     new_runtime_only = result_runtime_only - cov.runtime_only_paragraphs
     new_branches = result.branches_hit - cov.branches_hit
+    counted_new_branches = _counted_branches_for_mode(new_branches, cobol_mode)
+
+    if new_paras or new_branches or new_runtime_only:
+        log.debug(
+            "    >> NEW COVERAGE: paras=%s branches=%s",
+            sorted(new_paras)[:5] if new_paras else "none",
+            sorted(str(b) for b in new_branches)[:5] if new_branches else "none",
+        )
 
     # Track repeated execution signatures (same paragraph+branch outcome)
     # to short-circuit strict runs that are stuck in equivalent paths.
@@ -923,6 +1384,20 @@ def _execute_and_save(
     # Always save first few test cases; after that, only if new coverage
     force_save = tc_count < 5
     if not new_paras and not new_branches and not new_runtime_only and not force_save:
+        memory_store = getattr(ctx, "memory_store", None)
+        memory_state = getattr(ctx, "memory_state", None)
+        if memory_store is not None and memory_state is not None:
+            try:
+                memory_store.upsert_target_status(
+                    memory_state,
+                    canonical_target,
+                    attempts_delta=1,
+                    solved=False,
+                    nearest_paragraph_hits=len(result.paragraphs_hit),
+                    nearest_branch_hits=len(result.branches_hit),
+                )
+            except Exception as exc:
+                log.debug("Memory target update failed: %s", exc)
         return False, tc_count
 
     # Update coverage
@@ -968,18 +1443,131 @@ def _execute_and_save(
         "target": target,
     })
 
+    memory_store = getattr(ctx, "memory_store", None)
+    memory_state = getattr(ctx, "memory_state", None)
+    if memory_store is not None and memory_state is not None:
+        try:
+            memory_store.upsert_target_status(
+                memory_state,
+                canonical_target,
+                attempts_delta=1,
+                solved=bool(new_paras or counted_new_branches),
+                nearest_paragraph_hits=len(result.paragraphs_hit),
+                nearest_branch_hits=len(result.branches_hit),
+                last_error="",
+            )
+            memory_store.append_success(
+                memory_state,
+                SuccessState(
+                    target=canonical_target,
+                    input_state={k: v for k, v in input_state.items() if not str(k).startswith("_")},
+                    stub_outcomes=[[op, entries] for op, entries in stub_log],
+                    paragraphs_hit=list(result.paragraphs_hit),
+                    branches_hit=sorted(result.branches_hit),
+                    timestamp=time.time(),
+                ),
+            )
+        except Exception as exc:
+            log.debug("Memory success update failed: %s", exc)
+
     if new_paras:
         log.info("  [%s] +%d paras -> %d/%d: %s",
                  strategy_name, len(new_paras), len(cov.paragraphs_hit),
                  cov.total_paragraphs, sorted(new_paras))
-    if new_branches:
+    if counted_new_branches:
+        counted_total = len(_counted_branches_for_mode(cov.branches_hit, cobol_mode))
         log.info("  [%s] +%d branches -> %d/%d",
-                 strategy_name, len(new_branches), len(cov.branches_hit),
+                 strategy_name, len(counted_new_branches), counted_total,
                  cov.total_branches)
     if new_runtime_only:
         log.info("  [%s] +%d runtime-only paras (not in AST)",
                  strategy_name, len(new_runtime_only))
     return True, tc_count
+
+
+def _sync_memory_runtime_state(ctx: StrategyContext, cov: CoverageState) -> None:
+    """Mirror round-level strategy and API stats into persistent memory state."""
+    memory_store = getattr(ctx, "memory_store", None)
+    memory_state = getattr(ctx, "memory_state", None)
+    if memory_store is None or memory_state is None:
+        return
+
+    try:
+        for name, stats in cov.strategy_yields.items():
+            memory_store.upsert_strategy_stats(
+                memory_state,
+                name,
+                PersistedStrategyStats(
+                    total_cases=stats.total_cases,
+                    total_new_coverage=stats.total_new_coverage,
+                    rounds=stats.rounds,
+                    last_yield_round=stats.last_yield_round,
+                    last_updated=time.time(),
+                ),
+            )
+
+        jit = getattr(ctx, "jit_inference", None)
+        if jit is not None:
+            jit_hits = int(getattr(jit, "cache_hits", 0))
+            jit_misses = int(getattr(jit, "cache_misses", 0))
+            memory_store.update_api_ledger(
+                memory_state,
+                APIBudgetLedger(
+                    jit_requests=jit_hits + jit_misses,
+                    jit_cache_hits=jit_hits,
+                    jit_cache_misses=jit_misses,
+                    last_updated=time.time(),
+                ),
+            )
+            log.debug(
+                "Memory sync: jit_requests=%d hit=%d miss=%d",
+                jit_hits + jit_misses,
+                jit_hits,
+                jit_misses,
+            )
+    except Exception as exc:
+        log.debug("Memory runtime sync failed: %s", exc)
+
+
+def _jit_status_suffix(ctx: StrategyContext, enabled: bool = True) -> str:
+    """Build a compact JIT status suffix for progress/round logs."""
+    if not enabled:
+        return ""
+    jit = getattr(ctx, "jit_inference", None)
+    if jit is None:
+        return ""
+
+    snapshot = None
+    if hasattr(jit, "snapshot_metrics"):
+        try:
+            snapshot = jit.snapshot_metrics()
+        except Exception:
+            snapshot = None
+
+    if isinstance(snapshot, dict):
+        reqs = int(snapshot.get("requests", 0) or 0)
+        if reqs <= 0:
+            return ""
+        return (
+            " [JIT reqs={reqs} hit={hit:.1f}% skip_u={skip_u} skip_scope={skip_scope} ok={ok} fail={fail} avg={avg:.0f}ms]"
+        ).format(
+            reqs=reqs,
+            hit=float(snapshot.get("cache_hit_pct", 0.0) or 0.0),
+            skip_u=int(snapshot.get("skipped_untargeted", 0) or 0),
+            skip_scope=int(snapshot.get("skipped_out_of_scope", 0) or 0),
+            ok=int(snapshot.get("llm_successes", 0) or 0),
+            fail=int(snapshot.get("llm_failures", 0) or 0),
+            avg=float(snapshot.get("avg_latency_ms", 0.0) or 0.0),
+        )
+
+    # Backward-compatible fallback for older jit implementations.
+    hits = int(getattr(jit, "cache_hits", 0) or 0)
+    misses = int(getattr(jit, "cache_misses", 0) or 0)
+    reqs = hits + misses
+    if reqs <= 0:
+        return ""
+    hit_pct = 100.0 * hits / reqs if reqs else 0.0
+    return f" [JIT reqs={reqs} hit={hit_pct:.1f}%]"
 
 
 # ---------------------------------------------------------------------------
@@ -1033,6 +1621,16 @@ def run_cobol_coverage(
     call_graph = build_static_call_graph(program)
     gating_conds = extract_gating_conditions(program, call_graph)
     stub_mapping = extract_stub_status_mapping(program, var_report)
+    paragraph_comments: dict[str, list[str]] = {}
+    source_path = Path(cobol_source)
+    if source_path.exists():
+        try:
+            paragraph_comments = extract_paragraph_comments(
+                program,
+                source_path.read_text(errors="replace").splitlines(),
+            )
+        except Exception as exc:
+            log.debug("Failed to extract paragraph comments: %s", exc)
     seq_gates = extract_sequential_gates(program)
     if seq_gates:
         gating_conds = augment_gating_with_sequential_gates(
@@ -1073,28 +1671,31 @@ def run_cobol_coverage(
 
     # Prepare COBOL context (instrument + compile)
     log.info("Instrumenting and compiling COBOL ...")
-    strict_injectable = injectable[:40] if strict_branch_coverage else []
+    replay_injectable = injectable[:40]
+    payload_variables, payload_candidates = _build_transcript_payload_candidates(
+        domains,
+        stub_mapping,
+        replay_injectable,
+    )
     try:
-        # Don't pass injectable_vars — the init dispatch EVALUATE that Phase 10
-        # generates often gets destroyed by Phase 12, and the destruction
-        # cascades into neutralizing paragraphs and branches.  EIB fields are
-        # already set via VALUE clauses in coverage mode.  Input values are
-        # varied through the Python pre-run's stub_outcomes instead.
+        # Keep a bounded entry-input dispatch so COBOL can replay promising
+        # Python-discovered states without injecting every internal variable.
         context = prepare_context(
             cobol_source, copybook_dirs,
             enable_branch_tracing=True,
             work_dir=work_dir,
-            injectable_vars=strict_injectable,
+            injectable_vars=replay_injectable,
+            payload_variables=payload_variables,
             coverage_mode=True,
             allow_hardening_fallback=not strict_branch_coverage,
             llm_provider=llm_provider,
             llm_model=llm_model,
         )
     except RuntimeError as e:
-        if strict_branch_coverage and strict_injectable:
+        if replay_injectable:
             log.warning(
-                "Strict compile with %d injectable vars failed, retrying without injection: %s",
-                len(strict_injectable),
+                "Compile with %d injectable vars failed, retrying without injection: %s",
+                len(replay_injectable),
                 e,
             )
             context = prepare_context(
@@ -1102,6 +1703,7 @@ def run_cobol_coverage(
                 enable_branch_tracing=True,
                 work_dir=work_dir,
                 injectable_vars=[],
+                payload_variables=payload_variables,
                 coverage_mode=True,
                 allow_hardening_fallback=not strict_branch_coverage,
                 llm_provider=llm_provider,
@@ -1127,6 +1729,17 @@ def run_cobol_coverage(
     if store_path is None:
         store_path = tmpdir / f"{program.program_id}_cobol_testset.jsonl"
     store_path = Path(store_path)
+    memory_store = MemoryStore(derive_memory_dir(store_path))
+    memory_state = memory_store.load_state()
+    memory_state.meta.setdefault("program_id", program.program_id)
+    memory_state.meta.setdefault("mode", "cobol")
+    jit_inference = None
+    if llm_provider is not None:
+        jit_inference = JITValueInferenceService(
+            llm_provider,
+            llm_model,
+            cache_path=store_path.with_name(store_path.stem + "_jit_profiles.json"),
+        )
 
     # Load existing coverage
     existing_tcs, existing_paras, existing_branches = load_existing_coverage(store_path)
@@ -1174,6 +1787,28 @@ def run_cobol_coverage(
 
     tc_count = len(existing_tcs)
 
+    from .coverage_config import CoverageConfig, build_selector, build_strategies
+
+    if coverage_config is None:
+        coverage_config = CoverageConfig(default_batch_size=batch_size)
+
+    jit_cfg = getattr(coverage_config, "jit_logging", None)
+    scope_policy = str(getattr(jit_cfg, "jit_scope_policy", "target_gates_plus_slice") or "").strip().lower()
+    if scope_policy not in {"all", "target_gates_only", "target_gates_plus_slice"}:
+        scope_policy = "target_gates_plus_slice"
+    include_gates = scope_policy in {"target_gates_only", "target_gates_plus_slice"}
+    include_slice = scope_policy == "target_gates_plus_slice"
+    target_variable_allowlists = {}
+    if scope_policy != "all":
+        target_variable_allowlists = _build_target_variable_allowlists(
+            module,
+            context.branch_meta,
+            gating_conds,
+            stub_mapping,
+            include_gates=include_gates,
+            include_slice=include_slice,
+        )
+
     # --- BUILD STRATEGY CONTEXT ---
     ctx = StrategyContext(
         module=module,
@@ -1193,17 +1828,33 @@ def run_cobol_coverage(
         cobol_source_path=Path(cobol_source),
         llm_provider=llm_provider,
         llm_model=llm_model,
+        jit_inference=jit_inference,
+        paragraph_comments=paragraph_comments,
         siblings_88=siblings_88,
         flag_88_added=flag_88_added,
+        payload_candidates=payload_candidates,
+        target_variable_allowlists=target_variable_allowlists,
+        memory_store=memory_store,
+        memory_state=memory_state,
     )
     setattr(ctx, "execution_timeout", max(1, int(execution_timeout)))
     setattr(ctx, "strict_branch_coverage", bool(strict_branch_coverage))
 
     # --- REGISTER STRATEGIES ---
-    from .coverage_config import CoverageConfig, build_selector, build_strategies
-
-    if coverage_config is None:
-        coverage_config = CoverageConfig(default_batch_size=batch_size)
+    if jit_inference is not None and jit_cfg is not None:
+        try:
+            jit_inference.summary_interval_sec = max(1.0, float(jit_cfg.periodic_interval_ms) / 1000.0)
+            jit_inference.summary_every_requests = max(1, int(jit_cfg.summary_every_requests))
+            jit_inference.debug_min_interval_sec = max(0.0, float(jit_cfg.debug_min_interval_ms) / 1000.0)
+            jit_inference.require_target_paragraph_context = bool(
+                getattr(jit_cfg, "require_target_paragraph_context", True)
+            )
+            if not bool(jit_cfg.enabled):
+                # Keep counters active for suffix reporting, silence periodic INFO summaries.
+                jit_inference.summary_every_requests = 10**9
+                jit_inference.summary_interval_sec = 10**9
+        except Exception as exc:
+            log.debug("Failed to apply JIT logging config: %s", exc)
 
     if coverage_config.strategies or coverage_config.rounds:
         strategies = build_strategies(coverage_config, llm_provider, llm_model)
@@ -1211,6 +1862,7 @@ def run_cobol_coverage(
         strategies: list[Strategy] = [
             BaselineStrategy(),
             DirectParagraphStrategy(),
+            TranscriptSearchStrategy(),
             CorpusFuzzStrategy(),
             FaultInjectionStrategy(),
         ]
@@ -1268,6 +1920,7 @@ def _run_agentic_loop(
     round_num = 0
     strict_mode = bool(getattr(ctx, "strict_branch_coverage", False))
     strict_case_cap = 3
+    jit_logs_enabled = bool(getattr(config, "jit_logging", None).enabled) if getattr(config, "jit_logging", None) else True
     strict_strategy_order = [
         "baseline",
         "fault_injection",
@@ -1309,10 +1962,26 @@ def _run_agentic_loop(
         # Mode 3: Selector-driven (default)
         if strategy is None:
             strategy, batch_size = selector.select(strategies, cov, round_num)
-        round_new = 0
-        round_cov_before = len(cov.paragraphs_hit) + len(cov.branches_hit)
 
-        log.info("Round %d: %s (batch=%d)", round_num, strategy.name, batch_size)
+        preferred_target = _select_priority_branch_target(ctx, cov)
+        setattr(ctx, "preferred_target_key", preferred_target)
+        if preferred_target:
+            status = getattr(getattr(ctx, "memory_state", None), "targets", {}).get(preferred_target)
+            attempts = int(getattr(status, "attempts", 0) or 0) if status else 0
+            log.debug("Round %d preferred branch target: %s (attempts=%d)", round_num, preferred_target, attempts)
+
+        round_new = 0
+        para_before = len(cov.paragraphs_hit)
+        counted_before = len(_counted_branches_for_mode(cov.branches_hit, ctx.context is not None))
+        round_cov_before = len(cov.paragraphs_hit) + counted_before
+
+        log.info(
+            "Round %d: %s (batch=%d)%s",
+            round_num,
+            strategy.name,
+            batch_size,
+            _jit_status_suffix(ctx, enabled=jit_logs_enabled),
+        )
 
         cases_tried = 0
         for input_state, stubs, defaults, target in strategy.generate_cases(ctx, cov, batch_size):
@@ -1332,10 +2001,12 @@ def _run_agentic_loop(
             cases_tried += 1
 
             if cases_tried % 200 == 0:
-                log.info("  %s progress: %d cases tried, %d/%d paras, %d/%d branches",
+                counted_now = len(_counted_branches_for_mode(cov.branches_hit, ctx.context is not None))
+                log.info("  %s progress: %d cases tried, %d/%d paras, %d/%d branches%s",
                          strategy.name, cases_tried,
                          len(cov.paragraphs_hit), cov.total_paragraphs,
-                         len(cov.branches_hit), cov.total_branches)
+                         counted_now, cov.total_branches,
+                         _jit_status_suffix(ctx, enabled=jit_logs_enabled))
 
             if cov.consecutive_timeouts >= 5:
                 log.info(
@@ -1370,7 +2041,11 @@ def _run_agentic_loop(
                 break
 
         # Record yield for this strategy
-        round_cov_after = len(cov.paragraphs_hit) + len(cov.branches_hit)
+        counted_after = len(_counted_branches_for_mode(cov.branches_hit, ctx.context is not None))
+        para_after = len(cov.paragraphs_hit)
+        round_cov_after = len(cov.paragraphs_hit) + counted_after
+        para_delta = para_after - para_before
+        branch_delta = counted_after - counted_before
         new_coverage = round_cov_after - round_cov_before
 
         sy = cov.strategy_yields.setdefault(strategy.name, StrategyYield())
@@ -1380,10 +2055,20 @@ def _run_agentic_loop(
         if new_coverage > 0:
             sy.last_yield_round = round_num
 
-        log.info("Round %d done: %s -> %d new TCs, +%d coverage (%d/%d paras, %d/%d branches)",
-                 round_num, strategy.name, round_new, new_coverage,
-                 len(cov.paragraphs_hit), cov.total_paragraphs,
-                 len(cov.branches_hit), cov.total_branches)
+        log.info(
+            "Round %d done: %s -> %d new TCs, +%d paras, +%d branches (+%d coverage) (%d/%d paras, %d/%d branches)%s",
+            round_num,
+            strategy.name,
+            round_new,
+            para_delta,
+            branch_delta,
+            new_coverage,
+            len(cov.paragraphs_hit),
+            cov.total_paragraphs,
+            counted_after,
+            cov.total_branches,
+            _jit_status_suffix(ctx, enabled=jit_logs_enabled),
+        )
 
         # Update adaptive LLM strategy tracking
         if hasattr(strategy, '_consecutive_dry'):
@@ -1413,13 +2098,28 @@ def _run_agentic_loop(
                 )
                 break
 
+        _sync_memory_runtime_state(ctx, cov)
+        memory_store = getattr(ctx, "memory_store", None)
+        memory_state = getattr(ctx, "memory_state", None)
+        if memory_store is not None and memory_state is not None:
+            try:
+                memory_store.checkpoint(
+                    memory_state,
+                    round_num=round_num,
+                    tc_count=tc_count,
+                    extra_meta={
+                        "paragraphs_hit": len(cov.paragraphs_hit),
+                        "branches_hit": counted_after,
+                    },
+                )
+            except Exception as exc:
+                log.debug("Memory checkpoint failed: %s", exc)
+
         # Early termination conditions
         full_para = (cov.total_paragraphs > 0
                      and len(cov.paragraphs_hit) >= cov.total_paragraphs)
         # Only count COBOL-validated branches (exclude py: prefixed)
-        cobol_branches_hit = sum(
-            1 for b in cov.branches_hit if not b.startswith("py:")
-        )
+        cobol_branches_hit = len(_counted_branches_for_mode(cov.branches_hit, True))
         full_branch = (cov.total_branches > 0
                        and cobol_branches_hit >= cov.total_branches)
         if full_para and full_branch:
@@ -1450,15 +2150,33 @@ def _run_agentic_loop(
     # In COBOL mode, only count COBOL branches (not py:-prefixed Python ones).
     # In Python-only mode (ctx.context is None), all branches count.
     if ctx.context is not None:
-        counted_branches = {b for b in cov.branches_hit if not b.startswith("py:")}
+        counted_branches = _counted_branches_for_mode(cov.branches_hit, True)
     else:
-        counted_branches = cov.branches_hit
+        counted_branches = _counted_branches_for_mode(cov.branches_hit, False)
     report.branches_hit = len(counted_branches)
     report.elapsed_seconds = elapsed
     if cov.total_paragraphs > 0:
         report.paragraph_coverage = len(cov.paragraphs_hit) / cov.total_paragraphs
     if cov.total_branches > 0:
         report.branch_coverage = len(counted_branches) / cov.total_branches
+
+    _sync_memory_runtime_state(ctx, cov)
+    memory_store = getattr(ctx, "memory_store", None)
+    memory_state = getattr(ctx, "memory_state", None)
+    if memory_store is not None and memory_state is not None:
+        try:
+            memory_store.checkpoint(
+                memory_state,
+                round_num=round_num,
+                tc_count=tc_count,
+                extra_meta={
+                    "completed": True,
+                    "paragraph_coverage": report.paragraph_coverage,
+                    "branch_coverage": report.branch_coverage,
+                },
+            )
+        except Exception as exc:
+            log.debug("Final memory checkpoint failed: %s", exc)
 
     log.info("Coverage complete: %s", report.summary())
     return report
@@ -1504,6 +2222,15 @@ def run_coverage(
     call_graph = build_static_call_graph(program)
     gating_conds = extract_gating_conditions(program, call_graph)
     stub_mapping = extract_stub_status_mapping(program, var_report)
+    paragraph_comments: dict[str, list[str]] = {}
+    if cobol_source_path and Path(cobol_source_path).exists():
+        try:
+            paragraph_comments = extract_paragraph_comments(
+                program,
+                Path(cobol_source_path).read_text(errors="replace").splitlines(),
+            )
+        except Exception as exc:
+            log.debug("Failed to extract paragraph comments: %s", exc)
     seq_gates = extract_sequential_gates(program)
     if seq_gates:
         gating_conds = augment_gating_with_sequential_gates(
@@ -1538,6 +2265,10 @@ def run_coverage(
     if store_path is None:
         store_path = tmpdir / f"{program.program_id}_testset.jsonl"
     store_path = Path(store_path)
+    memory_store = MemoryStore(derive_memory_dir(store_path))
+    memory_state = memory_store.load_state()
+    memory_state.meta.setdefault("program_id", program.program_id)
+    memory_state.meta.setdefault("mode", "python")
 
     # Load existing coverage
     existing_tcs, existing_paras, existing_branches = load_existing_coverage(store_path)
@@ -1729,8 +2460,13 @@ def run_coverage(
         cobol_source_path=cobol_source_path,
         llm_provider=llm_provider,
         llm_model=llm_model,
+        jit_inference=None,
+        paragraph_comments=paragraph_comments,
         siblings_88=siblings_88,
         flag_88_added=flag_88_added,
+        payload_candidates={},
+        memory_store=memory_store,
+        memory_state=memory_state,
     )
 
     # --- REGISTER STRATEGIES ---
@@ -1745,6 +2481,7 @@ def run_coverage(
         strategies: list[Strategy] = [
             BaselineStrategy(),
             DirectParagraphStrategy(),
+            TranscriptSearchStrategy(),
             CorpusFuzzStrategy(),
             FaultInjectionStrategy(),
         ]

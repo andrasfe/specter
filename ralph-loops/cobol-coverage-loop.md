@@ -3,11 +3,11 @@
 ## Variables — EDIT THESE BEFORE LAUNCHING
 
 ```
-PROGRAM_ID       = CBPAUP0C
-AST_FILE         = /tmp/CBPAUP0C.ast
-COBOL_SOURCE     = /Users/andraslferenczi/war_rig/aws-mainframe-modernization-carddemo/app/app-authorization-ims-db2-mq/cbl/CBPAUP0C.cbl
-COPYBOOK_DIRS    = /Users/andraslferenczi/war_rig/aws-mainframe-modernization-carddemo/app/app-authorization-ims-db2-mq/cpy /Users/andraslferenczi/war_rig/aws-mainframe-modernization-carddemo/app/cpy
-TEST_STORE       = /tmp/specter_cov/CBPAUP0C_testset.jsonl
+PROGRAM_ID       = <program-id>
+AST_FILE         = /tmp/<program-id>.ast
+COBOL_SOURCE     = <path-to-source>.cbl
+COPYBOOK_DIRS    = <copybook-dir-1> <copybook-dir-2>
+TEST_STORE       = /tmp/specter_cov/<program-id>_testset.jsonl
 COVERAGE_BUDGET  = 5000
 COVERAGE_TIMEOUT = 300
 BATCH_SIZE       = 500
@@ -27,20 +27,15 @@ On each iteration, execute these steps in order:
 
 ### 1. Generate AST if missing
 
-Check if AST_FILE exists. If not:
-
-```bash
-cd ~/war_rig && uv run cobalt \
-  COBOL_SOURCE \
-  --copybook-dir <each dir from COPYBOOK_DIRS> \
-  -o AST_FILE
-```
+Check if AST_FILE exists. If not, generate it with your COBOL parser (e.g.
+cobalt) using COBOL_SOURCE and each directory from COPYBOOK_DIRS, writing the
+output to AST_FILE.
 
 ### 2. Clear previous test store and run coverage
 
 ```bash
 rm -f TEST_STORE
-cd ~/specter && python3 -m specter AST_FILE --cobol-coverage \
+python3 -m specter AST_FILE --cobol-coverage \
   --cobol-source COBOL_SOURCE \
   --copybook-dir <each dir from COPYBOOK_DIRS> \
   --test-store TEST_STORE \
@@ -115,7 +110,8 @@ Key files to investigate and modify (in ~/specter/specter/):
   return codes from EXEC/CALL stubs.
 
 - **Checkpoint/frequency branches:** Counters must exceed threshold values.
-  Check that the synthesis engine tries values above P-CHKP-FREQ / P-CHKP-DIS-FREQ.
+  Check that the synthesis engine tries values above the relevant checkpoint
+  frequency variables defined in working storage.
 
 ### 7. Run unit tests
 
@@ -139,54 +135,3 @@ Fixes: <brief description of what was changed>"
 
 Go back to step 2.
 
----
-
-## Program Structure: CBPAUP0C
-
-```
-MAIN-PARA
-  -> 1000-INITIALIZE / 1000-EXIT
-     - ACCEPT date, params
-     - Validate P-EXPIRY-DAYS (numeric check)
-     - Default P-CHKP-FREQ, P-CHKP-DIS-FREQ, P-DEBUG-FLAG
-  -> 2000-FIND-NEXT-AUTH-SUMMARY / 2000-EXIT  [loop entry]
-     - DLI GN PAUTSUM0
-     - EVALUATE DIBSTAT: '  ' / 'GB' / OTHER
-  -> LOOP UNTIL ERR-FLG-ON OR END-OF-AUTHDB:
-     -> 3000-FIND-NEXT-AUTH-DTL / 3000-EXIT
-        - DLI GNP PAUTDTL1
-        - EVALUATE DIBSTAT: '  ' / 'GE','GB' / OTHER
-     -> INNER LOOP UNTIL NO-MORE-AUTHS:
-        -> 4000-CHECK-IF-EXPIRED / 4000-EXIT
-           - COMPUTE day difference
-           - IF expired: approved vs declined path
-           - ELSE: not qualified
-        -> IF QUALIFIED-FOR-DELETE:
-           -> 5000-DELETE-AUTH-DTL / 5000-EXIT
-              - DLI DLET PAUTDTL1
-              - IF DIBSTAT = SPACES vs error
-        -> 3000-FIND-NEXT-AUTH-DTL (next iteration)
-     -> IF PA-APPROVED-AUTH-CNT <= 0 AND PA-APPROVED-AUTH-CNT <= 0:
-        -> 6000-DELETE-AUTH-SUMMARY / 6000-EXIT
-           - DLI DLET PAUTSUM0
-           - IF DIBSTAT = SPACES vs error
-     -> IF WS-AUTH-SMRY-PROC-CNT > P-CHKP-FREQ:
-        -> 9000-TAKE-CHECKPOINT / 9000-EXIT
-           - DLI CHKP
-           - IF DIBSTAT = SPACES:
-              - IF WS-NO-CHKP >= P-CHKP-DIS-FREQ: display
-           - ELSE: error -> 9999-ABEND
-     -> 2000-FIND-NEXT-AUTH-SUMMARY (next iteration)
-  -> 9000-TAKE-CHECKPOINT (final)
-  -> GOBACK
-
-  9999-ABEND / 9999-EXIT
-     - MOVE 16 TO RETURN-CODE, GOBACK
-```
-
-**17 paragraphs, 41 branch probes**
-
-Baseline: 12/17 paragraphs (70.6%), 12/41 branches (29.3%)
-
-Missing at baseline: likely 5000-DELETE-AUTH-DTL, 6000-DELETE-AUTH-SUMMARY,
-9000-TAKE-CHECKPOINT, and several branch arms in EVALUATE/IF blocks.

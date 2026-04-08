@@ -21,6 +21,7 @@ from specter.llm_fuzzer import (
     record_strategy_result,
     should_consult_llm,
 )
+from specter.variable_domain import VariableDomain
 from specter.variable_extractor import VariableInfo, VariableReport
 
 
@@ -274,6 +275,55 @@ class TestApplyStrategyToState(unittest.TestCase):
         state = apply_strategy_to_state(decision, {}, var_report, memory, rng)
         # Should use LLM-suggested values or condition literals
         self.assertIn(state.get("WS-CODE"), ["X", "Y"])
+
+    def test_random_exploration_uses_jit_inference_when_available(self):
+        import random
+
+        class StubJITInference:
+            def __init__(self):
+                self.calls = 0
+
+            def generate_value(self, var_name, domain, strategy, rng, **kwargs):
+                self.calls += 1
+                return "CA"
+
+            def infer_profile(self, var_name, domain, **kwargs):
+                return SemanticProfile(
+                    variable=var_name,
+                    data_type="text",
+                    description="State code",
+                    valid_values=["CA", "NY"],
+                )
+
+        memory = SessionMemory()
+        var_report = _make_var_report({
+            "WS-STATE": VariableInfo(name="WS-STATE", classification="input"),
+        })
+        decision = StrategyDecision(strategy="random_exploration")
+        rng = random.Random(42)
+        jit = StubJITInference()
+        domains = {
+            "WS-STATE": VariableDomain(
+                name="WS-STATE",
+                classification="input",
+                data_type="alpha",
+                max_length=2,
+            ),
+        }
+
+        state = apply_strategy_to_state(
+            decision,
+            {},
+            var_report,
+            memory,
+            rng,
+            jit_inference=jit,
+            domains=domains,
+        )
+
+        self.assertEqual(state["WS-STATE"], "CA")
+        self.assertIn("WS-STATE", memory.semantic_profiles)
+        self.assertGreaterEqual(jit.calls, 1)
 
 
 class TestSessionMemory(unittest.TestCase):
