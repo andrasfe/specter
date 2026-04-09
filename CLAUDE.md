@@ -76,6 +76,8 @@ No dependencies beyond Python 3.9+ stdlib for core functionality. Optional: `z3-
 
 - **`coverage_bundle.py`** — Portable coverage bundle export/import. `export_bundle()` compiles COBOL, extracts all metadata, queries LLM for per-variable hints and business scenarios, packages as binary + `coverage-spec.yaml`. `run_bundle()` loads spec + binary and runs coverage without AST/source/copybooks. Spec format is YAML, human-editable.
 
+- **`uncovered_report.py`** — Post-run diagnostic report. Writes `<store_stem>.uncovered.json` + `.uncovered.md` next to the test store when `_run_agentic_loop` finishes. Per uncovered branch direction captures: condition text (scanned from `.mock.cbl`), source line, condition category (file_status / 88_level / compound / numeric / etc.), variable dependencies with their classification and literals, 88-level parent lookup, reconstructed attempt counts by strategy, the nearest-hit test case, and heuristic next-step hints. Disabled with `--uncovered-report off` or `SPECTER_UNCOVERED_REPORT=off`. Defensive: any internal failure is logged, never aborts the coverage loop.
+
 - **`coverage_config.py`** — Pluggable strategy configuration. `CoverageConfig` supports explicit round sequences or selector-driven mode. `SeedConfig` for LLM seed generation parameters. `ValidationConfig` for auto-validation against COBOL. `JITLoggingConfig` controls JIT observability and `jit_scope_policy` (`all` / `target_gates_only` / `target_gates_plus_slice`). `load_config()` reads YAML (or JSON fallback).
 
 - **`cobol_validate.py`** — Two-pass COBOL validation. `validate_store()` compiles COBOL once, runs each test case from a `.jsonl` store through the binary, outputs a `.validated.jsonl` with only confirmed coverage.

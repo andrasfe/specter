@@ -2406,6 +2406,51 @@ def _run_agentic_loop(
         except Exception as exc:
             log.debug("Final memory checkpoint failed: %s", exc)
 
+    # --- Uncovered-branch diagnostic report ---
+    # Produces two sibling files next to the test store with a per-
+    # branch breakdown of what is still uncovered, what was tried, and
+    # what a reviewer should look at next. Controlled by the
+    # ``uncovered_report_path`` attribute that the CLI sets on ctx
+    # (or SPECTER_UNCOVERED_REPORT env var for programmatic runs).
+    # When neither is set, the default is to write next to the test
+    # store stem as ``<stem>.uncovered.json`` + ``<stem>.uncovered.md``.
+    # The helper is defensive and never aborts the coverage loop on
+    # its own failure — worst case, the files are missing and a
+    # warning is logged.
+    try:
+        from .uncovered_report import generate_uncovered_report
+        report_stem_raw = getattr(ctx, "uncovered_report_path", None)
+        if report_stem_raw is None:
+            report_stem_raw = os.environ.get("SPECTER_UNCOVERED_REPORT")
+        if report_stem_raw is None:
+            store = getattr(ctx, "store_path", None)
+            report_stem = Path(store) if store else None
+        elif str(report_stem_raw).strip().lower() in ("", "off", "false", "0", "none"):
+            report_stem = None
+        else:
+            report_stem = Path(report_stem_raw)
+
+        if report_stem is not None:
+            mock_src = None
+            cobol_ctx = getattr(ctx, "context", None)
+            if cobol_ctx is not None:
+                candidate = getattr(cobol_ctx, "instrumented_source_path", None)
+                if candidate:
+                    mock_src = Path(candidate)
+            generate_uncovered_report(
+                ctx=ctx,
+                cov=cov,
+                report=report,
+                program_id=getattr(
+                    getattr(ctx, "program", None), "program_id", "",
+                ) or "UNKNOWN",
+                mock_source_path=mock_src,
+                out_path_stem=report_stem,
+                format="both",
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Uncovered-branch report skipped: %s", exc)
+
     log.info("Coverage complete: %s", report.summary())
     return report
 

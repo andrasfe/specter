@@ -457,6 +457,24 @@ Semantic value generation inside baseline, direct-paragraph, and transcript-driv
 
 **`prepare_program_analysis(program, cobol_source, ...)`** (L103): Structured JSON per paragraph (comments, calls, stub ops, gating conditions, branch count). No LLM calls.
 
+### `specter/uncovered_report.py` — Post-run diagnostic report (~700 lines)
+
+Produces per-branch diagnostics for everything the coverage loop failed to hit, written next to the test store as `<stem>.uncovered.json` (tooling) and `<stem>.uncovered.md` (human review). Runs automatically at the end of `_run_agentic_loop`; can be disabled with `--uncovered-report off` or the `SPECTER_UNCOVERED_REPORT` env var.
+
+**`generate_uncovered_report(ctx, cov, report, program_id, mock_source_path, out_path_stem, format)`** — public entry. Defensive: on any internal failure it logs a warning and returns an empty report so the main coverage loop is never blocked.
+
+Per uncovered branch direction, the report captures:
+- **Identity**: branch id, direction (T/F), paragraph, source file + line
+- **Condition**: raw text (extracted from the instrumented `.mock.cbl` via `_extract_branch_conditions`) and a category label (`file_status_eq`, `status_flag_88`, `compound_and_or`, `numeric_cmp`, `not_numeric`, `string_eq`, `evaluate_when`, `evaluate_head`, `loop_until`, `other`, `unknown`)
+- **Variable dependencies**: variables referenced in the condition, their classification (`input`/`internal`/`status`/`flag`), harvested `condition_literals`, `valid_88_values`, and whether each is a stub-return variable (with the op key)
+- **88-level parent lookup**: when the condition variable is itself an 88-level child (e.g. `IF APPL-EOF`), a reverse-map entry `{'APPL-EOF': ('APPL-RESULT', 16)}` so the hint generator can point at the parent variable and activating value directly
+- **Reachability**: gating conditions on the enclosing paragraph (from `extract_gating_conditions`)
+- **Attempts**: reconstructed from the saved test-case list by matching (a) direct bid references in the `target` string (strong signal) and (b) paragraph hits (weaker). Counts are grouped by strategy
+- **Nearest hit**: the test case that came closest to the target branch — picked by "reaches the target paragraph AND covers the most nearby bids". Includes its `input_state`, `stub_outcomes`, and the originating strategy
+- **Hints**: heuristic next-step suggestions generated from the condition category (e.g. *"Needs file-status '22' on CARDFILE-STATUS. Verify FaultInjectionStrategy emits a `fault:READ:CARDFILE-FILE=22` case"*, or *"APPL-EOF is an 88-level flag child of APPL-RESULT. Set APPL-RESULT=16 in input_state to activate it"*)
+
+The Markdown companion groups entries by paragraph and leads with a category summary + top-paragraphs table so a reviewer can spot patterns at a glance.
+
 ### `specter/coverage_bundle.py` — Portable Bundle (~1100 lines)
 
 **`export_bundle(ast_source, cobol_source, ...)`** (L194): Export binary + `coverage-spec.yaml`. Optional LLM enrichment and obfuscation.

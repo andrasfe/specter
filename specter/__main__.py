@@ -186,6 +186,14 @@ def main(argv: list[str] | None = None) -> int:
               "SPECTER_LLM_REVIEW=0)."),
     )
     parser.add_argument(
+        "--uncovered-report",
+        metavar="PATH",
+        help=("Base path for the post-run uncovered-branch diagnostic "
+              "report. Writes <path>.uncovered.json + "
+              "<path>.uncovered.md next to the given stem. Defaults to "
+              "the test store stem. Pass 'off' to disable."),
+    )
+    parser.add_argument(
         "--concolic",
         action="store_true",
         help="Use Z3 concolic engine to solve for uncovered branches (requires z3-solver, implies --guided)",
@@ -361,6 +369,13 @@ def main(argv: list[str] | None = None) -> int:
     # set when the user passed the CLI flag.
     if args.no_llm_review:
         os.environ["SPECTER_LLM_REVIEW"] = "0"
+
+    # --uncovered-report: base path for the post-run diagnostic report.
+    # Read by cobol_coverage._run_agentic_loop finalization via the
+    # SPECTER_UNCOVERED_REPORT env var. When not set on the CLI, the
+    # default is to write next to the test store stem.
+    if args.uncovered_report:
+        os.environ["SPECTER_UNCOVERED_REPORT"] = args.uncovered_report
 
     # --extract-tests: standalone operation, no AST needed
     if args.extract_tests:
