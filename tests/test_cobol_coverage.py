@@ -1802,6 +1802,211 @@ class TestHeuristicSelector:
 
 
 # ---------------------------------------------------------------------------
+# T2-B: Concolic escalation hook
+# ---------------------------------------------------------------------------
+
+class TestCobolBranchesToIntSet:
+    """_cobol_branches_to_int_set converts '42:T' → 42, '42:F' → -42."""
+
+    def test_empty_set(self):
+        from specter.cobol_coverage import _cobol_branches_to_int_set
+        assert _cobol_branches_to_int_set(set()) == set()
+
+    def test_true_direction_is_positive(self):
+        from specter.cobol_coverage import _cobol_branches_to_int_set
+        assert _cobol_branches_to_int_set({"42:T"}) == {42}
+
+    def test_false_direction_is_negative(self):
+        from specter.cobol_coverage import _cobol_branches_to_int_set
+        assert _cobol_branches_to_int_set({"42:F"}) == {-42}
+
+    def test_both_directions(self):
+        from specter.cobol_coverage import _cobol_branches_to_int_set
+        assert _cobol_branches_to_int_set({"42:T", "42:F"}) == {42, -42}
+
+    def test_multiple_ids(self):
+        from specter.cobol_coverage import _cobol_branches_to_int_set
+        assert _cobol_branches_to_int_set({"1:T", "2:F", "3:T"}) == {1, -2, 3}
+
+    def test_evaluate_when_markers_skipped(self):
+        """EVALUATE WHEN-arm markers like '42:W1' don't parse as T/F."""
+        from specter.cobol_coverage import _cobol_branches_to_int_set
+        assert _cobol_branches_to_int_set({"42:T", "42:W1", "42:W2"}) == {42}
+
+    def test_malformed_entries_ignored(self):
+        from specter.cobol_coverage import _cobol_branches_to_int_set
+        assert _cobol_branches_to_int_set({"notanumber:T", "42"}) == set()
+
+
+class TestConcolicEscalationHook:
+    """_run_concolic_escalation wires the Z3 solver into the COBOL loop.
+
+    The solver itself lives in specter/concolic.py and is mocked here —
+    we only verify that the wiring passes the right state in and fans
+    solutions through _execute_and_save.
+    """
+
+    def _make_ctx_cov(self, branches_hit=None, test_cases=None, branch_meta=None):
+        from specter.coverage_strategies import StrategyContext
+        from specter.cobol_coverage import CoverageState
+        from specter.variable_extractor import VariableReport
+        import random
+
+        module = type("M", (), {"_default_state": staticmethod(lambda: {}),
+                                 "run": staticmethod(lambda s: s)})()
+        context_obj = type("C", (), {
+            "branch_meta": branch_meta or {42: {"paragraph": "P1", "condition": "X = 1"}},
+            "total_paragraphs": 5, "total_branches": 10,
+        })()
+        report = VariableReport()
+        call_graph = type("G", (), {"edges": {}, "reverse_edges": {},
+                                     "entry": "MAIN", "all_paragraphs": {"MAIN"}})()
+        ctx = StrategyContext(
+            module=module, context=context_obj, domains={},
+            stub_mapping={"READ:F": ["STATUS"]}, call_graph=call_graph,
+            gating_conds={}, var_report=report,
+            program=type("P", (), {"program_id": "T", "paragraphs": []})(),
+            all_paragraphs={"MAIN"},
+            success_stubs={}, success_defaults={},
+            rng=random.Random(42),
+            store_path=Path("/tmp/x.jsonl"),
+        )
+        # Expose branch_meta at the top level where _run_concolic_escalation reads it.
+        ctx.branch_meta = context_obj.branch_meta
+        cov = CoverageState(
+            total_paragraphs=5, total_branches=10,
+            all_paragraphs={"MAIN"}, _stub_mapping={"READ:F": ["STATUS"]},
+            branches_hit=branches_hit or {"42:T"},
+            test_cases=test_cases or [],
+        )
+        return ctx, cov
+
+    def test_no_branch_meta_returns_zero(self):
+        from specter.cobol_coverage import _run_concolic_escalation, CobolCoverageReport
+
+        ctx, cov = self._make_ctx_cov(branch_meta={})
+        ctx.branch_meta = {}
+        report = CobolCoverageReport()
+        n_exec, n_new = _run_concolic_escalation(ctx, cov, report, 0, trigger_idx=1)
+        assert n_exec == 0
+        assert n_new == 0
+
+    def test_empty_solutions_returns_zero(self):
+        """When the solver returns [], the escalation is a clean no-op."""
+        from unittest.mock import patch
+        from specter.cobol_coverage import _run_concolic_escalation, CobolCoverageReport
+
+        ctx, cov = self._make_ctx_cov()
+        report = CobolCoverageReport()
+        with patch("specter.concolic.solve_for_uncovered_branches", return_value=[]):
+            n_exec, n_new = _run_concolic_escalation(ctx, cov, report, 0, trigger_idx=1)
+        assert n_exec == 0
+        assert n_new == 0
+
+    def test_solutions_fed_through_execute_and_save(self):
+        """Each solution gets executed via _execute_and_save."""
+        from unittest.mock import patch
+        from specter.cobol_coverage import _run_concolic_escalation, CobolCoverageReport
+        from specter.concolic import ConcolicSolution
+
+        ctx, cov = self._make_ctx_cov()
+        report = CobolCoverageReport()
+        solutions = [
+            ConcolicSolution(
+                branch_id=42,
+                assignments={"X": 1},
+                stub_outcomes={"READ:F": [[("STATUS", "00")]]},
+            ),
+            ConcolicSolution(
+                branch_id=-42,
+                assignments={"X": 2},
+                stub_outcomes={},
+            ),
+        ]
+
+        # Intercept _execute_and_save to see that it was called with the
+        # right arguments. It has to return (bool, int) per its contract.
+        calls = []
+        def _fake_execute(ctx, cov, input_state, stub_outcomes,
+                          stub_defaults, strategy_name, target, report, tc_count):
+            calls.append((input_state, stub_outcomes, strategy_name, target))
+            return (True, tc_count + 1)
+
+        with patch("specter.concolic.solve_for_uncovered_branches", return_value=solutions), \
+             patch("specter.cobol_coverage._execute_and_save", side_effect=_fake_execute):
+            n_exec, _n_new = _run_concolic_escalation(
+                ctx, cov, report, 0, trigger_idx=1,
+            )
+        assert n_exec == 2
+        # First call: solution 0, target 'concolic:42', strategy 'concolic'
+        assert calls[0][0] == {"X": 1}
+        assert calls[0][1] == {"READ:F": [[("STATUS", "00")]]}
+        assert calls[0][2] == "concolic"
+        assert calls[0][3] == "concolic:42"
+        assert calls[1][3] == "concolic:-42"
+
+    def test_solver_exception_caught(self):
+        """An exception from the solver must not escape the escalation."""
+        from unittest.mock import patch
+        from specter.cobol_coverage import _run_concolic_escalation, CobolCoverageReport
+
+        ctx, cov = self._make_ctx_cov()
+        report = CobolCoverageReport()
+
+        def _boom(*a, **kw):
+            raise RuntimeError("z3 exploded")
+
+        with patch("specter.concolic.solve_for_uncovered_branches", side_effect=_boom):
+            n_exec, n_new = _run_concolic_escalation(
+                ctx, cov, report, 0, trigger_idx=1,
+            )
+        assert n_exec == 0
+        assert n_new == 0
+
+    def test_individual_solution_exception_skipped(self):
+        """A failure in one solution's execution must not abort the batch."""
+        from unittest.mock import patch
+        from specter.cobol_coverage import _run_concolic_escalation, CobolCoverageReport
+        from specter.concolic import ConcolicSolution
+
+        ctx, cov = self._make_ctx_cov()
+        report = CobolCoverageReport()
+        solutions = [
+            ConcolicSolution(branch_id=1, assignments={"X": 1}, stub_outcomes={}),
+            ConcolicSolution(branch_id=2, assignments={"X": 2}, stub_outcomes={}),
+            ConcolicSolution(branch_id=3, assignments={"X": 3}, stub_outcomes={}),
+        ]
+        call_count = [0]
+        def _maybe_fail(ctx, cov, input_state, *a, **kw):
+            call_count[0] += 1
+            if call_count[0] == 2:
+                raise RuntimeError("flaky executor")
+            return (True, 0)
+
+        with patch("specter.concolic.solve_for_uncovered_branches", return_value=solutions), \
+             patch("specter.cobol_coverage._execute_and_save", side_effect=_maybe_fail):
+            n_exec, _ = _run_concolic_escalation(
+                ctx, cov, report, 0, trigger_idx=1,
+            )
+        # Two of three should have run successfully — the middle one
+        # raised and was skipped.
+        assert n_exec == 2
+
+    def test_empty_test_cases_ok(self):
+        """A fresh run with no test cases yet must not crash."""
+        from unittest.mock import patch
+        from specter.cobol_coverage import _run_concolic_escalation, CobolCoverageReport
+
+        ctx, cov = self._make_ctx_cov(test_cases=[])
+        report = CobolCoverageReport()
+        with patch("specter.concolic.solve_for_uncovered_branches", return_value=[]):
+            n_exec, n_new = _run_concolic_escalation(
+                ctx, cov, report, 0, trigger_idx=1,
+            )
+        assert n_exec == 0
+
+
+# ---------------------------------------------------------------------------
 # Integration test (requires cobc)
 # ---------------------------------------------------------------------------
 

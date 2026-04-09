@@ -13,6 +13,7 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -1144,6 +1145,175 @@ def _strict_perturb_stub_log(
 # Standalone execute-and-save
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Concolic escalation (T2-B)
+# ---------------------------------------------------------------------------
+
+# Minimum number of consecutive stale rounds before the concolic solver is
+# invoked. Matches the monte_carlo path's trigger semantics: we don't want
+# to spend Z3 time while random search is still making progress, but as
+# soon as a plateau is detected we give the solver a chance to break it.
+_CONCOLIC_STALE_TRIGGER = 3
+
+# Hard cap on the total number of concolic invocations per coverage run.
+# Each invocation calls Z3 for every half- / fully-uncovered branch in
+# the current snapshot, so even at the cap the solver sees many chances.
+_CONCOLIC_MAX_TRIGGERS = 3
+
+
+def _cobol_branches_to_int_set(branches_hit: set[str]) -> set[int]:
+    """Convert ``{"42:T", "42:F", ...}`` to ``{42, -42, ...}``.
+
+    The COBOL coverage loop tracks branches as ``"<bid>:T"`` /
+    ``"<bid>:F"`` string keys, while ``solve_for_uncovered_branches``
+    expects a ``set[int]`` with positive IDs for the T direction and
+    negative IDs for the F direction. We ignore anything that doesn't
+    parse cleanly (e.g. EVALUATE WHEN-arm markers like ``"42:W1"``) so
+    the solver doesn't crash on unexpected shapes.
+    """
+    out: set[int] = set()
+    for key in branches_hit:
+        if ":" not in key:
+            continue
+        bid_str, direction = key.split(":", 1)
+        try:
+            bid = int(bid_str)
+        except ValueError:
+            continue
+        d = direction.upper()
+        if d.startswith("T"):
+            out.add(bid)
+        elif d.startswith("F"):
+            out.add(-bid)
+    return out
+
+
+@dataclass
+class _CorpusEntryShim:
+    """Lightweight corpus-entry wrapper used by the concolic escalation.
+
+    ``solve_for_uncovered_branches`` reads ``.coverage`` (set of
+    paragraph names that a corpus entry reaches) and ``.input_state``
+    (dict) from each entry to pick the best observed state for each
+    target branch. The COBOL loop stores test cases as plain dicts, so
+    we wrap them in this minimal shim on demand.
+    """
+
+    input_state: dict
+    coverage: frozenset
+
+
+def _run_concolic_escalation(
+    ctx: StrategyContext,
+    cov: CoverageState,
+    report: CobolCoverageReport,
+    tc_count: int,
+    trigger_idx: int,
+) -> tuple[int, int]:
+    """Invoke the Z3 solver against the current uncovered branches.
+
+    Returns ``(n_executed, n_new)`` — the number of concolic solutions
+    that were passed through ``_execute_and_save`` and the number that
+    actually produced new coverage. Callers use the ``n_new`` signal to
+    decide whether to reset ``stale_rounds``.
+
+    Never raises: any failure (z3 missing, solver timeout, empty
+    solution set, executor error) is logged and the escalation exits
+    cleanly so the outer loop can continue.
+    """
+    try:
+        from .concolic import solve_for_uncovered_branches
+    except ImportError:
+        log.debug("concolic engine not available")
+        return (0, 0)
+
+    branch_meta = getattr(ctx, "branch_meta", None)
+    if not branch_meta:
+        return (0, 0)
+
+    # Normalise branch_meta keys to int so the solver's
+    # ``sorted(branch_meta.keys())`` + ``abs_id`` arithmetic works.
+    # The COBOL executor sometimes hands back string keys like "42"
+    # which would crash the negate arithmetic (``-"42"``) downstream.
+    normalised_meta: dict[int, dict] = {}
+    for k, v in branch_meta.items():
+        try:
+            normalised_meta[int(k)] = v
+        except (TypeError, ValueError):
+            continue
+    if not normalised_meta:
+        log.debug("Concolic: no integer-keyed branches in branch_meta (type=%s)",
+                  type(next(iter(branch_meta))).__name__ if branch_meta else "empty")
+        return (0, 0)
+    branch_meta = normalised_meta
+
+    covered_int = _cobol_branches_to_int_set(cov.branches_hit)
+
+    # Build observed states and corpus-entry shims from the last 10
+    # saved test cases. The solver uses these to pick a realistic
+    # starting point per target branch.
+    recent = cov.test_cases[-10:] if cov.test_cases else []
+    observed_states = [tc.get("input_state", {}) for tc in recent]
+    corpus_entries: list[_CorpusEntryShim] = []
+    for tc in cov.test_cases:
+        paras = tc.get("paragraphs_covered") or tc.get("paragraphs_hit") or []
+        corpus_entries.append(
+            _CorpusEntryShim(
+                input_state=tc.get("input_state", {}),
+                coverage=frozenset(paras),
+            )
+        )
+
+    try:
+        solutions = solve_for_uncovered_branches(
+            branch_meta,
+            covered_int,
+            ctx.var_report,
+            observed_states,
+            stub_mapping=ctx.stub_mapping,
+            corpus_entries=corpus_entries,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("solve_for_uncovered_branches raised: %s", exc)
+        return (0, 0)
+
+    if not solutions:
+        log.info("Concolic escalation #%d: no solutions found", trigger_idx)
+        return (0, 0)
+
+    log.info(
+        "Concolic escalation #%d: %d solutions returned, executing ...",
+        trigger_idx, len(solutions),
+    )
+
+    paras_before = len(cov.paragraphs_hit)
+    branches_before = len(cov.branches_hit)
+
+    executed = 0
+    for sol in solutions:
+        input_state = dict(sol.assignments) if sol.assignments else {}
+        # solve_for_uncovered_branches may attach stub_outcomes to the
+        # solution when the target branch is gated on a stub-returned
+        # variable.
+        stub_outcomes = sol.stub_outcomes if sol.stub_outcomes else None
+        target = f"concolic:{sol.branch_id}"
+        try:
+            _, tc_count = _execute_and_save(
+                ctx, cov, input_state, stub_outcomes, None,
+                "concolic", target, report, tc_count,
+            )
+            executed += 1
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Concolic solution %s failed to execute: %s",
+                      sol.branch_id, exc)
+            continue
+
+    n_new_paras = len(cov.paragraphs_hit) - paras_before
+    n_new_branches = len(cov.branches_hit) - branches_before
+    n_new = n_new_paras + n_new_branches
+    return (executed, n_new)
+
+
 def _execute_and_save(
     ctx: StrategyContext,
     cov: CoverageState,
@@ -1936,6 +2106,10 @@ def _run_agentic_loop(
     explicit_idx = 0
     round_num = 0
     strict_mode = bool(getattr(ctx, "strict_branch_coverage", False))
+    # Concolic escalation state (T2-B). Counter is incremented each time
+    # the plateau hook fires; _CONCOLIC_MAX_TRIGGERS caps the total Z3
+    # invocations per run to keep wall-clock bounded.
+    _concolic_triggers_used = 0
     strict_case_cap = 3
     jit_logs_enabled = bool(getattr(config, "jit_logging", None).enabled) if getattr(config, "jit_logging", None) else True
     strict_strategy_order = [
@@ -2099,6 +2273,43 @@ def _run_agentic_loop(
             cov.stale_rounds += 1
         else:
             cov.stale_rounds = 0
+
+        # Concolic escalation on plateau (T2-B).
+        #
+        # When random + direct-paragraph + fault-injection search stalls,
+        # invoke Z3 against the remaining uncovered branches. The solver
+        # lives in specter/concolic.py and is already used by the Python-
+        # only monte_carlo path at three trigger points (:1326, :1839,
+        # :1938) — we mirror that pattern here. Solutions are heuristic
+        # because Z3 solves over the Python simulator's branch conditions,
+        # not the compiled COBOL binary, so we feed each solution through
+        # the normal _execute_and_save path and let coverage verification
+        # confirm whether the branch actually fired.
+        #
+        # Bypassed by SPECTER_CONCOLIC=0. Capped at _CONCOLIC_MAX_TRIGGERS
+        # invocations per coverage run to bound wall-clock Z3 time.
+        if (
+            cov.stale_rounds >= _CONCOLIC_STALE_TRIGGER
+            and _concolic_triggers_used < _CONCOLIC_MAX_TRIGGERS
+            and os.environ.get("SPECTER_CONCOLIC", "1").strip().lower() not in (
+                "0", "false", "no", "off", "",
+            )
+        ):
+            _concolic_triggers_used += 1
+            try:
+                n_solved, n_new = _run_concolic_escalation(
+                    ctx, cov, report, tc_count,
+                    trigger_idx=_concolic_triggers_used,
+                )
+                tc_count += n_solved
+                if n_new > 0:
+                    cov.stale_rounds = 0
+                log.info(
+                    "Concolic escalation #%d: %d solutions executed, %d added new coverage",
+                    _concolic_triggers_used, n_solved, n_new,
+                )
+            except Exception as exc:  # noqa: BLE001 - never crash the loop
+                log.warning("Concolic escalation failed: %s", exc)
 
         if strict_mode:
             stale_limit = 2
