@@ -2161,12 +2161,30 @@ def run_cobol_coverage(
     if setup_elapsed > 0.5:
         log.info("Coverage setup complete in %.1fs; starting execution loop", setup_elapsed)
 
-    return _run_agentic_loop(
-        ctx, cov, report, strategies, selector,
-        budget, timeout, loop_start_time, tc_count,
-        max_rounds=max_rounds,
-        config=coverage_config,
-    )
+    # Wrap the agentic loop so an exception propagating out of any
+    # strategy, executor call, solver, or LLM call still produces a
+    # final uncovered-branch diagnostic report on disk before the
+    # exception escalates. The inner round-boundary incremental
+    # writes fire before this as well — the try/finally only
+    # guarantees the terminal snapshot is written even on the
+    # unhappy path. Ctrl+C raises KeyboardInterrupt, which is a
+    # BaseException, so we catch BaseException here specifically
+    # (not just Exception) to cover interrupt signals.
+    try:
+        return _run_agentic_loop(
+            ctx, cov, report, strategies, selector,
+            budget, timeout, loop_start_time, tc_count,
+            max_rounds=max_rounds,
+            config=coverage_config,
+        )
+    except BaseException:
+        try:
+            _emit_uncovered_report(ctx, cov, report, reason="exception")
+        except Exception as emit_exc:  # noqa: BLE001
+            log.warning(
+                "Uncovered-branch report failed on exception path: %s", emit_exc,
+            )
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -2858,12 +2876,25 @@ def run_coverage(
     if setup_elapsed > 0.5:
         log.info("Coverage setup complete in %.1fs; starting execution loop", setup_elapsed)
 
-    cov_report = _run_agentic_loop(
-        ctx, cov, report, strategies, selector,
-        budget, timeout, loop_start_time, tc_count,
-        max_rounds=max_rounds,
-        config=coverage_config,
-    )
+    # See the matching comment at the Cobol-mode caller: an exception
+    # path through _run_agentic_loop still needs to leave a final
+    # uncovered-branch report on disk. This is the Python-only entry
+    # point; same pattern applies.
+    try:
+        cov_report = _run_agentic_loop(
+            ctx, cov, report, strategies, selector,
+            budget, timeout, loop_start_time, tc_count,
+            max_rounds=max_rounds,
+            config=coverage_config,
+        )
+    except BaseException:
+        try:
+            _emit_uncovered_report(ctx, cov, report, reason="exception")
+        except Exception as emit_exc:  # noqa: BLE001
+            log.warning(
+                "Uncovered-branch report failed on exception path: %s", emit_exc,
+            )
+        raise
 
     # Auto-validate against COBOL if configured
     val_cfg = getattr(coverage_config, "validation", None)
