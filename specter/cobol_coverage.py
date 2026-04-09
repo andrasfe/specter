@@ -1146,6 +1146,103 @@ def _strict_perturb_stub_log(
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
+# Uncovered-branch diagnostic report helper
+# ---------------------------------------------------------------------------
+
+# Minimum wall-clock interval between two incremental report writes.
+# Set low enough that round-boundary writes during a slow run (~30s/round)
+# always flush, but high enough that a fast-looping strict run doesn't
+# hammer the disk on every iteration.
+_UNCOVERED_REPORT_MIN_INTERVAL_SEC = 5.0
+
+
+def _resolve_uncovered_report_stem(ctx: StrategyContext) -> Path | None:
+    """Return the path stem the uncovered-branch report should be written to.
+
+    Priority:
+      1. ``ctx.uncovered_report_path`` (set by the caller/CLI).
+      2. ``SPECTER_UNCOVERED_REPORT`` env var.
+      3. ``ctx.store_path`` — default to writing next to the test store.
+
+    Returns ``None`` when any of the configured sources explicitly
+    disable the reporter (``"off"/"false"/"0"/"none"``) or when no
+    store path is available at all.
+    """
+    raw = getattr(ctx, "uncovered_report_path", None)
+    if raw is None:
+        raw = os.environ.get("SPECTER_UNCOVERED_REPORT")
+    if raw is None:
+        store = getattr(ctx, "store_path", None)
+        return Path(store) if store else None
+    if str(raw).strip().lower() in ("", "off", "false", "0", "none"):
+        return None
+    return Path(raw)
+
+
+def _emit_uncovered_report(
+    ctx: StrategyContext,
+    cov: CoverageState,
+    report: CobolCoverageReport,
+    *,
+    reason: str,
+) -> None:
+    """Write the uncovered-branch diagnostic report to disk.
+
+    Called both from within the round loop (as an incremental
+    snapshot so a canceled run still has a report on disk) and
+    from the loop's finalize block (to capture the terminal state).
+    Writes throttled by ``_UNCOVERED_REPORT_MIN_INTERVAL_SEC`` —
+    the ``"final"`` reason is always honoured immediately and
+    bypasses the throttle.
+
+    Defensive: any internal failure is logged at WARNING and the
+    main coverage loop continues unaffected.
+    """
+    try:
+        from .uncovered_report import generate_uncovered_report
+
+        report_stem = _resolve_uncovered_report_stem(ctx)
+        if report_stem is None:
+            return
+
+        # Throttle incremental writes so a fast strict run doesn't
+        # rewrite the files on every iteration. The final call
+        # always writes.
+        if reason != "final":
+            last_ts = getattr(ctx, "_uncovered_last_write_ts", 0.0)
+            now = time.time()
+            if now - last_ts < _UNCOVERED_REPORT_MIN_INTERVAL_SEC:
+                return
+            ctx._uncovered_last_write_ts = now
+
+        mock_src = None
+        cobol_ctx = getattr(ctx, "context", None)
+        if cobol_ctx is not None:
+            candidate = getattr(cobol_ctx, "instrumented_source_path", None)
+            if candidate:
+                mock_src = Path(candidate)
+
+        program_id = getattr(
+            getattr(ctx, "program", None), "program_id", "",
+        ) or "UNKNOWN"
+
+        generate_uncovered_report(
+            ctx=ctx,
+            cov=cov,
+            report=report,
+            program_id=program_id,
+            mock_source_path=mock_src,
+            out_path_stem=report_stem,
+            format="both",
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            "Uncovered-branch report skipped (reason=%s): %s",
+            reason, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Concolic escalation (T2-B)
 # ---------------------------------------------------------------------------
 
@@ -2368,6 +2465,28 @@ def _run_agentic_loop(
                          para_pct * 100, branch_pct * 100)
                 break
 
+        # Incremental uncovered-branch report snapshot. Writes the
+        # current state to disk next to the test store so a canceled
+        # run (Ctrl+C, SIGTERM, crash) leaves a fresh report behind.
+        # Throttled inside _emit_uncovered_report so fast rounds
+        # don't hammer the disk; the finalize-time call after the
+        # loop exits always writes the terminal state.
+        report.total_test_cases = tc_count
+        report.paragraphs_hit = len(cov.paragraphs_hit)
+        report.branches_hit = len(
+            _counted_branches_for_mode(cov.branches_hit, ctx.context is not None)
+        )
+        if cov.total_paragraphs > 0:
+            report.paragraph_coverage = (
+                len(cov.paragraphs_hit) / cov.total_paragraphs
+            )
+        if cov.total_branches > 0:
+            report.branch_coverage = (
+                report.branches_hit / cov.total_branches
+            )
+        report.elapsed_seconds = time.time() - start_time
+        _emit_uncovered_report(ctx, cov, report, reason="incremental")
+
         round_num += 1
 
     # --- FINALIZE ---
@@ -2407,49 +2526,12 @@ def _run_agentic_loop(
             log.debug("Final memory checkpoint failed: %s", exc)
 
     # --- Uncovered-branch diagnostic report ---
-    # Produces two sibling files next to the test store with a per-
-    # branch breakdown of what is still uncovered, what was tried, and
-    # what a reviewer should look at next. Controlled by the
-    # ``uncovered_report_path`` attribute that the CLI sets on ctx
-    # (or SPECTER_UNCOVERED_REPORT env var for programmatic runs).
-    # When neither is set, the default is to write next to the test
-    # store stem as ``<stem>.uncovered.json`` + ``<stem>.uncovered.md``.
-    # The helper is defensive and never aborts the coverage loop on
-    # its own failure — worst case, the files are missing and a
-    # warning is logged.
-    try:
-        from .uncovered_report import generate_uncovered_report
-        report_stem_raw = getattr(ctx, "uncovered_report_path", None)
-        if report_stem_raw is None:
-            report_stem_raw = os.environ.get("SPECTER_UNCOVERED_REPORT")
-        if report_stem_raw is None:
-            store = getattr(ctx, "store_path", None)
-            report_stem = Path(store) if store else None
-        elif str(report_stem_raw).strip().lower() in ("", "off", "false", "0", "none"):
-            report_stem = None
-        else:
-            report_stem = Path(report_stem_raw)
-
-        if report_stem is not None:
-            mock_src = None
-            cobol_ctx = getattr(ctx, "context", None)
-            if cobol_ctx is not None:
-                candidate = getattr(cobol_ctx, "instrumented_source_path", None)
-                if candidate:
-                    mock_src = Path(candidate)
-            generate_uncovered_report(
-                ctx=ctx,
-                cov=cov,
-                report=report,
-                program_id=getattr(
-                    getattr(ctx, "program", None), "program_id", "",
-                ) or "UNKNOWN",
-                mock_source_path=mock_src,
-                out_path_stem=report_stem,
-                format="both",
-            )
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Uncovered-branch report skipped: %s", exc)
+    # The helper also runs incrementally after every round (see the
+    # round-end dump inside the while-loop above), so a canceled run
+    # still has the latest snapshot on disk. This final call
+    # overwrites the last incremental snapshot with the coverage
+    # loop's terminal state.
+    _emit_uncovered_report(ctx, cov, report, reason="final")
 
     log.info("Coverage complete: %s", report.summary())
     return report

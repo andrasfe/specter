@@ -962,8 +962,11 @@ def _render_markdown(report: UncoveredReport) -> str:
                 lines.append(f"- **Nearest hit**: `{nh.strategy}` (`{nh.target}`)")
                 if preview:
                     lines.append(f"    - Input: `{preview}`")
-                if nh.stub_outcomes:
-                    stub_preview = list(nh.stub_outcomes.keys())[:4]
+                # stub_outcomes arrives as a dict in the in-memory runtime
+                # format but as a list of [op_key, outcome] pairs when it
+                # comes from a reloaded test store — handle both shapes.
+                stub_preview = _stub_op_preview(nh.stub_outcomes)
+                if stub_preview:
                     lines.append(f"    - Stub ops: `{stub_preview}`")
             if d.hints:
                 lines.append("- **Hints**:")
@@ -977,3 +980,29 @@ def _pct(num: int, denom: int) -> str:
     if not denom:
         return "n/a"
     return f"{100.0 * num / denom:.1f}%"
+
+
+def _stub_op_preview(stub_outcomes: Any, limit: int = 4) -> list[str]:
+    """Extract a short list of op-key names from a stub_outcomes value.
+
+    ``stub_outcomes`` is a ``dict[str, list]`` in the live runtime
+    (where the Strategy context builds it from scratch) but becomes a
+    ``list[[op_key, outcome], ...]`` after it round-trips through the
+    JSONL test store, because JSON has no tuple type and
+    ``test_store.TestCase`` serialises the runtime dict to a list of
+    pairs. The markdown renderer must tolerate both shapes; any
+    other shape is silently ignored.
+    """
+    if not stub_outcomes:
+        return []
+    if isinstance(stub_outcomes, dict):
+        return list(stub_outcomes.keys())[:limit]
+    if isinstance(stub_outcomes, (list, tuple)):
+        out: list[str] = []
+        for entry in stub_outcomes:
+            if isinstance(entry, (list, tuple)) and entry:
+                out.append(str(entry[0]))
+            if len(out) >= limit:
+                break
+        return out
+    return []

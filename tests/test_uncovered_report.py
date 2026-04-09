@@ -451,6 +451,56 @@ class TestGenerateUncoveredReport(unittest.TestCase):
             self.assertEqual(entry["condition_category"], "file_status_eq")
             self.assertIn("WS-STATUS", entry["condition_vars"])
 
+    def test_markdown_handles_list_form_stub_outcomes(self):
+        """Regression: reloaded test stores expose stub_outcomes as a
+        list of [op_key, outcome] pairs, not as a dict. The markdown
+        renderer must accept both shapes without crashing."""
+        from specter.uncovered_report import _render_markdown, _stub_op_preview
+
+        # dict form
+        self.assertEqual(
+            _stub_op_preview({"READ:F": [("X", "00")], "OPEN:F": []}),
+            ["READ:F", "OPEN:F"],
+        )
+        # list form (reloaded test store)
+        self.assertEqual(
+            _stub_op_preview([["READ:F", [("X", "00")]], ["OPEN:F", []]]),
+            ["READ:F", "OPEN:F"],
+        )
+        # truncated
+        self.assertEqual(
+            _stub_op_preview([["A", []], ["B", []], ["C", []]], limit=2),
+            ["A", "B"],
+        )
+        # garbage shapes return empty
+        self.assertEqual(_stub_op_preview(None), [])
+        self.assertEqual(_stub_op_preview("invalid"), [])
+        self.assertEqual(_stub_op_preview([]), [])
+
+        # Full render path: build a NearestHit with list-form stub_outcomes
+        # and confirm the markdown renderer doesn't crash.
+        from specter.uncovered_report import (
+            NearestHit, UncoveredBranchDetail, UncoveredReport,
+        )
+        detail = UncoveredBranchDetail(
+            branch_id=1, direction="T", branch_key="1:T", paragraph="MAIN",
+            source_file="", source_line=0, condition_text="IF X = '00'",
+            condition_category="file_status_eq",
+            nearest_hit=NearestHit(
+                test_case_id="tc-1", strategy="baseline", target="baseline",
+                input_state={"X": "AA"},
+                stub_outcomes=[["READ:F", [["X", "00"]]]],
+            ),
+        )
+        report = UncoveredReport(
+            program_id="TEST", total_branches=2, covered_branches=1,
+            uncovered_branches=1, total_test_cases=1, elapsed_seconds=1.0,
+            generated_at="2026-04-09T00:00:00+00:00", branches=[detail],
+        )
+        md = _render_markdown(report)
+        self.assertIn("Stub ops", md)
+        self.assertIn("READ:F", md)
+
     def test_never_raises_on_garbage_input(self):
         """If anything in the report pipeline crashes, the caller gets
         an empty report and a warning log. The main coverage loop
