@@ -343,3 +343,351 @@ class TestFaultStubs88:
             "STATUS-OK (contains 'OK') must be the primary success flag"
         assert vals["PSB-SCHED"] is False
         assert vals["SEGMENT-NOT-FOUND"] is False
+
+
+# ---------------------------------------------------------------------------
+# T2-A: 88-level VALUE extraction from COBOL source (inline definitions)
+# ---------------------------------------------------------------------------
+
+class TestExtract88ValuesFromSource:
+    """_extract_88_values_from_source parses inline 88-level VALUE clauses.
+
+    Unlike _extract_88_siblings_from_source, this captures the actual
+    activating value bound to each 88-level child so strategies can
+    inject ``APPL-RESULT = 16`` for branches gated on ``88 APPL-EOF
+    VALUE 16``.
+    """
+
+    def test_numeric_values(self):
+        from specter.variable_domain import _extract_88_values_from_source
+
+        cobol = """\
+       01  APPL-RESULT             PIC S9(9)   COMP.
+           88  APPL-AOK            VALUE 0.
+           88  APPL-EOF            VALUE 16.
+       01  OTHER-FIELD             PIC 9(2).
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cbl", delete=False) as f:
+            f.write(cobol)
+            path = f.name
+        try:
+            result = _extract_88_values_from_source(path)
+        finally:
+            Path(path).unlink()
+
+        assert "APPL-RESULT" in result
+        assert result["APPL-RESULT"]["APPL-AOK"] == 0
+        assert result["APPL-RESULT"]["APPL-EOF"] == 16
+
+    def test_string_values(self):
+        from specter.variable_domain import _extract_88_values_from_source
+
+        cobol = """\
+       05  WS-FL-DD                PIC X(8).
+           88  FL-TRNXFILE         VALUE 'TRNXFILE'.
+           88  FL-XREFFILE         VALUE 'XREFFILE'.
+       05  WS-OTHER                PIC X.
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cbl", delete=False) as f:
+            f.write(cobol)
+            path = f.name
+        try:
+            result = _extract_88_values_from_source(path)
+        finally:
+            Path(path).unlink()
+
+        assert result["WS-FL-DD"]["FL-TRNXFILE"] == "TRNXFILE"
+        assert result["WS-FL-DD"]["FL-XREFFILE"] == "XREFFILE"
+
+    def test_figurative_constant(self):
+        from specter.variable_domain import _extract_88_values_from_source
+
+        cobol = """\
+       05  DIBSTAT                 PIC XX.
+           88  STATUS-OK           VALUE SPACES.
+           88  STATUS-ERR          VALUE 'GE'.
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cbl", delete=False) as f:
+            f.write(cobol)
+            path = f.name
+        try:
+            result = _extract_88_values_from_source(path)
+        finally:
+            Path(path).unlink()
+
+        assert result["DIBSTAT"]["STATUS-OK"] == " "
+        assert result["DIBSTAT"]["STATUS-ERR"] == "GE"
+
+    def test_thru_range_uses_low_end(self):
+        from specter.variable_domain import _extract_88_values_from_source
+
+        cobol = """\
+       05  GRADE                   PIC X.
+           88  PASSING             VALUE 'A' THRU 'D'.
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cbl", delete=False) as f:
+            f.write(cobol)
+            path = f.name
+        try:
+            result = _extract_88_values_from_source(path)
+        finally:
+            Path(path).unlink()
+
+        assert result["GRADE"]["PASSING"] == "A"
+
+    def test_multi_value_list_uses_first(self):
+        from specter.variable_domain import _extract_88_values_from_source
+
+        cobol = """\
+       05  RC-FLAG                 PIC X(2).
+           88  RC-RETRY            VALUE '04', '08', '12'.
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cbl", delete=False) as f:
+            f.write(cobol)
+            path = f.name
+        try:
+            result = _extract_88_values_from_source(path)
+        finally:
+            Path(path).unlink()
+
+        assert result["RC-FLAG"]["RC-RETRY"] == "04"
+
+    def test_comment_lines_ignored(self):
+        from specter.variable_domain import _extract_88_values_from_source
+
+        cobol = (
+            "       05  ACTIVE-VAR              PIC 9.\n"
+            "           88  REAL-FLAG           VALUE 1.\n"
+            "      *    88  COMMENTED-FLAG      VALUE 9.\n"
+        )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cbl", delete=False) as f:
+            f.write(cobol)
+            path = f.name
+        try:
+            result = _extract_88_values_from_source(path)
+        finally:
+            Path(path).unlink()
+
+        assert result["ACTIVE-VAR"]["REAL-FLAG"] == 1
+        assert "COMMENTED-FLAG" not in result["ACTIVE-VAR"]
+
+    def test_nonexistent_file(self):
+        from specter.variable_domain import _extract_88_values_from_source
+        assert _extract_88_values_from_source("/nonexistent.cbl") == {}
+
+
+class TestParse88Literal:
+    """_parse_88_literal normalises VALUE clause right-hand sides."""
+
+    def test_integer(self):
+        from specter.variable_domain import _parse_88_literal
+        assert _parse_88_literal("0") == 0
+        assert _parse_88_literal("16") == 16
+        assert _parse_88_literal("-803") == -803
+
+    def test_float(self):
+        from specter.variable_domain import _parse_88_literal
+        assert _parse_88_literal("3.14") == 3.14
+
+    def test_quoted_string(self):
+        from specter.variable_domain import _parse_88_literal
+        assert _parse_88_literal("'00'") == "00"
+        assert _parse_88_literal('"AB"') == "AB"
+
+    def test_figurative_spaces(self):
+        from specter.variable_domain import _parse_88_literal
+        assert _parse_88_literal("SPACES") == " "
+        assert _parse_88_literal("SPACE") == " "
+
+    def test_figurative_zeros(self):
+        from specter.variable_domain import _parse_88_literal
+        assert _parse_88_literal("ZEROS") == 0
+        assert _parse_88_literal("ZEROES") == 0
+
+    def test_thru_range(self):
+        from specter.variable_domain import _parse_88_literal
+        assert _parse_88_literal("'A' THRU 'Z'") == "A"
+        assert _parse_88_literal("1 THROUGH 10") == 1
+
+    def test_multi_value_list(self):
+        from specter.variable_domain import _parse_88_literal
+        assert _parse_88_literal("'A', 'B', 'C'") == "A"
+        assert _parse_88_literal("1, 2, 3") == 1
+
+    def test_garbage_returns_none(self):
+        from specter.variable_domain import _parse_88_literal
+        assert _parse_88_literal("FUNCTION WHATEVER") is None
+
+
+class TestBuildDomainsWith88Source:
+    """build_variable_domains populates valid_88_values from COBOL source."""
+
+    def test_inline_values_populate_domain(self):
+        from specter.variable_domain import build_variable_domains
+        from specter.variable_extractor import VariableInfo, VariableReport
+
+        cobol = """\
+       01  APPL-RESULT             PIC S9(9)   COMP.
+           88  APPL-AOK            VALUE 0.
+           88  APPL-EOF            VALUE 16.
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".cbl", delete=False) as f:
+            f.write(cobol)
+            path = f.name
+
+        try:
+            report = VariableReport()
+            report.variables["APPL-RESULT"] = VariableInfo(
+                name="APPL-RESULT", classification="internal",
+            )
+            domains = build_variable_domains(
+                report, copybook_records=None, stub_mapping=None,
+                cobol_source=path,
+            )
+        finally:
+            Path(path).unlink()
+
+        assert "APPL-RESULT" in domains
+        dom = domains["APPL-RESULT"]
+        assert dom.valid_88_values.get("APPL-AOK") == 0
+        assert dom.valid_88_values.get("APPL-EOF") == 16
+
+    def test_copybook_values_not_overwritten(self):
+        """Source scanning must not clobber 88-values already set by a copybook."""
+        from specter.variable_domain import build_variable_domains
+        from specter.copybook_parser import CopybookField, CopybookRecord
+        from specter.variable_extractor import VariableInfo, VariableReport
+
+        # No COBOL source — copybook pass wins.
+        report = VariableReport()
+        report.variables["DIBSTAT"] = VariableInfo(
+            name="DIBSTAT", classification="status",
+        )
+        cf = CopybookField(
+            name="DIBSTAT", level=5, pic="XX", pic_type="alpha",
+            length=2, precision=0, occurs=0, is_filler=False,
+            values_88={"STATUS-OK": " ", "STATUS-ERR": "GE"},
+        )
+        rec = CopybookRecord(name="WS", fields=[cf], copybook_file="")
+
+        domains = build_variable_domains(
+            report, copybook_records=[rec], stub_mapping=None,
+            cobol_source=None,
+        )
+        assert domains["DIBSTAT"].valid_88_values["STATUS-OK"] == " "
+
+    def test_no_cobol_source_is_noop(self):
+        from specter.variable_domain import build_variable_domains
+        from specter.variable_extractor import VariableInfo, VariableReport
+
+        report = VariableReport()
+        report.variables["FOO"] = VariableInfo(name="FOO", classification="internal")
+        domains = build_variable_domains(
+            report, copybook_records=None, stub_mapping=None,
+            cobol_source=None,
+        )
+        assert "FOO" in domains
+        assert domains["FOO"].valid_88_values == {}
+
+
+class TestBaselineStrategy88Phase3:
+    """BaselineStrategy must yield one case per 88-level value for every
+    variable with valid_88_values, regardless of classification."""
+
+    def _make_ctx(self, domains):
+        import random
+        from specter.coverage_strategies import StrategyContext
+        from specter.variable_extractor import VariableReport
+
+        module = type("M", (), {"_default_state": staticmethod(lambda: {}),
+                                 "run": staticmethod(lambda s: s)})()
+        ctx_obj = type("C", (), {"branch_meta": {}, "total_paragraphs": 1,
+                                  "total_branches": 1})()
+        report = VariableReport()
+        program = type("P", (), {"program_id": "TEST", "paragraphs": []})()
+        call_graph = type("G", (), {"edges": {}, "reverse_edges": {},
+                                     "entry": "MAIN",
+                                     "all_paragraphs": {"MAIN"}})()
+        return StrategyContext(
+            module=module, context=ctx_obj, domains=domains,
+            stub_mapping={}, call_graph=call_graph, gating_conds={},
+            var_report=report, program=program,
+            all_paragraphs={"MAIN"},
+            success_stubs={}, success_defaults={},
+            rng=random.Random(42),
+            store_path=Path("/tmp/test.jsonl"),
+        )
+
+    def _make_cov(self):
+        from specter.cobol_coverage import CoverageState
+        return CoverageState(
+            total_paragraphs=1, total_branches=1,
+            all_paragraphs={"MAIN"}, _stub_mapping={},
+        )
+
+    def test_emits_one_case_per_88_value_for_internal_var(self):
+        """APPL-RESULT has 88-level children APPL-AOK (0) and
+        APPL-EOF (16). Phase 3 must yield both values."""
+        from specter.coverage_strategies import BaselineStrategy
+        from specter.variable_domain import VariableDomain
+
+        dom = VariableDomain(
+            name="APPL-RESULT", data_type="numeric",
+            max_length=9, classification="internal",
+            valid_88_values={"APPL-AOK": 0, "APPL-EOF": 16},
+        )
+        ctx = self._make_ctx({"APPL-RESULT": dom})
+        cov = self._make_cov()
+
+        s = BaselineStrategy()
+        cases = list(s.generate_cases(ctx, cov, 100))
+
+        phase3_targets = [t for (_is, _ss, _sd, t) in cases
+                          if t.startswith("88:APPL-RESULT=")]
+        # Expect one case per distinct 88-level value.
+        values = {t.split("=", 1)[1] for t in phase3_targets}
+        assert "0" in values, f"APPL-RESULT=0 missing, targets={phase3_targets}"
+        assert "16" in values, f"APPL-RESULT=16 missing, targets={phase3_targets}"
+
+    def test_string_88_values_formatted_for_cobol(self):
+        """WS-FL-DD='TRNXFILE' must be padded to the domain's max_length."""
+        from specter.coverage_strategies import BaselineStrategy
+        from specter.variable_domain import VariableDomain
+
+        dom = VariableDomain(
+            name="WS-FL-DD", data_type="alpha",
+            max_length=8, classification="internal",
+            valid_88_values={"FL-TRNXFILE": "TRNXFILE"},
+        )
+        ctx = self._make_ctx({"WS-FL-DD": dom})
+        cov = self._make_cov()
+
+        s = BaselineStrategy()
+        cases = list(s.generate_cases(ctx, cov, 100))
+
+        phase3 = [input_state for (input_state, _, _, t) in cases
+                  if t.startswith("88:WS-FL-DD=")]
+        assert phase3, "no 88-level case yielded for WS-FL-DD"
+        # At least one yielded case has WS-FL-DD set to the padded literal.
+        assert any(
+            state.get("WS-FL-DD", "").strip() == "TRNXFILE"
+            for state in phase3
+        )
+
+    def test_no_88_values_no_extra_cases(self):
+        """Variables without 88-level children don't trigger Phase 3."""
+        from specter.coverage_strategies import BaselineStrategy
+        from specter.variable_domain import VariableDomain
+
+        dom = VariableDomain(
+            name="PLAIN", data_type="alpha", max_length=4,
+            classification="input", valid_88_values={},
+        )
+        ctx = self._make_ctx({"PLAIN": dom})
+        cov = self._make_cov()
+
+        s = BaselineStrategy()
+        cases = list(s.generate_cases(ctx, cov, 100))
+
+        phase3 = [t for (_is, _ss, _sd, t) in cases if t.startswith("88:")]
+        assert phase3 == [], f"unexpected 88-level cases: {phase3}"

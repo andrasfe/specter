@@ -1640,7 +1640,10 @@ def run_cobol_coverage(
     # Build domain model
     log.info("Building variable domain model ...")
     copybook_records = load_copybooks(copybook_dirs) if copybook_dirs else []
-    domains = build_variable_domains(var_report, copybook_records, stub_mapping)
+    domains = build_variable_domains(
+        var_report, copybook_records, stub_mapping,
+        cobol_source=cobol_source,
+    )
     _enrich_domains_with_boolean_hints(domains, program)
     log.info("Domain model: %d variables (%d from copybooks)",
              len(domains), sum(1 for d in domains.values() if d.data_type != "unknown"))
@@ -1656,16 +1659,30 @@ def run_cobol_coverage(
     py_path.write_text(code)
     module = _load_module(py_path)
 
-    # Injectable variables for the init dispatch
+    # Injectable variables for the init dispatch.
+    #
+    # Historical behaviour restricted injection to variables classified as
+    # ``input``, ``status`` or ``flag``. That excluded *internal* variables
+    # like ``APPL-RESULT`` on CBACT02C/03C/CBCUS01C even though they carry
+    # 88-level children that gate real branches (``APPL-AOK``/``APPL-EOF``).
+    # Strategy Phase 3 (``BaselineStrategy``) can now emit cases that set
+    # those 88-level activating values directly in ``input_state``, but
+    # without a matching WHEN arm in the generated ``SPECTER-READ-INIT-VARS``
+    # paragraph the runtime silently drops the INIT record.
+    #
+    # Relax the filter: any variable that carries enough signal to drive
+    # targeted injection (either ``condition_literals`` or
+    # ``valid_88_values``) is injectable regardless of classification, as
+    # long as it is not a stub-return variable and not an EIB register.
     _EIB_NAMES = {"EIBCALEN", "EIBAID", "EIBTRNID", "EIBTIME", "EIBDATE",
                   "EIBTASKN", "EIBTRMID", "EIBCPOSN", "EIBFN", "EIBRCODE",
                   "EIBDS", "EIBREQID", "EIBRSRCE", "EIBRESP", "EIBRESP2"}
     injectable = [
         name for name, dom in domains.items()
-        if dom.classification in ("input", "status", "flag")
+        if (dom.condition_literals or dom.valid_88_values)
         and not dom.set_by_stub
         and name.upper() not in _EIB_NAMES
-        and (dom.condition_literals or dom.valid_88_values)
+        and dom.classification != "internal-no-inject"  # reserved for future opt-out
     ]
     log.info("Injectable variables: %d", len(injectable))
 
@@ -2239,7 +2256,10 @@ def run_coverage(
 
     # Build domain model
     copybook_records = load_copybooks(copybook_dirs) if copybook_dirs else []
-    domains = build_variable_domains(var_report, copybook_records, stub_mapping)
+    domains = build_variable_domains(
+        var_report, copybook_records, stub_mapping,
+        cobol_source=cobol_source,
+    )
     _enrich_domains_with_boolean_hints(domains, program)
     log.info("Domain model: %d variables", len(domains))
 

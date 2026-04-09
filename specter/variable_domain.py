@@ -112,6 +112,139 @@ def _compute_range(
 
 
 # ---------------------------------------------------------------------------
+# 88-level VALUE extraction from COBOL source
+# ---------------------------------------------------------------------------
+
+def _extract_88_values_from_source(
+    cobol_source: str | Path,
+) -> dict[str, dict[str, str | int | float]]:
+    """Scan a COBOL source file for 88-level VALUE clauses.
+
+    Returns a mapping ``parent_var_name -> {child_88_name -> child_value}``
+    so that variables defined inline in the program (not in a copybook)
+    still populate ``VariableDomain.valid_88_values``.
+
+    This complements ``cobol_coverage._extract_88_siblings_from_source``
+    (which only captures sibling *names*). The strategy layer needs the
+    actual activating VALUE to inject ``APPL-RESULT = 16`` when a branch
+    is gated on ``88 APPL-EOF VALUE 16``; without the VALUE, fault
+    injection can flip the flag name but cannot set the underlying
+    integer/string that activates it.
+
+    We track the most recently seen non-88 parent line and attach any
+    88-level children that follow it. The parser is deliberately
+    line-based and cheap — it does not try to handle every exotic
+    continuation, OCCURS-DEPENDING-ON, or multi-line VALUE clause.
+    """
+    result: dict[str, dict[str, str | int | float]] = {}
+    path = Path(cobol_source)
+    if not path.exists():
+        return result
+
+    # Match "nn PARENT-NAME ..." where nn is a level number in 01..49,
+    # 66, 77. Anything at 88 is a child, not a parent.
+    parent_re = re.compile(
+        r"^\s+(0[1-9]|[1-4][0-9]|66|77)\s+([A-Z0-9][A-Z0-9-]*)",
+        re.IGNORECASE,
+    )
+    # Match "88 NAME VALUE <literal>". The literal captures the rest of
+    # the line so we can post-process strings, numerics and THRU ranges.
+    child_re = re.compile(
+        r"^\s+88\s+([A-Z0-9][A-Z0-9-]*)\s+VALUES?\s+(.+?)\s*\.?\s*$",
+        re.IGNORECASE,
+    )
+
+    current_parent: str | None = None
+    for raw in path.read_text(errors="replace").splitlines():
+        # Skip fixed-format comment lines (col 7 = '*' or '/').
+        if len(raw) > 6 and raw[6] in ("*", "/"):
+            continue
+        # Mask out inline-quoted text so VALUE 'X' X-in-name doesn't
+        # confuse the level regex. We only care about structure, not
+        # literal content, so a blanking pass is sufficient.
+        stripped = raw.rstrip()
+        if not stripped:
+            continue
+
+        m_parent = parent_re.match(stripped)
+        if m_parent:
+            current_parent = m_parent.group(2).upper()
+            continue
+
+        m_child = child_re.match(stripped)
+        if m_child and current_parent is not None:
+            child_name = m_child.group(1).upper()
+            raw_value = m_child.group(2).strip()
+            parsed = _parse_88_literal(raw_value)
+            if parsed is not None:
+                result.setdefault(current_parent, {})[child_name] = parsed
+
+    return result
+
+
+_FIGURATIVE_LITERAL_MAP: dict[str, str | int] = {
+    "SPACES": " ", "SPACE": " ",
+    "ZEROS": 0, "ZERO": 0, "ZEROES": 0,
+    "LOW-VALUES": "", "LOW-VALUE": "",
+    "HIGH-VALUES": "\xff", "HIGH-VALUE": "\xff",
+    "QUOTES": '"', "QUOTE": '"',
+}
+
+
+def _parse_88_literal(raw: str) -> str | int | float | None:
+    """Parse the right-hand side of an 88-level VALUE clause.
+
+    Handles quoted strings, signed/unsigned integers, floats, figurative
+    constants, and ``VALUE 'X' THRU 'Y'`` ranges (returns the low end).
+    Multi-value lists like ``VALUE 'A', 'B', 'C'`` collapse to the first
+    entry — strategies that want to exercise every member should iterate
+    the sibling 88-level flags instead.
+    """
+    token = raw.strip()
+
+    # Match a leading quoted literal first so we can peel it off cleanly
+    # even when the VALUE clause is a multi-value list like
+    # ``VALUE 'A', 'B', 'C'``. We only need the first member — sibling
+    # 88-level flags are enumerated separately by the strategy layer.
+    m_quoted = re.match(r"^\s*'([^']*)'", token)
+    if m_quoted:
+        return m_quoted.group(1)
+    m_quoted = re.match(r'^\s*"([^"]*)"', token)
+    if m_quoted:
+        return m_quoted.group(1)
+
+    # THRU / THROUGH ranges — use the low end.
+    thru_split = re.split(r"\s+(?:THRU|THROUGH)\s+", token, maxsplit=1, flags=re.IGNORECASE)
+    if len(thru_split) == 2:
+        token = thru_split[0]
+
+    # Unquoted multi-value comma list — use the first entry.
+    if "," in token:
+        token = token.split(",", 1)[0].strip()
+
+    # Figurative constant.
+    upper = token.upper()
+    if upper in _FIGURATIVE_LITERAL_MAP:
+        return _FIGURATIVE_LITERAL_MAP[upper]
+
+    # Integer.
+    if re.match(r"^[+-]?\d+$", token):
+        try:
+            return int(token)
+        except ValueError:
+            return None
+
+    # Float.
+    if re.match(r"^[+-]?\d+\.\d+$", token):
+        try:
+            return float(token)
+        except ValueError:
+            return None
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Construction: build_variable_domains()
 # ---------------------------------------------------------------------------
 
@@ -119,6 +252,7 @@ def build_variable_domains(
     var_report: VariableReport,
     copybook_records: list[CopybookRecord] | None = None,
     stub_mapping: dict[str, list[str]] | None = None,
+    cobol_source: str | Path | None = None,
 ) -> dict[str, VariableDomain]:
     """Build unified domain model by merging PIC, AST, stub, and heuristic info.
 
@@ -126,6 +260,13 @@ def build_variable_domains(
         var_report: VariableReport from variable_extractor.
         copybook_records: Parsed copybook records (from parse_copybook).
         stub_mapping: Operation → status variable mapping.
+        cobol_source: Optional path to the COBOL source file. When
+            provided, 88-level VALUE clauses defined inline in the
+            program (not in a copybook) are extracted and populated into
+            ``VariableDomain.valid_88_values`` — this is what lets
+            strategies inject ``APPL-RESULT = 16`` to activate
+            ``88 APPL-EOF VALUE 16`` on programs like CBACT02C where
+            the 88-level items live in the program source itself.
 
     Returns:
         dict mapping variable name to VariableDomain.
@@ -185,6 +326,30 @@ def build_variable_domains(
             for var_name in status_vars:
                 if var_name in domains:
                     domains[var_name].set_by_stub = op_key
+
+    # Source 4: 88-level VALUE clauses scanned directly from the COBOL
+    # source. This is the only path that captures 88-level values for
+    # variables defined inline in the program (as opposed to variables
+    # declared in a copybook — those are already picked up via Source 1
+    # above). Without this, internal variables like APPL-RESULT with
+    # 88-level children APPL-AOK/APPL-EOF never get valid_88_values
+    # populated and strategies cannot inject the activating values.
+    if cobol_source:
+        source_88 = _extract_88_values_from_source(cobol_source)
+        for parent_name, child_values in source_88.items():
+            dom = domains.get(parent_name)
+            if dom is None:
+                # Variable referenced in the DATA DIVISION but not in
+                # the AST (e.g. unused) — create a minimal domain so
+                # strategies that enumerate all 88-bearing vars can find
+                # it. Classification stays "internal" by default.
+                dom = VariableDomain(name=parent_name)
+                dom.semantic_type = _infer_semantic_type(parent_name, dom.classification)
+                domains[parent_name] = dom
+            # Merge in inline values without overwriting any copybook
+            # entry that already claimed the same child name.
+            for child, value in child_values.items():
+                dom.valid_88_values.setdefault(child, value)
 
     return domains
 
@@ -447,10 +612,32 @@ def _generate_adversarial(domain: VariableDomain, rng: random.Random) -> str | i
 
 
 def format_value_for_cobol(domain: VariableDomain, value: str | int | float) -> str:
-    """Format a value for use in COBOL INIT records (string representation)."""
-    if domain.data_type in ("alpha", "unknown"):
+    """Format a value for use in COBOL INIT records (string representation).
+
+    When ``data_type`` is ``unknown`` (e.g. for variables defined inline
+    in the program source rather than in a copybook), the formatter
+    infers numeric vs alpha from the value itself rather than defaulting
+    to alpha padding. Without this, an 88-level literal like
+    ``APPL-AOK VALUE 0`` gets written as the string ``'0         '``
+    (space-padded) and the runtime ``MOVE`` into a ``PIC S9(9) COMP``
+    field either fails or produces garbage.
+    """
+    if domain.data_type == "alpha":
         s = str(value)
-        # Right-pad to max_length
+        if domain.max_length > 0:
+            s = s[:domain.max_length].ljust(domain.max_length)
+        return s
+
+    if domain.data_type == "unknown":
+        # Infer from the value's type. Numeric values format as numbers,
+        # strings fall back to the alpha path.
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float):
+            return f"{value:.{max(1, domain.precision)}f}" if domain.precision > 0 else str(value)
+        s = str(value)
         if domain.max_length > 0:
             s = s[:domain.max_length].ljust(domain.max_length)
         return s

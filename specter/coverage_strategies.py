@@ -298,6 +298,48 @@ class BaselineStrategy(Strategy):
                         )
                         base[name] = format_value_for_cobol(dom, lit)
                         yield base, ctx.success_stubs, ctx.success_defaults, f"lit:{name}"
+
+            # Phase 3: 88-level value enumeration for every variable with
+            # 88-level children, regardless of classification. The Phase 1
+            # "88_value" strategy only samples a random 88-level entry per
+            # call; and Phase 2 only fires on vars classified as "input".
+            # That means *internal* variables like APPL-RESULT — which
+            # gates APPL-AOK (VALUE 0) and APPL-EOF (VALUE 16) — never
+            # get their activating values injected, and the branches
+            # downstream of IF APPL-AOK / IF APPL-EOF stay uncovered.
+            # This phase yields one case per distinct 88-level value
+            # (de-duplicated across siblings) so every branch gated on
+            # an 88-level condition has a chance to fire.
+            for name, dom in ctx.domains.items():
+                if not dom.valid_88_values:
+                    continue
+                seen_values: set = set()
+                for value_88 in dom.valid_88_values.values():
+                    # Coerce unhashable values (e.g. lists from THRU
+                    # ranges, though _parse_88_literal already collapses
+                    # those) into hashable surrogate for dedupe.
+                    try:
+                        key = value_88
+                        if key in seen_values:
+                            continue
+                        seen_values.add(key)
+                    except TypeError:
+                        continue
+                    base = _build_input_state(
+                        ctx.domains,
+                        "semantic",
+                        ctx.rng,
+                        jit_inference=ctx.jit_inference,
+                        paragraph_comments=ctx.paragraph_comments,
+                    )
+                    try:
+                        base[name] = format_value_for_cobol(dom, value_88)
+                    except Exception:
+                        # Skip values that can't be coerced for this
+                        # domain (e.g. string value on a numeric field
+                        # when the parser was uncertain).
+                        continue
+                    yield base, ctx.success_stubs, ctx.success_defaults, f"88:{name}={value_88}"
         finally:
             ctx.current_target_key = prev_target_key
 

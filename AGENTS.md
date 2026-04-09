@@ -115,7 +115,11 @@ Classifies each variable as: `input` (read-before-write), `internal`, `status` (
 
 **`VariableDomain`** (L22): Merges PIC clauses (from copybooks), AST analysis, stub mappings, and naming heuristics.
 
-**`build_variable_domains()`** (L117): Builds domain for every variable.
+**`build_variable_domains()`** (L117): Builds domain for every variable. Accepts an optional `cobol_source` argument which, when provided, scans the COBOL source file directly for 88-level `VALUE` clauses on variables defined inline in the program (outside copybooks) and populates `VariableDomain.valid_88_values` with the activating values. This is what lets `BaselineStrategy` inject `APPL-RESULT = 16` to activate `88 APPL-EOF VALUE 16` on programs where the 88-level items live in the program source itself rather than a copybook.
+
+**`_extract_88_values_from_source(cobol_source)`**: Helper that walks the COBOL source line by line, tracks the current non-88-level parent identifier, and records every `88 <name> VALUE <literal>` child under that parent. Returns `dict[parent_name, dict[child_88_name, child_value]]`. Handles numeric / quoted string / figurative constant literals, collapses `THRU`/`THROUGH` ranges to the low end, and uses the first entry of multi-value lists.
+
+**`format_value_for_cobol(domain, value)`** (L614): Formats a value for INIT records. When `domain.data_type == "unknown"` (common for variables defined inline in the program rather than in a copybook), the formatter now infers numeric vs alpha from the value's Python type so an 88-level literal like `APPL-AOK VALUE 0` is written as the numeric string `"0"` instead of the space-padded alpha string `"0         "` that would fail a `MOVE` into a `PIC S9(9) COMP` field at runtime.
 
 **`generate_value(domain, strategy)`** (L219): 6 strategies — condition_literal, 88_value, boundary, semantic, random_valid, adversarial. In current coverage flows, `semantic` is usually attempted first through `jit_value_inference.py`; `generate_value()` remains the deterministic fallback.
 
@@ -397,6 +401,7 @@ Legacy note: `infer_variable_semantics()` still exists as the older eager bootst
 **`run_cobol_coverage(ast_source, cobol_source, copybook_dirs, ...)`** (L989): Main COBOL coverage entry point. Compiles, prepares context, extracts paragraph comments, builds a shared `JITValueInferenceService`, builds per-target variable allowlists, and runs the agentic loop.
 
 Important helpers:
+- **Injectable variables filter**: Variables that feed the runtime `SPECTER-READ-INIT-VARS` dispatch. A variable is injectable when it carries actionable signal (`condition_literals` OR `valid_88_values`), is not a stub-return variable, and is not a CICS EIB register. Classification is **not** a gating constraint — internal variables with 88-level children (e.g. `APPL-RESULT` on CBACT02C/03C/CBCUS01C) are included so `BaselineStrategy` Phase 3 can actually land their injected values at runtime instead of having the INIT record silently dropped.
 - **`_build_input_state(...)`**: Generates baseline input state from variable domains. Semantic generation now consults the shared JIT service first, then falls back to `generate_value()`.
 - **`extract_paragraph_comments(...)` integration**: COBOL source comments are harvested once and threaded into `StrategyContext` so paragraph-targeted semantic prompts can use nearby business hints.
 - **`_build_target_variable_allowlists(module, branch_meta, gating_conds, stub_mapping, *, include_gates, include_slice)`** (L520): Builds a `dict[str, set[str]]` keyed by `"para:<para_name>"`. For each paragraph in `branch_meta`, combines: gating variables from `extract_gating_variables_for_target`, stub-return variables from `stub_mapping`, and backward-slice variables from `slice_variable_names` (both ± branch IDs). Result is attached to `StrategyContext.target_variable_allowlists` and drives per-call JIT scope filtering. Controlled by `jit_scope_policy` (see `JITLoggingConfig`).
@@ -415,7 +420,7 @@ Phase-1 memory-guided persistence now runs as an additive layer in both COBOL an
 
 | Strategy | Priority | Method |
 |----------|----------|--------|
-| `BaselineStrategy` (L124) | 20 | All-success baseline with 5 value generation strategies |
+| `BaselineStrategy` (L124) | 20 | Three phases: (1) one case per value-generation strategy (condition_literal, semantic, random_valid, 88_value, boundary); (2) per-variable `condition_literal` fan-out for variables classified as `input`; (3) per-88-level-value fan-out for **every** variable that carries 88-level children in its domain, regardless of classification — this covers internal variables like `APPL-RESULT` whose 88-level children (`APPL-AOK` / `APPL-EOF`) gate downstream branches. |
 | `DirectParagraphStrategy` (L488) | 35 | **7-phase rotation**: param hill-climb → stub sweep → dataflow backprop → frontier → harvest → inverse → LLM |
 | `TranscriptSearchStrategy` (L1897) | 40 | Mutates ordered READ transcripts with domain-aware payload assignments |
 | `CorpusFuzzStrategy` (L1733) | 45 | AFL-inspired energy-based corpus scheduling with greedy set cover |
