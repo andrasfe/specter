@@ -915,7 +915,7 @@ def _fix_commented_statement_continuations(
         if carry_comment:
             leading_spaces = len(raw_content) - len(raw_content.lstrip(" "))
             is_new_statement = bool(re.match(
-                r"^(COMPUTE|MOVE|ADD|SUBTRACT|MULTIPLY|DIVIDE|IF|ELSE|PERFORM|STRING|UNSTRING|INSPECT|WRITE|READ|OPEN|CLOSE|START|DELETE|REWRITE|CALL|SET|EVALUATE|WHEN|SEARCH|EXIT|GO|GOBACK|STOP)\b",
+                r"^(COMPUTE|MOVE|ADD|SUBTRACT|MULTIPLY|DIVIDE|IF|ELSE|PERFORM|STRING|UNSTRING|INSPECT|WRITE|READ|OPEN|CLOSE|START|DELETE|REWRITE|CALL|SET|EVALUATE|WHEN|SEARCH|EXIT|GO|GOBACK|STOP|DISPLAY|ACCEPT|INITIALIZE|CONTINUE)\b",
                 stripped,
                 re.IGNORECASE,
             ))

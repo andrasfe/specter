@@ -17,6 +17,7 @@ import re
 from .cobol_mock import (
     InstrumentResult,
     MockConfig,
+    _format_mock_record,
     generate_init_records,
     generate_mock_data_ordered,
     instrument_cobol,
@@ -363,6 +364,7 @@ def run_test_case(
     stub_log: list[tuple[str, list]],
     work_dir: str | Path | None = None,
     timeout: int = 30,
+    stub_defaults: dict[str, list] | None = None,
 ) -> CobolTestResult:
     """Run a single test case against the compiled COBOL program.
 
@@ -372,6 +374,10 @@ def run_test_case(
         stub_log: Execution-ordered stub log from Python pre-run.
         work_dir: Directory for temp data files.
         timeout: Execution timeout in seconds.
+        stub_defaults: Optional stub defaults — used to insert success
+            records for OPEN/CLOSE operations that the Python pre-run
+            didn't consume (because the generated run() function often
+            doesn't call the OPEN paragraphs).
 
     Returns:
         CobolTestResult with coverage and output data.
@@ -386,6 +392,32 @@ def run_test_case(
     init_values = {k: str(v) for k, v in input_state.items()
                    if not str(k).startswith("_")}
     init_data = generate_init_records(init_values) if init_values else ""
+
+    # The Python pre-run's run() function calls paragraphs in SOURCE
+    # DECLARATION order (1000-GET-NEXT before 0000-ACCTFILE-OPEN),
+    # but the COBOL binary runs them in EXECUTION order (OPEN before
+    # GET-NEXT, per the main program's PERFORM sequence). This means
+    # the stub_log has READ/WRITE/CALL records first and OPEN records
+    # later, while the COBOL binary expects OPEN records first.
+    #
+    # If we write the mock data in stub_log order, the COBOL OPEN
+    # paragraph reads a READ record (wrong status — SPACES instead
+    # of '00'), and the success path is never exercised. This is the
+    # root cause of the APPL-AOK/STATUS='00' plateau on every batch
+    # program.
+    #
+    # Fix: reorder the stub_log so OPEN entries appear at the front
+    # (matching COBOL execution order), followed by everything else
+    # in their original order.
+    open_close_pad = ""
+    if stub_log:
+        open_entries = [(k, e) for k, e in stub_log if k.startswith("OPEN:")]
+        close_entries = [(k, e) for k, e in stub_log if k.startswith("CLOSE:")]
+        other_entries = [(k, e) for k, e in stub_log
+                         if not k.startswith("OPEN:") and not k.startswith("CLOSE:")]
+        # COBOL order: OPEN first, then main logic (READ/WRITE/CALL), then CLOSE
+        stub_log = open_entries + other_entries + close_entries
+
     stub_data = generate_mock_data_ordered(stub_log) if stub_log else ""
 
     # In coverage mode (RETURN/XCTL don't terminate), the COBOL program
@@ -396,7 +428,8 @@ def run_test_case(
         pad_record = f"{'CICS':<30}{'00':<20}{'0':>9}{' ' * 21}"[:80]
         pad_data = "\n".join([pad_record] * 50) + "\n"
 
-    # Concatenate: init records first, then stub records, then optional padding
+    # Concatenate: init records first, then stub records (now reordered
+    # with OPEN at front), then optional coverage padding.
     parts = [p for p in [init_data, stub_data, pad_data] if p]
     mock_data = "\n".join(parts) if parts else "\n"
 
