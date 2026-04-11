@@ -155,13 +155,11 @@ def _extract_88_values_from_source(
     )
 
     current_parent: str | None = None
+    parent_is_based = False
     for raw in path.read_text(errors="replace").splitlines():
         # Skip fixed-format comment lines (col 7 = '*' or '/').
         if len(raw) > 6 and raw[6] in ("*", "/"):
             continue
-        # Mask out inline-quoted text so VALUE 'X' X-in-name doesn't
-        # confuse the level regex. We only care about structure, not
-        # literal content, so a blanking pass is sufficient.
         stripped = raw.rstrip()
         if not stripped:
             continue
@@ -169,10 +167,22 @@ def _extract_88_values_from_source(
         m_parent = parent_re.match(stripped)
         if m_parent:
             current_parent = m_parent.group(2).upper()
+            # Skip BASED structures — their fields are pointer-addressed
+            # and have no valid storage at startup. Injecting a value
+            # via SPECTER-READ-INIT-VARS would dereference a null
+            # pointer and crash the binary (the CBSTM03A regression
+            # where UCB-ADDR inside 01 TIOT-ENTRY BASED caused
+            # SIGSEGV on every test case). Also skip structures with
+            # SET ADDRESS OF patterns, which imply the same layout.
+            upper_line = stripped.upper()
+            parent_is_based = bool(
+                re.search(r"\bBASED\b", upper_line)
+                or re.search(r"\bPOINTER\b", upper_line)
+            )
             continue
 
         m_child = child_re.match(stripped)
-        if m_child and current_parent is not None:
+        if m_child and current_parent is not None and not parent_is_based:
             child_name = m_child.group(1).upper()
             raw_value = m_child.group(2).strip()
             parsed = _parse_88_literal(raw_value)

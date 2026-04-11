@@ -1963,12 +1963,53 @@ def run_cobol_coverage(
     _EIB_NAMES = {"EIBCALEN", "EIBAID", "EIBTRNID", "EIBTIME", "EIBDATE",
                   "EIBTASKN", "EIBTRMID", "EIBCPOSN", "EIBFN", "EIBRCODE",
                   "EIBDS", "EIBREQID", "EIBRSRCE", "EIBRESP", "EIBRESP2"}
+
+    def _is_safe_to_inject(name: str, dom) -> bool:
+        """Return True if injecting a value at startup is safe.
+
+        Excludes variables that would crash the binary when the
+        generated ``SPECTER-READ-INIT-VARS`` dispatcher attempts
+        ``MOVE MOCK-ALPHA-STATUS TO <var>``:
+
+          * FILLER — unnamed padding; COBOL doesn't allow MOVE to FILLER.
+          * Null-sentinel 88-level flags — variables whose **only**
+            88-level children are LOW-VALUES / empty-string guards
+            (e.g. ``88 NULL-UCB VALUES LOW-VALUES`` under ``UCB-ADDR``
+            inside a BASED TIOT structure on CBSTM03A). Moving a
+            string into these pointer-addressed fields causes a null-
+            pointer dereference SIGSEGV at runtime.
+          * EIB registers — CICS control block fields.
+          * Stub-return variables — their values come from stubs, not
+            from startup injection.
+        """
+        upper = name.upper()
+        if upper == "FILLER" or upper.startswith("FILLER-"):
+            return False
+        if upper in _EIB_NAMES:
+            return False
+        if dom.set_by_stub:
+            return False
+        if dom.classification == "internal-no-inject":
+            return False
+        # Must carry actionable signal.
+        if not dom.condition_literals and not dom.valid_88_values:
+            return False
+        # Null-sentinel check: if ALL 88-level values resolve to
+        # empty-string / LOW-VALUES, the variable is almost certainly
+        # a pointer-null guard (e.g. 88 END-OF-TIOT VALUE LOW-VALUES)
+        # and injecting into it would dereference a null address.
+        if dom.valid_88_values and not dom.condition_literals:
+            all_null = all(
+                v == "" or v == 0 or (isinstance(v, str) and not v.strip())
+                for v in dom.valid_88_values.values()
+            )
+            if all_null:
+                return False
+        return True
+
     injectable = [
         name for name, dom in domains.items()
-        if (dom.condition_literals or dom.valid_88_values)
-        and not dom.set_by_stub
-        and name.upper() not in _EIB_NAMES
-        and dom.classification != "internal-no-inject"  # reserved for future opt-out
+        if _is_safe_to_inject(name, dom)
     ]
     log.info("Injectable variables: %d", len(injectable))
 
