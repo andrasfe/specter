@@ -337,6 +337,96 @@ def _sanitize_name(name: str) -> str:
     return "para_" + cleaned
 
 
+def _reorder_paragraphs_by_entry(
+    paragraphs: list,
+    cobol_source: str | None,
+) -> list:
+    """Reorder paragraphs so the ``run()`` function calls them in COBOL
+    execution order, not source declaration order.
+
+    Parses the unnamed PROCEDURE DIVISION entry section (the code
+    between ``PROCEDURE DIVISION.`` and the first named paragraph) for
+    ``PERFORM <para>`` targets. Paragraphs found in that section are
+    placed first, in the order they appear; paragraphs not found are
+    appended in their original declaration order.
+
+    When no COBOL source is available or no PERFORM targets are found,
+    returns the original list unchanged.
+
+    This is the key fix for the OPEN/READ mock-data ordering bug: the
+    cobalt parser doesn't emit ``entry_statements`` for the unnamed
+    driver code, so without this reorder the Python ``run()`` calls
+    paragraphs in declaration order (GET-NEXT before OPEN), the pre-
+    run's stub_log has READ records before OPEN records, and the COBOL
+    binary — which executes OPEN first — gets the wrong mock status.
+    """
+    if not cobol_source or not paragraphs:
+        return paragraphs
+
+    from pathlib import Path
+    path = Path(cobol_source)
+    if not path.exists():
+        return paragraphs
+
+    try:
+        source_lines = path.read_text(errors="replace").splitlines()
+    except Exception:
+        return paragraphs
+
+    # Find PROCEDURE DIVISION and the first named paragraph.
+    _para_re = re.compile(r"^\s{7}([A-Z0-9][A-Z0-9_-]*)\s*\.\s*$", re.IGNORECASE)
+    proc_start = None
+    first_para_line = None
+
+    for i, line in enumerate(source_lines):
+        upper = line.upper()
+        if "PROCEDURE DIVISION" in upper and (len(line) <= 6 or line[6] not in ("*", "/")):
+            proc_start = i
+            continue
+        if proc_start is not None and first_para_line is None:
+            m = _para_re.match(line)
+            if m:
+                first_para_line = i
+                break
+
+    if proc_start is None or first_para_line is None:
+        return paragraphs
+
+    # Extract PERFORM targets from the entry section.
+    _perform_re = re.compile(r"\bPERFORM\s+([A-Z0-9][A-Z0-9_-]*)\b", re.IGNORECASE)
+    entry_targets: list[str] = []
+    seen: set[str] = set()
+    for line in source_lines[proc_start + 1:first_para_line]:
+        if len(line) > 6 and line[6] in ("*", "/"):
+            continue
+        for m in _perform_re.finditer(line):
+            target = m.group(1).upper()
+            # Skip COBOL keywords that follow PERFORM
+            if target in ("UNTIL", "VARYING", "TIMES", "THRU", "THROUGH"):
+                continue
+            if target not in seen:
+                entry_targets.append(target)
+                seen.add(target)
+
+    if not entry_targets:
+        return paragraphs
+
+    # Build the reordered list: entry targets first, then the rest.
+    para_by_name = {p.name.upper(): p for p in paragraphs}
+    ordered: list = []
+    remaining: list = list(paragraphs)
+
+    for target in entry_targets:
+        p = para_by_name.get(target)
+        if p and p in remaining:
+            ordered.append(p)
+            remaining.remove(p)
+
+    # Append remaining paragraphs in their original declaration order.
+    ordered.extend(remaining)
+    return ordered
+
+
 def _sq(name: str) -> str:
     """Escape a variable name for safe use inside single-quoted Python strings."""
     return name.replace("'", "\\'")
@@ -2281,6 +2371,13 @@ def generate_code(
         # PROCEDURE DIVISION driver section), generate those as the entry
         # point.  Otherwise fall through all paragraphs sequentially
         # (standard COBOL fall-through semantics).
+        #
+        # NOTE: This calls paragraphs in DECLARATION order, not COBOL
+        # execution order. The stub_log reorder in
+        # cobol_executor.run_test_case compensates by moving OPEN
+        # records to the front of the mock data at COBOL replay time.
+        # We do NOT reorder the Python run() because that would change
+        # the Python-side state accumulation and break coverage.
         entry_stmts = getattr(program, "entry_statements", None)
         cb.line("try:")
         cb.indent()

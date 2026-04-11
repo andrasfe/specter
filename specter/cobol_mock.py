@@ -3987,8 +3987,12 @@ def generate_init_records(initial_values: dict[str, str]) -> str:
         except (ValueError, TypeError):
             num = 0
         records.append(_format_mock_record(op_key, alpha, num))
-    # Sentinel: non-INIT record to stop the init loop
-    records.append(_format_mock_record("END-INIT"))
+    # No sentinel needed: the init-vars reader loop terminates when it
+    # reads a record whose op_key(1:5) ≠ 'INIT:'. That non-INIT record
+    # gets saved as the pending record for the first business operation.
+    # An explicit END-INIT sentinel would consume the first business
+    # record's slot, shifting every subsequent operation by one and
+    # causing OPEN paragraphs to get SPACES instead of '00'.
     return "\n".join(records)
 
 

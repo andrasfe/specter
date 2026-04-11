@@ -417,6 +417,11 @@ def run_test_case(
                          if not k.startswith("OPEN:") and not k.startswith("CLOSE:")]
         # COBOL order: OPEN first, then main logic (READ/WRITE/CALL), then CLOSE
         stub_log = open_entries + other_entries + close_entries
+        if open_entries:
+            log.debug(
+                "Reordered stub_log: %d OPEN + %d other + %d CLOSE (moved %d OPEN entries to front)",
+                len(open_entries), len(other_entries), len(close_entries), len(open_entries),
+            )
 
     stub_data = generate_mock_data_ordered(stub_log) if stub_log else ""
 

@@ -976,15 +976,14 @@ class TestMockDataGeneration:
 
         records = generate_init_records({"WS-COUNT": "42", "WS-NAME": "HELLO"})
         lines = records.split("\n")
-        # Should have 2 INIT records + 1 END-INIT sentinel
-        assert len(lines) == 3
+        # Should have 2 INIT records (no END-INIT sentinel — removed
+        # because the sentinel consumed the first business record's
+        # slot, shifting every operation by one)
+        assert len(lines) == 2
         assert lines[0].startswith("INIT:WS-COUNT")
         assert lines[1].startswith("INIT:WS-NAME")
-        assert lines[2].startswith("END-INIT")
-        # INIT records are 80 chars; END-INIT sentinel is 60 chars (existing behavior)
         assert len(lines[0]) == 80
         assert len(lines[1]) == 80
-        assert len(lines[2]) >= 59
 
     def test_mock_data_ordered_format(self):
         from specter.cobol_mock import generate_mock_data_ordered
