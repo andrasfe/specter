@@ -140,6 +140,8 @@ class CoverageState:
     last_result_signature: tuple[frozenset[str], frozenset[str]] | None = None
     # Kept for strategies that check stub_mapping availability
     _stub_mapping: dict[str, list[str]] = field(default_factory=dict)
+    # Infrastructure branch keys to exclude from reported coverage.
+    _infra_keys: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -289,11 +291,60 @@ def load_existing_coverage(store_path: Path) -> tuple[list[dict], set[str], set[
     return test_cases, paras, branches
 
 
-def _counted_branches_for_mode(branches_hit: set[str], cobol_mode: bool) -> set[str]:
-    """Return the branch set that should count toward reported coverage."""
+def _counted_branches_for_mode(
+    branches_hit: set[str],
+    cobol_mode: bool,
+    infra_keys: set[str] | None = None,
+) -> set[str]:
+    """Return the branch set that should count toward reported coverage.
+
+    Filters out:
+      * ``py:``-prefixed Python-only branches when in COBOL mode.
+      * Infrastructure branches (specter's own SPECTER-* paragraphs)
+        when *infra_keys* is provided — these are not real program
+        logic and should not inflate the coverage numerator.
+    """
+    result = branches_hit
     if cobol_mode:
-        return {b for b in branches_hit if not b.startswith("py:")}
-    return branches_hit
+        result = {b for b in result if not b.startswith("py:")}
+    if infra_keys:
+        result = {b for b in result if b not in infra_keys}
+    return result
+
+
+def _infrastructure_branch_keys(branch_meta: dict) -> set[str]:
+    """Return branch keys (e.g. ``"42:T"``, ``"42:F"``) that belong to
+    specter's own instrumentation infrastructure and should be excluded
+    from the user-facing coverage total.
+
+    Infrastructure branches are injected by the mock pipeline (OPEN/CLOSE
+    MOCK-FILE, SPECTER-READ-INIT-VARS, SPECTER-NEXT-MOCK-RECORD,
+    SPECTER-APPLY-MOCK-PAYLOAD, SPECTER-EXIT-PARA, mock-file EOF
+    handling). They are real COBOL code that compiles and runs, but they
+    are NOT part of the user's business logic — counting them inflates
+    the denominator and misleads the reviewer about what remains to
+    cover.
+
+    The filter is conservative: it only excludes branches whose
+    enclosing paragraph starts with ``SPECTER-`` or is ``FILE-CONTROL``.
+    A slightly broader heuristic (checking for ``MOCK-EOF-FLAG`` in the
+    condition text) would catch more, but requires the full mock source
+    scan which we don't always have at counting time.
+    """
+    infra: set[str] = set()
+    for raw_bid, meta in branch_meta.items():
+        try:
+            bid = int(raw_bid)
+        except (TypeError, ValueError):
+            continue
+        para = str(meta.get("paragraph", "")).upper()
+        if (
+            para.startswith("SPECTER-")
+            or para == "FILE-CONTROL"
+        ):
+            infra.add(f"{bid}:T")
+            infra.add(f"{bid}:F")
+    return infra
 
 
 def _extract_branch_target_from_label(target: str) -> tuple[int, str] | None:
@@ -2110,22 +2161,33 @@ def run_cobol_coverage(
     existing_runtime_only = existing_paras - all_paras
 
     # Coverage state
+    # Subtract infrastructure branches (specter's own SPECTER-* paragraphs,
+    # FILE-CONTROL) from the total so the reported coverage % reflects
+    # real business logic, not instrumentation scaffolding. The raw
+    # context.total_branches counts every @@B: probe including those
+    # inside SPECTER-READ-INIT-VARS, SPECTER-NEXT-MOCK-RECORD, etc.
+    infra_keys = _infrastructure_branch_keys(context.branch_meta)
+    adjusted_total = max(0, context.total_branches - len(infra_keys))
+    log.info("Branch total: %d raw, %d infrastructure excluded, %d counted",
+             context.total_branches, len(infra_keys), adjusted_total)
+
     cov = CoverageState(
         paragraphs_hit=existing_ast_paras,
         runtime_only_paragraphs=existing_runtime_only,
         branches_hit=existing_branches,
         total_paragraphs=len(all_paras),
-        total_branches=context.total_branches,
+        total_branches=adjusted_total,
         test_cases=existing_tcs,
         all_paragraphs=all_paras,
         _stub_mapping=stub_mapping,
+        _infra_keys=infra_keys,
     )
     report = CobolCoverageReport(
         total_test_cases=len(existing_tcs),
         paragraphs_total=len(all_paras),
         runtime_trace_total=context.total_paragraphs,
         runtime_only_paragraphs=len(existing_runtime_only),
-        branches_total=context.total_branches,
+        branches_total=adjusted_total,
     )
 
     if existing_tcs:
@@ -2557,8 +2619,9 @@ def _run_agentic_loop(
         # Early termination conditions
         full_para = (cov.total_paragraphs > 0
                      and len(cov.paragraphs_hit) >= cov.total_paragraphs)
-        # Only count COBOL-validated branches (exclude py: prefixed)
-        cobol_branches_hit = len(_counted_branches_for_mode(cov.branches_hit, True))
+        # Only count COBOL-validated branches (exclude py: prefixed + infrastructure)
+        _infra = getattr(cov, "_infra_keys", None) or set()
+        cobol_branches_hit = len(_counted_branches_for_mode(cov.branches_hit, True, _infra))
         full_branch = (cov.total_branches > 0
                        and cobol_branches_hit >= cov.total_branches)
         if full_para and full_branch:
@@ -2608,12 +2671,14 @@ def _run_agentic_loop(
     report.total_test_cases = tc_count
     report.paragraphs_hit = len(cov.paragraphs_hit)
     report.runtime_only_paragraphs = len(cov.runtime_only_paragraphs)
-    # In COBOL mode, only count COBOL branches (not py:-prefixed Python ones).
+    # In COBOL mode, only count COBOL branches (not py:-prefixed Python ones)
+    # and exclude specter infrastructure branches (SPECTER-* paragraphs).
     # In Python-only mode (ctx.context is None), all branches count.
+    _infra = getattr(cov, "_infra_keys", None) or set()
     if ctx.context is not None:
-        counted_branches = _counted_branches_for_mode(cov.branches_hit, True)
+        counted_branches = _counted_branches_for_mode(cov.branches_hit, True, _infra)
     else:
-        counted_branches = _counted_branches_for_mode(cov.branches_hit, False)
+        counted_branches = _counted_branches_for_mode(cov.branches_hit, False, _infra)
     report.branches_hit = len(counted_branches)
     report.elapsed_seconds = elapsed
     if cov.total_paragraphs > 0:
