@@ -1014,8 +1014,13 @@ def _replace_io_verbs(lines: list[str], max_count: int = 0) -> tuple[list[str], 
 
             # Move mock status to the actual file status variable so that
             # 88-level conditions (WS-FILE-OK, WS-FILE-EOF) evaluate correctly.
-            # For OPEN, the regex captures the access mode (INPUT/OUTPUT) as
-            # target, so extract the actual file name from the block text.
+            # For OPEN, the initial regex captures the access mode
+            # (INPUT/OUTPUT) as target (group 3), not the file name. Extract
+            # the actual file name from the block text and also update the
+            # op_key so the DISPLAY 'SPECTER-MOCK:OPEN:<file>' marker above
+            # matches the key the Python pre-run uses. Without this, the
+            # COBOL trace says OPEN:INPUT and the executor can't reconcile
+            # it with the Python stub_log's OPEN:ACCTFILE-FILE.
             file_target = target
             if verb == "OPEN":
                 # OPEN INPUT/OUTPUT/I-O/EXTEND <file-name>
@@ -1026,6 +1031,18 @@ def _replace_io_verbs(lines: list[str], max_count: int = 0) -> tuple[list[str], 
                 )
                 if om:
                     file_target = om.group(1)
+                    # Fix the op_key and retroactively update the DISPLAY
+                    # marker we already emitted (it's the most recent line
+                    # in result that starts with DISPLAY 'SPECTER-MOCK:').
+                    corrected_key = f"{verb}:{file_target}"
+                    for ri in range(len(result) - 1, max(len(result) - 10, -1), -1):
+                        if f"SPECTER-MOCK:{op_key}" in result[ri]:
+                            result[ri] = result[ri].replace(
+                                f"SPECTER-MOCK:{op_key}",
+                                f"SPECTER-MOCK:{corrected_key}",
+                            )
+                            break
+                    op_key = corrected_key
 
             status_var = file_status_map.get(file_target)
             if not status_var:
