@@ -235,8 +235,15 @@ _CLASSIFIERS: list[tuple[str, re.Pattern]] = [
         r"\b[A-Z][A-Z0-9-]*-?STATUS\b\s*(?:=|EQUAL(?:\s+TO)?)\s*['\"]\d\d['\"]",
         re.IGNORECASE,
     )),
+    # Negated 88-level flag: "IF NOT C-FILE-OK", "IF NOT C-VSAM-FILE-OK"
     ("status_flag_88", re.compile(
-        r"^\s*IF\s+[A-Z][A-Z0-9-]*\s*(?:\.|$)",
+        r"^\s*IF\s+(?:NOT\s+)?[A-Z][A-Z0-9-]*\s*(?:\.|$)",
+        re.IGNORECASE,
+    )),
+    ("not_numeric", re.compile(r"\bNOT\s+NUMERIC\b", re.IGNORECASE)),
+    # IS POSITIVE / IS NEGATIVE / IS ZERO — COBOL sign-test conditions
+    ("numeric_sign", re.compile(
+        r"\bIS\s+(?:POSITIVE|NEGATIVE|ZERO)\b",
         re.IGNORECASE,
     )),
     ("compound_and_or", re.compile(
@@ -247,9 +254,20 @@ _CLASSIFIERS: list[tuple[str, re.Pattern]] = [
         r"[<>]=?|\bGREATER\b|\bLESS\b",
         re.IGNORECASE,
     )),
-    ("not_numeric", re.compile(r"\bNOT\s+NUMERIC\b", re.IGNORECASE)),
+    # String equality — "= 'X'" or "EQUAL 'X'" or "EQUAL TO 'X'"
     ("string_eq", re.compile(
-        r"=\s*['\"][^'\"]*['\"]",
+        r"(?:=|EQUAL(?:\s+TO)?)\s*['\"][^'\"]*['\"]",
+        re.IGNORECASE,
+    )),
+    # Numeric equality — "= 1" or "EQUAL 123" (no quotes)
+    ("numeric_eq", re.compile(
+        r"(?:=|EQUAL(?:\s+TO)?)\s+\d+\b",
+        re.IGNORECASE,
+    )),
+    # Figurative constant comparison — "EQUAL ZERO(S/ES)", "NOT EQUAL SPACES"
+    ("figurative_eq", re.compile(
+        r"(?:=|EQUAL(?:\s+TO)?)\s+(?:ZERO|ZEROS|ZEROES|SPACES?|LOW-VALUES?|HIGH-VALUES?)\b",
+        re.IGNORECASE,
     )),
 ]
 
@@ -518,6 +536,47 @@ def _generate_hints(detail: UncoveredBranchDetail) -> list[str]:
             "value-1, value+1). If not, the IF harvester in "
             "variable_extractor._harvest_condition_literals may be "
             "missing this comparison operator."
+        )
+
+    # ---- numeric equality (EQUAL 1, = 123) ----
+    if cat == "numeric_eq":
+        m = re.search(
+            r"(?:=|EQUAL(?:\s+TO)?)\s+(\d+)\b",
+            cond, re.IGNORECASE,
+        )
+        if m:
+            hints.append(
+                f"Numeric equality. The condition checks for value {m.group(1)}. "
+                f"Ensure the variable's condition_literals include {m.group(1)} "
+                f"and the injectable_vars filter allows it through."
+            )
+
+    # ---- IS POSITIVE / IS NEGATIVE / IS ZERO ----
+    if cat == "numeric_sign":
+        if "POSITIVE" in cond.upper():
+            hints.append(
+                "IS POSITIVE guard. Inject a positive value (e.g. 1 or 100) "
+                "into the variable. If it's derived from a computation, "
+                "trace which inputs drive it positive."
+            )
+        elif "NEGATIVE" in cond.upper():
+            hints.append(
+                "IS NEGATIVE guard. Inject a negative value (e.g. -1) into "
+                "the variable. If the PIC is unsigned, this branch may be "
+                "structurally unreachable."
+            )
+        else:
+            hints.append(
+                "IS ZERO guard. Inject 0 or ZEROS into the variable."
+            )
+
+    # ---- figurative constant equality ----
+    if cat == "figurative_eq":
+        hints.append(
+            "Figurative constant comparison (ZERO/ZEROS/SPACES/LOW-VALUES). "
+            "Ensure the variable's condition_literals includes the figurative "
+            "value. If the branch is the NOT-EQUAL direction, try injecting "
+            "a non-zero/non-space value."
         )
 
     # ---- EVALUATE WHEN literal ----
