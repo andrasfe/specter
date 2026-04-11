@@ -186,6 +186,18 @@ def main(argv: list[str] | None = None) -> int:
               "SPECTER_LLM_REVIEW=0)."),
     )
     parser.add_argument(
+        "--agent-iterations",
+        type=int, default=3, metavar="N",
+        help="Max LLM turns per branch in the inner agent loop (default: 3)",
+    )
+    parser.add_argument(
+        "--no-branch-agent",
+        action="store_true",
+        help=("Disable the inner agent loop that investigates stubborn "
+              "uncovered branches with focused LLM reasoning "
+              "(also controllable via SPECTER_BRANCH_AGENT=0)."),
+    )
+    parser.add_argument(
         "--uncovered-report",
         metavar="PATH",
         help=("Base path for the post-run uncovered-branch diagnostic "
@@ -369,6 +381,12 @@ def main(argv: list[str] | None = None) -> int:
     # set when the user passed the CLI flag.
     if args.no_llm_review:
         os.environ["SPECTER_LLM_REVIEW"] = "0"
+
+    if args.no_branch_agent:
+        os.environ["SPECTER_BRANCH_AGENT"] = "0"
+
+    if args.agent_iterations:
+        os.environ["SPECTER_AGENT_ITERATIONS"] = str(args.agent_iterations)
 
     # --uncovered-report: base path for the post-run diagnostic report.
     # Read by cobol_coverage._run_agentic_loop finalization via the

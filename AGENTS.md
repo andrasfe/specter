@@ -457,6 +457,22 @@ Semantic value generation inside baseline, direct-paragraph, and transcript-driv
 
 **`prepare_program_analysis(program, cobol_source, ...)`** (L103): Structured JSON per paragraph (comments, calls, stub ops, gating conditions, branch count). No LLM calls.
 
+### `specter/branch_agent.py` — Inner agent loop for stubborn branches (~450 lines)
+
+Focused, multi-turn LLM investigation for branches that no strategy can reach. When the coverage loop plateaus (`stale_rounds >= 3`), the agent picks the top-K highest-priority uncovered branches and runs an inner loop for each:
+
+1. **Gather context**: `backward_slice(module_source, target_bid)` (the code path to the branch), `branch_meta` (paragraph + condition), variable domains (classification, literals, 88-values, stub ops), the nearest-hit test case, and what previous agent runs tried (from `memory_state.targets`).
+2. **Ask the LLM**: prompt with the actual code, exact condition, prior failures, and request for structured JSON (`input_state`, `stub_outcomes`, `reasoning`).
+3. **Execute**: feed the proposal through `_execute_and_save()` like any strategy yield.
+4. **Evaluate + feed back**: if the branch wasn't hit, append the execution trace (which paragraphs/branches DID fire, rc, error) to the prompt and ask the LLM to try a different approach.
+5. **Journal**: every iteration is recorded in `BranchAgentJournal` (branch_key, iterations, success/failure, final_reasoning). Journals persist to `memory_state` for cross-run learning and appear in the uncovered-branch report.
+
+**`run_branch_agent(ctx, cov, report, tc_count, ...)`** — top-level entry point. Picks top-K branches via `_select_priority_branch_targets`, runs `investigate_branch()` for each, persists journals, returns `(journals, n_solved, tc_count)`.
+
+**`investigate_branch(bid, direction, ctx, cov, ...)`** — the inner loop. Up to `max_iterations` (default 3, configurable via `--agent-iterations N` or `SPECTER_AGENT_ITERATIONS` env var) LLM turns per branch.
+
+Configuration: `--agent-iterations N` (LLM turns per branch), `--no-branch-agent` (kill switch), `SPECTER_BRANCH_AGENT=0` (env var kill switch). Capped at `_BRANCH_AGENT_MAX_INVOCATIONS = 3` per coverage run.
+
 ### `specter/uncovered_report.py` — Post-run diagnostic report (~700 lines)
 
 Produces per-branch diagnostics for everything the coverage loop failed to hit, written next to the test store as `<stem>.uncovered.json` (tooling) and `<stem>.uncovered.md` (human review). Runs automatically at the end of `_run_agentic_loop`; can be disabled with `--uncovered-report off` or the `SPECTER_UNCOVERED_REPORT` env var.

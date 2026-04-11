@@ -1272,9 +1272,13 @@ def _emit_uncovered_report(
 _CONCOLIC_STALE_TRIGGER = 3
 
 # Hard cap on the total number of concolic invocations per coverage run.
-# Each invocation calls Z3 for every half- / fully-uncovered branch in
-# the current snapshot, so even at the cap the solver sees many chances.
 _CONCOLIC_MAX_TRIGGERS = 3
+
+# Branch agent (inner LLM loop for stubborn branches) — config.
+_BRANCH_AGENT_STALE_TRIGGER = 3     # stale rounds before agent kicks in
+_BRANCH_AGENT_MAX_INVOCATIONS = 3   # max times the agent runs per coverage run
+_BRANCH_AGENT_MAX_BRANCHES = 3      # branches to investigate per invocation
+_BRANCH_AGENT_DEFAULT_ITERATIONS = 3 # LLM turns per branch
 
 
 def _cobol_branches_to_int_set(branches_hit: set[str]) -> set[int]:
@@ -2267,6 +2271,8 @@ def _run_agentic_loop(
     # the plateau hook fires; _CONCOLIC_MAX_TRIGGERS caps the total Z3
     # invocations per run to keep wall-clock bounded.
     _concolic_triggers_used = 0
+    # Branch agent invocation counter.
+    _branch_agent_invocations_used = 0
     strict_case_cap = 3
     jit_logs_enabled = bool(getattr(config, "jit_logging", None).enabled) if getattr(config, "jit_logging", None) else True
     strict_strategy_order = [
@@ -2430,6 +2436,54 @@ def _run_agentic_loop(
             cov.stale_rounds += 1
         else:
             cov.stale_rounds = 0
+
+        # Inner branch agent on plateau.
+        #
+        # When random + direct-paragraph + fault-injection search stalls,
+        # run a focused, multi-turn LLM investigation for the top-K
+        # stubbornest uncovered branches. Each investigation is up to
+        # max_agent_iterations turns of: LLM proposes → execute → feed
+        # result back → LLM proposes again. The agent journals what it
+        # tried so the next run (or a human reviewer) can pick up where
+        # it left off. Runs BEFORE concolic (which is cheaper but less
+        # targeted) and BEFORE the plateau-stop decision.
+        #
+        # Bypassed by SPECTER_BRANCH_AGENT=0 or --no-branch-agent.
+        if (
+            cov.stale_rounds >= _BRANCH_AGENT_STALE_TRIGGER
+            and _branch_agent_invocations_used < _BRANCH_AGENT_MAX_INVOCATIONS
+        ):
+            _branch_agent_invocations_used += 1
+            try:
+                from .branch_agent import run_branch_agent
+                agent_max_iters = int(
+                    os.environ.get("SPECTER_AGENT_ITERATIONS", _BRANCH_AGENT_DEFAULT_ITERATIONS),
+                )
+                # Recover the LLM provider/model from the JIT inference
+                # service (which stored them at construction time). The
+                # provider isn't passed into _run_agentic_loop directly.
+                jit = getattr(ctx, "jit_inference", None)
+                _agent_provider = getattr(jit, "provider", None) if jit else None
+                _agent_model = getattr(jit, "model", None) if jit else None
+                journals, n_solved, tc_count = run_branch_agent(
+                    ctx=ctx,
+                    cov=cov,
+                    report=report,
+                    tc_count=tc_count,
+                    max_iterations=agent_max_iters,
+                    max_branches=_BRANCH_AGENT_MAX_BRANCHES,
+                    llm_provider=_agent_provider,
+                    llm_model=_agent_model,
+                    invocation_idx=_branch_agent_invocations_used,
+                )
+                if n_solved > 0:
+                    cov.stale_rounds = 0
+                # Attach journals to ctx so the uncovered report can include them.
+                agent_journals = getattr(ctx, "_agent_journals", None) or []
+                agent_journals.extend(journals)
+                ctx._agent_journals = agent_journals
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Branch agent failed: %s", exc)
 
         # Concolic escalation on plateau (T2-B).
         #
