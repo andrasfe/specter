@@ -2026,6 +2026,8 @@ class FaultInjectionStrategy(Strategy):
     _STATUS_FILE = [
         "10", "22", "23", "34", "35", "37", "39", "41", "42", "43",
         "44", "46", "47", "48", "49", "92",
+        # Non-numeric status to trigger IF IO-STATUS NOT NUMERIC branches.
+        "9X",
     ]
     _STATUS_SQL = [0, 100, -803, -805, -904, -911]
     _STATUS_CICS = [0, 12, 13, 16, 22, 27, 36, 44, 80, 82]
