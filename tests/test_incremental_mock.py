@@ -13,6 +13,7 @@ import pytest
 
 from specter.incremental_mock import (
     Resolution,
+    _add_missing_qualified_subfields,
     _apply_preventive_fixes,
     _build_fix_prompt,
     _cluster_errors,
@@ -248,6 +249,39 @@ class TestMissingParagraphStubs:
         )
 
         assert any("R--1DE2X." in line for line in stubs)
+
+
+class TestQualifiedSubfieldFixer:
+    """Test deterministic fix for qualified missing child fields."""
+
+    def test_replaces_filler_under_existing_parent(self):
+        src = [
+            "       WORKING-STORAGE SECTION.\n",
+            "       01  DCLTAX-TYPE.\n",
+            "           05  FILLER PIC X.\n",
+            "       PROCEDURE DIVISION.\n",
+            "           MOVE WS-TAX TO TAX-TYPE-CD OF DCLTAX-TYPE.\n",
+        ]
+        errs = [(100, "'TAX-TYPE-CD IN DCLTAX-TYPE' is not defined")]
+
+        out, n = _add_missing_qualified_subfields(errs, src)
+
+        assert n == 1
+        assert any("05  TAX-TYPE-CD PIC X(02)." in ln for ln in out)
+        assert not any("05  FILLER PIC X." in ln for ln in out)
+
+    def test_no_change_when_parent_missing(self):
+        src = [
+            "       WORKING-STORAGE SECTION.\n",
+            "       01  SOME-OTHER-REC.\n",
+            "           05  FILLER PIC X.\n",
+        ]
+        errs = [(42, "'TAX-TYPE-CD IN DCLTAX-TYPE' is not defined")]
+
+        out, n = _add_missing_qualified_subfields(errs, src)
+
+        assert n == 0
+        assert out == src
 
 
 class TestMissingPeriodsFixer:

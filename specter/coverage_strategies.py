@@ -32,6 +32,59 @@ CaseT = Tuple[dict, Optional[dict], Optional[dict], str]
 
 
 # ---------------------------------------------------------------------------
+# EVALUATE value normalization
+# ---------------------------------------------------------------------------
+
+_EVALUATE_FIGURATIVE_VALUES = {
+    "SPACE": " ",
+    "SPACES": " ",
+    "ZERO": 0,
+    "ZEROS": 0,
+    "ZEROES": 0,
+}
+
+
+def _normalize_evaluate_subject_value(raw_value) -> str | int | float | bool | None:
+    """Return a concrete subject value for single-subject EVALUATE arms.
+
+    Bare identifiers are intentionally rejected here. For a subject variable,
+    a bare WHEN token is usually another variable name, an 88-level condition
+    name, or parser noise; those should be sourced from harvested literals or
+    domain 88-values instead of being injected verbatim into input_state.
+    """
+    if raw_value is None:
+        return None
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, (int, float)):
+        return raw_value
+
+    text = str(raw_value).strip()
+    if not text:
+        return None
+
+    upper = text.upper()
+    if upper in {"OTHER", "WHEN OTHER"}:
+        return None
+    if upper in _EVALUATE_FIGURATIVE_VALUES:
+        return _EVALUATE_FIGURATIVE_VALUES[upper]
+
+    if text[0] == text[-1] and text[0] in {"'", '"'} and len(text) >= 2:
+        return text[1:-1]
+    if re.fullmatch(r"[+-]?\d+", text):
+        return int(text)
+    if re.fullmatch(r"[+-]?\d+\.\d+", text):
+        return float(text)
+
+    m = re.fullmatch(r"DFHRESP\((\w+)\)", upper)
+    if m:
+        from .condition_parser import _DFHRESP
+        return _DFHRESP.get(m.group(1))
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Shared context
 # ---------------------------------------------------------------------------
 
@@ -812,20 +865,23 @@ class DirectParagraphStrategy(Strategy):
                 subj = meta["subject"]
                 if subj not in cv:
                     cv[subj] = []
-                w = cond
-                if w.startswith("'") and w.endswith("'"):
-                    cv[subj].append(w[1:-1])
-                elif w.lstrip("+-").isdigit():
-                    cv[subj].append(int(w))
-                elif w not in ("OTHER", ""):
-                    cv[subj].append(w)
+                # Use the sanitization function to validate and normalize EVALUATE arm values
+                normalized = _normalize_evaluate_subject_value(cond)
+                if normalized is not None and normalized not in cv[subj]:
+                    cv[subj].append(normalized)
                 info = ctx.var_report.variables.get(subj)
                 if info and hasattr(info, "condition_literals"):
                     for lit in info.condition_literals:
                         if lit not in cv[subj]:
                             cv[subj].append(lit)
+                dom = ctx.domains.get(subj)
+                if dom and hasattr(dom, "valid_88_values"):
+                    for lit in (dom.valid_88_values or {}).values():
+                        if lit not in cv[subj]:
+                            cv[subj].append(lit)
                 if -99999 not in cv[subj]:
                     cv[subj].append(-99999)
+
                 continue
             if not cond:
                 continue

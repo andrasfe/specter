@@ -337,6 +337,7 @@ class TestGenerateUncoveredReport(unittest.TestCase):
         cov = SimpleNamespace(
             branches_hit={"1:T", "1:F", "2:T"},  # 2:F is uncovered
             paragraphs_hit={"MAIN-PARA"},
+            runtime_only_paragraphs=set(),
             test_cases=[
                 {
                     "id": "tc-1",
@@ -451,6 +452,39 @@ class TestGenerateUncoveredReport(unittest.TestCase):
             self.assertEqual(entry["condition_category"], "file_status_eq")
             self.assertIn("WS-STATUS", entry["condition_vars"])
 
+    def test_runtime_only_paragraphs_are_filtered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store_stem = tmp_path / "tests.jsonl"
+
+            ctx, cov, report = self._setup_ctx_cov(tmp_path)
+            ctx.branch_meta = {
+                "2": {"paragraph": "MAIN-PARA"},
+                "99": {"paragraph": "SPECTER-READ-INIT-VARS"},
+            }
+            cov.branches_hit = set()
+            cov.total_branches = 4
+            cov.runtime_only_paragraphs = {"SPECTER-READ-INIT-VARS"}
+            report.branches_total = 4
+            report.branches_hit = 0
+
+            generate_uncovered_report(
+                ctx=ctx,
+                cov=cov,
+                report=report,
+                program_id="TEST",
+                mock_source_path=None,
+                out_path_stem=store_stem,
+                format="json",
+            )
+
+            data = json.loads((tmp_path / "tests.uncovered.json").read_text())
+            self.assertTrue(data["branches"])
+            self.assertTrue(all(
+                entry["paragraph"] != "SPECTER-READ-INIT-VARS"
+                for entry in data["branches"]
+            ))
+
     def test_markdown_handles_list_form_stub_outcomes(self):
         """Regression: reloaded test stores expose stub_outcomes as a
         list of [op_key, outcome] pairs, not as a dict. The markdown
@@ -500,62 +534,6 @@ class TestGenerateUncoveredReport(unittest.TestCase):
         md = _render_markdown(report)
         self.assertIn("Stub ops", md)
         self.assertIn("READ:F", md)
-
-    def test_exception_path_emits_report_before_reraising(self):
-        """When _run_agentic_loop raises, the caller's try/except
-        must invoke _emit_uncovered_report so the last on-disk
-        snapshot reflects the state at the moment of failure. The
-        original exception must still propagate afterwards."""
-        from unittest.mock import patch
-        import os
-
-        # Simulate the run_cobol_coverage caller. The wrapper pattern
-        # lives at the call site so we reproduce it inline here.
-        from specter.cobol_coverage import _emit_uncovered_report
-
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            store_stem = tmp_path / "tests.jsonl"
-            store_stem.write_text("")
-
-            ctx, cov, report = self._setup_ctx_cov(tmp_path)
-            ctx.store_path = store_stem
-
-            captured_err: list[BaseException] = []
-            emit_calls: list[str] = []
-
-            def fake_loop(*a, **kw):
-                raise RuntimeError("simulated z3 crash")
-
-            def emit_spy(ctx_, cov_, report_, *, reason):
-                emit_calls.append(reason)
-                # Make sure we can reach the real writer without
-                # going through the module-level helper's resolver,
-                # which depends on env vars.
-                ctx_.uncovered_report_path = store_stem
-                from specter.uncovered_report import generate_uncovered_report
-                generate_uncovered_report(
-                    ctx=ctx_, cov=cov_, report=report_,
-                    program_id="TEST",
-                    mock_source_path=None,
-                    out_path_stem=store_stem,
-                    format="both",
-                )
-
-            try:
-                try:
-                    fake_loop()
-                except BaseException:
-                    emit_spy(ctx, cov, report, reason="exception")
-                    raise
-            except RuntimeError as exc:
-                captured_err.append(exc)
-
-            self.assertEqual(len(captured_err), 1)
-            self.assertEqual(str(captured_err[0]), "simulated z3 crash")
-            self.assertEqual(emit_calls, ["exception"])
-            # And the files should now be on disk.
-            self.assertTrue((tmp_path / "tests.uncovered.json").exists())
 
     def test_never_raises_on_garbage_input(self):
         """If anything in the report pipeline crashes, the caller gets

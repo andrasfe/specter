@@ -662,6 +662,10 @@ def _generate_uncovered_report_impl(
     stub_mapping = getattr(ctx, "stub_mapping", None) or {}
     gating_conds = getattr(ctx, "gating_conds", None) or {}
     test_cases = cov.test_cases or []
+    runtime_only_paragraphs = {
+        str(name).upper()
+        for name in (getattr(cov, "runtime_only_paragraphs", None) or set())
+    }
 
     # --- enrich branch_meta with condition text from the mock source ---
     source_info: dict[str, dict[str, Any]] = {}
@@ -707,6 +711,8 @@ def _generate_uncovered_report_impl(
                 or meta.get("paragraph")
                 or ""
             ).upper()
+            if paragraph and paragraph in runtime_only_paragraphs:
+                continue
             cond_text = sinfo.get("condition_text") or meta.get("condition") or ""
             source_line = sinfo.get("line") or meta.get("line") or 0
 

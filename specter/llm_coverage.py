@@ -87,7 +87,7 @@ def _reconnect_provider(provider: LLMProvider) -> LLMProvider:
             except Exception as exc:
                 logger.warning("Provider %s() failed during reconnect: %s", method_name, exc)
 
-    # 3) SafeChain-specific cache reset + re-instantiation.
+    # 3) Provider-specific cache reset + re-instantiation.
     try:
         if hasattr(refreshed, "_models") and isinstance(getattr(refreshed, "_models"), dict):
             getattr(refreshed, "_models").clear()

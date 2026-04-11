@@ -93,6 +93,17 @@ class TestHarvestConditionLiterals(unittest.TestCase):
         _harvest_condition_literals(report, "UNTIL END-FLAG = 'Y'")
         self.assertIn("Y", report.variables["END-FLAG"].condition_literals)
 
+    def test_subscript_with_index_token_harvests_parent_var(self):
+        report = self._report_with("BUCKET-AGED-PENALTY")
+        _harvest_condition_literals(
+            report,
+            "IF BUCKET-AGED-PENALTY (1 I) LESS ZEROS",
+        )
+        lits = report.variables["BUCKET-AGED-PENALTY"].condition_literals
+        self.assertIn(0, lits)
+        self.assertIn(-1, lits)
+        self.assertIn(1, lits)
+
     def test_empty_condition(self):
         report = self._report_with("X")
         _harvest_condition_literals(report, "")
@@ -161,6 +172,65 @@ class TestExtractVariablesWithLiterals(unittest.TestCase):
         # WHEN text "WHEN WHEN 'GE'" doesn't have a comparison operator,
         # so it won't be harvested via the comparison-based approach.
         # That's expected — WHEN values are simple matches, not conditions.
+
+    def test_move_target_subscript_fragments_are_ignored(self):
+        """Malformed split tokens like '1)' or 'I)' must not become variables."""
+        prog = Program(
+            program_id="TEST",
+            paragraphs=[
+                Paragraph(
+                    name="MAIN",
+                    line_start=1,
+                    line_end=10,
+                    statements=[
+                        Statement(
+                            type="MOVE",
+                            text="MOVE WS-IN TO WS-ARR (1 I)",
+                            line_start=2,
+                            line_end=2,
+                            attributes={
+                                "source": "WS-IN",
+                                "targets": "WS-ARR (1 I)",
+                            },
+                            children=[],
+                        )
+                    ],
+                )
+            ],
+        )
+        report = extract_variables(prog)
+        self.assertIn("WS-IN", report.variables)
+        self.assertIn("WS-ARR", report.variables)
+        self.assertNotIn("1)", report.variables)
+        self.assertNotIn("I)", report.variables)
+
+    def test_numeric_fragment_token_is_ignored(self):
+        """Numeric artifact tokens must be dropped during write extraction."""
+        prog = Program(
+            program_id="TEST",
+            paragraphs=[
+                Paragraph(
+                    name="MAIN",
+                    line_start=1,
+                    line_end=10,
+                    statements=[
+                        Statement(
+                            type="MOVE",
+                            text="MOVE X TO 12)",
+                            line_start=2,
+                            line_end=2,
+                            attributes={
+                                "source": "X",
+                                "targets": "12)",
+                            },
+                            children=[],
+                        )
+                    ],
+                )
+            ],
+        )
+        report = extract_variables(prog)
+        self.assertNotIn("12)", report.variables)
 
 
 class TestEvaluateWhenLiteralHarvest(unittest.TestCase):

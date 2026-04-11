@@ -544,6 +544,12 @@ _MAX_CONTEXT_LINES = 1000  # max lines sent to LLM per error (was 500)
 # scribe calls and (_LLM_REVIEW_MAX_REVISIONS + 1) reviewer calls per
 # error attempt — i.e. 4 + 4 = 8 LLM calls at the cap.
 _LLM_REVIEW_MAX_REVISIONS = 3
+# After this many total reviewer blocks on the *same* error line (across
+# all outer attempts), the reviewer is bypassed for that line and the
+# compiler result becomes the sole acceptance gate.  This breaks the
+# adversarial deadlock where the reviewer vetos every proposal the scribe
+# can generate.
+_LLM_REVIEWER_BYPASS_THRESHOLD = _LLM_REVIEW_MAX_REVISIONS
 
 
 def _format_rejected_proposal(fixes: dict[int, str]) -> str:
@@ -1216,6 +1222,101 @@ def _generate_record_stubs(
     return stubs
 
 
+def _add_missing_qualified_subfields(
+    errors: list[tuple[int, str]],
+    src_lines: list[str],
+) -> tuple[list[str], int]:
+    """Add missing 05-level fields under existing qualified parent records."""
+    qualified: dict[str, set[str]] = {}
+    for _, msg in errors:
+        m = re.match(
+            r"'([A-Z0-9_-]+)\s+(?:IN|OF)\s+([A-Z0-9_-]+)'\s+is not defined",
+            msg,
+            re.IGNORECASE,
+        )
+        if not m:
+            continue
+        field, parent = m.group(1).upper(), m.group(2).upper()
+        qualified.setdefault(parent, set()).add(field)
+
+    if not qualified:
+        return src_lines, 0
+
+    def _infer_pic(name: str) -> str:
+        upper = name.upper()
+        if any(kw in upper for kw in ("STATUS", "CD", "CODE", "IND", "FLAG")):
+            return "PIC X(02)"
+        if any(kw in upper for kw in ("AMT", "RATE", "BAL", "AMOUNT")):
+            return "PIC S9(13)V99 COMP-3"
+        if any(kw in upper for kw in ("DT", "DATE")):
+            return "PIC X(10)"
+        if any(kw in upper for kw in ("NO", "NBR", "NUM", "ID", "ACCT")):
+            return "PIC X(20)"
+        return "PIC X(256)"
+
+    level_name_re = re.compile(
+        r"^\s{6}\s+(\d{2})\s+([A-Z0-9_-]+)\b",
+        re.IGNORECASE,
+    )
+    out = list(src_lines)
+    fixes = 0
+
+    parent_indices: dict[str, int] = {}
+    for i, line in enumerate(out):
+        if len(line) > 6 and line[6:7] == "*":
+            continue
+        m = level_name_re.match(line)
+        if not m:
+            continue
+        level, name = int(m.group(1)), m.group(2).upper()
+        if level == 1:
+            parent_indices[name] = i
+
+    for parent, want_fields in qualified.items():
+        start = parent_indices.get(parent)
+        if start is None:
+            continue
+
+        end = len(out)
+        for j in range(start + 1, len(out)):
+            if len(out[j]) > 6 and out[j][6:7] == "*":
+                continue
+            m = level_name_re.match(out[j])
+            if m and int(m.group(1)) == 1:
+                end = j
+                break
+
+        existing_fields: set[str] = set()
+        filler_at: int | None = None
+        for j in range(start + 1, end):
+            if len(out[j]) > 6 and out[j][6:7] == "*":
+                continue
+            m = level_name_re.match(out[j])
+            if not m:
+                continue
+            level, name = int(m.group(1)), m.group(2).upper()
+            if level >= 2:
+                existing_fields.add(name)
+            if level == 5 and name == "FILLER" and "PIC X" in out[j].upper():
+                filler_at = j
+
+        missing = [f for f in sorted(want_fields) if f not in existing_fields]
+        if not missing:
+            continue
+
+        if filler_at is not None and len(missing) == 1:
+            f = missing[0]
+            out[filler_at] = f"{_B}05  {f} {_infer_pic(f)}.\n"
+            fixes += 1
+            continue
+
+        insert_lines = [f"{_B}05  {f} {_infer_pic(f)}.\n" for f in missing]
+        out[end:end] = insert_lines
+        fixes += len(insert_lines)
+
+    return out, fixes
+
+
 def _generate_file_stubs(
     errors: list[tuple[int, str]],
     src_lines: list[str],
@@ -1636,6 +1737,18 @@ def _compile_and_fix(
                     pre_errors = _parse_errors(stderr_pre, source_name) if rc_pre != 0 else []
         not_defined = [(ln, msg) for ln, msg in pre_errors
                        if "is not defined" in msg]
+        # First, fix 'FIELD IN/OF RECORD' qualified-name errors where the
+        # parent record already exists but is missing the child field.
+        if not_defined:
+            src_q = source_path.read_text(errors="replace").splitlines(keepends=True)
+            src_q2, n_q = _add_missing_qualified_subfields(not_defined, src_q)
+            if n_q > 0:
+                source_path.write_text("".join(src_q2))
+                log.info("  Pre-fix: added/repaired %d qualified subfields", n_q)
+                rc_pre, stderr_pre = _cobc_syntax_check(source_path, copybook_dirs)
+                pre_errors = _parse_errors(stderr_pre, source_name) if rc_pre != 0 else []
+                not_defined = [(ln, msg) for ln, msg in pre_errors
+                               if "is not defined" in msg]
         if not_defined:
             src = source_path.read_text(errors="replace").splitlines(keepends=True)
             stubs = _generate_record_stubs(not_defined, src)
@@ -1775,6 +1888,10 @@ def _compile_and_fix(
     # for the same line, it's permanently skipped.
     revert_count: dict[int, int] = {}
     _MAX_REVERTS_PER_LINE = 3
+    # Tracks how many times the reviewer has blocked a fix per error line.
+    # When the count reaches _LLM_REVIEWER_BYPASS_THRESHOLD the reviewer is
+    # skipped for that line so the compiler can be the final arbiter.
+    reviewer_block_count: dict[int, int] = {}
 
     # Memory of failed attempts: (line, error_msg, fix_summary, reason)
     failed_attempts: list[tuple[int, str, str, str]] = []
@@ -2354,7 +2471,22 @@ def _compile_and_fix(
 
         review_blocked = False
         review_block_reason = ""
-        if llm_provider is not None and review_enabled():
+        # Bypass the reviewer when it has already blocked this error line too
+        # many times — the adversarial deadlock means the compiler should be
+        # the sole gate from here on for this line.
+        _bypass_reviewer = any(
+            reviewer_block_count.get(tl, 0) >= _LLM_REVIEWER_BYPASS_THRESHOLD
+            for tl in targeted_lines
+        )
+        if _bypass_reviewer:
+            log.info(
+                "  [%d/%d] Reviewer bypassed: line %s blocked %d+ times, "
+                "compiler is final arbiter.",
+                attempt + 1, max_fix_attempts,
+                next(iter(targeted_lines)),
+                max(reviewer_block_count.get(tl, 0) for tl in targeted_lines),
+            )
+        if llm_provider is not None and review_enabled() and not _bypass_reviewer:
             review_label = (
                 f"batch:{largest_group_type[:30]}"
                 if use_batch_mode
@@ -2411,7 +2543,13 @@ def _compile_and_fix(
                     "\n\nA reviewer rejected the previous proposal:\n"
                     + _format_rejected_proposal(fixes)
                     + f"\nReviewer's reason: {verdict.reason}\n"
-                    + "Address the reviewer's concern and propose a "
+                )
+                if verdict.guidance:
+                    review_extra += (
+                        f"Reviewer's guidance: Instead, {verdict.guidance}\n"
+                    )
+                review_extra += (
+                    "Address the reviewer's concern and propose a "
                     + "DIFFERENT, non-destructive fix. Do not comment out "
                     + "active code, do not rename undefined symbols, do "
                     + "not insert GOBACK/EXIT to short-circuit logic, do "
@@ -2476,6 +2614,25 @@ def _compile_and_fix(
             ))
             for tl in targeted_lines:
                 failed_error_lines.add(tl)
+                reviewer_block_count[tl] = reviewer_block_count.get(tl, 0) + 1
+            # Log running block counts so operators can see the deadlock forming.
+            for tl in targeted_lines:
+                cnt = reviewer_block_count.get(tl, 0)
+                remaining = _LLM_REVIEWER_BYPASS_THRESHOLD - cnt
+                if remaining <= 0:
+                    log.warning(
+                        "  [%d/%d] Reviewer block tally: line %d blocked %d times "
+                        "(>= threshold %d) — bypass is now ACTIVE for this line",
+                        attempt + 1, max_fix_attempts, tl, cnt,
+                        _LLM_REVIEWER_BYPASS_THRESHOLD,
+                    )
+                else:
+                    log.info(
+                        "  [%d/%d] Reviewer block tally: line %d blocked %d/%d times "
+                        "(%d more until reviewer bypass)",
+                        attempt + 1, max_fix_attempts, tl, cnt,
+                        _LLM_REVIEWER_BYPASS_THRESHOLD, remaining,
+                    )
             continue
 
         # ===== Apply, recompile, verify =====

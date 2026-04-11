@@ -13,6 +13,7 @@ _logger = logging.getLogger(__name__)
 
 # Variable name pattern (COBOL style with hyphens)
 _VAR_RE = re.compile(r"\b([A-Z][A-Z0-9-]*(?:\([^)]*\))?)\b")
+_VALID_VAR_NAME_RE = re.compile(r"^[A-Z][A-Z0-9-]*$")
 
 # Tokens that are COBOL keywords, not variables
 _KEYWORDS = frozenset({
@@ -118,12 +119,17 @@ def _clean_var_name(name: str) -> str:
     paren = name.find("(")
     if paren >= 0:
         name = name[:paren]
-    return name.rstrip(".,;:'")
+    return name.rstrip(".,;:'()[]")
+
+
+def _is_valid_var_name(name: str) -> bool:
+    """Return True for canonical COBOL variable identifiers only."""
+    return bool(_VALID_VAR_NAME_RE.fullmatch(name))
 
 
 def _record_read(report: VariableReport, name: str):
     name = _clean_var_name(name.upper())
-    if name in _KEYWORDS or len(name) < 2:
+    if name in _KEYWORDS or len(name) < 2 or not _is_valid_var_name(name):
         return
     if name not in report.variables:
         report.variables[name] = VariableInfo(name=name, first_access="read")
@@ -132,7 +138,7 @@ def _record_read(report: VariableReport, name: str):
 
 def _record_write(report: VariableReport, name: str):
     name = _clean_var_name(name.upper())
-    if name in _KEYWORDS or len(name) < 2:
+    if name in _KEYWORDS or len(name) < 2 or not _is_valid_var_name(name):
         return
     if name not in report.variables:
         report.variables[name] = VariableInfo(name=name, first_access="write")
@@ -144,7 +150,15 @@ def _extract_names_from_text(text: str) -> list[str]:
     # Remove quoted strings first
     cleaned = re.sub(r"'[^']*'", "", text)
     names = _VAR_RE.findall(cleaned)
-    return [n for n in names if _clean_var_name(n.upper()) not in _KEYWORDS and len(n) >= 2]
+    result: list[str] = []
+    for n in names:
+        cleaned = _clean_var_name(n.upper())
+        if cleaned in _KEYWORDS or len(cleaned) < 2:
+            continue
+        if not _is_valid_var_name(cleaned):
+            continue
+        result.append(n)
+    return result
 
 
 def _extract_from_condition(report: VariableReport, condition: str):
@@ -213,12 +227,19 @@ def _harvest_condition_literals(
         var_name = None
         for tok in reversed(lhs_tokens):
             tok_upper = tok.upper()
+            cleaned = _clean_var_name(tok_upper)
             if (tok_upper not in _KEYWORDS
                     and tok_upper not in ("AND", "OR", "NOT")
                     and tok_upper not in _FIGURATIVE_LITERALS
                     and not tok.startswith("'")
                     and not re.match(r"^-?\d+\.?\d*$", tok)):
-                var_name = _clean_var_name(tok_upper)
+                # Subscript fragments like "I" in "VAR (1 I)" are not the
+                # condition variable; keep scanning for the real identifier.
+                if len(cleaned) < 2:
+                    continue
+                if not _is_valid_var_name(cleaned):
+                    continue
+                var_name = cleaned
                 break
 
         if not var_name or len(var_name) < 2:

@@ -207,7 +207,7 @@ class Resolution:
 
 **Safeguards**:
 - **Rule-based quality gate**: Cheap pre-filter that rejects fixes which are >50% commenting out code with no stubs added.
-- **Scribe / challenger LLM review** (`specter/llm_review.py`): After the rule-based gate accepts a proposal, a second LLM call (the *challenger*) is asked to verify the fix is non-destructive against an explicit rubric (commenting out referenced lines, renaming undefined symbols, narrowing PIC clauses, mid-paragraph GOBACK/EXIT, replaced business statements, ...). The challenger returns `{"verdict": "accept" | "reject", "reason": "...", "severity": "high" | "low"}`. On `reject` the scribe is re-prompted with the reviewer's reason appended and tries again, up to `_LLM_REVIEW_MAX_REVISIONS = 3` revisions per error attempt before the proposal is recorded as failed. On `unknown` (reviewer outage / parse failure / kill switch active) the proposal passes through unblocked. Worst-case cost is 4 scribe calls + 4 reviewer calls per error attempt; most attempts pass on the first review. Bypassed via `--no-llm-review` CLI flag or `SPECTER_LLM_REVIEW=0` env var.
+- **Scribe / challenger LLM review** (`specter/llm_review.py`): After the rule-based gate accepts a proposal, a second LLM call (the *challenger*) is asked to verify the fix is non-destructive against an explicit rubric (commenting out referenced lines, renaming undefined symbols, narrowing PIC clauses, mid-paragraph GOBACK/EXIT, replaced business statements, ...). The challenger returns `{"verdict": "accept" | "reject", "reason": "...", "severity": "high" | "low", "guidance": "..."}`. `ReviewVerdict` carries `verdict`, `reason`, `severity` (`high` = revise, `low` = abandon), and an optional `guidance` string the scribe can follow to find a better fix location. On `reject` the scribe is re-prompted with the reviewer's reason (and guidance if any) appended and tries again, up to `_LLM_REVIEW_MAX_REVISIONS = 3` revisions per error attempt before the proposal is recorded as failed. On `unknown` (reviewer outage / parse failure / kill switch active) the proposal passes through unblocked. Worst-case cost is 4 scribe calls + 4 reviewer calls per error attempt; most attempts pass on the first review. Bypassed via `--no-llm-review` CLI flag or `SPECTER_LLM_REVIEW=0` env var.
 - **Failed-attempt memory**: LLM sees "WHAT WORKED" and "WHAT FAILED" sections with prior attempts from this cycle (now also includes reviewer-blocked attempts).
 - **Error clustering**: Adjacent errors (within 10 lines) are treated as one root cause — failing one marks the whole cluster.
 - **Relaxed verification**: Accept if total error count drops (not just the specific line).
@@ -316,7 +316,7 @@ Current behavior:
 Safety rules now enforced by the deterministic tracer:
 - Inline `ELSE IF ...` and `ELSE <verb> ...` forms are skipped rather than split by inserted probes.
 - Period-delimited IFs are skipped rather than rewritten into structured IFs.
-- Probe counts reflect directions actually inserted, not assumed T/F pairs.
+- Probe counts reflect directions actually inserted (including deterministic `ELSE` injection for structured IFs that originally had no ELSE), not assumed T/F pairs.
 
 After Phase 9 writes probes, `incremental_mock.py` recompiles the executable so the runtime binary matches the final instrumented source.
 
@@ -474,6 +474,41 @@ Per uncovered branch direction, the report captures:
 - **Hints**: heuristic next-step suggestions generated from the condition category (e.g. *"Needs file-status '22' on CARDFILE-STATUS. Verify FaultInjectionStrategy emits a `fault:READ:CARDFILE-FILE=22` case"*, or *"APPL-EOF is an 88-level flag child of APPL-RESULT. Set APPL-RESULT=16 in input_state to activate it"*)
 
 The Markdown companion groups entries by paragraph and leads with a category summary + top-paragraphs table so a reviewer can spot patterns at a glance.
+
+#### Debugging Unreachable Coverage Gaps
+
+When a branch shows **`Attempts: 0`** — meaning no strategy ever generated a test case for its paragraph — the root cause is typically one of:
+
+1. **Structural unreachability**: The paragraph has no incoming edges in the call graph
+   - **Check**: Use `build_static_call_graph(program)` to verify an edge path connects the program entry to the target paragraph via PERFORM or GO TO
+   - **Fix**: If no path exists, the paragraph may be dead code or only reachable via external entry points not captured in the AST
+   - **Example**: `3173-00-MONTA-BUCKET` with 48 uncovered branches saw 0 attempts → likely gated by a high-level condition that constrains which paragraphs are PERFORMed at all
+
+2. **Input variable underspecification**: Gating conditions depend on input variables that don't carry sufficient literal diversity
+   - **Check**: Run `variable_extractor.extract_variables(program)` and inspect the `condition_literals` for each input variable; expand with `--init-var VAR=value` CLI overrides
+   - **Example**: `BUCKET-AGED-PENALTY LESS ZEROS` with known literals `{0, -1, 1, ''}` means the harvester found the boundary but random fuzzing may still miss the true case; seed with `--init-var 'BUCKET-AGED-PENALTY=-1'`
+   - **Harvester gaps**: Check `_harvest_condition_literals()` in `variable_extractor.py` — it supports basic IF `<var> op <literal>` forms; EVALUATE WHEN or complex AND/OR may not be harvested
+
+3. **88-level sibling activation**: A branch condition references an 88-level flag (e.g., `IF APPL-EOF`) but the parent variable is not set to the activating value in any test case
+   - **Check**: The uncovered report shows the 88-level child name and the parent + activating value (e.g., `{'APPL-EOF': ('APPL-RESULT', 16)}`)
+   - **Fix**: Ensure `BaselineStrategy` Phase 3 injects the parent variable with that value; verify `variable_domain.py` correctly parsed the 88 VALUE clauses from copybooks or inline program source
+   - **Example**: If `APPL-RESULT = 16` activates `88 APPL-EOF VALUE 16` but coverage never hits the `IF APPL-EOF` branch, check that the test-store contains at least one case with `APPL-RESULT=16` in its `input_state`
+
+4. **Stub-return variable gating**: A branch depends on the result of a previous operation's mock response (e.g., `IF SQLCODE = 0`)
+   - **Check**: Verify the `op_key` in the variable report (e.g., `CICS-READ:MYFILE`) appears in test-case `stub_outcomes`; FaultInjectionStrategy should rotate through all expected return codes
+   - **Fix**: Expand the stub domain in `coverage_strategies.py` or ensure `--coverage-budget` is large enough for `FaultInjectionStrategy` to explore all fault codes
+
+#### Performance Tuning for Coverage
+
+Common adjustments when plateau occurs:
+
+| Symptom | Tuning |
+|---------|--------|
+| Conditions with high literal diversity (>5 unique known values) never covered | Increase `--coverage-batch-size` (e.g., 500 → 1000) to generate more cases per strategy round |
+| File-status or SQL-error branches stuck at 0% | Run `--coverage-rounds` longer or explicitly call `FaultInjectionStrategy` via `coverage-config.yaml` with higher priority |
+| 88-level flag siblings in uncovered → baseline phase not running long enough | Verify `BaselineStrategy` priority is high (default 20) and phase count allows per-88-sibling fan-out |
+| Compound AND/OR (`compound_and_or` category) rarely hit | Use `--llm-guided` to seed semantic inputs that naturally satisfy multi-variable constraints |
+| Random walk exhausted corpus but coverage stalled | Try `--coverage-config` with `strategies: [direct_paragraph, corpus_fuzz]` (drop baseline/fault_injection if 0 attempts on most) |
 
 ### `specter/coverage_bundle.py` — Portable Bundle (~1100 lines)
 
@@ -648,26 +683,33 @@ python3 -m specter program.ast --java -o project/ \
 
 | File | Tests | Coverage |
 |------|-------|----------|
-| `test_incremental_mock.py` | 24 | Incremental pipeline, resolutions, max_count batching |
-| `test_cobol_coverage.py` | 81 | Integration: AST → Python → COBOL execution, JIT scope/gating, allowlist building |
-| `test_condition_parser.py` | 27 | COBOL condition → Python translation |
-| `test_copybook_parser.py` | 38 | Copybook parsing, PIC types, 88-level values |
-| `test_code_generator.py` | 15 | Python code generation for all statement types |
-| `test_variable_extractor.py` | 15 | Variable classification, literal harvesting |
-| `test_llm_coverage.py` | 22 | LLM provider abstraction, coverage gaps |
-| `test_fuzzer.py` | 28 | Coverage-guided fuzzing, energy, corpus |
-| `test_test_synthesis.py` | 17 | 5-layer synthesis, gating constraints |
-| `test_static_analysis.py` | 18 | Call graph, gating conditions, equality constraints |
-| `test_backward_slicer.py` | 12 | Program slicing for variable deps |
-| `test_concolic.py` | 28 | Z3 concolic solver |
-| `test_88_siblings.py` | 15 | COBOL 88-level sibling detection |
-| `test_llm_fuzzer.py` | 32 | LLM-guided fuzzing |
-| `test_coverage_config.py` | 13 | Configuration management |
+| `test_cobol_coverage.py` | 102 | Integration: AST → Python → COBOL execution, JIT scope/gating, allowlist building, concolic escalation hook, FaultInjection re-entrant, branch-id conversion |
 | `test_java_condition_parser.py` | 56 | Java condition code generation |
+| `test_copybook_parser.py` | 38 | Copybook parsing, PIC types, 88-level values |
+| `test_uncovered_report.py` | 36 | Post-run diagnostic report: condition classification, variable extraction, branch-condition scanning, attempt counting, hint generation, incremental + exception-path writes, stub_outcomes dual-shape |
+| `test_incremental_mock.py` | 36 | Incremental pipeline, resolutions, max_count batching, mock infrastructure |
+| `test_88_siblings.py` | 36 | COBOL 88-level sibling detection, inline 88-value extraction from source, BaselineStrategy Phase 3 enumeration |
+| `test_llm_fuzzer.py` | 33 | LLM-guided fuzzing |
+| `test_fuzzer.py` | 29 | Coverage-guided fuzzing, energy, corpus |
+| `test_concolic.py` | 28 | Z3 concolic solver |
+| `test_condition_parser.py` | 27 | COBOL condition → Python translation |
+| `test_variable_extractor.py` | 24 | Variable classification, literal harvesting, EVALUATE WHEN literal harvest, subscript filtering |
+| `test_llm_review.py` | 22 | Scribe/challenger LLM review: verdict parsing, kill switch, accept/reject paths, exception safety |
+| `test_llm_coverage.py` | 22 | LLM provider abstraction, coverage gaps |
+| `test_static_analysis.py` | 18 | Call graph, gating conditions, equality constraints |
+| `test_test_synthesis.py` | 17 | 5-layer synthesis, gating constraints |
+| `test_code_generator.py` | 15 | Python code generation for all statement types |
+| `test_analysis.py` | 14 | Dynamic analysis |
+| `test_coverage_config.py` | 13 | Configuration management |
+| `test_backward_slicer.py` | 12 | Program slicing for variable deps |
+| `test_stub_diversification.py` | 12 | Stub diversification |
+| `test_multi_program.py` | 11 | Multi-program XCTL routing |
+| `test_integration_uncovered_fixes.py` | 8 | Integration: uncovered-branch fix workflows |
 | `test_end_to_end.py` | 8 | Full pipeline (skipped if AST files missing) |
+| `test_ast_parser.py` | 5 | AST deserialization |
 | `test_memory_store.py` | 3 | Memory persistence: derive_memory_dir, round-trip save/load, prune+checkpoint |
 
-**Total: ~459 tests**
+**Total: 625 tests**
 
 ### Running Tests
 ```bash

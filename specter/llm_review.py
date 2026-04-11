@@ -41,6 +41,7 @@ class ReviewVerdict:
     verdict: str             # 'accept' | 'reject' | 'unknown'
     reason: str              # one-line explanation, fed back into the scribe
     severity: str = "high"   # 'high' (block + revise) or 'low' (block + abandon)
+    guidance: str | None = None  # optional: where to look for the fix instead
 
     @property
     def accepted(self) -> bool:
@@ -112,6 +113,10 @@ You MUST respond with a single JSON object on one line, no markdown:
 Use "severity":"high" for outright destructive fixes (revise and try again).
 Use "severity":"low" for borderline fixes that are safer to abandon than to
 keep looping on (the scribe gets one final chance).
+
+Optionally include "guidance" to tell the scribe where to look for a proper fix
+instead (e.g., "add a missing 05-level field under the 01-level record stub in
+WORKING-STORAGE around line 2400").
 """
 
 
@@ -205,11 +210,12 @@ def parse_review_response(text: str | None) -> ReviewVerdict:
             verdict = str(obj.get("verdict", "")).strip().lower()
             reason = str(obj.get("reason", "")).strip() or "(no reason given)"
             severity = str(obj.get("severity", "high")).strip().lower()
+            guidance = str(obj.get("guidance", "")).strip() or None
             if verdict not in ("accept", "reject", "unknown"):
                 verdict = "unknown"
             if severity not in ("high", "low"):
                 severity = "high"
-            return ReviewVerdict(verdict=verdict, reason=reason, severity=severity)
+            return ReviewVerdict(verdict=verdict, reason=reason, severity=severity, guidance=guidance)
     except (json.JSONDecodeError, ValueError, TypeError):
         pass
 
@@ -223,7 +229,10 @@ def parse_review_response(text: str | None) -> ReviewVerdict:
     reason = m_r.group(1).strip() if m_r else "(no reason given)"
     m_s = _SEVERITY_RE.search(cleaned)
     severity = m_s.group(1).lower() if m_s else "high"
-    return ReviewVerdict(verdict=verdict, reason=reason, severity=severity)
+    # Try to extract guidance field if present
+    m_g = re.search(r'\"guidance\"\\s*:\\s*\"([^\"]+)\"', cleaned)
+    guidance = m_g.group(1).strip() if m_g else None
+    return ReviewVerdict(verdict=verdict, reason=reason, severity=severity, guidance=guidance)
 
 
 # ---------------------------------------------------------------------------

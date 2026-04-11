@@ -1511,6 +1511,7 @@ def _add_branch_tracing(
                     result.append(
                         f"{_B}DISPLAY '@@B:{bid}:F'\n"
                     )
+                    branch_directions.setdefault(bid, set()).add("F")
                     meta = branch_meta.get(bid, {})
                     cond_vars = _extract_condition_vars(meta.get("condition", ""))
                     vs = _gen_var_snapshot(bid, cond_vars)
@@ -1574,7 +1575,14 @@ def _add_branch_tracing(
         i += 1
 
     # Compute total directions from the probes that were actually inserted.
-    total_directions = sum(len(directions) for directions in branch_directions.values())
+    # This keeps count aligned with emitted source even if bookkeeping drifts.
+    probe_re = re.compile(r"@@B:(\d+):([A-Z0-9]+)")
+    emitted_directions: set[tuple[str, str]] = set()
+    for out_line in result:
+        m_probe = probe_re.search(out_line)
+        if m_probe:
+            emitted_directions.add((m_probe.group(1), m_probe.group(2)))
+    total_directions = len(emitted_directions)
 
     log.info("Branch tracing stats: %s", _stats)
     return result, branch_meta, total_directions
