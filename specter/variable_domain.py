@@ -404,10 +404,29 @@ def _append_unique_candidate(
 
 
 def payload_kind_for_domain(domain: VariableDomain | None) -> str:
-    """Return the transcript payload encoding kind for a variable domain."""
-    if domain and domain.data_type not in {"alpha", "group", "unknown"}:
-        return "numeric"
-    return "alpha"
+    """Return the transcript payload encoding kind for a variable domain.
+
+    File-status variables (``semantic_type == "status_file"``) are ALWAYS
+    alpha (PIC XX per the COBOL standard) even though their condition
+    literals ('00', '10') look numeric. Using the numeric mock field
+    for these produces garbage because MOCK-NUM-STATUS (PIC S9(09)) is
+    a 9-byte signed DISPLAY number whose raw bytes are often spaces,
+    and moving spaces-as-numeric to a 2-byte GROUP item yields SPACES
+    instead of '00'. This was the root cause of the OPEN success-path
+    plateau: every WHEN arm for file-status variables in
+    SPECTER-APPLY-MOCK-PAYLOAD was doing
+    ``MOVE MOCK-NUM-STATUS TO <STATUS-VAR>`` instead of
+    ``MOVE MOCK-ALPHA-STATUS TO <STATUS-VAR>``.
+    """
+    if domain is None:
+        return "alpha"
+    # File-status variables are always alphanumeric (PIC XX).
+    if domain.semantic_type == "status_file":
+        return "alpha"
+    # GROUP items and unknowns are always alpha.
+    if domain.data_type in {"alpha", "group", "unknown"}:
+        return "alpha"
+    return "numeric"
 
 
 def build_payload_value_candidates(
