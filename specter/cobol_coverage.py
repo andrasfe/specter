@@ -1620,7 +1620,11 @@ def _execute_and_save(
             if strict_fast:
                 effective_timeout = min(effective_timeout, 120)
 
-            result = run_test_case(ctx.context, input_state, stub_log, timeout=effective_timeout)
+            result = run_test_case(
+                ctx.context, input_state, stub_log,
+                timeout=effective_timeout,
+                stub_defaults=stub_defaults,
+            )
             log.info(
                 "  [%s] rc=%s time=%.0fms stubops=%d paras=%d branches=%d%s",
                 strategy_name,
