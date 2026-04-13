@@ -2521,7 +2521,6 @@ def _run_agentic_loop(
         ):
             _branch_agent_invocations_used += 1
             try:
-                from .branch_agent import run_branch_agent
                 agent_max_iters = int(
                     os.environ.get("SPECTER_AGENT_ITERATIONS", _BRANCH_AGENT_DEFAULT_ITERATIONS),
                 )
@@ -2531,17 +2530,37 @@ def _run_agentic_loop(
                 jit = getattr(ctx, "jit_inference", None)
                 _agent_provider = getattr(jit, "provider", None) if jit else None
                 _agent_model = getattr(jit, "model", None) if jit else None
-                journals, n_solved, tc_count = run_branch_agent(
-                    ctx=ctx,
-                    cov=cov,
-                    report=report,
-                    tc_count=tc_count,
-                    max_iterations=agent_max_iters,
-                    max_branches=_BRANCH_AGENT_MAX_BRANCHES,
-                    llm_provider=_agent_provider,
-                    llm_model=_agent_model,
-                    invocation_idx=_branch_agent_invocations_used,
-                )
+                # Use multi-agent swarm by default; fall back to single
+                # agent when SPECTER_BRANCH_SWARM=0.
+                _use_swarm = os.environ.get(
+                    "SPECTER_BRANCH_SWARM", "1",
+                ).strip().lower() not in ("0", "false", "no", "off")
+                if _use_swarm:
+                    from .branch_swarm import run_branch_swarm
+                    journals, n_solved, tc_count = run_branch_swarm(
+                        ctx=ctx,
+                        cov=cov,
+                        report=report,
+                        tc_count=tc_count,
+                        max_iterations=agent_max_iters,
+                        max_branches=_BRANCH_AGENT_MAX_BRANCHES,
+                        llm_provider=_agent_provider,
+                        llm_model=_agent_model,
+                        invocation_idx=_branch_agent_invocations_used,
+                    )
+                else:
+                    from .branch_agent import run_branch_agent
+                    journals, n_solved, tc_count = run_branch_agent(
+                        ctx=ctx,
+                        cov=cov,
+                        report=report,
+                        tc_count=tc_count,
+                        max_iterations=agent_max_iters,
+                        max_branches=_BRANCH_AGENT_MAX_BRANCHES,
+                        llm_provider=_agent_provider,
+                        llm_model=_agent_model,
+                        invocation_idx=_branch_agent_invocations_used,
+                    )
                 if n_solved > 0:
                     cov.stale_rounds = 0
                 # Attach journals to ctx so the uncovered report can include them.

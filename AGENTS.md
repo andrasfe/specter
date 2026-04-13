@@ -457,19 +457,37 @@ Semantic value generation inside baseline, direct-paragraph, and transcript-driv
 
 **`prepare_program_analysis(program, cobol_source, ...)`** (L103): Structured JSON per paragraph (comments, calls, stub ops, gating conditions, branch count). No LLM calls.
 
-### `specter/branch_agent.py` — Inner agent loop for stubborn branches (~450 lines)
+### `specter/branch_swarm.py` — Multi-agent swarm for stubborn branches (~700 lines)
 
-Focused, multi-turn LLM investigation for branches that no strategy can reach. When the coverage loop plateaus (`stale_rounds >= 3`), the agent picks the top-K highest-priority uncovered branches and runs an inner loop for each:
+Replaces the single-agent sequential loop with a 4-specialist + 1-judge architecture.  When the coverage loop plateaus (`stale_rounds >= 3`), the swarm picks the top-K highest-priority uncovered branches and runs a multi-round investigation for each.
 
-1. **Gather context**: `backward_slice(module_source, target_bid)` (the code path to the branch), `branch_meta` (paragraph + condition), variable domains (classification, literals, 88-values, stub ops), the nearest-hit test case, and what previous agent runs tried (from `memory_state.targets`).
-2. **Ask the LLM**: prompt with the actual code, exact condition, prior failures, and request for structured JSON (`input_state`, `stub_outcomes`, `reasoning`).
-3. **Execute**: feed the proposal through `_execute_and_save()` like any strategy yield.
-4. **Evaluate + feed back**: if the branch wasn't hit, append the execution trace (which paragraphs/branches DID fire, rc, error) to the prompt and ask the LLM to try a different approach.
-5. **Journal**: every iteration is recorded in `BranchAgentJournal` (branch_key, iterations, success/failure, final_reasoning). Journals persist to `memory_state` for cross-run learning and appear in the uncovered-branch report.
+**Specialists** (run concurrently per round via `ThreadPoolExecutor(max_workers=4)`):
+
+1. **Condition Cracker** — reads backward slice, condition text, variable domains (PIC type, length, precision, condition_literals, 88-level values). Proposes `input_state` values to satisfy the branch condition.
+2. **Path Finder** — reads static call graph (`call_graph.path_to(paragraph)`), gating conditions, path constraints. Proposes how to *reach* the target paragraph. Solves the common "0 attempts" case where the paragraph is structurally unreachable.
+3. **Stub Architect** — reads stub mapping, fault tables (file-status/SQL/CICS/DLI/MQ), operation keys from the backward slice. Proposes `stub_outcomes` and `stub_defaults`.
+4. **History Miner** — reads test corpus, nearest-hit test cases, prior attempt feedback, cross-branch `SolutionPattern`s. Proposes targeted mutations of near-miss cases.
+
+**Judge** (sequential per round):
+
+- Receives all 4 `SpecialistProposal`s, synthesizes 1–3 concrete test cases via `_synthesize_test_cases()`. Merge priority: path_finder (reach first) > condition_cracker > stub_architect > history_miner.
+- Runs **Python first** (~3 ms via `_python_execute()`) to check if the target branch flips in the simulator.
+- **Promotes to COBOL** via `_execute_and_save()` for real coverage recording.
+- Builds structured `JudgeFeedback` (reached_paragraph, actual_var_values, branches_hit, error) and feeds it back to specialists for the next round.
+
+**Cross-branch learning**: When a branch is solved, the judge records a `SolutionPattern` (winning specialist, key variables, key stubs) in `memory_state.meta["solution_patterns"]`. The History Miner reads these patterns for subsequent branches.
+
+**`run_branch_swarm(ctx, cov, report, tc_count, ...)`** — top-level entry point. Signature-compatible with `run_branch_agent()`. Returns `(journals, n_solved, tc_count)`. `SwarmJournal` provides a backward-compatible `iterations` property that flattens rounds into `AgentIteration` objects.
+
+**`investigate_branch_swarm(bid, direction, ...)`** — per-branch loop. Each round = 4 parallel specialist LLM calls + judge synthesis + execution. Up to `max_rounds` (default 3) rounds per branch.
+
+Configuration: `SPECTER_BRANCH_SWARM=0` to fall back to the single-agent `branch_agent.py`. Otherwise the swarm is used by default. `--agent-iterations N` controls rounds per branch, `--no-branch-agent` disables both.
+
+### `specter/branch_agent.py` — Single-agent fallback for stubborn branches (~450 lines)
+
+Legacy single-agent loop retained as fallback when `SPECTER_BRANCH_SWARM=0`. Focused, multi-turn LLM investigation: gather context → propose → execute → feed back → repeat up to `max_iterations` turns.
 
 **`run_branch_agent(ctx, cov, report, tc_count, ...)`** — top-level entry point. Picks top-K branches via `_select_priority_branch_targets`, runs `investigate_branch()` for each, persists journals, returns `(journals, n_solved, tc_count)`.
-
-**`investigate_branch(bid, direction, ctx, cov, ...)`** — the inner loop. Up to `max_iterations` (default 3, configurable via `--agent-iterations N` or `SPECTER_AGENT_ITERATIONS` env var) LLM turns per branch.
 
 Configuration: `--agent-iterations N` (LLM turns per branch), `--no-branch-agent` (kill switch), `SPECTER_BRANCH_AGENT=0` (env var kill switch). Capped at `_BRANCH_AGENT_MAX_INVOCATIONS = 3` per coverage run.
 
