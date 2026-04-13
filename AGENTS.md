@@ -232,6 +232,7 @@ class Resolution:
 - **`_fix_redefinitions(errors, src_lines)`**: Intentional no-op placeholder; duplicate definitions are no longer auto-commented out
 - **`_fix_commented_statement_continuations(src_lines)`**: Comment orphaned continuation lines after already-commented statements
 - **`_fix_group_item_pic(errors, src_lines)`**: Deterministic pre-fix for group item PIC errors
+- **`_fix_condition_name_moves(errors, src_lines)`**: Deterministic pre-fix for "condition-name not allowed here" errors. When the mock generator produces `MOVE MOCK-ALPHA-STATUS TO <88-LEVEL-FLAG>` (from checkpoint-resumed builds or copybook variables not in `condition_names_88`), this rewrites it to `SET <FLAG> TO TRUE` before the LLM loop runs. Zero LLM cost; prevents destructive LLM fixes that spread multi-value lists across unrelated lines.
 - **`_fix_long_lines(src_lines)`**: Wrap lines past col 72
 - **`_find_procedure_insertion_point(src_lines)`**: Find a safe insertion point for paragraph stubs near end of PROCEDURE DIVISION
 - **`_find_file_control_end(src_lines)`**: Find insertion point for SELECT stubs
@@ -261,7 +262,7 @@ The underlying transformation functions called by `incremental_mock.py`.
 
 **Non-destructive fallback policy**: `cobol_mock.py` no longer uses broad paragraph neutralization, exact-line comment-out salvage, or hard-comment procedure fallback as a generic recovery path. Fallback recovery now prefers targeted normalization, paragraph-header canonicalization, injected stub repair, and diagnostics, preserving original business logic unless an actual I/O block is being replaced by design.
 
-**`MockConfig`** (L62): Configuration dataclass — copybook_dirs, trace_paragraphs, mock_file_name, stop_on_exec_return/xctl, eib_calen, eib_aid, initial_values, payload_variables.
+**`MockConfig`** (L62): Configuration dataclass — copybook_dirs, trace_paragraphs, mock_file_name, stop_on_exec_return/xctl, eib_calen, eib_aid, initial_values, payload_variables, `condition_names_88` (dict[str, str] mapping 88-level child name → activating value, populated from copybooks + `_extract_88_values_from_source` at instrumentation time). When generating mock status-setting code for an 88-level flag, the generator emits `IF MOCK-ALPHA-STATUS = '<activating_value>' SET <flag> TO TRUE END-IF` instead of the invalid `MOVE MOCK-ALPHA-STATUS TO <flag>`. Three emission sites: `_replace_io_verbs`, `SPECTER-READ-INIT-VARS`, `SPECTER-APPLY-MOCK-PAYLOAD`.
 
 #### Core Replacement Functions (all support `max_count` for incremental batching)
 
@@ -457,27 +458,35 @@ Semantic value generation inside baseline, direct-paragraph, and transcript-driv
 
 **`prepare_program_analysis(program, cobol_source, ...)`** (L103): Structured JSON per paragraph (comments, calls, stub ops, gating conditions, branch count). No LLM calls.
 
-### `specter/branch_swarm.py` — Swarm + planner pipeline for stubborn branches (~1000 lines)
+### `specter/branch_swarm.py` — Swarm + planner pipeline with iterative deepening (~1200 lines)
 
-Combines parallel specialist proposals (diverse LLM perspectives) with hierarchical execution planning (correct end-to-end trace construction). When the coverage loop plateaus (`stale_rounds >= 3`), the swarm picks the top-K uncovered branches and runs up to `max_rounds` attempts per branch.
+Combines parallel specialist proposals (diverse LLM perspectives) with hierarchical execution planning (correct end-to-end trace construction) and iterative deepening (decompose into reachability then branch flipping). When the coverage loop plateaus (`stale_rounds >= 3`), the swarm picks the top-K uncovered branches and runs up to `max_rounds` attempts per branch.
 
-**Round flow per branch:**
+**Iterative deepening — two-phase per branch:**
 
-1. **Specialist swarm** (4 parallel LLM calls): Condition Cracker (variable values to satisfy condition), Path Finder (how to reach the paragraph), Stub Architect (I/O stub outcomes with ordered operation sequences and 88-level parent resolution), History Miner (mutations of nearest-hit test cases). Proposals merged with priority: path_finder > condition_cracker > stub_architect > history_miner.
+- **Phase 1 (Reach)**: When the target paragraph hasn't been visited by any test case, the first 1–2 rounds focus exclusively on getting the COBOL binary to execute the target paragraph. The condition text is temporarily replaced with `(Phase 1: just reach paragraph X)` so specialists propose stubs for reachability, not the branch condition. Validated by `paragraph in result.paragraphs_hit`.
 
-2. **Route Planner** (deterministic): `_plan_route(bctx, ctx)` uses `StaticCallGraph.path_to(paragraph)` and `gating_conds` to compute the ordered paragraph path from program entry to the target, with gating conditions at each step.
+- **Phase 2 (Flip)**: Once reachability is solved (or was already solved from prior strategies), remaining rounds focus on flipping the specific branch condition. Phase 1's working input_state and stubs are warm-started into `nearest_hit` so the History Miner and other specialists build on the known-working base.
 
-3. **Python validation** (~3 ms): `_validate_python()` forward-runs the merged candidate through the Python simulator. On failure, produces per-gate diagnosis (actual variable values, which gates passed/failed, nearby branches fired).
+Round allocation: if the paragraph is already in `cov.paragraphs_hit`, Phase 1 is skipped and all rounds go to Phase 2. Otherwise 2 rounds for Phase 1, remaining for Phase 2. Each round runs `_run_swarm_round()`.
 
-4. **Gate Solver** (0–1 LLM call): Only called when Python validation fails. `_solve_gates()` sends a backward-chaining prompt with the full route + specialist proposals + Python diagnosis. Refines the merged proposal.
+**Round flow (Phase 1 or Phase 2):**
 
-5. **Tape Builder** (deterministic): `_build_tape()` runs `_python_pre_run` to get execution-ordered `stub_log`, producing `(input_state, stub_log)` ready for `run_test_case`.
+1. **Specialist swarm** (4 parallel LLM calls): Condition Cracker, Path Finder, Stub Architect, History Miner. Proposals merged with priority: path_finder > condition_cracker > stub_architect > history_miner. Specialists see the **full COBOL execution trace** from the previous round via `_format_prior_feedback()` — including which paragraphs executed, where execution stopped, and COBOL DISPLAY error messages (filtered for ERROR/ABEND/STATUS/FAIL keywords).
 
-6. **Direct Execution**: `_execute_directly()` calls `run_test_case` directly, bypassing `_execute_and_save`. Handles coverage bookkeeping inline (update `cov.branches_hit`, save to store).
+2. **Route Planner** (deterministic): `_plan_route(bctx, ctx)` uses `StaticCallGraph.path_to(paragraph)` and `gating_conds` to compute the ordered paragraph path from program entry to the target.
 
-**Failure logging**: When a branch is not solved, `_write_failure_log()` appends a structured JSON entry to `<store_stem>.swarm_failures.jsonl` with the full diagnostic context: route, gates, specialist proposals, Python validation diagnosis, execution feedback per round, and 88-level parent mappings. This enables post-run analysis of why the swarm couldn't crack specific branches.
+3. **Python validation** (~3 ms): `_validate_python()` forward-runs the merged candidate. On failure, produces per-gate diagnosis.
 
-**LLM budget**: 4–5 calls per round (4 specialists + 0–1 gate solver refinement).
+4. **Gate Solver** (0–1 LLM call): Only called when Python validation fails. `_solve_gates()` sends a backward-chaining prompt with route + proposals + diagnosis. Refines the merged proposal.
+
+5. **Tape Builder** (deterministic): `_build_tape()` runs `_python_pre_run` for execution-ordered `stub_log`.
+
+6. **Direct Execution**: `_execute_directly()` calls `run_test_case` directly, bypassing `_execute_and_save`. Captures `cobol_trace` (ordered paragraph list) and `display_output` into `JudgeFeedback` for the next round's specialists.
+
+**Failure logging**: `_write_failure_log()` appends a structured JSON entry to `<store_stem>.swarm_failures.jsonl` with full diagnostic context including `cobol_trace` and `display_output` per round.
+
+**LLM budget**: 4–5 calls per round (4 specialists + 0–1 gate solver refinement). Total per branch: up to `max_rounds × 5` calls.
 
 **`run_branch_swarm(ctx, cov, report, tc_count, ...)`** — top-level entry. Signature-compatible with `run_branch_agent()`. Returns `(journals, n_solved, tc_count)`. `SwarmJournal` backward-compatible with `BranchAgentJournal`.
 
