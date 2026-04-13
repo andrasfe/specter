@@ -1238,6 +1238,7 @@ def investigate_branch_swarm(
             f"Exhausted {max_rounds} rounds. "
             f"Approaches: {'; '.join(all_reasons[:4])}"
         )
+        _write_failure_log(ctx, bctx, route, journal)
 
     return journal, tc_count
 
@@ -1350,6 +1351,83 @@ def _extract_condition_vars(text: str) -> list[str]:
         seen.add(name)
         out.append(name)
     return out
+
+
+def _write_failure_log(
+    ctx,
+    bctx: BranchContext,
+    route: list[tuple[str, list[dict]]],
+    journal: SwarmJournal,
+) -> None:
+    """Write a structured diagnostic entry for a failed swarm investigation.
+
+    Appends one JSON line per failed branch to ``<store_stem>.swarm_failures.jsonl``
+    so analysts can review why the swarm couldn't crack specific branches.
+    """
+    store_path = getattr(ctx, "store_path", None)
+    if store_path is None:
+        return
+
+    failure_path = Path(str(store_path)).with_name(
+        Path(str(store_path)).stem + ".swarm_failures.jsonl"
+    )
+
+    entry: dict[str, Any] = {
+        "branch_key": bctx.branch_key,
+        "paragraph": bctx.paragraph,
+        "condition_text": bctx.condition_text,
+        "route": [p for p, _ in route] if route else [],
+        "route_gates": [
+            {"paragraph": p, "gates": gs} for p, gs in route
+        ] if route else [],
+        "stub_ops_in_slice": bctx.stub_ops_in_slice,
+        "stub_op_sequence": bctx.stub_op_sequence,
+        "condition_vars": _extract_condition_vars(bctx.condition_text),
+        "rounds": [],
+    }
+
+    # 88-level info for condition vars
+    for var in entry["condition_vars"]:
+        parent = bctx.parent_88_lookup.get(var)
+        if parent:
+            entry.setdefault("88_level_parents", {})[var] = {
+                "parent": parent[0], "value": parent[1],
+            }
+
+    for rnd in journal.rounds:
+        round_entry: dict[str, Any] = {
+            "round": rnd.round_num,
+            "proposals": [],
+            "feedback": [],
+        }
+        for p in rnd.proposals:
+            round_entry["proposals"].append({
+                "specialist": p.specialist,
+                "confidence": p.confidence,
+                "input_state": p.input_state,
+                "stub_outcomes_keys": list(p.stub_outcomes.keys()),
+                "reasoning": p.reasoning,
+            })
+        for fb in rnd.feedback:
+            round_entry["feedback"].append({
+                "reached_paragraph": fb.reached_paragraph,
+                "branch_hit": fb.branch_hit,
+                "cobol_promoted": fb.cobol_promoted,
+                "actual_var_values": fb.actual_var_values,
+                "branches_hit": fb.branches_hit[:10],
+                "paragraphs_hit": fb.paragraphs_hit[:10],
+                "error": fb.error,
+            })
+        entry["rounds"].append(round_entry)
+
+    entry["final_reasoning"] = journal.final_reasoning
+
+    try:
+        with open(failure_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, default=str) + "\n")
+        log.info("  Swarm failure logged to %s", failure_path)
+    except Exception as exc:
+        log.debug("Failed to write swarm failure log: %s", exc)
 
 
 def _record_solution_pattern(
