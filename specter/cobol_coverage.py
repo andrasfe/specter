@@ -942,10 +942,30 @@ def _build_success_stubs(
             dom = domains.get(var)
             var_upper = var.upper()
             is_88 = var_upper in siblings_88 or var_upper in flag_88_added
-            # 88-level: only the primary success flag is True
+            # 88-level: set the PARENT variable to the activating value
+            # so the rewritten condition (_to_num(state['PARENT']) == VAL)
+            # evaluates correctly. Also set the child for legacy compat.
             if is_88 and _success_flag:
                 success_entries.append((var, var_upper == _success_flag))
                 eof_entries.append((var, False))
+                # Find the parent and its activating value for this child.
+                for parent_name, parent_dom in domains.items():
+                    v88 = getattr(parent_dom, "valid_88_values", None) or {}
+                    if var_upper in {k.upper() for k in v88}:
+                        act_val = v88.get(var, v88.get(var_upper))
+                        if act_val is None:
+                            for k, v in v88.items():
+                                if k.upper() == var_upper:
+                                    act_val = v
+                                    break
+                        if act_val is not None:
+                            is_success = (var_upper == _success_flag)
+                            if is_success:
+                                success_entries.append((parent_name, act_val))
+                            # For EOF: use a non-matching value for the parent
+                            # (the first non-success 88-level value, or just
+                            # leave it — the child=False already signals EOF).
+                        break
             elif dom and dom.semantic_type == "status_file":
                 success_entries.append((var, "00"))
                 eof_entries.append((var, "10"))
