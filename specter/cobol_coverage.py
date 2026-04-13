@@ -1535,11 +1535,15 @@ def _execute_and_save(
             else:
                 stub_log = []
 
-            # Replay through COBOL if Python found new py: branches.
+            # Replay through COBOL if Python found new py: branches OR if
+            # the caller is the branch swarm (which specifically targets
+            # COBOL-uncovered branches — the py: versions may already be
+            # covered by earlier strategies while the COBOL versions are not).
             # Project the direct-execution state down to entry-safe injected
             # variables so COBOL replays are not polluted by Python locals.
             py_new = {b for b in result.branches_hit if b.startswith("py:")} - cov.branches_hit
-            if py_new:
+            force_cobol_replay = strategy_name == "branch_swarm" and stub_outcomes
+            if py_new or force_cobol_replay:
                 seed_state = _best_memory_seed_input(getattr(ctx, "memory_state", None), canonical_target)
                 if not seed_state:
                     seed_state = _best_cobol_seed_input(cov)
