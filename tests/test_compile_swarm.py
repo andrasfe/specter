@@ -95,20 +95,60 @@ class TestScoreProposal(unittest.TestCase):
         score = _score_proposal(p, src)
         self.assertGreater(score, 0)
 
-    def test_commented_out_fix_scores_low(self):
-        # All fixes are comments → penalty
+    def test_commented_out_fix_hard_rejected(self):
+        """ANY comment-out of an active line is hard-rejected."""
         p = CompileFixProposal(
             specialist="s",
-            fixes={
-                1: "      *COMMENTED\n",
-                2: "      *COMMENTED\n",
-                3: "      *COMMENTED\n",
-            },
+            fixes={1: "      *COMMENTED\n"},
             reasoning="",
         )
-        src = self._src("A", "B", "C")
+        src = self._src("           DISPLAY 'X'")  # original was active
         score = _score_proposal(p, src)
-        self.assertLess(score, 0)
+        self.assertLessEqual(score, -100)
+
+    def test_continue_replacement_hard_rejected(self):
+        """Replacing an active statement with CONTINUE is hard-rejected."""
+        p = CompileFixProposal(
+            specialist="s",
+            fixes={1: "           CONTINUE\n"},
+            reasoning="",
+        )
+        src = self._src("           MOVE X TO Y")
+        score = _score_proposal(p, src)
+        self.assertLessEqual(score, -100)
+
+    def test_exit_replacement_hard_rejected(self):
+        """Replacing with EXIT is hard-rejected."""
+        p = CompileFixProposal(
+            specialist="s",
+            fixes={1: "           EXIT.\n"},
+            reasoning="",
+        )
+        src = self._src("           MOVE X TO Y")
+        score = _score_proposal(p, src)
+        self.assertLessEqual(score, -100)
+
+    def test_deletion_hard_rejected(self):
+        """Replacing with whitespace-only is hard-rejected."""
+        p = CompileFixProposal(
+            specialist="s",
+            fixes={1: "\n"},
+            reasoning="",
+        )
+        src = self._src("           MOVE X TO Y")
+        score = _score_proposal(p, src)
+        self.assertLessEqual(score, -100)
+
+    def test_continue_to_continue_allowed(self):
+        """Changing an already-CONTINUE line to CONTINUE is fine."""
+        p = CompileFixProposal(
+            specialist="s",
+            fixes={1: "           CONTINUE\n"},
+            reasoning="",
+        )
+        src = self._src("           CONTINUE")
+        score = _score_proposal(p, src)
+        self.assertGreater(score, -100)
 
     def test_unwanted_goback_penalty(self):
         p = CompileFixProposal(

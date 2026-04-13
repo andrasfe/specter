@@ -67,7 +67,12 @@ def _syntax_prompt(error_line: int, error_msg: str, context: str) -> str:
         f'  "{error_line}": "<corrected line>",\n'
         f'  "reasoning": "syntax rule applied"\n'
         f'}}\n'
-        f"Do NOT comment out referenced code. Do NOT change business logic.\n"
+        f"FORBIDDEN fixes — the judge will REJECT these:\n"
+        f"- Commenting out the offending line (turning it into *COMMENT)\n"
+        f"- Replacing it with CONTINUE, EXIT, or NEXT SENTENCE (no-op)\n"
+        f"- Deleting the line (whitespace-only replacement)\n"
+        f"- Inserting GOBACK/EXIT PROGRAM to short-circuit\n"
+        f"Actually FIX the error — don't hide it.\n"
     )
 
 
@@ -179,47 +184,78 @@ def _parse_fix_response(text: str | None, specialist: str) -> CompileFixProposal
     )
 
 
+_NOP_PATTERNS = re.compile(
+    r"^\s*(CONTINUE|EXIT|NEXT\s+SENTENCE)\s*\.?\s*$",
+    re.IGNORECASE,
+)
+# Comment patterns: COBOL fixed-format uses col 7 = '*' or '/'.
+# Any line where the non-whitespace content starts with '*' is a comment.
+_COMMENT_PATTERNS = re.compile(r"^\s*\*")
+
+
+def _is_comment_or_nop(content: str, orig: str | None) -> bool:
+    """Return True if the fix is a trivial comment-out or no-op.
+
+    A fix is considered "taking the easy way out" when:
+    - It comments out a previously-active line
+    - It replaces an active statement with CONTINUE / EXIT / NEXT SENTENCE
+    - It's just whitespace (line deletion)
+    """
+    if not content.strip():
+        return True  # blank line = deletion
+    # Comment-out detection: new line is a comment, old wasn't (or was different).
+    if _COMMENT_PATTERNS.match(content):
+        if orig is None or not _COMMENT_PATTERNS.match(orig):
+            return True
+    # NOP replacement: new is trivial NOP, old was not a NOP.
+    if _NOP_PATTERNS.match(content):
+        if orig is None or not _NOP_PATTERNS.match(orig):
+            return True
+    return False
+
+
 def _score_proposal(proposal: CompileFixProposal, src_lines: list[str]) -> int:
     """Score a fix proposal. Higher is better.
 
-    Scoring criteria (in priority order):
-      - +10 if the fix address the specific error line
-      - -50 if the fix is mostly commenting out (>50% of affected lines)
-      - -20 if the fix adds GOBACK/EXIT (short-circuit)
+    Hard rejection (returns -999) for "easy way out" fixes:
+      - ANY fix that comments out a previously-active line
+      - ANY fix that replaces an active statement with CONTINUE/EXIT/NEXT
+      - ANY fix that is whitespace (line deletion)
+
+    Soft scoring for acceptable fixes:
+      - +10 for addressing the error line
+      - -20 for inserting GOBACK/EXIT (short-circuit)
       - +5 for structural keywords (SET, MOVE, PIC, 01-level)
       - 0 baseline
     """
     if not proposal.fixes:
-        return -100  # empty proposal is useless
+        return -999  # empty proposal is useless
 
     score = 0
-    commented_count = 0
-    total_count = 0
-
     for ln, content in proposal.fixes.items():
-        total_count += 1
-        stripped = content.strip()
-        if stripped.startswith(("*", "*>")) or stripped.startswith("      *"):
-            commented_count += 1
-        # Short-circuit patterns
+        idx = ln - 1
+        orig = src_lines[idx] if 0 <= idx < len(src_lines) else None
+
+        # HARD REJECTION — never take the easy way out
+        if _is_comment_or_nop(content, orig):
+            return -999
+
+        # Short-circuit patterns (GOBACK in a non-GOBACK line)
         if re.search(r"\b(GOBACK|STOP\s+RUN|EXIT\s+PROGRAM)\b", content, re.IGNORECASE):
-            # Only penalize if this wasn't a GOBACK originally
-            idx = ln - 1
-            if 0 <= idx < len(src_lines):
-                orig = src_lines[idx]
-                if not re.search(r"\b(GOBACK|STOP\s+RUN|EXIT\s+PROGRAM)\b", orig, re.IGNORECASE):
-                    score -= 20
+            if orig is None or not re.search(
+                r"\b(GOBACK|STOP\s+RUN|EXIT\s+PROGRAM)\b", orig, re.IGNORECASE,
+            ):
+                return -999
+
         # Structural keyword bonus
-        if re.search(r"\b(SET.*TO\s+TRUE|SET.*TO\s+FALSE|01\s+[A-Z]|PIC\s+)", content, re.IGNORECASE):
+        if re.search(
+            r"\b(SET.*TO\s+TRUE|SET.*TO\s+FALSE|01\s+[A-Z]|PIC\s+)",
+            content, re.IGNORECASE,
+        ):
             score += 5
 
-    # Penalize commenting-out heavy fixes
-    if total_count > 0 and commented_count / total_count > 0.5:
-        score -= 100
-
-    # Reward addressing the expected line (assumes caller passes one error)
+    # Reward addressing the expected line.
     score += 10
-
     return score
 
 
@@ -241,11 +277,11 @@ def _judge_proposals(
             p.specialist, s, len(p.fixes), p.reasoning[:80],
         )
 
-    if not scored or scored[0][1] < -50:
+    if not scored or scored[0][1] <= -100:
         return CompileFixProposal(
             specialist="judge",
             fixes={},
-            reasoning="all proposals rejected by judge",
+            reasoning="all proposals rejected by judge (comment-out / NOP / short-circuit)",
         )
     return scored[0][0]
 
