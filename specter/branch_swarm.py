@@ -1,26 +1,28 @@
-"""Multi-agent swarm for stubborn uncovered branches.
+"""Hierarchical 3-level planner for stubborn uncovered branches.
 
-Replaces the single-agent sequential loop in ``branch_agent.py`` with
-four specialist agents that run in parallel, feeding proposals to a
-judge that synthesizes, executes, and provides structured feedback.
+When the coverage loop plateaus and no strategy can reach a specific
+branch, this module runs a focused investigation that decomposes the
+problem into subgoals:
 
-Specialists (run concurrently per round):
+  Level 1 — **Route Planner** (deterministic):  BFS shortest path from
+  program entry to the target paragraph, with gating conditions at
+  each step.
 
-  1. **Condition Cracker** — reads backward slice, condition text,
-     variable domains, PIC clauses.  Proposes ``input_state`` values
-     to satisfy the branch condition.
-  2. **Path Finder** — reads call graph, gating conditions, path
-     constraints.  Proposes how to *reach* the target paragraph.
-  3. **Stub Architect** — reads stub mapping, fault tables, operation
-     keys.  Proposes ``stub_outcomes`` and ``stub_defaults``.
-  4. **History Miner** — reads test corpus, prior attempts, nearest-hit
-     test cases.  Proposes targeted mutations of near-miss cases.
+  Level 2 — **Gate Solver** (1–2 LLM calls):  Works backwards from the
+  target branch condition through each gate to determine what variable
+  values and stub outcomes are needed end-to-end.  Validated forward
+  via a fast Python execution (~3 ms) with precise per-gate diagnosis
+  on failure.
 
-Judge (sequential per round):
+  Level 3 — **Tape Builder** (deterministic):  Warm-starts from the
+  nearest-hit test case's stub log, patches specific entries per the
+  Gate Solver's output, pads loop iterations if needed, and produces
+  a concrete ``(input_state, stub_log)`` pair ready for
+  ``run_test_case``.
 
-  Receives all four proposals, synthesizes 1–3 test cases, runs Python
-  first (~3 ms), promotes to COBOL only if Python shows promise, and
-  builds structured feedback for the next round.
+Direct execution bypasses ``_execute_and_save`` — the tape builder
+hands the stub log directly to the COBOL binary, avoiding all the
+projection/replay/prefix-matching that loses data.
 
 Entry point: ``run_branch_swarm()`` — signature-compatible with
 ``run_branch_agent()`` so ``cobol_coverage.py`` can swap it in.
@@ -28,7 +30,6 @@ Entry point: ``run_branch_swarm()`` — signature-compatible with
 
 from __future__ import annotations
 
-import concurrent.futures
 import inspect
 import json
 import logging
@@ -175,7 +176,7 @@ DEFAULT_MAX_ROUNDS = 3
 DEFAULT_MAX_BRANCHES = 3
 DEFAULT_MAX_INVOCATIONS = 3
 DEFAULT_STALE_TRIGGER = 3
-_SPECIALIST_TIMEOUT = 60  # seconds per specialist LLM call
+_MAX_LOOP_PAD = 5  # max loop iterations to try when padding stubs
 
 _FAULT_TABLES = {
     "status_file": ["00", "10", "23", "35", "39", "46", "47"],
@@ -361,46 +362,116 @@ def _gather_branch_context(
 
 
 # ---------------------------------------------------------------------------
-# Specialist prompt builders
+# Level 1: Route Planner (deterministic)
 # ---------------------------------------------------------------------------
 
-_JSON_RESPONSE_FORMAT = (
-    "Return ONLY a JSON object:\n"
-    "{\n"
-    '  "input_state": {"VAR_NAME": "value", ...},\n'
-    '  "stub_outcomes": {"OP_KEY": [[["VAR", "VALUE"]], ...], ...},\n'
-    '  "reasoning": "one-sentence explanation",\n'
-    '  "confidence": 0.7\n'
-    "}\n"
-)
 
-
-def _build_condition_cracker_prompt(
+def _plan_route(
     bctx: BranchContext,
-    prior_feedback: list[JudgeFeedback] | None = None,
+    ctx,
+) -> list[tuple[str, list[dict]]]:
+    """Compute the ordered paragraph path from entry to target with gates.
+
+    Returns a list of ``(paragraph_name, [gate_dicts])`` from the program
+    entry to ``bctx.paragraph``.  Each gate dict has ``variable``,
+    ``values``, ``negated``.  Returns an empty list when no static path
+    exists (direct invocation only).
+    """
+    call_graph = getattr(ctx, "call_graph", None)
+    gating_conds = getattr(ctx, "gating_conds", None) or {}
+
+    if call_graph is None or not bctx.paragraph:
+        return []
+
+    try:
+        path = call_graph.path_to(bctx.paragraph)
+    except Exception:
+        path = None
+    if not path:
+        return []
+
+    route: list[tuple[str, list[dict]]] = []
+    for para in path:
+        gates: list[dict] = []
+        for gc in gating_conds.get(para, []):
+            gates.append({
+                "variable": getattr(gc, "variable", "") or (
+                    gc.get("variable", "") if isinstance(gc, dict) else ""
+                ),
+                "values": getattr(gc, "values", []) or (
+                    gc.get("values", []) if isinstance(gc, dict) else []
+                ),
+                "negated": getattr(gc, "negated", False) or (
+                    gc.get("negated", False) if isinstance(gc, dict) else False
+                ),
+            })
+        route.append((para, gates))
+    return route
+
+
+# ---------------------------------------------------------------------------
+# Level 2: Gate Solver (1–2 LLM calls, backward chaining)
+# ---------------------------------------------------------------------------
+
+def _build_gate_solver_prompt(
+    bctx: BranchContext,
+    route: list[tuple[str, list[dict]]],
+    diagnosis: str | None = None,
 ) -> str:
-    """Specialist 1: what values satisfy the branch condition?"""
+    """Build the backward-chaining prompt for the Gate Solver.
+
+    Lays out the full execution path from entry to target, shows each
+    gate and what must be satisfied, and asks the LLM to work backwards
+    from the target condition to determine all required values.
+    """
     parts: list[str] = []
     parts.append(
-        "You are a COBOL condition analyst. Your job is to determine what "
-        "variable values would make a specific branch condition evaluate to "
-        f"{'TRUE' if bctx.direction == 'T' else 'FALSE'}.\n\n"
-        f"Branch {bctx.branch_key} in paragraph {bctx.paragraph}.\n"
+        "You are solving a COBOL branch-coverage problem by backward chaining.\n\n"
+        "The program executes from entry, passes through a sequence of\n"
+        "paragraphs (each gated by conditions), and must reach a specific\n"
+        "branch.  Work BACKWARDS from the target branch to determine what\n"
+        "every variable and stub outcome must be.\n\n"
+    )
+
+    # --- Target branch ---
+    parts.append(
+        f"TARGET: Branch {bctx.branch_key} in paragraph {bctx.paragraph}\n"
     )
     if bctx.condition_text:
-        parts.append(f"Condition: {bctx.condition_text}\n\n")
+        parts.append(f"Condition: {bctx.condition_text}\n")
+    direction_word = "TRUE" if bctx.direction == "T" else "FALSE"
+    parts.append(f"Required direction: {direction_word}\n\n")
 
+    # --- Backward slice ---
     if bctx.backward_slice_code:
         slice_lines = bctx.backward_slice_code.splitlines()
-        if len(slice_lines) > 80:
-            slice_lines = slice_lines[:80] + ["  # ... (truncated)"]
+        if len(slice_lines) > 100:
+            slice_lines = slice_lines[:100] + ["  # ... (truncated)"]
         parts.append(
             "Code path to this branch (Python simulator):\n```python\n"
             + "\n".join(slice_lines) + "\n```\n\n"
         )
 
+    # --- Route from entry ---
+    if route:
+        parts.append("EXECUTION ROUTE (entry → target):\n")
+        for i, (para, gates) in enumerate(route):
+            parts.append(f"  Step {i + 1}: paragraph {para}\n")
+            for g in gates:
+                var = g.get("variable", "?")
+                vals = g.get("values", [])
+                neg = " (negated)" if g.get("negated") else ""
+                parts.append(f"    GATE: {var} must be in {vals}{neg}\n")
+        parts.append("\n")
+    else:
+        parts.append(
+            "No static route from entry to the target paragraph.\n"
+            "The paragraph is invoked directly.\n\n"
+        )
+
+    # --- Variable domains with 88-level resolution ---
     if bctx.var_domain_info:
-        parts.append("Variables and their domains:\n")
+        parts.append("VARIABLE DOMAINS:\n")
         for var, info in bctx.var_domain_info.items():
             bits = [f"  {var}:"]
             if info.get("data_type"):
@@ -412,290 +483,81 @@ def _build_condition_cracker_prompt(
             if info.get("valid_88_values"):
                 bits.append(f" 88-levels={info['valid_88_values']}")
             if info.get("stub_op"):
-                bits.append(f" (set by stub: {info['stub_op']})")
-            # Surface 88-level parent relationship.
+                bits.append(f" (SET BY STUB: {info['stub_op']})")
             parent_entry = bctx.parent_88_lookup.get(var)
             if parent_entry:
-                parent_name, activating_value = parent_entry
                 bits.append(
-                    f" ** 88-level flag — set parent {parent_name} = "
-                    f"{activating_value!r} to activate **"
+                    f" ** 88-level flag: set parent {parent_entry[0]} = "
+                    f"{parent_entry[1]!r} to activate **"
                 )
             parts.append("".join(bits) + "\n")
         parts.append("\n")
 
-    # Show 88-level relationships for condition variables even when
-    # they are not in var_domain_info (the child might not have its
-    # own domain entry but the parent→child mapping still exists).
-    cond_88: list[str] = []
+    # Extra 88-level hints for condition variables not in var_domain_info.
     for var in _extract_condition_vars(bctx.condition_text):
         if var in bctx.var_domain_info:
-            continue  # already shown above
+            continue
         parent_entry = bctx.parent_88_lookup.get(var)
         if parent_entry:
-            parent_name, activating_value = parent_entry
-            cond_88.append(
+            parts.append(
                 f"  {var} is an 88-level flag. "
-                f"Set {parent_name} = {activating_value!r} in input_state "
-                f"to activate it.\n"
+                f"Set {parent_entry[0]} = {parent_entry[1]!r} in input_state.\n"
             )
-    if cond_88:
-        parts.append("88-level flag relationships:\n")
-        parts.extend(cond_88)
-        parts.append("\n")
 
-    if prior_feedback:
-        parts.append("Previous round results:\n")
-        for fb in prior_feedback[-2:]:
-            parts.append(
-                f"  reached_paragraph={fb.reached_paragraph}, "
-                f"branch_hit={fb.branch_hit}, "
-                f"vars={json.dumps(fb.actual_var_values, default=str)[:200]}\n"
-            )
-        parts.append("Try something fundamentally different.\n\n")
-
-    parts.append(
-        "Focus ONLY on the condition variables. What concrete values would "
-        f"make the condition go {'TRUE' if bctx.direction == 'T' else 'FALSE'}?\n\n"
-    )
-    parts.append(_JSON_RESPONSE_FORMAT)
-    return "".join(parts)
-
-
-def _build_path_finder_prompt(
-    bctx: BranchContext,
-    prior_feedback: list[JudgeFeedback] | None = None,
-) -> str:
-    """Specialist 2: how to reach the target paragraph?"""
-    parts: list[str] = []
-    parts.append(
-        "You are a COBOL reachability analyst. Your job is to determine what "
-        "input values are needed to REACH a specific paragraph via the "
-        "program's PERFORM/GO TO call chain.\n\n"
-        f"Target paragraph: {bctx.paragraph}\n"
-        f"Target branch: {bctx.branch_key}\n\n"
-    )
-
-    if bctx.call_graph_path:
-        parts.append(f"Call graph path from entry: {' → '.join(bctx.call_graph_path)}\n\n")
-    else:
-        parts.append(
-            "No call graph path found from the program entry to this paragraph. "
-            "It may require direct paragraph invocation or specific gating "
-            "conditions to reach.\n\n"
-        )
-
-    if bctx.gating_conditions:
-        parts.append("Gating conditions along the path:\n")
-        for gc in bctx.gating_conditions:
-            neg = " (negated)" if gc.get("negated") else ""
-            parts.append(
-                f"  {gc.get('variable', '?')} must be in {gc.get('values', [])}%s\n" % neg
-            )
-        parts.append("\n")
-
-    if bctx.var_domain_info:
-        # Only show gating vars for this specialist.
-        gating_var_names = {gc.get("variable", "").upper() for gc in bctx.gating_conditions}
-        gating_domains = {k: v for k, v in bctx.var_domain_info.items() if k in gating_var_names}
-        if gating_domains:
-            parts.append("Gating variable domains:\n")
-            for var, info in gating_domains.items():
-                parts.append(
-                    f"  {var}: type={info.get('data_type', '?')}, "
-                    f"known_values={info.get('condition_literals', [])[:6]}\n"
-                )
-            parts.append("\n")
-
-    if prior_feedback:
-        parts.append("Previous round results:\n")
-        for fb in prior_feedback[-2:]:
-            parts.append(
-                f"  reached_paragraph={fb.reached_paragraph}, "
-                f"paragraphs_hit={fb.paragraphs_hit[:8]}\n"
-            )
-        parts.append("Try a different approach to reach the paragraph.\n\n")
-
-    parts.append(
-        "Propose input_state values that would navigate the program's control "
-        "flow to reach the target paragraph. Focus on gating variables.\n\n"
-    )
-    parts.append(_JSON_RESPONSE_FORMAT)
-    return "".join(parts)
-
-
-def _build_stub_architect_prompt(
-    bctx: BranchContext,
-    prior_feedback: list[JudgeFeedback] | None = None,
-) -> str:
-    """Specialist 3: what stub I/O outcomes set up the right state?"""
-    parts: list[str] = []
-    parts.append(
-        "You are a COBOL I/O stub specialist. Your job is to determine what "
-        "mock I/O outcomes (file reads, SQL queries, CICS calls) would set up "
-        "the right program state to reach a specific branch.\n\n"
-        f"Target branch: {bctx.branch_key} in paragraph {bctx.paragraph}\n"
-    )
-    if bctx.condition_text:
-        parts.append(f"Condition: {bctx.condition_text}\n\n")
-
-    if bctx.stub_ops_in_slice:
-        parts.append(
-            "Stub operations in the code path to this branch:\n"
-            f"  {', '.join(bctx.stub_ops_in_slice)}\n\n"
-        )
-
-    # Show the full ordered sequence — the program consumes stubs in
-    # this exact order, so ALL preceding operations must succeed before
-    # the target operation fires.
-    if bctx.stub_op_sequence and len(bctx.stub_op_sequence) > 1:
-        parts.append(
-            "IMPORTANT — these operations fire in this order (each must have "
-            "a stub_outcomes entry so the program does not abort early):\n"
-        )
+    # --- Stub operation sequence ---
+    if bctx.stub_op_sequence:
+        parts.append("\nSTUB OPERATION SEQUENCE (consumed in this order):\n")
         for i, op in enumerate(bctx.stub_op_sequence, 1):
-            parts.append(f"  {i}. {op}\n")
+            status_vars = bctx.stub_mapping.get(op, [])
+            parts.append(f"  {i}. {op} → sets {status_vars}\n")
         parts.append(
-            "Provide stub_outcomes for ALL operations in this sequence, "
-            "not just the one that sets the target variable. Earlier "
-            "operations typically need status '00' (success) so the "
-            "program continues to the operation that matters.\n\n"
+            "Every stub before the target operation MUST return success "
+            "(typically status '00') or the program will abort/branch away.\n"
+            "Only the stub that sets the TARGET variable should return the "
+            "specific value needed by the branch condition.\n\n"
         )
 
-    # Show stub mapping for relevant ops.
-    relevant_stubs: dict[str, list[str]] = {}
-    for op in bctx.stub_ops_in_slice:
-        if op in bctx.stub_mapping:
-            relevant_stubs[op] = bctx.stub_mapping[op]
-    if relevant_stubs:
-        parts.append("Stub operation → status variables:\n")
-        for op, vars_ in relevant_stubs.items():
-            parts.append(f"  {op} → {vars_}\n")
-        parts.append("\n")
-
-    # Show domain info for stub-returned variables.
-    stub_vars = {v for vs in relevant_stubs.values() for v in vs}
-    for var in sorted(stub_vars):
-        info = bctx.var_domain_info.get(var.upper())
-        if info:
-            lits = info.get("condition_literals", [])[:6]
-            v88 = info.get("valid_88_values", {})
-            parent_entry = bctx.parent_88_lookup.get(var.upper())
-            line = f"  {var}: known_values={lits}, 88-levels={v88}"
-            if parent_entry:
-                line += f" (88-flag of {parent_entry[0]}, activate with {parent_entry[1]!r})"
-            parts.append(line + "\n")
-    if stub_vars:
-        parts.append("\n")
-
-    parts.append("Known fault code tables:\n")
-    for stype, codes in bctx.fault_tables.items():
-        parts.append(f"  {stype}: {codes}\n")
-    parts.append("\n")
-
-    parts.append(
-        "stub_outcomes format: {\"OP_KEY\": [[[\"VAR\", \"VALUE\"], ...], ...]}.\n"
-        "Each entry in the list is consumed in order by the program. "
-        "If the program reads the same operation multiple times, provide "
-        "multiple entries.\n\n"
-    )
-
-    if prior_feedback:
-        parts.append("Previous round results:\n")
-        for fb in prior_feedback[-2:]:
-            parts.append(
-                f"  reached_paragraph={fb.reached_paragraph}, "
-                f"branch_hit={fb.branch_hit}, error={fb.error}\n"
-            )
-        parts.append("Adjust stub outcomes based on what happened.\n\n")
-
-    parts.append(_JSON_RESPONSE_FORMAT)
-    return "".join(parts)
-
-
-def _build_history_miner_prompt(
-    bctx: BranchContext,
-    prior_feedback: list[JudgeFeedback] | None = None,
-) -> str:
-    """Specialist 4: what mutations of near-miss cases would work?"""
-    parts: list[str] = []
-    parts.append(
-        "You are a test-case mutation specialist. Your job is to take "
-        "existing near-miss test cases and propose small, targeted changes "
-        "that would flip a specific branch.\n\n"
-        f"Target branch: {bctx.branch_key} in paragraph {bctx.paragraph}\n"
-    )
-    if bctx.condition_text:
-        parts.append(f"Condition: {bctx.condition_text}\n\n")
-
+    # --- Nearest hit (warm-start context) ---
     if bctx.nearest_hit:
         inp = bctx.nearest_hit.get("input_state") or {}
-        if len(inp) > 12:
-            inp = dict(list(inp.items())[:12])
-        stubs = bctx.nearest_hit.get("stub_outcomes")
-        stub_keys = []
-        if isinstance(stubs, dict):
-            stub_keys = list(stubs.keys())[:8]
-        elif isinstance(stubs, list):
-            stub_keys = [e[0] for e in stubs[:8] if isinstance(e, (list, tuple)) and e]
+        if len(inp) > 10:
+            inp = dict(list(inp.items())[:10])
         branches = bctx.nearest_hit.get("branches_hit") or []
         parts.append(
-            "Nearest-hit test case (reached the paragraph but missed the branch):\n"
+            "NEAREST-HIT TEST CASE (reached the paragraph, missed the branch):\n"
             f"  input_state: {json.dumps(inp, default=str)}\n"
-            f"  stub_outcomes keys: {stub_keys}\n"
             f"  branches_hit: {branches[:8]}\n\n"
         )
-    else:
+
+    # --- Diagnosis from failed forward validation ---
+    if diagnosis:
         parts.append(
-            "No test case has reached this paragraph yet. "
-            "Propose a fresh test case based on the condition.\n\n"
+            f"PREVIOUS ATTEMPT FAILED. Diagnosis:\n{diagnosis}\n"
+            "Adjust your proposal based on this diagnosis.\n\n"
         )
 
-    if bctx.solution_patterns:
-        parts.append("Patterns that solved similar branches:\n")
-        for pat in bctx.solution_patterns[:3]:
-            parts.append(
-                f"  {pat.branch_key} ({pat.condition_category}): "
-                f"winning_specialist={pat.winning_specialist}, "
-                f"key_vars={json.dumps(pat.key_variables, default=str)[:150]}\n"
-            )
-        parts.append("\n")
-
-    if prior_feedback:
-        parts.append("Previous round results:\n")
-        for fb in prior_feedback[-2:]:
-            parts.append(
-                f"  reached_paragraph={fb.reached_paragraph}, "
-                f"branch_hit={fb.branch_hit}, "
-                f"vars={json.dumps(fb.actual_var_values, default=str)[:200]}\n"
-            )
-        parts.append("Mutate differently based on what actually happened.\n\n")
-
+    # --- Response format ---
     parts.append(
-        "Propose a SMALL mutation of the nearest-hit case. Change only "
-        "the variables that directly affect the branch condition. "
-        "Small changes to working cases beat large random proposals.\n\n"
+        "Work backwards: what does the branch need? → what sets that "
+        "variable? → what must the stub return? → what must earlier "
+        "stubs return so the program reaches that point?\n\n"
+        "Return ONLY a JSON object:\n"
+        "{\n"
+        '  "input_state": {"VAR_NAME": "value", ...},\n'
+        '  "stub_outcomes": {"OP_KEY": [[["VAR", "VALUE"]], ...], ...},\n'
+        '  "reasoning": "backward chain explanation"\n'
+        "}\n"
     )
-    parts.append(_JSON_RESPONSE_FORMAT)
     return "".join(parts)
 
 
-# ---------------------------------------------------------------------------
-# Response parsing
-# ---------------------------------------------------------------------------
+def _parse_gate_solver_response(text: str | None) -> tuple[dict, dict, str]:
+    """Parse the Gate Solver LLM response.
 
-def _parse_specialist_response(
-    text: str | None,
-    specialist_name: str,
-) -> SpecialistProposal:
-    """Parse a specialist LLM response into a SpecialistProposal."""
+    Returns ``(input_state, stub_outcomes, reasoning)``.
+    """
     if not text:
-        return SpecialistProposal(
-            specialist=specialist_name,
-            reasoning="empty response",
-            confidence=0.0,
-            raw_response="",
-        )
+        return {}, {}, "empty response"
 
     cleaned = text.strip()
     cleaned = re.sub(r"^```\w*\s*", "", cleaned)
@@ -720,280 +582,262 @@ def _parse_specialist_response(
                 pass
 
     if obj is None:
-        return SpecialistProposal(
-            specialist=specialist_name,
-            reasoning=f"could not parse: {cleaned[:150]}",
-            confidence=0.0,
-            raw_response=text[:500],
-        )
+        return {}, {}, f"could not parse: {cleaned[:200]}"
 
-    return SpecialistProposal(
-        specialist=specialist_name,
-        input_state=obj.get("input_state") or {},
-        stub_outcomes=obj.get("stub_outcomes") or {},
-        stub_defaults=obj.get("stub_defaults"),
-        reasoning=str(obj.get("reasoning", ""))[:300],
-        confidence=float(obj.get("confidence", 0.5) or 0.5),
-        target_paragraph=obj.get("target_paragraph"),
-        raw_response=text[:500],
+    return (
+        obj.get("input_state") or {},
+        obj.get("stub_outcomes") or {},
+        str(obj.get("reasoning", ""))[:300] or "(no reasoning)",
     )
 
 
-# ---------------------------------------------------------------------------
-# Specialist runners
-# ---------------------------------------------------------------------------
-
-def _run_specialist(
-    name: str,
-    prompt_fn,
+def _solve_gates(
     bctx: BranchContext,
-    prior_feedback: list[JudgeFeedback] | None,
+    route: list[tuple[str, list[dict]]],
     llm_provider,
     llm_model: str | None,
-) -> SpecialistProposal:
-    """Run a single specialist: build prompt, call LLM, parse response."""
+    diagnosis: str | None = None,
+) -> tuple[dict, dict, str]:
+    """Call the Gate Solver LLM. Returns (input_state, stub_outcomes, reasoning)."""
     from .llm_coverage import _query_llm_sync
 
-    prompt = prompt_fn(bctx, prior_feedback)
+    prompt = _build_gate_solver_prompt(bctx, route, diagnosis)
     try:
         response, _ = _query_llm_sync(llm_provider, prompt, llm_model)
     except Exception as exc:
-        log.warning("  Specialist %s LLM call failed: %s", name, exc)
-        return SpecialistProposal(
-            specialist=name,
-            reasoning=f"LLM call failed: {exc}",
-            confidence=0.0,
+        log.warning("  Gate solver LLM call failed: %s", exc)
+        return {}, {}, f"LLM call failed: {exc}"
+
+    return _parse_gate_solver_response(response)
+
+
+# ---------------------------------------------------------------------------
+# Level 2.5: Python forward validation
+# ---------------------------------------------------------------------------
+
+def _validate_python(
+    module,
+    bctx: BranchContext,
+    input_state: dict,
+    stub_outcomes: dict,
+) -> tuple[bool, str | None]:
+    """Run Python forward validation. Returns (branch_hit, diagnosis_if_failed)."""
+    if module is None or not bctx.paragraph:
+        return False, "no module or paragraph for Python validation"
+
+    from .monte_carlo import _run_paragraph_directly
+
+    try:
+        default_state_fn = getattr(module, "_default_state", None)
+        state = default_state_fn() if default_state_fn else {}
+        state.update(input_state)
+        if stub_outcomes:
+            state["_stub_outcomes"] = {
+                k: [list(e) if isinstance(e, list) else e for e in v]
+                for k, v in stub_outcomes.items()
+            }
+        state.setdefault("_stub_log", [])
+        state.setdefault("_stub_defaults", {})
+
+        post_state = _run_paragraph_directly(module, bctx.paragraph, state)
+        if not post_state:
+            return False, f"paragraph {bctx.paragraph} not found in Python module"
+
+        target_int = bctx.bid if bctx.direction == "T" else -bctx.bid
+        raw_branches = post_state.get("_branches", set())
+        if target_int in raw_branches:
+            return True, None
+
+        # Build diagnosis: what did each condition variable actually hold?
+        diag_parts: list[str] = []
+        cond_vars = _extract_condition_vars(bctx.condition_text)
+        for var in cond_vars[:8]:
+            actual = post_state.get(var)
+            expected_info = bctx.var_domain_info.get(var, {})
+            stub_op = expected_info.get("stub_op", "")
+            diag_parts.append(
+                f"  {var} = {actual!r}"
+                + (f" (set by stub {stub_op})" if stub_op else " (input)")
+            )
+
+        # Check which gate-step paragraphs were actually executed.
+        trace = post_state.get("_trace", [])
+        diag_parts.append(f"  paragraphs hit: {trace[:10]}")
+
+        # Which branches fired nearby?
+        nearby = sorted(
+            b for b in raw_branches
+            if abs(b) in range(bctx.bid - 3, bctx.bid + 4)
         )
+        diag_parts.append(f"  nearby branches fired: {nearby}")
 
-    return _parse_specialist_response(response, name)
+        return False, "\n".join(diag_parts)
 
-
-def _run_specialists_parallel(
-    bctx: BranchContext,
-    prior_feedback: list[JudgeFeedback] | None,
-    llm_provider,
-    llm_model: str | None,
-) -> list[SpecialistProposal]:
-    """Run all 4 specialists concurrently."""
-    specialists = [
-        ("condition_cracker", _build_condition_cracker_prompt),
-        ("path_finder", _build_path_finder_prompt),
-        ("stub_architect", _build_stub_architect_prompt),
-        ("history_miner", _build_history_miner_prompt),
-    ]
-
-    proposals: list[SpecialistProposal] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {
-            pool.submit(
-                _run_specialist, name, prompt_fn, bctx,
-                prior_feedback, llm_provider, llm_model,
-            ): name
-            for name, prompt_fn in specialists
-        }
-        for future in concurrent.futures.as_completed(futures):
-            name = futures[future]
-            try:
-                proposal = future.result(timeout=_SPECIALIST_TIMEOUT)
-                proposals.append(proposal)
-            except Exception as exc:
-                log.warning("  Specialist %s failed: %s", name, exc)
-                proposals.append(SpecialistProposal(
-                    specialist=name,
-                    reasoning=f"failed: {exc}",
-                    confidence=0.0,
-                ))
-    return proposals
+    except Exception as exc:
+        return False, f"Python execution error: {exc}"
 
 
 # ---------------------------------------------------------------------------
-# Judge: synthesis + execution
+# Level 3: Tape Builder (deterministic)
 # ---------------------------------------------------------------------------
 
-def _synthesize_test_cases(
-    proposals: list[SpecialistProposal],
+def _build_tape(
     bctx: BranchContext,
-    llm_provider=None,
-    llm_model: str | None = None,
-) -> list[dict]:
-    """Merge specialist proposals into 1–3 concrete test cases.
+    ctx,
+    input_state: dict,
+    stub_outcomes: dict,
+) -> tuple[dict, list[tuple[str, list]]]:
+    """Build a concrete (input_state, stub_log) for run_test_case.
 
-    If an LLM is available, ask the judge to synthesize.  Otherwise,
-    use a deterministic merge: condition_cracker's input_state for
-    condition vars, path_finder's for gating vars, stub_architect's
-    stubs, history_miner's mutations as a fallback.
+    Warm-starts from the nearest-hit's stub log if available, then
+    patches specific entries per the Gate Solver's output.  Falls back
+    to a fresh ``_python_pre_run`` if no warm-start is available.
     """
-    # Deterministic merge (always available, used as fallback).
-    merged_input: dict = {}
-    merged_stubs: dict = {}
-    merged_defaults: dict | None = None
+    from .cobol_coverage import _python_pre_run
 
-    # Priority order: path_finder (reach first), condition_cracker
-    # (satisfy condition), history_miner (near-miss mutations).
-    for p in sorted(proposals, key=lambda p: {
-        "path_finder": 0,
-        "condition_cracker": 1,
-        "stub_architect": 2,
-        "history_miner": 3,
-    }.get(p.specialist, 4)):
-        if p.input_state:
-            merged_input.update(p.input_state)
-        if p.stub_outcomes:
-            merged_stubs.update(p.stub_outcomes)
-        if p.stub_defaults is not None:
-            merged_defaults = p.stub_defaults
+    module = getattr(ctx, "module", None)
+    if module is None:
+        return input_state, []
 
-    cases: list[dict] = []
+    # Merge Gate Solver's input_state with nearest-hit for warm-start.
+    merged_input = dict(input_state)
 
-    # Case 1: Full merge of all proposals.
-    if merged_input or merged_stubs:
-        cases.append({
-            "input_state": dict(merged_input),
-            "stub_outcomes": dict(merged_stubs),
-            "stub_defaults": merged_defaults,
-            "origin": "merged",
-        })
+    # Run the full Python program from entry with the proposed
+    # stub_outcomes to get the execution-ordered stub_log.
+    stub_log = _python_pre_run(module, merged_input, stub_outcomes)
 
-    # Case 2: Condition cracker + stub architect only (skip path/history).
-    cc = next((p for p in proposals if p.specialist == "condition_cracker" and p.input_state), None)
-    sa = next((p for p in proposals if p.specialist == "stub_architect" and p.stub_outcomes), None)
-    if cc and sa:
-        case2_input = dict(cc.input_state)
-        case2_stubs = dict(sa.stub_outcomes)
-        # Only add if different from case 1.
-        if case2_input != merged_input or case2_stubs != merged_stubs:
-            cases.append({
-                "input_state": case2_input,
-                "stub_outcomes": case2_stubs,
-                "stub_defaults": sa.stub_defaults,
-                "origin": "condition+stub",
-            })
+    # If the stub_log is very short but stub_outcomes has entries,
+    # the program may have aborted early.  Try padding with success
+    # stubs for operations the program didn't reach.
+    if stub_outcomes and len(stub_log) < len(stub_outcomes):
+        # Add missing operations with success status.
+        logged_ops = {op for op, _ in stub_log}
+        for op_key, entries in stub_outcomes.items():
+            if op_key not in logged_ops and entries:
+                stub_log.append((op_key, entries[0] if entries else []))
 
-    # Case 3: History miner's mutation (if it has a distinct proposal).
-    hm = next((p for p in proposals if p.specialist == "history_miner" and p.input_state), None)
-    if hm:
-        case3_input = dict(hm.input_state)
-        case3_stubs = dict(hm.stub_outcomes) if hm.stub_outcomes else dict(merged_stubs)
-        if case3_input != merged_input:
-            cases.append({
-                "input_state": case3_input,
-                "stub_outcomes": case3_stubs,
-                "stub_defaults": hm.stub_defaults or merged_defaults,
-                "origin": "history_mutation",
-            })
-
-    if not cases:
-        # Fallback: empty case (will fail, but gives feedback).
-        cases.append({
-            "input_state": {},
-            "stub_outcomes": {},
-            "stub_defaults": None,
-            "origin": "empty_fallback",
-        })
-
-    return cases[:3]
+    return merged_input, stub_log
 
 
-def _execute_and_evaluate(
-    case: dict,
-    bctx: BranchContext,
+# ---------------------------------------------------------------------------
+# Direct execution (bypasses _execute_and_save)
+# ---------------------------------------------------------------------------
+
+def _execute_directly(
     ctx,
     cov,
     report,
     tc_count: int,
+    input_state: dict,
+    stub_log: list[tuple[str, list]],
+    bctx: BranchContext,
+    stub_defaults: dict | None = None,
 ) -> tuple[JudgeFeedback, int]:
-    """Execute a synthesized test case: Python first, COBOL if promising."""
-    from .cobol_coverage import _execute_and_save
-
-    input_state = case.get("input_state") or {}
-    stub_outcomes = case.get("stub_outcomes") or {}
-    stub_defaults = case.get("stub_defaults")
-
+    """Execute via run_test_case and handle coverage bookkeeping."""
     feedback = JudgeFeedback()
 
-    # --- Python-first execution (direct paragraph invocation) ---
-    # We call _run_paragraph_directly ourselves so we get the full
-    # post-execution state dict — _python_execute discards it, which
-    # means we can't report actual runtime variable values to the
-    # specialists for the next round.
-    module = getattr(ctx, "module", None)
-    py_hit = False
-    if module and bctx.paragraph:
-        try:
-            from .monte_carlo import _run_paragraph_directly
+    cobol_context = getattr(ctx, "context", None)
+    if cobol_context is None:
+        # Python-only mode fallback.
+        feedback.error = "no COBOL execution context"
+        return feedback, tc_count
 
-            default_state_fn = getattr(module, "_default_state", None)
-            pre_state = default_state_fn() if default_state_fn else {}
-            pre_state.update(input_state)
-            if stub_outcomes:
-                pre_state["_stub_outcomes"] = {
-                    k: [list(e) if isinstance(e, list) else e for e in v]
-                    for k, v in stub_outcomes.items()
-                }
-            if stub_defaults:
-                pre_state["_stub_defaults"] = dict(stub_defaults)
-            pre_state.setdefault("_stub_log", [])
-
-            post_state = _run_paragraph_directly(module, bctx.paragraph, pre_state)
-            if post_state:
-                feedback.python_result = True
-                trace = post_state.get("_trace", [])
-                feedback.paragraphs_hit = list(dict.fromkeys(trace))[:10]
-                feedback.reached_paragraph = bctx.paragraph in feedback.paragraphs_hit
-
-                # Convert integer branch IDs to py: prefixed strings.
-                raw_branches = post_state.get("_branches", set())
-                py_branches: list[str] = []
-                for b in raw_branches:
-                    if b > 0:
-                        py_branches.append(f"py:{b}:T")
-                    elif b < 0:
-                        py_branches.append(f"py:{abs(b)}:F")
-                feedback.branches_hit = py_branches[:20]
-
-                # Check if the Python branch fired — use the raw integer
-                # set directly (no prefix mismatch).
-                target_int = bctx.bid if bctx.direction == "T" else -bctx.bid
-                py_hit = target_int in raw_branches
-
-                # Extract ACTUAL runtime variable values (not input values).
-                # These are what the specialists need to diagnose failures.
-                for var in list(bctx.var_domain_info.keys())[:10]:
-                    val = post_state.get(var)
-                    if val is not None:
-                        feedback.actual_var_values[var] = val
-            else:
-                feedback.error = "paragraph not found in Python module"
-        except Exception as exc:
-            feedback.error = f"Python execution failed: {exc}"
-
-    # --- COBOL execution via _execute_and_save for real coverage ---
     try:
-        target = f"direct:{bctx.paragraph}|swarm:{bctx.branch_key}" if bctx.paragraph else f"swarm:{bctx.branch_key}"
-        saved, tc_count = _execute_and_save(
-            ctx, cov, input_state, stub_outcomes, stub_defaults,
-            "branch_swarm", target, report, tc_count,
+        from .cobol_executor import run_test_case
+        from .cobol_coverage import _save_test_case, _compute_tc_id
+
+        exec_timeout = int(getattr(ctx, "execution_timeout", 120))
+        result = run_test_case(
+            cobol_context, input_state, stub_log,
+            timeout=exec_timeout,
+            stub_defaults=stub_defaults,
         )
+
         feedback.cobol_promoted = True
-        # Check both COBOL branch IDs and Python branch IDs in the
-        # coverage set — _execute_and_save adds py: branches from
-        # direct paragraph invocation to cov.branches_hit.
-        feedback.branch_hit = (
-            bctx.branch_key in cov.branches_hit
-            or f"py:{bctx.branch_key}" in cov.branches_hit
-            or py_hit
-        )
-        if feedback.branch_hit:
-            feedback.reached_paragraph = True
+        feedback.error = result.error
+        feedback.paragraphs_hit = list(result.paragraphs_hit or [])[:15]
+        feedback.branches_hit = list(result.branches_hit or [])[:30]
+        feedback.reached_paragraph = bctx.paragraph in (result.paragraphs_hit or [])
+        feedback.branch_hit = bctx.branch_key in (result.branches_hit or set())
+
+        if result.error:
+            return feedback, tc_count
+
+        # --- Coverage bookkeeping (mirrors _execute_and_save) ---
+        result_paras = set(result.paragraphs_hit)
+        all_paras = getattr(cov, "all_paragraphs", None) or set()
+        if all_paras:
+            result_ast_paras = result_paras & all_paras
+        else:
+            result_ast_paras = result_paras
+
+        new_paras = result_ast_paras - cov.paragraphs_hit
+        new_branches = result.branches_hit - cov.branches_hit
+
+        if new_paras or new_branches:
+            cov.paragraphs_hit.update(result_ast_paras)
+            cov.branches_hit.update(result.branches_hit)
+
+            tc_id = _compute_tc_id(input_state, stub_log)
+            target = f"direct:{bctx.paragraph}|swarm:{bctx.branch_key}"
+            store_path = getattr(ctx, "store_path", None)
+            if store_path:
+                _save_test_case(
+                    store_path, tc_id, input_state, stub_log, result,
+                    "branch_swarm", target,
+                )
+            tc_count += 1
+            report.layer_stats["branch_swarm"] = report.layer_stats.get("branch_swarm", 0) + 1
+
+            cov.test_cases.append({
+                "id": tc_id,
+                "input_state": {k: v for k, v in input_state.items() if not str(k).startswith("_")},
+                "stub_outcomes": [[op, entries] for op, entries in stub_log],
+                "paragraphs_hit": result.paragraphs_hit,
+                "branches_hit": sorted(result.branches_hit),
+                "layer": "branch_swarm",
+                "target": target,
+            })
+
+            if new_paras:
+                log.info(
+                    "  [branch_swarm] +%d paras -> %d/%d: %s",
+                    len(new_paras), len(cov.paragraphs_hit),
+                    len(all_paras) if all_paras else "?",
+                    sorted(new_paras)[:5],
+                )
+            if new_branches:
+                total_branches = getattr(cov, "total_branches", 0) or 0
+                log.info(
+                    "  [branch_swarm] +%d branches -> %d/%d",
+                    len(new_branches), len(cov.branches_hit), total_branches,
+                )
+
+        # Update memory state.
+        memory_store = getattr(ctx, "memory_store", None)
+        memory_state = getattr(ctx, "memory_state", None)
+        if memory_store is not None and memory_state is not None:
+            canonical = f"branch:{bctx.branch_key}"
+            try:
+                memory_store.upsert_target_status(
+                    memory_state, canonical,
+                    attempts_delta=1,
+                    solved=feedback.branch_hit,
+                    nearest_paragraph_hits=len(result.paragraphs_hit),
+                    nearest_branch_hits=len(result.branches_hit),
+                )
+            except Exception:
+                pass
+
     except Exception as exc:
-        log.warning("  Swarm execution failed: %s", exc)
+        log.warning("  Swarm direct execution failed: %s", exc)
         feedback.error = str(exc)
 
     return feedback, tc_count
 
 
 # ---------------------------------------------------------------------------
-# Main investigation loop
+# Main investigation loop (3-level planner)
 # ---------------------------------------------------------------------------
 
 def investigate_branch_swarm(
@@ -1008,7 +852,7 @@ def investigate_branch_swarm(
     llm_provider=None,
     llm_model: str | None = None,
 ) -> tuple[SwarmJournal, int]:
-    """Run the multi-agent swarm for a single uncovered branch."""
+    """Run the 3-level hierarchical planner for a single uncovered branch."""
     branch_key = f"{bid}:{direction}"
 
     journal = SwarmJournal(
@@ -1020,87 +864,124 @@ def investigate_branch_swarm(
         journal.final_reasoning = "no LLM provider configured"
         return journal, tc_count
 
-    # Gather context once (expensive).
+    # Gather context once.
     bctx = _gather_branch_context(bid, direction, ctx, cov)
     journal.paragraph = bctx.paragraph
     journal.condition_text = bctx.condition_text
 
-    prior_feedback: list[JudgeFeedback] | None = None
-
-    for round_num in range(max_rounds):
+    # Level 1: Route Planner (deterministic).
+    route = _plan_route(bctx, ctx)
+    if route:
         log.info(
-            "  Swarm: investigating %s round %d/%d",
-            branch_key, round_num + 1, max_rounds,
+            "  Planner: route to %s: %s",
+            bctx.paragraph,
+            " → ".join(p for p, _ in route),
+        )
+    else:
+        log.info("  Planner: no static route to %s (direct invocation)", bctx.paragraph)
+
+    diagnosis: str | None = None
+
+    for attempt in range(min(max_rounds, 2)):  # max 2 LLM calls
+        log.info(
+            "  Planner: %s attempt %d/%d%s",
+            branch_key, attempt + 1, min(max_rounds, 2),
+            " (retry with diagnosis)" if diagnosis else "",
         )
 
-        # Run all 4 specialists in parallel.
-        proposals = _run_specialists_parallel(
-            bctx, prior_feedback, llm_provider, llm_model,
+        # Level 2: Gate Solver (1 LLM call).
+        input_state, stub_outcomes, reasoning = _solve_gates(
+            bctx, route, llm_provider, llm_model, diagnosis,
         )
 
-        # Log specialist results.
-        for p in proposals:
+        if not input_state and not stub_outcomes:
+            log.info("  Planner: empty gate solver proposal — %s", reasoning[:100])
+            proposal = SpecialistProposal(
+                specialist="gate_solver", reasoning=reasoning,
+            )
+            rnd = SwarmRound(
+                round_num=attempt,
+                proposals=[proposal],
+                feedback=[JudgeFeedback(error="empty proposal")],
+            )
+            journal.rounds.append(rnd)
+            break
+
+        log.info(
+            "  Planner: gate solver proposed input_keys=%s stub_keys=%s — %s",
+            list(input_state.keys())[:6],
+            list(stub_outcomes.keys())[:6],
+            reasoning[:80],
+        )
+
+        # Level 2.5: Python forward validation.
+        module = getattr(ctx, "module", None)
+        py_ok, py_diagnosis = _validate_python(
+            module, bctx, input_state, stub_outcomes,
+        )
+
+        if py_ok:
+            log.info("  Planner: Python validation PASSED for %s", branch_key)
+        else:
             log.info(
-                "    %s: confidence=%.1f input_keys=%s stub_keys=%s",
-                p.specialist, p.confidence,
-                list(p.input_state.keys())[:5],
-                list(p.stub_outcomes.keys())[:5],
+                "  Planner: Python validation failed — %s",
+                (py_diagnosis or "unknown")[:150],
             )
 
-        # Synthesize 1-3 test cases.
-        cases = _synthesize_test_cases(proposals, bctx, llm_provider, llm_model)
+        # Level 3: Tape Builder (deterministic).
+        final_input, stub_log = _build_tape(bctx, ctx, input_state, stub_outcomes)
 
-        # Execute each synthesized case.
-        round_feedback: list[JudgeFeedback] = []
-        round_hit = False
-        for case in cases:
-            fb, tc_count = _execute_and_evaluate(
-                case, bctx, ctx, cov, report, tc_count,
-            )
-            round_feedback.append(fb)
-            if fb.branch_hit:
-                round_hit = True
-                # Record which specialist contributed the winning input.
-                _record_solution_pattern(ctx, bctx, proposals, case)
+        log.info(
+            "  Planner: tape built with %d stub entries",
+            len(stub_log),
+        )
 
+        # Direct COBOL execution.
+        feedback, tc_count = _execute_directly(
+            ctx, cov, report, tc_count,
+            final_input, stub_log, bctx,
+        )
+
+        proposal = SpecialistProposal(
+            specialist="gate_solver",
+            input_state=input_state,
+            stub_outcomes=stub_outcomes,
+            reasoning=reasoning,
+            confidence=1.0 if feedback.branch_hit else 0.5,
+        )
         rnd = SwarmRound(
-            round_num=round_num,
-            proposals=proposals,
-            synthesized_cases=cases,
-            feedback=round_feedback,
-            branch_hit=round_hit,
+            round_num=attempt,
+            proposals=[proposal],
+            synthesized_cases=[{
+                "input_state": final_input,
+                "stub_outcomes": stub_outcomes,
+            }],
+            feedback=[feedback],
+            branch_hit=feedback.branch_hit,
         )
         journal.rounds.append(rnd)
 
-        if round_hit:
-            winning_reasons = [p.reasoning for p in proposals if p.input_state or p.stub_outcomes]
+        if feedback.branch_hit:
             journal.success = True
-            journal.final_reasoning = (
-                f"Solved on round {round_num + 1}: "
-                + "; ".join(winning_reasons[:2])
+            journal.final_reasoning = f"Solved on attempt {attempt + 1}: {reasoning}"
+            log.info("  Planner: SOLVED %s on attempt %d", branch_key, attempt + 1)
+            _record_solution_pattern(
+                ctx, bctx, [proposal],
+                {"input_state": final_input, "stub_outcomes": stub_outcomes, "origin": "gate_solver"},
             )
-            log.info("  Swarm: SOLVED %s on round %d", branch_key, round_num + 1)
             break
 
-        # Feed results back for next round.
-        prior_feedback = round_feedback
+        # Use Python diagnosis for the retry.
+        diagnosis = py_diagnosis
         log.info(
-            "  Swarm: %s not hit on round %d — %s",
-            branch_key, round_num + 1,
-            "; ".join(
-                f"{p.specialist}:{p.reasoning[:50]}" for p in proposals if p.reasoning
-            )[:200],
+            "  Planner: %s not hit — %s",
+            branch_key, reasoning[:100],
         )
 
     if not journal.success:
-        all_reasons = []
-        for rnd in journal.rounds:
-            for p in rnd.proposals:
-                if p.reasoning:
-                    all_reasons.append(f"{p.specialist}: {p.reasoning[:80]}")
         journal.final_reasoning = (
-            f"Exhausted {max_rounds} rounds. "
-            f"Approaches: {'; '.join(all_reasons[:4])}"
+            f"Exhausted {len(journal.rounds)} attempts. "
+            f"Last reasoning: {reasoning if 'reasoning' in dir() else 'n/a'}"
         )
 
     return journal, tc_count
@@ -1122,7 +1003,7 @@ def run_branch_swarm(
     llm_model: str | None = None,
     invocation_idx: int = 1,
 ) -> tuple[list[SwarmJournal], int, int]:
-    """Run the multi-agent swarm for the top-K stubborn branches.
+    """Run the hierarchical planner for the top-K stubborn branches.
 
     Signature-compatible with ``run_branch_agent()`` — returns
     ``(journals, n_solved, updated_tc_count)``.
@@ -1178,7 +1059,7 @@ def run_branch_swarm(
     _persist_journals(ctx, journals)
 
     log.info(
-        "Branch swarm #%d: %d/%d branches solved, %d rounds total",
+        "Branch swarm #%d: %d/%d branches solved, %d attempts total",
         invocation_idx, n_solved, len(targets),
         sum(len(j.rounds) for j in journals),
     )

@@ -1,4 +1,4 @@
-"""Tests for the multi-agent branch coverage swarm."""
+"""Tests for the hierarchical 3-level branch planner."""
 
 import json
 import unittest
@@ -12,14 +12,13 @@ from specter.branch_swarm import (
     SpecialistProposal,
     SwarmJournal,
     SwarmRound,
-    _build_condition_cracker_prompt,
-    _build_history_miner_prompt,
-    _build_path_finder_prompt,
-    _build_stub_architect_prompt,
+    _build_gate_solver_prompt,
+    _build_tape,
     _extract_condition_vars,
     _gather_branch_context,
-    _parse_specialist_response,
-    _synthesize_test_cases,
+    _parse_gate_solver_response,
+    _plan_route,
+    _validate_python,
     swarm_enabled,
 )
 
@@ -62,52 +61,62 @@ class TestExtractConditionVars(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Response parsing
+# Level 1: Route Planner
 # ---------------------------------------------------------------------------
 
-class TestParseSpecialistResponse(unittest.TestCase):
-    def test_valid_json(self):
-        resp = json.dumps({
-            "input_state": {"WS-X": "A"},
-            "stub_outcomes": {},
-            "reasoning": "test",
-            "confidence": 0.8,
-        })
-        p = _parse_specialist_response(resp, "condition_cracker")
-        self.assertEqual(p.specialist, "condition_cracker")
-        self.assertEqual(p.input_state, {"WS-X": "A"})
-        self.assertAlmostEqual(p.confidence, 0.8)
+class TestPlanRoute(unittest.TestCase):
+    def test_returns_route_with_gates(self):
+        call_graph = SimpleNamespace(
+            path_to=lambda t: ["ENTRY", "INIT", "MAIN"] if t == "MAIN" else None,
+        )
+        gc_init = SimpleNamespace(variable="WS-MODE", values=["A"], negated=False)
+        gating_conds = {"INIT": [gc_init], "MAIN": []}
+        ctx = SimpleNamespace(call_graph=call_graph, gating_conds=gating_conds)
+        bctx = BranchContext(
+            bid=1, direction="T", branch_key="1:T", paragraph="MAIN",
+            condition_text="", backward_slice_code="", var_domain_info={},
+            nearest_hit=None, call_graph_path=[], gating_conditions=[],
+            stub_ops_in_slice=[], stub_mapping={}, fault_tables={},
+            test_case_count=0, solution_patterns=[],
+        )
 
-    def test_markdown_fenced(self):
-        resp = "```json\n" + json.dumps({
-            "input_state": {"A": 1},
-            "reasoning": "fenced",
-        }) + "\n```"
-        p = _parse_specialist_response(resp, "stub_architect")
-        self.assertEqual(p.input_state, {"A": 1})
+        route = _plan_route(bctx, ctx)
+        self.assertEqual(len(route), 3)
+        self.assertEqual(route[0][0], "ENTRY")
+        self.assertEqual(route[1][0], "INIT")
+        self.assertEqual(route[1][1][0]["variable"], "WS-MODE")
+        self.assertEqual(route[2][0], "MAIN")
 
-    def test_empty_response(self):
-        p = _parse_specialist_response(None, "path_finder")
-        self.assertEqual(p.confidence, 0.0)
-        self.assertIn("empty", p.reasoning)
+    def test_returns_empty_when_unreachable(self):
+        call_graph = SimpleNamespace(path_to=lambda t: None)
+        ctx = SimpleNamespace(call_graph=call_graph, gating_conds={})
+        bctx = BranchContext(
+            bid=1, direction="T", branch_key="1:T", paragraph="UNREACHABLE",
+            condition_text="", backward_slice_code="", var_domain_info={},
+            nearest_hit=None, call_graph_path=[], gating_conditions=[],
+            stub_ops_in_slice=[], stub_mapping={}, fault_tables={},
+            test_case_count=0, solution_patterns=[],
+        )
+        self.assertEqual(_plan_route(bctx, ctx), [])
 
-    def test_garbage_response(self):
-        p = _parse_specialist_response("no json here at all !!!", "history_miner")
-        self.assertEqual(p.input_state, {})
-        self.assertIn("could not parse", p.reasoning)
-
-    def test_json_in_prose(self):
-        resp = 'Here is my proposal:\n{"input_state": {"X": "1"}, "reasoning": "embedded"}'
-        p = _parse_specialist_response(resp, "condition_cracker")
-        self.assertEqual(p.input_state, {"X": "1"})
+    def test_returns_empty_when_no_call_graph(self):
+        ctx = SimpleNamespace(call_graph=None, gating_conds={})
+        bctx = BranchContext(
+            bid=1, direction="T", branch_key="1:T", paragraph="P",
+            condition_text="", backward_slice_code="", var_domain_info={},
+            nearest_hit=None, call_graph_path=[], gating_conditions=[],
+            stub_ops_in_slice=[], stub_mapping={}, fault_tables={},
+            test_case_count=0, solution_patterns=[],
+        )
+        self.assertEqual(_plan_route(bctx, ctx), [])
 
 
 # ---------------------------------------------------------------------------
-# Prompt builders
+# Level 2: Gate Solver prompt + parsing
 # ---------------------------------------------------------------------------
 
-class TestPromptBuilders(unittest.TestCase):
-    def _bctx(self, **overrides) -> BranchContext:
+class TestGateSolverPrompt(unittest.TestCase):
+    def _bctx(self, **overrides):
         defaults = dict(
             bid=42, direction="T", branch_key="42:T",
             paragraph="MAIN-PARA", condition_text="IF WS-STATUS = '00'",
@@ -118,159 +127,128 @@ class TestPromptBuilders(unittest.TestCase):
                 "valid_88_values": {}, "stub_op": "READ:FILE",
             }},
             nearest_hit={"input_state": {"WS-X": "A"}, "branches_hit": ["41:T"]},
-            call_graph_path=["ENTRY", "INIT-PARA", "MAIN-PARA"],
-            gating_conditions=[{"variable": "WS-FLAG", "values": ["Y"], "negated": False}],
+            call_graph_path=[], gating_conditions=[],
             stub_ops_in_slice=["READ:FILE"],
+            stub_op_sequence=["OPEN:FILE", "READ:FILE"],
             stub_mapping={"READ:FILE": ["WS-STATUS"]},
-            fault_tables={"status_file": ["00", "10", "23"]},
-            test_case_count=15,
-            solution_patterns=[],
+            fault_tables={"status_file": ["00", "10"]},
+            test_case_count=15, solution_patterns=[],
+            parent_88_lookup={},
         )
         defaults.update(overrides)
         return BranchContext(**defaults)
 
-    def test_condition_cracker_prompt(self):
-        prompt = _build_condition_cracker_prompt(self._bctx())
-        self.assertIn("condition analyst", prompt)
+    def test_prompt_includes_backward_chaining(self):
+        prompt = _build_gate_solver_prompt(self._bctx(), [])
+        self.assertIn("backward", prompt.lower())
         self.assertIn("WS-STATUS", prompt)
-        self.assertIn("TRUE", prompt)  # direction=T
-        self.assertIn("00", prompt)  # condition literal
+        self.assertIn("TRUE", prompt)
 
-    def test_path_finder_prompt(self):
-        prompt = _build_path_finder_prompt(self._bctx())
-        self.assertIn("reachability", prompt)
-        self.assertIn("ENTRY", prompt)
-        self.assertIn("WS-FLAG", prompt)
+    def test_prompt_includes_route(self):
+        route = [
+            ("ENTRY", []),
+            ("INIT", [{"variable": "WS-MODE", "values": ["A"], "negated": False}]),
+            ("MAIN-PARA", []),
+        ]
+        prompt = _build_gate_solver_prompt(self._bctx(), route)
+        self.assertIn("EXECUTION ROUTE", prompt)
+        self.assertIn("WS-MODE", prompt)
+        self.assertIn("Step 1", prompt)
 
-    def test_stub_architect_prompt(self):
-        prompt = _build_stub_architect_prompt(self._bctx())
-        self.assertIn("stub", prompt.lower())
-        self.assertIn("READ:FILE", prompt)
-        self.assertIn("status_file", prompt)
+    def test_prompt_includes_stub_sequence(self):
+        prompt = _build_gate_solver_prompt(self._bctx(), [])
+        self.assertIn("STUB OPERATION SEQUENCE", prompt)
+        self.assertIn("1. OPEN:FILE", prompt)
+        self.assertIn("2. READ:FILE", prompt)
+        self.assertIn("success", prompt.lower())
 
-    def test_stub_architect_shows_operation_sequence(self):
-        """When multiple stubs fire in order, the prompt should list
-        the full sequence and instruct the LLM to provide stubs for all."""
-        bctx = self._bctx(
-            stub_ops_in_slice=["OPEN:ACCT-FILE", "READ:ACCT-REC", "REWRITE:ACCT-REC"],
-            stub_op_sequence=["OPEN:ACCT-FILE", "READ:ACCT-REC", "REWRITE:ACCT-REC"],
-        )
-        prompt = _build_stub_architect_prompt(bctx)
-        self.assertIn("fire in this order", prompt)
-        self.assertIn("1. OPEN:ACCT-FILE", prompt)
-        self.assertIn("2. READ:ACCT-REC", prompt)
-        self.assertIn("3. REWRITE:ACCT-REC", prompt)
-        self.assertIn("ALL operations", prompt)
-
-    def test_history_miner_prompt(self):
-        prompt = _build_history_miner_prompt(self._bctx())
-        self.assertIn("mutation", prompt.lower())
-        self.assertIn("WS-X", prompt)  # from nearest_hit
-
-    def test_condition_cracker_with_feedback(self):
-        fb = [JudgeFeedback(
-            reached_paragraph=True, branch_hit=False,
-            actual_var_values={"WS-STATUS": "00"},
-        )]
-        prompt = _build_condition_cracker_prompt(self._bctx(), prior_feedback=fb)
-        self.assertIn("Previous round", prompt)
-        self.assertIn("fundamentally different", prompt)
-
-    def test_condition_cracker_shows_88_parent(self):
-        """When a condition variable is an 88-level child, the prompt
-        should tell the LLM to set the parent variable."""
+    def test_prompt_includes_88_level(self):
         bctx = self._bctx(
             condition_text="IF APPL-AOK",
-            var_domain_info={"APPL-AOK": {
-                "classification": "flag", "data_type": "alpha",
-            }},
             parent_88_lookup={"APPL-AOK": ("APPL-RESULT", 0)},
+            var_domain_info={},
         )
-        prompt = _build_condition_cracker_prompt(bctx)
+        prompt = _build_gate_solver_prompt(bctx, [])
         self.assertIn("APPL-RESULT", prompt)
-        self.assertIn("88-level flag", prompt)
+        self.assertIn("88-level", prompt)
 
-    def test_condition_cracker_88_not_in_domain_info(self):
-        """88-level child may not have its own domain entry — the prompt
-        should still surface the parent from parent_88_lookup."""
-        bctx = self._bctx(
-            condition_text="IF END-OF-FILE",
-            var_domain_info={},  # no entry for END-OF-FILE
-            parent_88_lookup={"END-OF-FILE": ("FILE-STATUS", "10")},
-        )
-        prompt = _build_condition_cracker_prompt(bctx)
-        self.assertIn("FILE-STATUS", prompt)
-        self.assertIn("88-level flag", prompt)
+    def test_prompt_includes_diagnosis_on_retry(self):
+        diag = "  WS-STATUS = '' (set by stub READ:FILE)\n  nearby branches: [-42]"
+        prompt = _build_gate_solver_prompt(self._bctx(), [], diagnosis=diag)
+        self.assertIn("PREVIOUS ATTEMPT FAILED", prompt)
+        self.assertIn("WS-STATUS = ''", prompt)
 
-    def test_path_finder_no_path(self):
-        prompt = _build_path_finder_prompt(self._bctx(call_graph_path=[]))
-        self.assertIn("No call graph path", prompt)
+    def test_prompt_includes_nearest_hit(self):
+        prompt = _build_gate_solver_prompt(self._bctx(), [])
+        self.assertIn("NEAREST-HIT", prompt)
+        self.assertIn("WS-X", prompt)
 
-    def test_history_miner_no_nearest_hit(self):
-        prompt = _build_history_miner_prompt(self._bctx(nearest_hit=None))
-        self.assertIn("No test case has reached", prompt)
+
+class TestParseGateSolverResponse(unittest.TestCase):
+    def test_valid_json(self):
+        resp = json.dumps({
+            "input_state": {"WS-X": "A"},
+            "stub_outcomes": {"READ:F": [[["S", "00"]]]},
+            "reasoning": "test",
+        })
+        inp, stubs, reason = _parse_gate_solver_response(resp)
+        self.assertEqual(inp, {"WS-X": "A"})
+        self.assertEqual(stubs, {"READ:F": [[["S", "00"]]]})
+
+    def test_empty_response(self):
+        inp, stubs, reason = _parse_gate_solver_response(None)
+        self.assertEqual(inp, {})
+        self.assertIn("empty", reason)
+
+    def test_garbage_response(self):
+        inp, stubs, reason = _parse_gate_solver_response("no json at all!!!")
+        self.assertEqual(inp, {})
+        self.assertIn("could not parse", reason)
+
+    def test_markdown_fenced(self):
+        resp = "```json\n" + json.dumps({
+            "input_state": {"A": 1},
+            "reasoning": "fenced",
+        }) + "\n```"
+        inp, stubs, reason = _parse_gate_solver_response(resp)
+        self.assertEqual(inp, {"A": 1})
 
 
 # ---------------------------------------------------------------------------
-# Test case synthesis
+# Level 2.5: Python forward validation
 # ---------------------------------------------------------------------------
 
-class TestSynthesizeTestCases(unittest.TestCase):
-    def _bctx(self):
-        return BranchContext(
+class TestValidatePython(unittest.TestCase):
+    def test_returns_false_when_no_module(self):
+        bctx = BranchContext(
             bid=1, direction="T", branch_key="1:T", paragraph="P",
             condition_text="", backward_slice_code="", var_domain_info={},
             nearest_hit=None, call_graph_path=[], gating_conditions=[],
             stub_ops_in_slice=[], stub_mapping={}, fault_tables={},
             test_case_count=0, solution_patterns=[],
         )
+        ok, diag = _validate_python(None, bctx, {}, {})
+        self.assertFalse(ok)
+        self.assertIn("no module", diag)
 
-    def test_merges_all_proposals(self):
-        proposals = [
-            SpecialistProposal(specialist="path_finder", input_state={"GATE": "Y"}),
-            SpecialistProposal(specialist="condition_cracker", input_state={"WS-X": "10"}),
-            SpecialistProposal(specialist="stub_architect", stub_outcomes={"READ:F": [[["S", "00"]]]}),
-            SpecialistProposal(specialist="history_miner", input_state={"WS-X": "99"}),
-        ]
-        cases = _synthesize_test_cases(proposals, self._bctx())
-        self.assertGreaterEqual(len(cases), 1)
-        merged = cases[0]
-        # Path finder values should be in the merge.
-        self.assertEqual(merged["input_state"]["GATE"], "Y")
-        # Condition cracker overwrites path_finder for shared keys
-        # but path_finder's unique keys remain.
-        self.assertIn("WS-X", merged["input_state"])
-        self.assertIn("READ:F", merged["stub_outcomes"])
 
-    def test_empty_proposals_fallback(self):
-        proposals = [
-            SpecialistProposal(specialist="condition_cracker"),
-            SpecialistProposal(specialist="path_finder"),
-        ]
-        cases = _synthesize_test_cases(proposals, self._bctx())
-        self.assertEqual(len(cases), 1)
-        self.assertEqual(cases[0]["origin"], "empty_fallback")
+# ---------------------------------------------------------------------------
+# Level 3: Tape Builder
+# ---------------------------------------------------------------------------
 
-    def test_distinct_history_mutation_added(self):
-        proposals = [
-            SpecialistProposal(specialist="condition_cracker", input_state={"A": "1"}),
-            SpecialistProposal(specialist="stub_architect", stub_outcomes={"OP": [[["V", "0"]]]}),
-            SpecialistProposal(specialist="history_miner", input_state={"B": "99"}),
-            SpecialistProposal(specialist="path_finder"),
-        ]
-        cases = _synthesize_test_cases(proposals, self._bctx())
-        origins = [c["origin"] for c in cases]
-        self.assertIn("history_mutation", origins)
-
-    def test_caps_at_3(self):
-        proposals = [
-            SpecialistProposal(specialist="condition_cracker", input_state={"A": "1"}),
-            SpecialistProposal(specialist="stub_architect", stub_outcomes={"OP": [[["V", "0"]]]}),
-            SpecialistProposal(specialist="history_miner", input_state={"B": "2"}),
-            SpecialistProposal(specialist="path_finder", input_state={"C": "3"}),
-        ]
-        cases = _synthesize_test_cases(proposals, self._bctx())
-        self.assertLessEqual(len(cases), 3)
+class TestBuildTape(unittest.TestCase):
+    def test_returns_empty_when_no_module(self):
+        bctx = BranchContext(
+            bid=1, direction="T", branch_key="1:T", paragraph="P",
+            condition_text="", backward_slice_code="", var_domain_info={},
+            nearest_hit=None, call_graph_path=[], gating_conditions=[],
+            stub_ops_in_slice=[], stub_mapping={}, fault_tables={},
+            test_case_count=0, solution_patterns=[],
+        )
+        ctx = SimpleNamespace(module=None)
+        inp, log = _build_tape(bctx, ctx, {"X": "1"}, {})
+        self.assertEqual(inp, {"X": "1"})
+        self.assertEqual(log, [])
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +263,7 @@ class TestSwarmJournalCompat(unittest.TestCase):
                 SwarmRound(
                     round_num=0,
                     proposals=[
-                        SpecialistProposal(specialist="cc", reasoning="try A"),
+                        SpecialistProposal(specialist="gate_solver", reasoning="try A"),
                     ],
                     synthesized_cases=[{"input_state": {"X": "1"}, "stub_outcomes": {}}],
                     feedback=[JudgeFeedback(branch_hit=False, reached_paragraph=True)],
@@ -303,7 +281,7 @@ class TestSwarmJournalCompat(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Context gathering (with mocked ctx/cov)
+# Context gathering
 # ---------------------------------------------------------------------------
 
 class TestGatherBranchContext(unittest.TestCase):
@@ -316,6 +294,7 @@ class TestGatherBranchContext(unittest.TestCase):
             call_graph=None,
             gating_conds={},
             memory_state=None,
+            var_report=None,
         )
         cov = SimpleNamespace(
             test_cases=[],
@@ -331,6 +310,7 @@ class TestGatherBranchContext(unittest.TestCase):
             branch_meta={},
             module=None, domains={}, stub_mapping={},
             call_graph=None, gating_conds={}, memory_state=None,
+            var_report=None,
         )
         cov = SimpleNamespace(test_cases=[], branches_hit=set())
         bctx = _gather_branch_context(99, "F", ctx, cov)

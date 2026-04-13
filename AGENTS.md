@@ -457,31 +457,31 @@ Semantic value generation inside baseline, direct-paragraph, and transcript-driv
 
 **`prepare_program_analysis(program, cobol_source, ...)`** (L103): Structured JSON per paragraph (comments, calls, stub ops, gating conditions, branch count). No LLM calls.
 
-### `specter/branch_swarm.py` — Multi-agent swarm for stubborn branches (~700 lines)
+### `specter/branch_swarm.py` — Hierarchical 3-level planner for stubborn branches (~800 lines)
 
-Replaces the single-agent sequential loop with a 4-specialist + 1-judge architecture.  When the coverage loop plateaus (`stale_rounds >= 3`), the swarm picks the top-K highest-priority uncovered branches and runs a multi-round investigation for each.
+Decomposes stubborn-branch coverage into three sequential levels: deterministic route planning, LLM-guided gate solving with backward chaining, and deterministic tape building with direct COBOL execution. When the coverage loop plateaus (`stale_rounds >= 3`), the planner picks the top-K uncovered branches and runs 1–2 attempts per branch.
 
-**Specialists** (run concurrently per round via `ThreadPoolExecutor(max_workers=4)`):
+**Level 1: Route Planner** (deterministic, no LLM):
 
-1. **Condition Cracker** — reads backward slice, condition text, variable domains (PIC type, length, precision, condition_literals, 88-level values). Proposes `input_state` values to satisfy the branch condition.
-2. **Path Finder** — reads static call graph (`call_graph.path_to(paragraph)`), gating conditions, path constraints. Proposes how to *reach* the target paragraph. Solves the common "0 attempts" case where the paragraph is structurally unreachable.
-3. **Stub Architect** — reads stub mapping, fault tables (file-status/SQL/CICS/DLI/MQ), operation keys from the backward slice. Proposes `stub_outcomes` and `stub_defaults`.
-4. **History Miner** — reads test corpus, nearest-hit test cases, prior attempt feedback, cross-branch `SolutionPattern`s. Proposes targeted mutations of near-miss cases.
+`_plan_route(bctx, ctx)` uses `StaticCallGraph.path_to(paragraph)` and `gating_conds` to compute the ordered paragraph path from program entry to the target, with gating conditions at each step. Returns empty when the paragraph is structurally unreachable (direct invocation only).
 
-**Judge** (sequential per round):
+**Level 2: Gate Solver** (1–2 LLM calls, backward chaining):
 
-- Receives all 4 `SpecialistProposal`s, synthesizes 1–3 concrete test cases via `_synthesize_test_cases()`. Merge priority: path_finder (reach first) > condition_cracker > stub_architect > history_miner.
-- Runs **Python first** (~3 ms via `_python_execute()`) to check if the target branch flips in the simulator.
-- **Promotes to COBOL** via `_execute_and_save()` for real coverage recording.
-- Builds structured `JudgeFeedback` (reached_paragraph, actual_var_values, branches_hit, error) and feeds it back to specialists for the next round.
+`_solve_gates(bctx, route, llm_provider, llm_model, diagnosis)` sends a single structured prompt to the LLM that lays out the full execution route, all gates, variable domains (with 88-level parent resolution), the ordered stub operation sequence, and the nearest-hit test case. The prompt asks the LLM to work **backwards** from the target branch condition: "what does the branch need → what sets that variable → what must the stub return → what must earlier stubs return." On failure, `_validate_python()` runs the Python simulator (~3 ms), inspects actual runtime variable values at each gate, and produces a per-gate diagnosis that feeds into one LLM retry.
 
-**Cross-branch learning**: When a branch is solved, the judge records a `SolutionPattern` (winning specialist, key variables, key stubs) in `memory_state.meta["solution_patterns"]`. The History Miner reads these patterns for subsequent branches.
+**Level 3: Tape Builder** (deterministic, no LLM):
 
-**`run_branch_swarm(ctx, cov, report, tc_count, ...)`** — top-level entry point. Signature-compatible with `run_branch_agent()`. Returns `(journals, n_solved, tc_count)`. `SwarmJournal` provides a backward-compatible `iterations` property that flattens rounds into `AgentIteration` objects.
+`_build_tape(bctx, ctx, input_state, stub_outcomes)` runs `_python_pre_run` from `cobol_coverage.py` with the Gate Solver's proposed values to get the execution-ordered `stub_log`. This produces a concrete `(input_state, stub_log)` pair ready for `run_test_case`.
 
-**`investigate_branch_swarm(bid, direction, ...)`** — per-branch loop. Each round = 4 parallel specialist LLM calls + judge synthesis + execution. Up to `max_rounds` (default 3) rounds per branch.
+**Direct Execution** (bypasses `_execute_and_save`):
 
-Configuration: `SPECTER_BRANCH_SWARM=0` to fall back to the single-agent `branch_agent.py`. Otherwise the swarm is used by default. `--agent-iterations N` controls rounds per branch, `--no-branch-agent` disables both.
+`_execute_directly(ctx, cov, report, tc_count, input_state, stub_log, bctx)` calls `run_test_case` from `cobol_executor.py` directly and handles coverage bookkeeping (update `cov.branches_hit`, `cov.paragraphs_hit`, save to test store). This avoids the projection/replay/prefix-matching pipeline that previously lost stub data.
+
+**LLM budget**: 1–2 calls per branch (gate solver + optional retry with diagnosis). Down from 12+ calls in the previous 4-specialist model.
+
+**`run_branch_swarm(ctx, cov, report, tc_count, ...)`** — top-level entry. Signature-compatible with `run_branch_agent()`. Returns `(journals, n_solved, tc_count)`. `SwarmJournal` backward-compatible with `BranchAgentJournal`.
+
+Configuration: `SPECTER_BRANCH_SWARM=0` to fall back to single-agent `branch_agent.py`. `--agent-iterations N` controls max attempts per branch, `--no-branch-agent` disables both.
 
 ### `specter/branch_agent.py` — Single-agent fallback for stubborn branches (~450 lines)
 
