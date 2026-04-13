@@ -1546,12 +1546,15 @@ def _execute_and_save(
                 ctx.module, input_state, stub_outcomes, stub_defaults,
                 paragraph=direct_para,
             )
-            # Compute a proper stub_log via a full-program pre-run so the
-            # saved test case carries the execution-ordered stubs.  Without
-            # this, direct-paragraph test cases are saved with empty stubs
-            # and COBOL replays can't reproduce the intended I/O sequence.
-            if stub_outcomes:
+            # Compute stub_log for the saved test case.  For the branch
+            # swarm (which constructs precise stub_outcomes), run a pre-run
+            # to get execution-ordered stubs.  For other strategies, use a
+            # lightweight log from the Python direct-execution result so
+            # we don't generate thousands of entries from looping programs.
+            if strategy_name == "branch_swarm" and stub_outcomes:
                 stub_log = _python_pre_run(ctx.module, input_state, stub_outcomes, stub_defaults)
+                if len(stub_log) > 200:
+                    stub_log = stub_log[:200]
             else:
                 stub_log = []
 
