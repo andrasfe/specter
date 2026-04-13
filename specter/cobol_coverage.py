@@ -1526,7 +1526,14 @@ def _execute_and_save(
                 ctx.module, input_state, stub_outcomes, stub_defaults,
                 paragraph=direct_para,
             )
-            stub_log = []
+            # Compute a proper stub_log via a full-program pre-run so the
+            # saved test case carries the execution-ordered stubs.  Without
+            # this, direct-paragraph test cases are saved with empty stubs
+            # and COBOL replays can't reproduce the intended I/O sequence.
+            if stub_outcomes:
+                stub_log = _python_pre_run(ctx.module, input_state, stub_outcomes, stub_defaults)
+            else:
+                stub_log = []
 
             # Replay through COBOL if Python found new py: branches.
             # Project the direct-execution state down to entry-safe injected
