@@ -496,6 +496,8 @@ class _CodeBuilder:
         self.branch_meta: dict[int, dict] = {}
         self.current_para: str = ""
         self.siblings_88: dict[str, set[str]] = {}
+        # 88-level child → (parent_name, activating_value) for condition rewriting.
+        self.level_88_map: dict[str, tuple[str, Any]] = {}
 
     def next_branch_id(self) -> int:
         """Return a unique branch ID for instrumentation."""
@@ -521,6 +523,51 @@ class _CodeBuilder:
 
     def build(self) -> str:
         return "\n".join(self.lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# 88-level condition rewriting
+# ---------------------------------------------------------------------------
+
+_BARE_STATE_RE = re.compile(r"state\['([A-Z][A-Z0-9-]*)'\]")
+
+
+def _rewrite_88_level_conditions(
+    py_cond: str,
+    level_88_map: dict[str, tuple[str, Any]],
+) -> str:
+    """Rewrite bare 88-level truthy checks to parent-value comparisons.
+
+    In COBOL, ``IF APPL-AOK`` where ``88 APPL-AOK VALUE 0`` means
+    "if APPL-RESULT = 0".  The condition parser produces
+    ``state['APPL-AOK']`` (a Python truthy check on a separate variable).
+    This rewrites it to ``_to_num(state['APPL-RESULT']) == 0`` (or
+    ``state['APPL-RESULT'] == 'value'`` for alpha parents).
+    """
+    if not level_88_map:
+        return py_cond
+
+    def _replace_bare_88(match: re.Match) -> str:
+        """Replace a bare state['CHILD'] if it's an 88-level."""
+        child = match.group(1)
+        entry = level_88_map.get(child)
+        if entry is None:
+            return match.group(0)  # not an 88-level, leave as-is
+
+        parent, value = entry
+        # Check if this is a "bare" reference — not already part of a
+        # comparison (== / != / > / < / in).  Look at what follows.
+        end = match.end()
+        rest = py_cond[end:end + 20].lstrip()
+        if rest and rest[0] in ("=", "!", ">", "<", "i"):
+            # Already in a comparison — don't rewrite.
+            return match.group(0)
+
+        if isinstance(value, (int, float)):
+            return f"_to_num(state['{parent}']) == {value!r}"
+        return f"state['{parent}'] == {value!r}"
+
+    return _BARE_STATE_RE.sub(_replace_bare_88, py_cond)
 
 
 # ---------------------------------------------------------------------------
@@ -937,6 +984,7 @@ def _gen_if(cb: _CodeBuilder, stmt: Statement):
         cb.line(f"if True:  # IF: {_oneline(stmt.text)}")
     else:
         py_cond = cobol_condition_to_python(condition)
+        py_cond = _rewrite_88_level_conditions(py_cond, cb.level_88_map)
         cb.line(f"if {py_cond}:")
     cb.indent()
     cb.line(f"state.get('_branches', set()).add({bid})")
@@ -1114,6 +1162,7 @@ def _gen_perform(cb: _CodeBuilder, stmt: Statement):
         by_val = _resolve_source(m_vary.group(3).strip())
         until_cond = m_vary.group(4).strip().rstrip(".")
         py_until = cobol_condition_to_python(until_cond)
+        py_until = _rewrite_88_level_conditions(py_until, cb.level_88_map)
         bid = cb.next_branch_id()
         cb.branch_meta[bid] = {
             "condition": until_cond,
@@ -1183,6 +1232,7 @@ def _gen_perform_thru(cb: _CodeBuilder, stmt: Statement):
 
     if condition:
         py_cond = cobol_condition_to_python(condition)
+        py_cond = _rewrite_88_level_conditions(py_cond, cb.level_88_map)
         bid = cb.next_branch_id()
         cb.branch_meta[bid] = {
             "condition": condition,
@@ -1221,6 +1271,7 @@ def _gen_perform_inline(cb: _CodeBuilder, stmt: Statement):
 
     if condition:
         py_cond = cobol_condition_to_python(condition)
+        py_cond = _rewrite_88_level_conditions(py_cond, cb.level_88_map)
         loop_bid = cb.next_branch_id()
         cb.branch_meta[loop_bid] = {
             "condition": condition,
@@ -1238,6 +1289,7 @@ def _gen_perform_inline(cb: _CodeBuilder, stmt: Statement):
             by_val = _resolve_source(m_vary.group(3).strip())
             until_cond = m_vary.group(4).strip()
             py_until = cobol_condition_to_python(until_cond)
+            py_until = _rewrite_88_level_conditions(py_until, cb.level_88_map)
             loop_bid = cb.next_branch_id()
             cb.branch_meta[loop_bid] = {
                 "condition": until_cond,
@@ -1976,7 +2028,8 @@ def generate_code(
 
     cb = _CodeBuilder()
 
-    # Build 88-level siblings map from copybook records and COBOL source
+    # Build 88-level siblings map and parent→child→value map from
+    # copybook records and COBOL source.
     if copybook_records:
         for rec in copybook_records:
             for fld in rec.fields:
@@ -1984,10 +2037,24 @@ def generate_code(
                     names = {n.upper() for n in fld.values_88.keys()}
                     for name in names:
                         cb.siblings_88.setdefault(name, set()).update(names - {name})
+                    # Build child → (parent, value) map for condition rewriting.
+                    parent_name = fld.name.upper() if fld.name else ""
+                    if parent_name:
+                        for child_name, child_value in fld.values_88.items():
+                            cb.level_88_map.setdefault(
+                                child_name.upper(), (parent_name, child_value),
+                            )
     if cobol_source:
         from .cobol_coverage import _extract_88_siblings_from_source
         for name, sibs in _extract_88_siblings_from_source(cobol_source).items():
             cb.siblings_88.setdefault(name, set()).update(sibs)
+        # Also extract parent→child→value from the source for inline 88-levels.
+        from .variable_domain import _extract_88_values_from_source
+        for parent_name, children in _extract_88_values_from_source(cobol_source).items():
+            for child_name, child_value in children.items():
+                cb.level_88_map.setdefault(
+                    child_name.upper(), (parent_name.upper(), child_value),
+                )
 
     # Heuristic: infer 88-level siblings from FOUND/NFOUND naming convention.
     # Always runs — adds pairs not already covered by copybooks.
