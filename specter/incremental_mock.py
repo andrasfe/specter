@@ -3032,13 +3032,15 @@ def incremental_instrument(
     # Build MockConfig for phase functions that need it
     from .cobol_mock import MockConfig
 
-    # Collect 88-level condition-names from copybooks and source so the
-    # mock generator can use SET instead of MOVE for these variables.
-    _cond_88: set[str] = set()
+    # Collect 88-level condition-names and their activating values from
+    # copybooks and source so the mock generator can use SET instead of
+    # the invalid MOVE for these variables.
+    _cond_88: dict[str, str] = {}
     try:
         from .variable_domain import _extract_88_values_from_source
         for parent, children in _extract_88_values_from_source(str(source_path)).items():
-            _cond_88.update(k.upper() for k in children)
+            for child_name, child_value in children.items():
+                _cond_88.setdefault(child_name.upper(), str(child_value))
     except Exception:
         pass
     try:
@@ -3049,7 +3051,8 @@ def incremental_instrument(
                     rec = parse_copybook(cpf.read_text(errors="replace"))
                     for fld in rec.fields:
                         if fld.values_88:
-                            _cond_88.update(k.upper() for k in fld.values_88)
+                            for child_name, child_value in fld.values_88.items():
+                                _cond_88.setdefault(child_name.upper(), str(child_value))
                 except Exception:
                     pass
     except Exception:
