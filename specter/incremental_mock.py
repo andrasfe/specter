@@ -2618,13 +2618,77 @@ def _compile_and_fix(
                     )
                     break
 
-                # Revise: re-call the scribe with the reviewer's comment.
+                # Revise: on first rejection, try the compile-fix swarm
+                # (3 parallel specialists). On subsequent rejections,
+                # fall back to single-scribe revision.
+                scribe_attempt += 1
+                use_swarm = scribe_attempt == 1 and not use_batch_mode
+                if use_swarm:
+                    try:
+                        from .compile_swarm import (
+                            propose_compile_fix_swarm,
+                            swarm_enabled as _swarm_enabled,
+                        )
+                        use_swarm = _swarm_enabled()
+                    except ImportError:
+                        use_swarm = False
+
+                if use_swarm:
+                    log.info(
+                        "  [%d/%d] Reviewer rejected fix (rev %d) — trying compile swarm",
+                        attempt + 1, max_fix_attempts, scribe_attempt,
+                    )
+                    # Build a focused context around the error line.
+                    _ctx_start = max(0, chosen_line - 15)
+                    _ctx_end = min(len(src_lines), chosen_line + 15)
+                    _ctx = "".join(
+                        f"{i+1:5}: {line}" if not line.endswith("\n") else f"{i+1:5}: {line}"
+                        for i, line in enumerate(src_lines[_ctx_start:_ctx_end], start=_ctx_start)
+                    )
+                    try:
+                        swarm_fixes, swarm_reason = propose_compile_fix_swarm(
+                            error_line=chosen_line,
+                            error_msg=chosen_msg,
+                            context=_ctx,
+                            src_lines=src_lines,
+                            llm_provider=llm_provider,
+                            llm_model=llm_model,
+                        )
+                        if swarm_fixes:
+                            revised_fixes = swarm_fixes
+                            log.info(
+                                "  [%d/%d] Compile swarm proposed %d-line fix: %s",
+                                attempt + 1, max_fix_attempts,
+                                len(swarm_fixes), swarm_reason[:100],
+                            )
+                            # Skip to the revised-fix validation below.
+                            revised_fixes, _ = _sanitize_llm_fix_lines(revised_fixes)
+                            if revised_fixes:
+                                revised_fingerprint = "|".join(
+                                    f"{ln}:{revised_fixes[ln].strip()}"
+                                    for ln in sorted(revised_fixes.keys())
+                                )
+                                if revised_fingerprint in tried_fix_fingerprints:
+                                    review_blocked = True
+                                    review_block_reason = (
+                                        "Compile swarm produced a duplicate of "
+                                        "an earlier failed attempt"
+                                    )
+                                    break
+                                tried_fix_fingerprints.add(revised_fingerprint)
+                                fixes = revised_fixes
+                                continue
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "  Compile swarm failed, falling back to scribe: %s", exc,
+                        )
+
+                # Fallback: single-scribe revision with reviewer's comment.
                 log.info(
                     "  [%d/%d] Reviewer rejected fix (rev %d): %s — re-prompting scribe",
-                    attempt + 1, max_fix_attempts, scribe_attempt + 1,
+                    attempt + 1, max_fix_attempts, scribe_attempt,
                     verdict.reason[:120],
                 )
-                scribe_attempt += 1
                 review_extra = (
                     "\n\nA reviewer rejected the previous proposal:\n"
                     + _format_rejected_proposal(fixes)
