@@ -1,28 +1,30 @@
-"""Hierarchical 3-level planner for stubborn uncovered branches.
+"""Swarm + planner pipeline for stubborn uncovered branches.
 
-When the coverage loop plateaus and no strategy can reach a specific
-branch, this module runs a focused investigation that decomposes the
-problem into subgoals:
+Combines parallel specialist proposals (diverse perspectives) with
+hierarchical execution planning (correct end-to-end trace):
 
-  Level 1 — **Route Planner** (deterministic):  BFS shortest path from
-  program entry to the target paragraph, with gating conditions at
-  each step.
+  **Specialist swarm** (4 parallel LLM calls per round):
+  Condition Cracker, Path Finder, Stub Architect, History Miner —
+  each proposes ``input_state`` and ``stub_outcomes`` from a
+  different angle.  Proposals are merged into a single candidate.
 
-  Level 2 — **Gate Solver** (1–2 LLM calls):  Works backwards from the
-  target branch condition through each gate to determine what variable
-  values and stub outcomes are needed end-to-end.  Validated forward
-  via a fast Python execution (~3 ms) with precise per-gate diagnosis
-  on failure.
+  **Route Planner** (deterministic):  BFS shortest path from program
+  entry to the target paragraph, with gating conditions at each step.
 
-  Level 3 — **Tape Builder** (deterministic):  Warm-starts from the
-  nearest-hit test case's stub log, patches specific entries per the
-  Gate Solver's output, pads loop iterations if needed, and produces
-  a concrete ``(input_state, stub_log)`` pair ready for
-  ``run_test_case``.
+  **Python validation** (~3 ms):  Forward-runs the candidate through
+  the Python simulator.  On failure, produces per-gate diagnosis.
 
-Direct execution bypasses ``_execute_and_save`` — the tape builder
-hands the stub log directly to the COBOL binary, avoiding all the
-projection/replay/prefix-matching that loses data.
+  **Gate Solver** (0–1 LLM call):  Only called when Python validation
+  fails.  Receives the route + specialist proposals + diagnosis and
+  produces a refined proposal via backward chaining.
+
+  **Tape Builder** (deterministic):  Runs ``_python_pre_run`` to get
+  execution-ordered ``stub_log``, producing a concrete
+  ``(input_state, stub_log)`` pair ready for ``run_test_case``.
+
+  **Direct execution**:  Bypasses ``_execute_and_save`` — calls
+  ``run_test_case`` directly with the tape, handles coverage
+  bookkeeping inline.  No projection, no replay, no data loss.
 
 Entry point: ``run_branch_swarm()`` — signature-compatible with
 ``run_branch_agent()`` so ``cobol_coverage.py`` can swap it in.
@@ -30,6 +32,7 @@ Entry point: ``run_branch_swarm()`` — signature-compatible with
 
 from __future__ import annotations
 
+import concurrent.futures
 import inspect
 import json
 import logging
@@ -177,6 +180,7 @@ DEFAULT_MAX_BRANCHES = 3
 DEFAULT_MAX_INVOCATIONS = 3
 DEFAULT_STALE_TRIGGER = 3
 _MAX_LOOP_PAD = 5  # max loop iterations to try when padding stubs
+_SPECIALIST_TIMEOUT = 60  # seconds per specialist LLM call
 
 _FAULT_TABLES = {
     "status_file": ["00", "10", "23", "35", "39", "46", "47"],
@@ -407,6 +411,232 @@ def _plan_route(
             })
         route.append((para, gates))
     return route
+
+
+# ---------------------------------------------------------------------------
+# Specialist proposal generation (parallel)
+# ---------------------------------------------------------------------------
+
+_JSON_RESPONSE_FORMAT = (
+    "Return ONLY a JSON object:\n"
+    "{\n"
+    '  "input_state": {"VAR_NAME": "value", ...},\n'
+    '  "stub_outcomes": {"OP_KEY": [[["VAR", "VALUE"]], ...], ...},\n'
+    '  "reasoning": "one-sentence explanation",\n'
+    '  "confidence": 0.7\n'
+    "}\n"
+)
+
+
+def _build_condition_cracker_prompt(bctx: BranchContext, prior_feedback: list[JudgeFeedback] | None = None) -> str:
+    """Specialist 1: what values satisfy the branch condition?"""
+    parts: list[str] = []
+    parts.append(
+        "You are a COBOL condition analyst. Your job is to determine what "
+        "variable values would make a specific branch condition evaluate to "
+        f"{'TRUE' if bctx.direction == 'T' else 'FALSE'}.\n\n"
+        f"Branch {bctx.branch_key} in paragraph {bctx.paragraph}.\n"
+    )
+    if bctx.condition_text:
+        parts.append(f"Condition: {bctx.condition_text}\n\n")
+    if bctx.backward_slice_code:
+        sl = bctx.backward_slice_code.splitlines()
+        if len(sl) > 80:
+            sl = sl[:80] + ["  # ... (truncated)"]
+        parts.append("Code path:\n```python\n" + "\n".join(sl) + "\n```\n\n")
+    if bctx.var_domain_info:
+        parts.append("Variables and their domains:\n")
+        for var, info in bctx.var_domain_info.items():
+            bits = [f"  {var}:"]
+            if info.get("data_type"): bits.append(f" type={info['data_type']}")
+            if info.get("max_length"): bits.append(f" len={info['max_length']}")
+            if info.get("condition_literals"): bits.append(f" known_values={info['condition_literals'][:6]}")
+            if info.get("valid_88_values"): bits.append(f" 88-levels={info['valid_88_values']}")
+            if info.get("stub_op"): bits.append(f" (set by stub: {info['stub_op']})")
+            pe = bctx.parent_88_lookup.get(var)
+            if pe: bits.append(f" ** 88-level flag — set parent {pe[0]} = {pe[1]!r} to activate **")
+            parts.append("".join(bits) + "\n")
+        parts.append("\n")
+    for var in _extract_condition_vars(bctx.condition_text):
+        if var in bctx.var_domain_info: continue
+        pe = bctx.parent_88_lookup.get(var)
+        if pe: parts.append(f"  {var} is an 88-level flag. Set {pe[0]} = {pe[1]!r} in input_state.\n")
+    if prior_feedback:
+        parts.append("Previous round results:\n")
+        for fb in prior_feedback[-2:]:
+            parts.append(f"  reached={fb.reached_paragraph}, hit={fb.branch_hit}, vars={json.dumps(fb.actual_var_values, default=str)[:200]}\n")
+        parts.append("Try something fundamentally different.\n\n")
+    parts.append(f"Focus ONLY on condition variables. What values make it {'TRUE' if bctx.direction == 'T' else 'FALSE'}?\n\n")
+    parts.append(_JSON_RESPONSE_FORMAT)
+    return "".join(parts)
+
+
+def _build_path_finder_prompt(bctx: BranchContext, prior_feedback: list[JudgeFeedback] | None = None) -> str:
+    """Specialist 2: how to reach the target paragraph?"""
+    parts: list[str] = []
+    parts.append(f"You are a COBOL reachability analyst.\n\nTarget: {bctx.paragraph}, branch {bctx.branch_key}\n\n")
+    if bctx.call_graph_path:
+        parts.append(f"Call graph path: {' → '.join(bctx.call_graph_path)}\n\n")
+    else:
+        parts.append("No static path from entry. May require direct invocation.\n\n")
+    if bctx.gating_conditions:
+        parts.append("Gating conditions:\n")
+        for gc in bctx.gating_conditions:
+            neg = " (negated)" if gc.get("negated") else ""
+            parts.append(f"  {gc.get('variable', '?')} must be in {gc.get('values', [])}{neg}\n")
+        parts.append("\n")
+    if prior_feedback:
+        parts.append("Previous results:\n")
+        for fb in prior_feedback[-2:]:
+            parts.append(f"  reached={fb.reached_paragraph}, paras={fb.paragraphs_hit[:8]}\n")
+        parts.append("Try a different approach.\n\n")
+    parts.append("Propose input_state values to reach the target paragraph.\n\n")
+    parts.append(_JSON_RESPONSE_FORMAT)
+    return "".join(parts)
+
+
+def _build_stub_architect_prompt(bctx: BranchContext, prior_feedback: list[JudgeFeedback] | None = None) -> str:
+    """Specialist 3: what stub I/O outcomes set up the right state?"""
+    parts: list[str] = []
+    parts.append(f"You are a COBOL I/O stub specialist.\n\nTarget: {bctx.branch_key} in {bctx.paragraph}\n")
+    if bctx.condition_text: parts.append(f"Condition: {bctx.condition_text}\n\n")
+    if bctx.stub_op_sequence and len(bctx.stub_op_sequence) > 1:
+        parts.append("Operations fire in this order (ALL need stubs):\n")
+        for i, op in enumerate(bctx.stub_op_sequence, 1):
+            parts.append(f"  {i}. {op}\n")
+        parts.append("Earlier ops need success ('00'). Only the target op gets the fault value.\n\n")
+    elif bctx.stub_ops_in_slice:
+        parts.append(f"Stub ops in slice: {', '.join(bctx.stub_ops_in_slice)}\n\n")
+    relevant = {op: bctx.stub_mapping[op] for op in bctx.stub_ops_in_slice if op in bctx.stub_mapping}
+    if relevant:
+        parts.append("Stub → status vars:\n")
+        for op, vs in relevant.items(): parts.append(f"  {op} → {vs}\n")
+        parts.append("\n")
+    for var in sorted({v for vs in relevant.values() for v in vs}):
+        info = bctx.var_domain_info.get(var.upper())
+        if info:
+            pe = bctx.parent_88_lookup.get(var.upper())
+            line = f"  {var}: known={info.get('condition_literals', [])[:6]}, 88={info.get('valid_88_values', {})}"
+            if pe: line += f" (88-flag of {pe[0]}, activate with {pe[1]!r})"
+            parts.append(line + "\n")
+    parts.append(f"\nFault tables: {bctx.fault_tables}\n\n")
+    if prior_feedback:
+        parts.append("Previous results:\n")
+        for fb in prior_feedback[-2:]:
+            parts.append(f"  reached={fb.reached_paragraph}, hit={fb.branch_hit}, error={fb.error}\n")
+        parts.append("Adjust stubs.\n\n")
+    parts.append(_JSON_RESPONSE_FORMAT)
+    return "".join(parts)
+
+
+def _build_history_miner_prompt(bctx: BranchContext, prior_feedback: list[JudgeFeedback] | None = None) -> str:
+    """Specialist 4: what mutations of near-miss cases would work?"""
+    parts: list[str] = []
+    parts.append(f"You are a test-case mutation specialist.\n\nTarget: {bctx.branch_key} in {bctx.paragraph}\n")
+    if bctx.condition_text: parts.append(f"Condition: {bctx.condition_text}\n\n")
+    if bctx.nearest_hit:
+        inp = bctx.nearest_hit.get("input_state") or {}
+        if len(inp) > 12: inp = dict(list(inp.items())[:12])
+        branches = bctx.nearest_hit.get("branches_hit") or []
+        parts.append(f"Nearest-hit:\n  input: {json.dumps(inp, default=str)}\n  branches: {branches[:8]}\n\n")
+    else:
+        parts.append("No test case has reached this paragraph yet.\n\n")
+    if bctx.solution_patterns:
+        parts.append("Patterns that solved similar branches:\n")
+        for pat in bctx.solution_patterns[:3]:
+            parts.append(f"  {pat.branch_key}: {pat.winning_specialist}, vars={json.dumps(pat.key_variables, default=str)[:150]}\n")
+        parts.append("\n")
+    if prior_feedback:
+        parts.append("Previous results:\n")
+        for fb in prior_feedback[-2:]:
+            parts.append(f"  reached={fb.reached_paragraph}, hit={fb.branch_hit}, vars={json.dumps(fb.actual_var_values, default=str)[:200]}\n")
+        parts.append("Mutate differently.\n\n")
+    parts.append("Propose a SMALL mutation. Change only variables affecting the branch.\n\n")
+    parts.append(_JSON_RESPONSE_FORMAT)
+    return "".join(parts)
+
+
+def _parse_specialist_response(text: str | None, specialist_name: str) -> SpecialistProposal:
+    """Parse a specialist LLM response into a SpecialistProposal."""
+    if not text:
+        return SpecialistProposal(specialist=specialist_name, reasoning="empty response", confidence=0.0, raw_response="")
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```\w*\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    obj: dict | None = None
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict): obj = parsed
+    except (json.JSONDecodeError, ValueError, TypeError): pass
+    if obj is None:
+        m = re.search(r"\{[\s\S]*\}", cleaned)
+        if m:
+            try:
+                parsed = json.loads(m.group(0))
+                if isinstance(parsed, dict): obj = parsed
+            except (json.JSONDecodeError, ValueError, TypeError): pass
+    if obj is None:
+        return SpecialistProposal(specialist=specialist_name, reasoning=f"could not parse: {cleaned[:150]}", confidence=0.0, raw_response=text[:500])
+    return SpecialistProposal(
+        specialist=specialist_name, input_state=obj.get("input_state") or {},
+        stub_outcomes=obj.get("stub_outcomes") or {}, stub_defaults=obj.get("stub_defaults"),
+        reasoning=str(obj.get("reasoning", ""))[:300],
+        confidence=float(obj.get("confidence", 0.5) or 0.5),
+        target_paragraph=obj.get("target_paragraph"), raw_response=text[:500],
+    )
+
+
+def _run_specialist(name, prompt_fn, bctx, prior_feedback, llm_provider, llm_model):
+    """Run a single specialist: build prompt, call LLM, parse response."""
+    from .llm_coverage import _query_llm_sync
+    prompt = prompt_fn(bctx, prior_feedback)
+    try:
+        response, _ = _query_llm_sync(llm_provider, prompt, llm_model)
+    except Exception as exc:
+        return SpecialistProposal(specialist=name, reasoning=f"LLM call failed: {exc}", confidence=0.0)
+    return _parse_specialist_response(response, name)
+
+
+def _run_specialists_parallel(bctx, prior_feedback, llm_provider, llm_model):
+    """Run all 4 specialists concurrently."""
+    specialists = [
+        ("condition_cracker", _build_condition_cracker_prompt),
+        ("path_finder", _build_path_finder_prompt),
+        ("stub_architect", _build_stub_architect_prompt),
+        ("history_miner", _build_history_miner_prompt),
+    ]
+    proposals: list[SpecialistProposal] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            pool.submit(_run_specialist, name, fn, bctx, prior_feedback, llm_provider, llm_model): name
+            for name, fn in specialists
+        }
+        for future in concurrent.futures.as_completed(futures):
+            name = futures[future]
+            try:
+                proposals.append(future.result(timeout=_SPECIALIST_TIMEOUT))
+            except Exception as exc:
+                proposals.append(SpecialistProposal(specialist=name, reasoning=f"failed: {exc}", confidence=0.0))
+    return proposals
+
+
+def _merge_proposals(proposals: list[SpecialistProposal]) -> tuple[dict, dict]:
+    """Merge specialist proposals into a single (input_state, stub_outcomes).
+
+    Priority: path_finder (reach first) > condition_cracker > stub_architect
+    > history_miner.  Later specialists override earlier ones for shared keys.
+    """
+    merged_input: dict = {}
+    merged_stubs: dict = {}
+    for p in sorted(proposals, key=lambda p: {
+        "path_finder": 0, "condition_cracker": 1,
+        "stub_architect": 2, "history_miner": 3,
+    }.get(p.specialist, 4)):
+        if p.input_state:
+            merged_input.update(p.input_state)
+        if p.stub_outcomes:
+            merged_stubs.update(p.stub_outcomes)
+    return merged_input, merged_stubs
 
 
 # ---------------------------------------------------------------------------
@@ -852,7 +1082,17 @@ def investigate_branch_swarm(
     llm_provider=None,
     llm_model: str | None = None,
 ) -> tuple[SwarmJournal, int]:
-    """Run the 3-level hierarchical planner for a single uncovered branch."""
+    """Run the swarm + planner pipeline for a single uncovered branch.
+
+    Round flow:
+      1. 4 specialists propose in parallel (diverse perspectives)
+      2. Merge proposals into a candidate (input_state, stub_outcomes)
+      3. Route Planner provides the execution path (deterministic)
+      4. Python forward validation with per-gate diagnosis
+      5. If Python fails, Gate Solver refines via 1 LLM call with diagnosis
+      6. Tape Builder constructs the execution-ordered stub_log
+      7. Direct COBOL execution (bypasses _execute_and_save)
+    """
     branch_key = f"{bid}:{direction}"
 
     journal = SwarmJournal(
@@ -869,89 +1109,94 @@ def investigate_branch_swarm(
     journal.paragraph = bctx.paragraph
     journal.condition_text = bctx.condition_text
 
-    # Level 1: Route Planner (deterministic).
+    # Level 1: Route Planner (deterministic, once per branch).
     route = _plan_route(bctx, ctx)
     if route:
         log.info(
-            "  Planner: route to %s: %s",
+            "  Swarm: route to %s: %s",
             bctx.paragraph,
             " → ".join(p for p, _ in route),
         )
     else:
-        log.info("  Planner: no static route to %s (direct invocation)", bctx.paragraph)
+        log.info("  Swarm: no static route to %s (direct invocation)", bctx.paragraph)
 
-    diagnosis: str | None = None
+    prior_feedback: list[JudgeFeedback] | None = None
 
-    for attempt in range(min(max_rounds, 2)):  # max 2 LLM calls
+    for round_num in range(max_rounds):
         log.info(
-            "  Planner: %s attempt %d/%d%s",
-            branch_key, attempt + 1, min(max_rounds, 2),
-            " (retry with diagnosis)" if diagnosis else "",
+            "  Swarm: investigating %s round %d/%d",
+            branch_key, round_num + 1, max_rounds,
         )
 
-        # Level 2: Gate Solver (1 LLM call).
-        input_state, stub_outcomes, reasoning = _solve_gates(
-            bctx, route, llm_provider, llm_model, diagnosis,
+        # --- Phase A: Specialist proposals (4 parallel LLM calls) ---
+        proposals = _run_specialists_parallel(
+            bctx, prior_feedback, llm_provider, llm_model,
         )
+        for p in proposals:
+            log.info(
+                "    %s: confidence=%.1f input_keys=%s stub_keys=%s",
+                p.specialist, p.confidence,
+                list(p.input_state.keys())[:5],
+                list(p.stub_outcomes.keys())[:5],
+            )
+
+        # Merge into a single candidate.
+        input_state, stub_outcomes = _merge_proposals(proposals)
 
         if not input_state and not stub_outcomes:
-            log.info("  Planner: empty gate solver proposal — %s", reasoning[:100])
-            proposal = SpecialistProposal(
-                specialist="gate_solver", reasoning=reasoning,
-            )
+            log.info("  Swarm: all specialists returned empty proposals")
             rnd = SwarmRound(
-                round_num=attempt,
-                proposals=[proposal],
-                feedback=[JudgeFeedback(error="empty proposal")],
+                round_num=round_num, proposals=proposals,
+                feedback=[JudgeFeedback(error="empty proposals")],
             )
             journal.rounds.append(rnd)
-            break
+            continue
 
-        log.info(
-            "  Planner: gate solver proposed input_keys=%s stub_keys=%s — %s",
-            list(input_state.keys())[:6],
-            list(stub_outcomes.keys())[:6],
-            reasoning[:80],
-        )
-
-        # Level 2.5: Python forward validation.
+        # --- Phase B: Python forward validation ---
         module = getattr(ctx, "module", None)
         py_ok, py_diagnosis = _validate_python(
             module, bctx, input_state, stub_outcomes,
         )
 
         if py_ok:
-            log.info("  Planner: Python validation PASSED for %s", branch_key)
+            log.info("  Swarm: Python validation PASSED for %s", branch_key)
         else:
             log.info(
-                "  Planner: Python validation failed — %s",
+                "  Swarm: Python validation failed — %s",
                 (py_diagnosis or "unknown")[:150],
             )
 
-        # Level 3: Tape Builder (deterministic).
+        # --- Phase C: Gate Solver refinement (only if Python failed) ---
+        # The Gate Solver sees the full route + the specialist proposals +
+        # the Python diagnosis, and produces a refined proposal.
+        if not py_ok and py_diagnosis:
+            refined_input, refined_stubs, reasoning = _solve_gates(
+                bctx, route, llm_provider, llm_model, py_diagnosis,
+            )
+            if refined_input or refined_stubs:
+                # Overlay refinements on the specialist merge.
+                input_state.update(refined_input)
+                stub_outcomes.update(refined_stubs)
+                log.info(
+                    "  Swarm: gate solver refined — input_keys=%s stub_keys=%s — %s",
+                    list(refined_input.keys())[:5],
+                    list(refined_stubs.keys())[:5],
+                    reasoning[:80],
+                )
+
+        # --- Phase D: Tape Builder (deterministic) ---
         final_input, stub_log = _build_tape(bctx, ctx, input_state, stub_outcomes)
+        log.info("  Swarm: tape built with %d stub entries", len(stub_log))
 
-        log.info(
-            "  Planner: tape built with %d stub entries",
-            len(stub_log),
-        )
-
-        # Direct COBOL execution.
+        # --- Phase E: Direct COBOL execution ---
         feedback, tc_count = _execute_directly(
             ctx, cov, report, tc_count,
             final_input, stub_log, bctx,
         )
 
-        proposal = SpecialistProposal(
-            specialist="gate_solver",
-            input_state=input_state,
-            stub_outcomes=stub_outcomes,
-            reasoning=reasoning,
-            confidence=1.0 if feedback.branch_hit else 0.5,
-        )
         rnd = SwarmRound(
-            round_num=attempt,
-            proposals=[proposal],
+            round_num=round_num,
+            proposals=proposals,
             synthesized_cases=[{
                 "input_state": final_input,
                 "stub_outcomes": stub_outcomes,
@@ -963,25 +1208,35 @@ def investigate_branch_swarm(
 
         if feedback.branch_hit:
             journal.success = True
-            journal.final_reasoning = f"Solved on attempt {attempt + 1}: {reasoning}"
-            log.info("  Planner: SOLVED %s on attempt %d", branch_key, attempt + 1)
+            winning_reasons = [p.reasoning for p in proposals if p.input_state or p.stub_outcomes]
+            journal.final_reasoning = (
+                f"Solved on round {round_num + 1}: "
+                + "; ".join(winning_reasons[:2])
+            )
+            log.info("  Swarm: SOLVED %s on round %d", branch_key, round_num + 1)
             _record_solution_pattern(
-                ctx, bctx, [proposal],
-                {"input_state": final_input, "stub_outcomes": stub_outcomes, "origin": "gate_solver"},
+                ctx, bctx, proposals,
+                {"input_state": final_input, "stub_outcomes": stub_outcomes, "origin": "swarm+planner"},
             )
             break
 
-        # Use Python diagnosis for the retry.
-        diagnosis = py_diagnosis
+        # Feed results back for the next round's specialists.
+        prior_feedback = [feedback]
         log.info(
-            "  Planner: %s not hit — %s",
-            branch_key, reasoning[:100],
+            "  Swarm: %s not hit on round %d — %s",
+            branch_key, round_num + 1,
+            "; ".join(f"{p.specialist}:{p.reasoning[:50]}" for p in proposals if p.reasoning)[:200],
         )
 
     if not journal.success:
+        all_reasons = []
+        for rnd in journal.rounds:
+            for p in rnd.proposals:
+                if p.reasoning:
+                    all_reasons.append(f"{p.specialist}: {p.reasoning[:80]}")
         journal.final_reasoning = (
-            f"Exhausted {len(journal.rounds)} attempts. "
-            f"Last reasoning: {reasoning if 'reasoning' in dir() else 'n/a'}"
+            f"Exhausted {max_rounds} rounds. "
+            f"Approaches: {'; '.join(all_reasons[:4])}"
         )
 
     return journal, tc_count

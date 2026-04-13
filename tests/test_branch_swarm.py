@@ -12,11 +12,17 @@ from specter.branch_swarm import (
     SpecialistProposal,
     SwarmJournal,
     SwarmRound,
+    _build_condition_cracker_prompt,
     _build_gate_solver_prompt,
+    _build_history_miner_prompt,
+    _build_path_finder_prompt,
+    _build_stub_architect_prompt,
     _build_tape,
     _extract_condition_vars,
     _gather_branch_context,
+    _merge_proposals,
     _parse_gate_solver_response,
+    _parse_specialist_response,
     _plan_route,
     _validate_python,
     swarm_enabled,
@@ -109,6 +115,99 @@ class TestPlanRoute(unittest.TestCase):
             test_case_count=0, solution_patterns=[],
         )
         self.assertEqual(_plan_route(bctx, ctx), [])
+
+
+# ---------------------------------------------------------------------------
+# Specialist prompts
+# ---------------------------------------------------------------------------
+
+class TestSpecialistPrompts(unittest.TestCase):
+    def _bctx(self, **overrides):
+        defaults = dict(
+            bid=42, direction="T", branch_key="42:T",
+            paragraph="MAIN-PARA", condition_text="IF WS-STATUS = '00'",
+            backward_slice_code="state['WS-STATUS'] = '00'\n",
+            var_domain_info={"WS-STATUS": {
+                "classification": "status", "data_type": "alpha",
+                "max_length": 2, "condition_literals": ["00", "10"],
+                "valid_88_values": {}, "stub_op": "READ:FILE",
+            }},
+            nearest_hit={"input_state": {"WS-X": "A"}, "branches_hit": ["41:T"]},
+            call_graph_path=["ENTRY", "INIT", "MAIN-PARA"],
+            gating_conditions=[{"variable": "WS-FLAG", "values": ["Y"], "negated": False}],
+            stub_ops_in_slice=["READ:FILE"],
+            stub_op_sequence=["OPEN:FILE", "READ:FILE"],
+            stub_mapping={"READ:FILE": ["WS-STATUS"]},
+            fault_tables={"status_file": ["00", "10"]},
+            test_case_count=15, solution_patterns=[],
+            parent_88_lookup={},
+        )
+        defaults.update(overrides)
+        return BranchContext(**defaults)
+
+    def test_condition_cracker(self):
+        prompt = _build_condition_cracker_prompt(self._bctx())
+        self.assertIn("WS-STATUS", prompt)
+        self.assertIn("TRUE", prompt)
+
+    def test_condition_cracker_88_level(self):
+        bctx = self._bctx(
+            condition_text="IF APPL-AOK",
+            parent_88_lookup={"APPL-AOK": ("APPL-RESULT", 0)},
+        )
+        prompt = _build_condition_cracker_prompt(bctx)
+        self.assertIn("APPL-RESULT", prompt)
+
+    def test_path_finder(self):
+        prompt = _build_path_finder_prompt(self._bctx())
+        self.assertIn("reachability", prompt.lower())
+        self.assertIn("ENTRY", prompt)
+
+    def test_stub_architect(self):
+        prompt = _build_stub_architect_prompt(self._bctx())
+        self.assertIn("READ:FILE", prompt)
+        self.assertIn("OPEN:FILE", prompt)
+
+    def test_stub_architect_sequence(self):
+        prompt = _build_stub_architect_prompt(self._bctx())
+        self.assertIn("fire in this order", prompt)
+
+    def test_history_miner(self):
+        prompt = _build_history_miner_prompt(self._bctx())
+        self.assertIn("mutation", prompt.lower())
+        self.assertIn("WS-X", prompt)
+
+
+class TestParseSpecialistResponse(unittest.TestCase):
+    def test_valid_json(self):
+        p = _parse_specialist_response(json.dumps({"input_state": {"X": "1"}, "reasoning": "ok"}), "cc")
+        self.assertEqual(p.input_state, {"X": "1"})
+
+    def test_empty(self):
+        p = _parse_specialist_response(None, "cc")
+        self.assertEqual(p.confidence, 0.0)
+
+    def test_garbage(self):
+        p = _parse_specialist_response("no json!!!", "cc")
+        self.assertIn("could not parse", p.reasoning)
+
+
+class TestMergeProposals(unittest.TestCase):
+    def test_merges_all(self):
+        proposals = [
+            SpecialistProposal(specialist="path_finder", input_state={"GATE": "Y"}),
+            SpecialistProposal(specialist="condition_cracker", input_state={"WS-X": "10"}),
+            SpecialistProposal(specialist="stub_architect", stub_outcomes={"READ:F": [[["S", "00"]]]}),
+        ]
+        inp, stubs = _merge_proposals(proposals)
+        self.assertEqual(inp["GATE"], "Y")
+        self.assertIn("WS-X", inp)
+        self.assertIn("READ:F", stubs)
+
+    def test_empty_proposals(self):
+        inp, stubs = _merge_proposals([SpecialistProposal(specialist="cc")])
+        self.assertEqual(inp, {})
+        self.assertEqual(stubs, {})
 
 
 # ---------------------------------------------------------------------------
