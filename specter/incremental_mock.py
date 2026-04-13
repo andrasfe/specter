@@ -1895,6 +1895,8 @@ def _compile_and_fix(
 
     # Memory of failed attempts: (line, error_msg, fix_summary, reason)
     failed_attempts: list[tuple[int, str, str, str]] = []
+    # Reviewer override log — written to disk for uncovered-report diagnostics.
+    reviewer_overrides: list[dict] = []
     # Memory of successful fixes for context
     successful_fixes: list[str] = []
 
@@ -2486,6 +2488,16 @@ def _compile_and_fix(
                 next(iter(targeted_lines)),
                 max(reviewer_block_count.get(tl, 0) for tl in targeted_lines),
             )
+            reviewer_overrides.append({
+                "phase": phase,
+                "line": next(iter(targeted_lines)),
+                "error": largest_group_type if use_batch_mode else chosen_msg,
+                "fix_summary": fix_summary or "",
+                "reviewer_reason": "Reviewer bypassed after repeated blocks",
+                "revisions_attempted": 0,
+                "fix_lines": {str(k): v for k, v in fixes.items()} if fixes else {},
+                "outcome": "reviewer_bypassed",
+            })
         if llm_provider is not None and review_enabled() and not _bypass_reviewer:
             review_label = (
                 f"batch:{largest_group_type[:30]}"
@@ -2612,6 +2624,16 @@ def _compile_and_fix(
                 fix_summary,
                 review_block_reason,
             ))
+            reviewer_overrides.append({
+                "phase": phase,
+                "line": next(iter(targeted_lines)),
+                "error": largest_group_type if use_batch_mode else chosen_msg,
+                "fix_summary": fix_summary or "",
+                "reviewer_reason": review_block_reason,
+                "revisions_attempted": scribe_attempt,
+                "fix_lines": {str(k): v for k, v in fixes.items()} if fixes else {},
+                "outcome": "abandoned",
+            })
             for tl in targeted_lines:
                 failed_error_lines.add(tl)
                 reviewer_block_count[tl] = reviewer_block_count.get(tl, 0) + 1
@@ -2784,6 +2806,21 @@ def _compile_and_fix(
                 failed_error_lines.update(targeted_lines)
             log.info("  [%d/%d] ✗ Reverted (%d → %d errors)",
                      attempt, max_fix_attempts, n_errors, new_error_count)
+
+    # Persist reviewer override log for uncovered-report diagnostics.
+    if reviewer_overrides:
+        overrides_path = source_path.parent / "reviewer_overrides.jsonl"
+        try:
+            import json as _json
+            with open(overrides_path, "a", encoding="utf-8") as fh:
+                for entry in reviewer_overrides:
+                    fh.write(_json.dumps(entry, default=str) + "\n")
+            log.info(
+                "Wrote %d reviewer override(s) to %s",
+                len(reviewer_overrides), overrides_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to write reviewer overrides: %s", exc)
 
     return new_resolutions
 

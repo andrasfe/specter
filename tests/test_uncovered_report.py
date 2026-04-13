@@ -13,6 +13,7 @@ from specter.uncovered_report import (
     UncoveredBranchDetail,
     _classify_condition,
     _count_attempts,
+    _count_attempts_from_memory_targets,
     _extract_branch_conditions,
     _extract_condition_vars,
     _generate_hints,
@@ -126,6 +127,19 @@ class TestExtractConditionVars(unittest.TestCase):
     def test_duplicates_deduped(self):
         result = _extract_condition_vars("IF A-VAR = A-VAR")
         self.assertEqual(result, ["A-VAR"])
+
+    def test_quoted_literals_not_extracted(self):
+        result = _extract_condition_vars("WHEN 'ERRORES                   '")
+        self.assertNotIn("ERRORES", result)
+
+    def test_quoted_set_not_extracted(self):
+        result = _extract_condition_vars("IF MOCK-OP-KEY(1:4) = 'SET:'")
+        self.assertIn("MOCK-OP-KEY", result)
+        self.assertNotIn("SET", result)
+
+    def test_var_outside_quotes_still_extracted(self):
+        result = _extract_condition_vars("IF WS-STATUS = '00'")
+        self.assertEqual(result, ["WS-STATUS"])
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +268,39 @@ class TestCountAttempts(unittest.TestCase):
         # The second test case covered more same-paragraph branches.
         self.assertEqual(nearest.strategy, "direct_paragraph")
         self.assertEqual(nearest.input_state.get("WS-FOO"), "B")
+
+
+class TestCountAttemptsFromMemoryTargets(unittest.TestCase):
+    def test_empty_memory_targets(self):
+        total, branch_total, para_total = _count_attempts_from_memory_targets(
+            {}, 42, "T", "MAIN",
+        )
+        self.assertEqual((total, branch_total, para_total), (0, 0, 0))
+
+    def test_branch_and_paragraph_keys_counted(self):
+        targets = {
+            "branch:42:T": {"attempts": 3},
+            "para:MAIN-PARA": {"attempts": 5},
+            "para:OTHER": {"attempts": 9},
+        }
+        total, branch_total, para_total = _count_attempts_from_memory_targets(
+            targets, 42, "T", "MAIN-PARA",
+        )
+        self.assertEqual(total, 8)
+        self.assertEqual(branch_total, 3)
+        self.assertEqual(para_total, 5)
+
+    def test_supports_object_status_shape(self):
+        targets = {
+            "branch:7:F": SimpleNamespace(attempts=4),
+            "para:P": SimpleNamespace(attempts=2),
+        }
+        total, branch_total, para_total = _count_attempts_from_memory_targets(
+            targets, 7, "F", "P",
+        )
+        self.assertEqual(total, 6)
+        self.assertEqual(branch_total, 4)
+        self.assertEqual(para_total, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +613,197 @@ class TestGenerateUncoveredReport(unittest.TestCase):
                 format="both",
             )
             self.assertIsNotNone(result)
+
+    def test_specter_paragraphs_filtered_without_runtime_only(self):
+        """SPECTER-* paragraphs are filtered by name even when they are
+        not in runtime_only_paragraphs (e.g. never hit by any test)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store_stem = tmp_path / "tests.jsonl"
+
+            ctx, cov, report = self._setup_ctx_cov(tmp_path)
+            ctx.branch_meta = {
+                "2": {"paragraph": "MAIN-PARA"},
+                "50": {"paragraph": "SPECTER-APPLY-MOCK-PAYLOAD"},
+                "51": {"paragraph": "SPECTER-READ-INIT-VARS"},
+                "52": {"paragraph": "FILE-CONTROL"},
+            }
+            cov.branches_hit = set()
+            cov.runtime_only_paragraphs = set()  # never hit
+            cov.total_branches = 8
+            report.branches_total = 8
+            report.branches_hit = 0
+
+            generate_uncovered_report(
+                ctx=ctx, cov=cov, report=report,
+                program_id="TEST",
+                mock_source_path=None,
+                out_path_stem=store_stem,
+                format="json",
+            )
+
+            data = json.loads((tmp_path / "tests.uncovered.json").read_text())
+            paras = {b["paragraph"] for b in data["branches"]}
+            self.assertNotIn("SPECTER-APPLY-MOCK-PAYLOAD", paras)
+            self.assertNotIn("SPECTER-READ-INIT-VARS", paras)
+            self.assertNotIn("FILE-CONTROL", paras)
+            self.assertIn("MAIN-PARA", paras)
+
+    def test_mock_only_conditions_filtered(self):
+        """Branches whose condition only references MOCK-* variables
+        are infrastructure injected by the I/O replacement pipeline."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store_stem = tmp_path / "tests.jsonl"
+
+            cobol = (
+                "       PROCEDURE DIVISION.\n"
+                "       READ-PARA.\n"
+                "           IF MOCK-EOF-FLAG = 'Y'\n"
+                "           DISPLAY '@@B:10:T'\n"
+                "               CONTINUE\n"
+                "           ELSE\n"
+                "           DISPLAY '@@B:10:F'\n"
+                "               CONTINUE\n"
+                "           END-IF\n"
+                "           IF WS-STATUS = '00'\n"
+                "           DISPLAY '@@B:11:T'\n"
+                "               CONTINUE\n"
+                "           ELSE\n"
+                "           DISPLAY '@@B:11:F'\n"
+                "               CONTINUE\n"
+                "           END-IF.\n"
+            )
+            mock_path = tmp_path / "TEST.mock.cbl"
+            mock_path.write_text(cobol)
+
+            ctx, cov, report = self._setup_ctx_cov(tmp_path)
+            ctx.branch_meta = {
+                "10": {"paragraph": "READ-PARA"},
+                "11": {"paragraph": "READ-PARA"},
+            }
+            cov.branches_hit = set()
+            cov.total_branches = 4
+            report.branches_total = 4
+            report.branches_hit = 0
+
+            generate_uncovered_report(
+                ctx=ctx, cov=cov, report=report,
+                program_id="TEST",
+                mock_source_path=mock_path,
+                out_path_stem=store_stem,
+                format="json",
+            )
+
+            data = json.loads((tmp_path / "tests.uncovered.json").read_text())
+            keys = {b["branch_key"] for b in data["branches"]}
+            # MOCK-EOF-FLAG branches should be filtered
+            self.assertNotIn("10:T", keys)
+            self.assertNotIn("10:F", keys)
+            # Business logic branch should remain
+            self.assertIn("11:T", keys)
+            self.assertIn("11:F", keys)
+
+    def test_falls_back_to_memory_attempt_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store_stem = tmp_path / "tests.jsonl"
+
+            ctx, cov, report = self._setup_ctx_cov(tmp_path)
+            # No saved test cases reached this branch, but memory tracked attempts.
+            cov.test_cases = []
+            cov.branches_hit = {"1:T", "1:F", "2:T"}  # 2:F uncovered
+            ctx.memory_state = SimpleNamespace(
+                targets={
+                    "branch:2:F": SimpleNamespace(attempts=7),
+                    "para:MAIN-PARA": SimpleNamespace(attempts=9),
+                },
+            )
+
+            generate_uncovered_report(
+                ctx=ctx,
+                cov=cov,
+                report=report,
+                program_id="TEST",
+                mock_source_path=None,
+                out_path_stem=store_stem,
+                format="json",
+            )
+
+            data = json.loads((tmp_path / "tests.uncovered.json").read_text())
+            self.assertEqual(len(data["branches"]), 1)
+            detail = data["branches"][0]
+            self.assertEqual(detail["branch_key"], "2:F")
+            self.assertEqual(detail["total_attempts"], 16)
+            self.assertEqual(len(detail["attempts_by_strategy"]), 1)
+            self.assertEqual(
+                detail["attempts_by_strategy"][0]["strategy"],
+                "memory_target_status",
+            )
+
+    def test_compile_fix_overrides_loaded_from_jsonl(self):
+        """Reviewer override decisions written by _compile_and_fix should
+        appear in the uncovered report JSON and Markdown."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            store_stem = tmp_path / "tests.jsonl"
+            mock_path = tmp_path / "TEST.mock.cbl"
+            mock_path.write_text(
+                "       PROCEDURE DIVISION.\n"
+                "       MAIN-PARA.\n"
+                "           IF WS-X = 'A'\n"
+                "           DISPLAY '@@B:1:T'\n"
+                "               CONTINUE\n"
+                "           ELSE\n"
+                "           DISPLAY '@@B:1:F'\n"
+                "               CONTINUE\n"
+                "           END-IF.\n"
+            )
+
+            # Write a reviewer_overrides.jsonl next to the mock source.
+            overrides = [
+                {
+                    "phase": "exec_replacement",
+                    "line": 500,
+                    "error": "WS-FOO is not defined",
+                    "fix_summary": "Added PIC X(10) stub",
+                    "reviewer_reason": "REVIEWER REJECTED after 3 revisions: comments out MOVE",
+                    "revisions_attempted": 3,
+                    "fix_lines": {"500": "      *    MOVE WS-FOO TO WS-BAR."},
+                    "outcome": "abandoned",
+                },
+            ]
+            overrides_path = tmp_path / "reviewer_overrides.jsonl"
+            overrides_path.write_text(
+                "\n".join(json.dumps(o) for o in overrides) + "\n"
+            )
+
+            ctx, cov, report = self._setup_ctx_cov(tmp_path)
+            ctx.branch_meta = {"1": {"paragraph": "MAIN-PARA"}}
+            cov.branches_hit = {"1:T"}
+            cov.total_branches = 2
+            report.branches_total = 2
+            report.branches_hit = 1
+
+            generate_uncovered_report(
+                ctx=ctx, cov=cov, report=report,
+                program_id="TEST",
+                mock_source_path=mock_path,
+                out_path_stem=store_stem,
+                format="both",
+            )
+
+            data = json.loads((tmp_path / "tests.uncovered.json").read_text())
+            self.assertEqual(len(data["compile_fix_overrides"]), 1)
+            ov = data["compile_fix_overrides"][0]
+            self.assertEqual(ov["phase"], "exec_replacement")
+            self.assertEqual(ov["outcome"], "abandoned")
+            self.assertEqual(ov["line"], 500)
+
+            md = (tmp_path / "tests.uncovered.md").read_text()
+            self.assertIn("Compile-fix reviewer overrides", md)
+            self.assertIn("exec_replacement", md)
+            self.assertIn("abandoned", md)
 
 
 if __name__ == "__main__":
