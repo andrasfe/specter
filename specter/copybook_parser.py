@@ -261,13 +261,24 @@ def _extract_occurs(stmt: str) -> int:
 
 
 def _extract_88_value(stmt: str) -> str:
-    """Extract VALUE from an 88-level statement."""
+    """Extract VALUE from an 88-level statement.
+
+    For multi-value lists (``VALUE 400 401 402`` or ``VALUE 'A', 'B'``),
+    returns only the first value. The mock generator needs a single
+    concrete value for the ``IF MOCK-ALPHA-STATUS = '<val>'`` check.
+    """
     m = re.search(r'\bVALUE\s+(.+)', stmt, re.IGNORECASE)
     if m:
         val = m.group(1).strip().rstrip('.')
-        # Remove quotes if present
-        val = val.strip("'\"")
-        return val
+        # Handle quoted first value: VALUE 'X' 'Y' or VALUE 'X', 'Y'
+        m_quoted = re.match(r"^['\"]([^'\"]*)['\"]", val)
+        if m_quoted:
+            return m_quoted.group(1)
+        # Handle THRU/THROUGH — take the low end
+        val = re.split(r'\s+(?:THRU|THROUGH)\s+', val, maxsplit=1, flags=re.IGNORECASE)[0]
+        # Unquoted: split on space or comma, take first token
+        first = re.split(r'[\s,]+', val, maxsplit=1)[0].strip()
+        return first
     return ''
 
 

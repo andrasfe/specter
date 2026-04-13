@@ -228,9 +228,13 @@ def _parse_88_literal(raw: str) -> str | int | float | None:
     if len(thru_split) == 2:
         token = thru_split[0]
 
-    # Unquoted multi-value comma list — use the first entry.
+    # Unquoted multi-value list — use the first entry.
+    # COBOL allows VALUE 400 401 402 (space-separated) or VALUE 400, 401
+    # (comma-separated). Take only the first token.
     if "," in token:
         token = token.split(",", 1)[0].strip()
+    if " " in token:
+        token = token.split(None, 1)[0].strip()
 
     # Figurative constant.
     upper = token.upper()
