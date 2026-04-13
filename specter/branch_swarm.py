@@ -903,7 +903,7 @@ def _execute_and_evaluate(
     tc_count: int,
 ) -> tuple[JudgeFeedback, int]:
     """Execute a synthesized test case: Python first, COBOL if promising."""
-    from .cobol_coverage import _python_execute, _execute_and_save
+    from .cobol_coverage import _execute_and_save
 
     input_state = case.get("input_state") or {}
     stub_outcomes = case.get("stub_outcomes") or {}
@@ -911,34 +911,63 @@ def _execute_and_evaluate(
 
     feedback = JudgeFeedback()
 
-    # --- Python-first execution ---
+    # --- Python-first execution (direct paragraph invocation) ---
+    # We call _run_paragraph_directly ourselves so we get the full
+    # post-execution state dict — _python_execute discards it, which
+    # means we can't report actual runtime variable values to the
+    # specialists for the next round.
     module = getattr(ctx, "module", None)
-    if module:
+    py_hit = False
+    if module and bctx.paragraph:
         try:
-            py_result = _python_execute(
-                module, input_state, stub_outcomes, stub_defaults,
-                paragraph=bctx.paragraph or None,
-            )
-            feedback.python_result = py_result.error is None
-            feedback.paragraphs_hit = list(py_result.paragraphs_hit or [])[:10]
-            feedback.branches_hit = list(py_result.branches_hit or [])[:20]
-            feedback.reached_paragraph = bctx.paragraph in (py_result.paragraphs_hit or [])
-            feedback.error = py_result.error
+            from .monte_carlo import _run_paragraph_directly
 
-            # Check if the Python simulation hit the target branch.
-            py_branch_t = f"py:{bctx.bid}:T" if bctx.direction == "T" else f"py:{bctx.bid}:F"
-            py_hit = py_branch_t in (py_result.branches_hit or set())
+            default_state_fn = getattr(module, "_default_state", None)
+            pre_state = default_state_fn() if default_state_fn else {}
+            pre_state.update(input_state)
+            if stub_outcomes:
+                pre_state["_stub_outcomes"] = {
+                    k: [list(e) if isinstance(e, list) else e for e in v]
+                    for k, v in stub_outcomes.items()
+                }
+            if stub_defaults:
+                pre_state["_stub_defaults"] = dict(stub_defaults)
+            pre_state.setdefault("_stub_log", [])
 
-            # Extract actual variable values from the result for feedback.
-            # The Python executor returns state after execution.
-            for var in list(bctx.var_domain_info.keys())[:8]:
-                val = input_state.get(var)
-                if val is not None:
-                    feedback.actual_var_values[var] = val
+            post_state = _run_paragraph_directly(module, bctx.paragraph, pre_state)
+            if post_state:
+                feedback.python_result = True
+                trace = post_state.get("_trace", [])
+                feedback.paragraphs_hit = list(dict.fromkeys(trace))[:10]
+                feedback.reached_paragraph = bctx.paragraph in feedback.paragraphs_hit
+
+                # Convert integer branch IDs to py: prefixed strings.
+                raw_branches = post_state.get("_branches", set())
+                py_branches: list[str] = []
+                for b in raw_branches:
+                    if b > 0:
+                        py_branches.append(f"py:{b}:T")
+                    elif b < 0:
+                        py_branches.append(f"py:{abs(b)}:F")
+                feedback.branches_hit = py_branches[:20]
+
+                # Check if the Python branch fired — use the raw integer
+                # set directly (no prefix mismatch).
+                target_int = bctx.bid if bctx.direction == "T" else -bctx.bid
+                py_hit = target_int in raw_branches
+
+                # Extract ACTUAL runtime variable values (not input values).
+                # These are what the specialists need to diagnose failures.
+                for var in list(bctx.var_domain_info.keys())[:10]:
+                    val = post_state.get(var)
+                    if val is not None:
+                        feedback.actual_var_values[var] = val
+            else:
+                feedback.error = "paragraph not found in Python module"
         except Exception as exc:
             feedback.error = f"Python execution failed: {exc}"
 
-    # --- COBOL execution (always attempt via _execute_and_save for real coverage) ---
+    # --- COBOL execution via _execute_and_save for real coverage ---
     try:
         target = f"direct:{bctx.paragraph}|swarm:{bctx.branch_key}" if bctx.paragraph else f"swarm:{bctx.branch_key}"
         saved, tc_count = _execute_and_save(
@@ -946,7 +975,14 @@ def _execute_and_evaluate(
             "branch_swarm", target, report, tc_count,
         )
         feedback.cobol_promoted = True
-        feedback.branch_hit = bctx.branch_key in cov.branches_hit
+        # Check both COBOL branch IDs and Python branch IDs in the
+        # coverage set — _execute_and_save adds py: branches from
+        # direct paragraph invocation to cov.branches_hit.
+        feedback.branch_hit = (
+            bctx.branch_key in cov.branches_hit
+            or f"py:{bctx.branch_key}" in cov.branches_hit
+            or py_hit
+        )
         if feedback.branch_hit:
             feedback.reached_paragraph = True
     except Exception as exc:
