@@ -1130,6 +1130,74 @@ def _execute_directly(
 # Main investigation loop (3-level planner)
 # ---------------------------------------------------------------------------
 
+def _run_swarm_round(
+    bctx: BranchContext,
+    route: list[tuple[str, list[dict]]],
+    ctx,
+    cov,
+    report,
+    tc_count: int,
+    prior_feedback: list[JudgeFeedback] | None,
+    llm_provider,
+    llm_model: str | None,
+    round_num: int,
+) -> tuple[SwarmRound, int, JudgeFeedback]:
+    """Execute one swarm round: specialists → merge → validate → tape → execute."""
+    proposals = _run_specialists_parallel(
+        bctx, prior_feedback, llm_provider, llm_model,
+    )
+    for p in proposals:
+        log.info(
+            "    %s: confidence=%.1f input_keys=%s stub_keys=%s",
+            p.specialist, p.confidence,
+            list(p.input_state.keys())[:5],
+            list(p.stub_outcomes.keys())[:5],
+        )
+
+    input_state, stub_outcomes = _merge_proposals(proposals)
+
+    if not input_state and not stub_outcomes:
+        log.info("  Swarm: all specialists returned empty proposals")
+        fb = JudgeFeedback(error="empty proposals")
+        rnd = SwarmRound(round_num=round_num, proposals=proposals, feedback=[fb])
+        return rnd, tc_count, fb
+
+    # Python forward validation.
+    module = getattr(ctx, "module", None)
+    py_ok, py_diagnosis = _validate_python(module, bctx, input_state, stub_outcomes)
+    if py_ok:
+        log.info("  Swarm: Python validation PASSED for %s", bctx.branch_key)
+    else:
+        log.info("  Swarm: Python validation failed — %s", (py_diagnosis or "unknown")[:150])
+
+    # Gate Solver refinement (only if Python failed).
+    if not py_ok and py_diagnosis:
+        refined_input, refined_stubs, reasoning = _solve_gates(
+            bctx, route, llm_provider, llm_model, py_diagnosis,
+        )
+        if refined_input or refined_stubs:
+            input_state.update(refined_input)
+            stub_outcomes.update(refined_stubs)
+            log.info("  Swarm: gate solver refined — %s", reasoning[:80])
+
+    # Tape Builder + Direct COBOL execution.
+    final_input, stub_log = _build_tape(bctx, ctx, input_state, stub_outcomes)
+    log.info("  Swarm: tape built with %d stub entries", len(stub_log))
+
+    feedback, tc_count = _execute_directly(
+        ctx, cov, report, tc_count, final_input, stub_log, bctx,
+    )
+
+    rnd = SwarmRound(
+        round_num=round_num,
+        proposals=proposals,
+        synthesized_cases=[{"input_state": final_input, "stub_outcomes": stub_outcomes}],
+        feedback=[feedback],
+        branch_hit=feedback.branch_hit,
+    )
+    return rnd, tc_count, feedback
+
+
 def investigate_branch_swarm(
     *,
     bid: int,
@@ -1142,16 +1210,15 @@ def investigate_branch_swarm(
     llm_provider=None,
     llm_model: str | None = None,
 ) -> tuple[SwarmJournal, int]:
-    """Run the swarm + planner pipeline for a single uncovered branch.
+    """Run the swarm + planner pipeline with iterative deepening.
 
-    Round flow:
-      1. 4 specialists propose in parallel (diverse perspectives)
-      2. Merge proposals into a candidate (input_state, stub_outcomes)
-      3. Route Planner provides the execution path (deterministic)
-      4. Python forward validation with per-gate diagnosis
-      5. If Python fails, Gate Solver refines via 1 LLM call with diagnosis
-      6. Tape Builder constructs the execution-ordered stub_log
-      7. Direct COBOL execution (bypasses _execute_and_save)
+    Phase 1 (Reach): Focus on getting the COBOL binary to execute the
+    target paragraph. Ignore the branch condition. Validated by
+    checking ``paragraph in result.paragraphs_hit``.
+
+    Phase 2 (Flip): Once reachability is solved, focus on flipping the
+    specific branch condition using the working stubs from Phase 1 as
+    a warm-start base.
     """
     branch_key = f"{bid}:{direction}"
 
@@ -1169,124 +1236,112 @@ def investigate_branch_swarm(
     journal.paragraph = bctx.paragraph
     journal.condition_text = bctx.condition_text
 
-    # Level 1: Route Planner (deterministic, once per branch).
+    # Route Planner (deterministic, once per branch).
     route = _plan_route(bctx, ctx)
     if route:
-        log.info(
-            "  Swarm: route to %s: %s",
-            bctx.paragraph,
-            " → ".join(p for p, _ in route),
-        )
+        log.info("  Swarm: route to %s: %s", bctx.paragraph, " → ".join(p for p, _ in route))
     else:
         log.info("  Swarm: no static route to %s (direct invocation)", bctx.paragraph)
 
+    # Check if the paragraph is already reachable from existing test cases.
+    para_reached = bctx.paragraph in cov.paragraphs_hit
+
+    # --- Phase 1: Reach the paragraph ---
+    # Allocate rounds: if paragraph already reached, skip to Phase 2.
+    phase1_rounds = 0 if para_reached else min(2, max_rounds)
+    phase2_rounds = max_rounds - phase1_rounds
+
     prior_feedback: list[JudgeFeedback] | None = None
+    reach_input: dict = {}
+    reach_stubs: dict = {}
+    round_idx = 0
 
-    for round_num in range(max_rounds):
-        log.info(
-            "  Swarm: investigating %s round %d/%d",
-            branch_key, round_num + 1, max_rounds,
-        )
+    if not para_reached and phase1_rounds > 0:
+        log.info("  Swarm: Phase 1 (REACH %s) — %d rounds", bctx.paragraph, phase1_rounds)
 
-        # --- Phase A: Specialist proposals (4 parallel LLM calls) ---
-        proposals = _run_specialists_parallel(
-            bctx, prior_feedback, llm_provider, llm_model,
-        )
-        for p in proposals:
-            log.info(
-                "    %s: confidence=%.1f input_keys=%s stub_keys=%s",
-                p.specialist, p.confidence,
-                list(p.input_state.keys())[:5],
-                list(p.stub_outcomes.keys())[:5],
-            )
+        # Temporarily modify bctx to focus specialists on reachability.
+        # Clear condition_text so they don't try to satisfy the branch.
+        saved_condition = bctx.condition_text
+        bctx.condition_text = f"(Phase 1: just reach paragraph {bctx.paragraph})"
 
-        # Merge into a single candidate.
-        input_state, stub_outcomes = _merge_proposals(proposals)
-
-        if not input_state and not stub_outcomes:
-            log.info("  Swarm: all specialists returned empty proposals")
-            rnd = SwarmRound(
-                round_num=round_num, proposals=proposals,
-                feedback=[JudgeFeedback(error="empty proposals")],
+        for r in range(phase1_rounds):
+            log.info("  Swarm: reach %s round %d/%d", branch_key, r + 1, phase1_rounds)
+            rnd, tc_count, feedback = _run_swarm_round(
+                bctx, route, ctx, cov, report, tc_count,
+                prior_feedback, llm_provider, llm_model, round_idx,
             )
             journal.rounds.append(rnd)
-            continue
+            round_idx += 1
 
-        # --- Phase B: Python forward validation ---
-        module = getattr(ctx, "module", None)
-        py_ok, py_diagnosis = _validate_python(
-            module, bctx, input_state, stub_outcomes,
-        )
+            if feedback.reached_paragraph:
+                log.info("  Swarm: Phase 1 SUCCESS — %s reached on round %d", bctx.paragraph, r + 1)
+                para_reached = True
+                # Save the working input/stubs for Phase 2 warm-start.
+                if rnd.synthesized_cases:
+                    reach_input = rnd.synthesized_cases[0].get("input_state", {})
+                    reach_stubs = rnd.synthesized_cases[0].get("stub_outcomes", {})
+                break
 
-        if py_ok:
-            log.info("  Swarm: Python validation PASSED for %s", branch_key)
+            prior_feedback = [feedback]
+            log.info("  Swarm: %s not reached on round %d", bctx.paragraph, r + 1)
+
+        # Restore condition text for Phase 2.
+        bctx.condition_text = saved_condition
+
+        if not para_reached:
+            log.info("  Swarm: Phase 1 FAILED — %s never reached", bctx.paragraph)
+
+    # --- Phase 2: Flip the branch ---
+    if phase2_rounds > 0:
+        phase = "Phase 2 (FLIP)" if phase1_rounds > 0 else "investigating"
+        log.info("  Swarm: %s %s — %d rounds", phase, branch_key, phase2_rounds)
+
+        # Warm-start Phase 2 with Phase 1's working stubs if available.
+        if reach_input or reach_stubs:
+            # Inject reach stubs into the nearest_hit so History Miner sees them.
+            if bctx.nearest_hit is None:
+                bctx.nearest_hit = {}
+            if reach_input:
+                existing_input = bctx.nearest_hit.get("input_state", {})
+                existing_input.update(reach_input)
+                bctx.nearest_hit["input_state"] = existing_input
+
+        # Reset feedback for Phase 2 — carry over the last Phase 1 feedback
+        # so specialists see the trace from the successful reach attempt.
+        if prior_feedback and para_reached:
+            pass  # keep the successful reach feedback
         else:
-            log.info(
-                "  Swarm: Python validation failed — %s",
-                (py_diagnosis or "unknown")[:150],
-            )
+            prior_feedback = None
 
-        # --- Phase C: Gate Solver refinement (only if Python failed) ---
-        # The Gate Solver sees the full route + the specialist proposals +
-        # the Python diagnosis, and produces a refined proposal.
-        if not py_ok and py_diagnosis:
-            refined_input, refined_stubs, reasoning = _solve_gates(
-                bctx, route, llm_provider, llm_model, py_diagnosis,
+        for r in range(phase2_rounds):
+            log.info("  Swarm: %s %s round %d/%d", phase, branch_key, r + 1, phase2_rounds)
+            rnd, tc_count, feedback = _run_swarm_round(
+                bctx, route, ctx, cov, report, tc_count,
+                prior_feedback, llm_provider, llm_model, round_idx,
             )
-            if refined_input or refined_stubs:
-                # Overlay refinements on the specialist merge.
-                input_state.update(refined_input)
-                stub_outcomes.update(refined_stubs)
-                log.info(
-                    "  Swarm: gate solver refined — input_keys=%s stub_keys=%s — %s",
-                    list(refined_input.keys())[:5],
-                    list(refined_stubs.keys())[:5],
-                    reasoning[:80],
+            journal.rounds.append(rnd)
+            round_idx += 1
+
+            if feedback.branch_hit:
+                journal.success = True
+                winning_reasons = [p.reasoning for p in rnd.proposals if p.input_state or p.stub_outcomes]
+                journal.final_reasoning = (
+                    f"Solved on round {round_idx}: " + "; ".join(winning_reasons[:2])
                 )
+                log.info("  Swarm: SOLVED %s on round %d", branch_key, round_idx)
+                _record_solution_pattern(
+                    ctx, bctx, rnd.proposals,
+                    {"input_state": rnd.synthesized_cases[0] if rnd.synthesized_cases else {},
+                     "stub_outcomes": {}, "origin": "swarm+planner"},
+                )
+                break
 
-        # --- Phase D: Tape Builder (deterministic) ---
-        final_input, stub_log = _build_tape(bctx, ctx, input_state, stub_outcomes)
-        log.info("  Swarm: tape built with %d stub entries", len(stub_log))
-
-        # --- Phase E: Direct COBOL execution ---
-        feedback, tc_count = _execute_directly(
-            ctx, cov, report, tc_count,
-            final_input, stub_log, bctx,
-        )
-
-        rnd = SwarmRound(
-            round_num=round_num,
-            proposals=proposals,
-            synthesized_cases=[{
-                "input_state": final_input,
-                "stub_outcomes": stub_outcomes,
-            }],
-            feedback=[feedback],
-            branch_hit=feedback.branch_hit,
-        )
-        journal.rounds.append(rnd)
-
-        if feedback.branch_hit:
-            journal.success = True
-            winning_reasons = [p.reasoning for p in proposals if p.input_state or p.stub_outcomes]
-            journal.final_reasoning = (
-                f"Solved on round {round_num + 1}: "
-                + "; ".join(winning_reasons[:2])
+            prior_feedback = [feedback]
+            log.info(
+                "  Swarm: %s not hit on round %d — %s",
+                branch_key, round_idx,
+                "; ".join(f"{p.specialist}:{p.reasoning[:50]}" for p in rnd.proposals if p.reasoning)[:200],
             )
-            log.info("  Swarm: SOLVED %s on round %d", branch_key, round_num + 1)
-            _record_solution_pattern(
-                ctx, bctx, proposals,
-                {"input_state": final_input, "stub_outcomes": stub_outcomes, "origin": "swarm+planner"},
-            )
-            break
-
-        # Feed results back for the next round's specialists.
-        prior_feedback = [feedback]
-        log.info(
-            "  Swarm: %s not hit on round %d — %s",
-            branch_key, round_num + 1,
-            "; ".join(f"{p.specialist}:{p.reasoning[:50]}" for p in proposals if p.reasoning)[:200],
-        )
 
     if not journal.success:
         all_reasons = []
@@ -1295,7 +1350,8 @@ def investigate_branch_swarm(
                 if p.reasoning:
                     all_reasons.append(f"{p.specialist}: {p.reasoning[:80]}")
         journal.final_reasoning = (
-            f"Exhausted {max_rounds} rounds. "
+            f"Exhausted {max_rounds} rounds "
+            f"(reached={para_reached}). "
             f"Approaches: {'; '.join(all_reasons[:4])}"
         )
         _write_failure_log(ctx, bctx, route, journal)
