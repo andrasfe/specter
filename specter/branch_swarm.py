@@ -77,6 +77,10 @@ class JudgeFeedback:
     python_result: bool = False
     cobol_promoted: bool = False
     branch_hit: bool = False
+    # COBOL execution trace — ordered list of paragraph names as executed.
+    cobol_trace: list[str] = field(default_factory=list)
+    # COBOL DISPLAY output — status messages, error messages, etc.
+    display_output: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -413,6 +417,73 @@ def _plan_route(
     return route
 
 
+def _format_prior_feedback(
+    prior_feedback: list[JudgeFeedback] | None,
+    bctx: BranchContext,
+) -> str:
+    """Format prior round feedback for specialist prompts.
+
+    Includes COBOL execution trace and display output so specialists
+    can see exactly where the program went and where it diverged.
+    """
+    if not prior_feedback:
+        return ""
+    parts: list[str] = ["Previous round COBOL execution results:\n"]
+    for fb in prior_feedback[-2:]:
+        parts.append(
+            f"  reached_paragraph={fb.reached_paragraph}, "
+            f"branch_hit={fb.branch_hit}, "
+            f"error={fb.error}\n"
+        )
+        if fb.cobol_trace:
+            # Show the trace up to and around the target paragraph.
+            trace = fb.cobol_trace
+            parts.append(f"  execution trace ({len(trace)} paragraphs): ")
+            # Find the target paragraph position in the trace.
+            target_idx = None
+            for i, p in enumerate(trace):
+                if p == bctx.paragraph:
+                    target_idx = i
+                    break
+            if target_idx is not None:
+                # Show context around the target.
+                start = max(0, target_idx - 3)
+                end = min(len(trace), target_idx + 4)
+                window = trace[start:end]
+                marker = f" → [{bctx.paragraph}] ← "
+                parts.append(
+                    " → ".join(
+                        f"[{p}]" if p == bctx.paragraph else p
+                        for p in window
+                    )
+                )
+                if start > 0:
+                    parts.insert(-1, f"...({start} earlier) → ")
+                parts.append("\n")
+            else:
+                # Target never reached — show where execution stopped.
+                parts.append(" → ".join(trace[-6:]))
+                parts.append(f"\n  ** {bctx.paragraph} NEVER REACHED — "
+                             f"execution stopped at {trace[-1] if trace else '(empty)'} **\n")
+        if fb.display_output:
+            # Show error/status messages from COBOL DISPLAY output.
+            error_msgs = [
+                d for d in fb.display_output
+                if any(kw in d.upper() for kw in ("ERROR", "ABEND", "STATUS", "FAIL"))
+            ][:5]
+            if error_msgs:
+                parts.append("  COBOL error messages:\n")
+                for msg in error_msgs:
+                    parts.append(f"    {msg}\n")
+        if fb.actual_var_values:
+            parts.append(
+                f"  actual variable values: "
+                f"{json.dumps(fb.actual_var_values, default=str)[:200]}\n"
+            )
+    parts.append("Adjust your proposal based on WHERE execution stopped.\n\n")
+    return "".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Specialist proposal generation (parallel)
 # ---------------------------------------------------------------------------
@@ -461,11 +532,7 @@ def _build_condition_cracker_prompt(bctx: BranchContext, prior_feedback: list[Ju
         if var in bctx.var_domain_info: continue
         pe = bctx.parent_88_lookup.get(var)
         if pe: parts.append(f"  {var} is an 88-level flag. Set {pe[0]} = {pe[1]!r} in input_state.\n")
-    if prior_feedback:
-        parts.append("Previous round results:\n")
-        for fb in prior_feedback[-2:]:
-            parts.append(f"  reached={fb.reached_paragraph}, hit={fb.branch_hit}, vars={json.dumps(fb.actual_var_values, default=str)[:200]}\n")
-        parts.append("Try something fundamentally different.\n\n")
+    parts.append(_format_prior_feedback(prior_feedback, bctx))
     parts.append(f"Focus ONLY on condition variables. What values make it {'TRUE' if bctx.direction == 'T' else 'FALSE'}?\n\n")
     parts.append(_JSON_RESPONSE_FORMAT)
     return "".join(parts)
@@ -485,11 +552,7 @@ def _build_path_finder_prompt(bctx: BranchContext, prior_feedback: list[JudgeFee
             neg = " (negated)" if gc.get("negated") else ""
             parts.append(f"  {gc.get('variable', '?')} must be in {gc.get('values', [])}{neg}\n")
         parts.append("\n")
-    if prior_feedback:
-        parts.append("Previous results:\n")
-        for fb in prior_feedback[-2:]:
-            parts.append(f"  reached={fb.reached_paragraph}, paras={fb.paragraphs_hit[:8]}\n")
-        parts.append("Try a different approach.\n\n")
+    parts.append(_format_prior_feedback(prior_feedback, bctx))
     parts.append("Propose input_state values to reach the target paragraph.\n\n")
     parts.append(_JSON_RESPONSE_FORMAT)
     return "".join(parts)
@@ -520,11 +583,7 @@ def _build_stub_architect_prompt(bctx: BranchContext, prior_feedback: list[Judge
             if pe: line += f" (88-flag of {pe[0]}, activate with {pe[1]!r})"
             parts.append(line + "\n")
     parts.append(f"\nFault tables: {bctx.fault_tables}\n\n")
-    if prior_feedback:
-        parts.append("Previous results:\n")
-        for fb in prior_feedback[-2:]:
-            parts.append(f"  reached={fb.reached_paragraph}, hit={fb.branch_hit}, error={fb.error}\n")
-        parts.append("Adjust stubs.\n\n")
+    parts.append(_format_prior_feedback(prior_feedback, bctx))
     parts.append(_JSON_RESPONSE_FORMAT)
     return "".join(parts)
 
@@ -546,11 +605,7 @@ def _build_history_miner_prompt(bctx: BranchContext, prior_feedback: list[JudgeF
         for pat in bctx.solution_patterns[:3]:
             parts.append(f"  {pat.branch_key}: {pat.winning_specialist}, vars={json.dumps(pat.key_variables, default=str)[:150]}\n")
         parts.append("\n")
-    if prior_feedback:
-        parts.append("Previous results:\n")
-        for fb in prior_feedback[-2:]:
-            parts.append(f"  reached={fb.reached_paragraph}, hit={fb.branch_hit}, vars={json.dumps(fb.actual_var_values, default=str)[:200]}\n")
-        parts.append("Mutate differently.\n\n")
+    parts.append(_format_prior_feedback(prior_feedback, bctx))
     parts.append("Propose a SMALL mutation. Change only variables affecting the branch.\n\n")
     parts.append(_JSON_RESPONSE_FORMAT)
     return "".join(parts)
@@ -989,6 +1044,11 @@ def _execute_directly(
         feedback.branches_hit = list(result.branches_hit or [])[:30]
         feedback.reached_paragraph = bctx.paragraph in (result.paragraphs_hit or [])
         feedback.branch_hit = bctx.branch_key in (result.branches_hit or set())
+        feedback.cobol_trace = list(result.paragraphs_hit or [])[:30]
+        feedback.display_output = [
+            line for line in (result.display_output or [])
+            if not line.startswith("SPECTER-")
+        ][:15]
 
         if result.error:
             return feedback, tc_count
@@ -1416,6 +1476,8 @@ def _write_failure_log(
                 "actual_var_values": fb.actual_var_values,
                 "branches_hit": fb.branches_hit[:10],
                 "paragraphs_hit": fb.paragraphs_hit[:10],
+                "cobol_trace": fb.cobol_trace[:20],
+                "display_output": fb.display_output[:10],
                 "error": fb.error,
             })
         entry["rounds"].append(round_entry)

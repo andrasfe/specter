@@ -22,6 +22,7 @@ from specter.branch_swarm import (
     _gather_branch_context,
     _merge_proposals,
     _parse_gate_solver_response,
+    _format_prior_feedback,
     _parse_specialist_response,
     _plan_route,
     _validate_python,
@@ -213,6 +214,62 @@ class TestMergeProposals(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Level 2: Gate Solver prompt + parsing
 # ---------------------------------------------------------------------------
+
+class TestFormatPriorFeedback(unittest.TestCase):
+    def _bctx(self, **overrides):
+        defaults = dict(
+            bid=42, direction="T", branch_key="42:T",
+            paragraph="TARGET-PARA", condition_text="IF X = '00'",
+            backward_slice_code="", var_domain_info={},
+            nearest_hit=None, call_graph_path=[], gating_conditions=[],
+            stub_ops_in_slice=[], stub_op_sequence=[],
+            stub_mapping={}, fault_tables={},
+            test_case_count=0, solution_patterns=[],
+            parent_88_lookup={},
+        )
+        defaults.update(overrides)
+        return BranchContext(**defaults)
+
+    def test_empty_feedback(self):
+        result = _format_prior_feedback(None, self._bctx())
+        self.assertEqual(result, "")
+
+    def test_includes_cobol_trace(self):
+        fb = JudgeFeedback(
+            reached_paragraph=False,
+            cobol_trace=["OPEN-FILES", "READ-RECORD", "ABEND-PROGRAM"],
+        )
+        result = _format_prior_feedback([fb], self._bctx())
+        self.assertIn("OPEN-FILES", result)
+        self.assertIn("ABEND-PROGRAM", result)
+        self.assertIn("NEVER REACHED", result)
+
+    def test_target_found_in_trace(self):
+        fb = JudgeFeedback(
+            reached_paragraph=True,
+            cobol_trace=["OPEN-FILES", "READ-RECORD", "TARGET-PARA", "CLOSE-FILES"],
+        )
+        result = _format_prior_feedback([fb], self._bctx())
+        self.assertIn("[TARGET-PARA]", result)
+        self.assertNotIn("NEVER REACHED", result)
+
+    def test_includes_error_display_output(self):
+        fb = JudgeFeedback(
+            display_output=["ERROR: Cannot open CUSTOMER-INPUT, Status: 35",
+                            "SOME NORMAL MESSAGE"],
+        )
+        result = _format_prior_feedback([fb], self._bctx())
+        self.assertIn("ERROR: Cannot open", result)
+        self.assertNotIn("SOME NORMAL MESSAGE", result)
+
+    def test_includes_actual_var_values(self):
+        fb = JudgeFeedback(
+            actual_var_values={"WS-STATUS": "10"},
+        )
+        result = _format_prior_feedback([fb], self._bctx())
+        self.assertIn("WS-STATUS", result)
+        self.assertIn("10", result)
+
 
 class TestGateSolverPrompt(unittest.TestCase):
     def _bctx(self, **overrides):
