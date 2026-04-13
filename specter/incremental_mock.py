@@ -3031,6 +3031,30 @@ def incremental_instrument(
 
     # Build MockConfig for phase functions that need it
     from .cobol_mock import MockConfig
+
+    # Collect 88-level condition-names from copybooks and source so the
+    # mock generator can use SET instead of MOVE for these variables.
+    _cond_88: set[str] = set()
+    try:
+        from .variable_domain import _extract_88_values_from_source
+        for parent, children in _extract_88_values_from_source(str(source_path)).items():
+            _cond_88.update(k.upper() for k in children)
+    except Exception:
+        pass
+    try:
+        from .copybook_parser import parse_copybook
+        for cpd in copybook_dirs:
+            for cpf in Path(cpd).glob("*.[cC][pP][yY]"):
+                try:
+                    rec = parse_copybook(cpf.read_text(errors="replace"))
+                    for fld in rec.fields:
+                        if fld.values_88:
+                            _cond_88.update(k.upper() for k in fld.values_88)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     config = MockConfig(
         copybook_dirs=list(copybook_dirs),
         trace_paragraphs=True,
@@ -3040,6 +3064,7 @@ def incremental_instrument(
         stop_on_exec_xctl=stop_on_exec_xctl,
         eib_calen=eib_calen,
         eib_aid=eib_aid,
+        condition_names_88=_cond_88,
     )
 
     # Load prior resolutions and checkpoint for resume
@@ -3219,7 +3244,7 @@ def incremental_instrument(
         batch_num = 0
         while True:
             lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-            new_lines, replaced = _replace_io_verbs(lines, max_count=batch_size)
+            new_lines, replaced = _replace_io_verbs(lines, max_count=batch_size, condition_names_88=config.condition_names_88)
             if replaced == 0:
                 break
             batch_num += 1
@@ -3246,7 +3271,7 @@ def incremental_instrument(
                     mock_path.write_text(snapshot)
                     for _ in range(batch_size):
                         lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
-                        one_lines, one_replaced = _replace_io_verbs(lines, max_count=1)
+                        one_lines, one_replaced = _replace_io_verbs(lines, max_count=1, condition_names_88=config.condition_names_88)
                         if one_replaced == 0:
                             break
                         mock_path.write_text("".join(one_lines))

@@ -75,6 +75,22 @@ class MockConfig:
     payload_variables: dict[str, str] = field(default_factory=dict)  # var→("alpha"|"numeric") for SET replay
     eib_calen: int = 0                # Initial EIBCALEN VALUE in EIB stub
     eib_aid: str = "SPACES"           # Initial EIBAID VALUE in EIB stub (hex literal or SPACES)
+    condition_names_88: set[str] = field(default_factory=set)  # 88-level flags that need SET, not MOVE
+
+    def mock_set_status(self, var: str, indent: str = _B) -> str:
+        """Generate code to set a status variable from the mock alpha status.
+
+        For 88-level condition-names, generates ``SET <var> TO TRUE`` when
+        the mock status indicates success, instead of an invalid ``MOVE``.
+        For regular variables, generates ``MOVE MOCK-ALPHA-STATUS TO <var>``.
+        """
+        if var.upper() in self.condition_names_88:
+            return (
+                f"{indent}IF MOCK-ALPHA-STATUS = 'Y' OR = '0'\n"
+                f"{indent}  SET {var} TO TRUE\n"
+                f"{indent}END-IF\n"
+            )
+        return f"{indent}MOVE MOCK-ALPHA-STATUS TO {var}\n"
 
 
 @dataclass
@@ -906,7 +922,7 @@ def _extract_file_status_map(lines: list[str]) -> dict[str, str]:
     return status_map
 
 
-def _replace_io_verbs(lines: list[str], max_count: int = 0) -> tuple[list[str], int]:
+def _replace_io_verbs(lines: list[str], max_count: int = 0, condition_names_88: set[str] | None = None) -> tuple[list[str], int]:
     """Replace standalone READ/WRITE/OPEN/CLOSE/START/DELETE with mocks.
 
     Args:
@@ -1052,9 +1068,16 @@ def _replace_io_verbs(lines: list[str], max_count: int = 0) -> tuple[list[str], 
                         status_var = sv
                         break
             if status_var:
-                result.append(
-                    f"{_B}MOVE MOCK-ALPHA-STATUS TO {status_var}\n"
-                )
+                if condition_names_88 and status_var.upper() in condition_names_88:
+                    result.append(
+                        f"{_B}IF MOCK-ALPHA-STATUS = 'Y' OR = '0'\n"
+                        f"{_B}  SET {status_var} TO TRUE\n"
+                        f"{_B}END-IF\n"
+                    )
+                else:
+                    result.append(
+                        f"{_B}MOVE MOCK-ALPHA-STATUS TO {status_var}\n"
+                    )
 
             result.append(f"{_B}PERFORM SPECTER-APPLY-MOCK-PAYLOAD\n")
 
@@ -2466,7 +2489,14 @@ def _add_mock_file_handling(
                 final.append(f"{_B}      MOVE {val} TO {var}\n")
             else:
                 final.append(f"{_B}    WHEN '{padded}'\n")
-                final.append(f"{_B}      MOVE MOCK-ALPHA-STATUS TO {var}\n")
+                if var.upper() in config.condition_names_88:
+                    final.append(
+                        f"{_B}      IF MOCK-ALPHA-STATUS = 'Y' OR = '0'\n"
+                        f"{_B}        SET {var} TO TRUE\n"
+                        f"{_B}      END-IF\n"
+                    )
+                else:
+                    final.append(f"{_B}      MOVE MOCK-ALPHA-STATUS TO {var}\n")
         final.append(f"{_B}  END-EVALUATE\n")
         final.append(f"{_B}  GO TO SPECTER-READ-INIT-VARS\n")
         final.append(f"{_B}END-IF.\n")
@@ -2510,6 +2540,12 @@ def _add_mock_file_handling(
                 final.append(f"{_B}    WHEN '{padded}'\n")
                 if kind == "numeric":
                     final.append(f"{_B}      MOVE MOCK-NUM-STATUS TO {var}\n")
+                elif var.upper() in config.condition_names_88:
+                    final.append(
+                        f"{_B}      IF MOCK-ALPHA-STATUS = 'Y' OR = '0'\n"
+                        f"{_B}        SET {var} TO TRUE\n"
+                        f"{_B}      END-IF\n"
+                    )
                 else:
                     final.append(f"{_B}      MOVE MOCK-ALPHA-STATUS TO {var}\n")
             final.append(f"{_B}    WHEN OTHER\n")
