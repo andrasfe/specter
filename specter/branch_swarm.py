@@ -117,6 +117,11 @@ class BranchContext:
     fault_tables: dict[str, list]
     test_case_count: int
     solution_patterns: list[SolutionPattern]
+    # 88-level child → (parent_name, activating_value) reverse map.
+    parent_88_lookup: dict[str, tuple[str, Any]] = field(default_factory=dict)
+    # Full ordered stub operation sequence from the backward slice,
+    # preserving duplicates (e.g. OPEN then READ then REWRITE).
+    stub_op_sequence: list[str] = field(default_factory=list)
 
 
 # Backward-compatible journal (wraps SwarmRound list into AgentIteration list)
@@ -285,10 +290,36 @@ def _gather_branch_context(
             "negated": getattr(gc, "negated", False) or (gc.get("negated", False) if isinstance(gc, dict) else False),
         })
 
+    # --- 88-level parent lookup ---
+    # Build a reverse map: 88-level child name → (parent, activating value).
+    # This lets specialists know that e.g. APPL-AOK is activated by
+    # setting APPL-RESULT = 0, rather than treating it as a regular variable.
+    parent_88_lookup: dict[str, tuple[str, Any]] = {}
+    for parent_name, parent_dom in domains.items():
+        v88 = getattr(parent_dom, "valid_88_values", None) or {}
+        for child_name, child_value in v88.items():
+            parent_88_lookup.setdefault(
+                child_name.upper(), (parent_name, child_value),
+            )
+    # Also check var_report for broader 88-level data.
+    var_report = getattr(ctx, "var_report", None)
+    if var_report:
+        for parent_name, parent_info in getattr(var_report, "variables", {}).items():
+            v88 = getattr(parent_info, "valid_88_values", None) or {}
+            if isinstance(v88, dict):
+                for child_name, child_value in v88.items():
+                    parent_88_lookup.setdefault(
+                        child_name.upper(), (parent_name, child_value),
+                    )
+
     # --- stub operations in the slice ---
+    # Deduplicated list for prompt summaries.
     stub_ops_in_slice: list[str] = []
+    # Full ordered sequence preserving duplicates for sequencing context.
+    stub_op_sequence: list[str] = []
     if slice_code:
         for m in re.finditer(r"_apply_stub_outcome\(state,\s*'([^']+)'\)", slice_code):
+            stub_op_sequence.append(m.group(1))
             if m.group(1) not in stub_ops_in_slice:
                 stub_ops_in_slice.append(m.group(1))
 
@@ -324,6 +355,8 @@ def _gather_branch_context(
         fault_tables=dict(_FAULT_TABLES),
         test_case_count=total_attempts,
         solution_patterns=patterns,
+        parent_88_lookup=parent_88_lookup,
+        stub_op_sequence=stub_op_sequence,
     )
 
 
@@ -380,7 +413,35 @@ def _build_condition_cracker_prompt(
                 bits.append(f" 88-levels={info['valid_88_values']}")
             if info.get("stub_op"):
                 bits.append(f" (set by stub: {info['stub_op']})")
+            # Surface 88-level parent relationship.
+            parent_entry = bctx.parent_88_lookup.get(var)
+            if parent_entry:
+                parent_name, activating_value = parent_entry
+                bits.append(
+                    f" ** 88-level flag — set parent {parent_name} = "
+                    f"{activating_value!r} to activate **"
+                )
             parts.append("".join(bits) + "\n")
+        parts.append("\n")
+
+    # Show 88-level relationships for condition variables even when
+    # they are not in var_domain_info (the child might not have its
+    # own domain entry but the parent→child mapping still exists).
+    cond_88: list[str] = []
+    for var in _extract_condition_vars(bctx.condition_text):
+        if var in bctx.var_domain_info:
+            continue  # already shown above
+        parent_entry = bctx.parent_88_lookup.get(var)
+        if parent_entry:
+            parent_name, activating_value = parent_entry
+            cond_88.append(
+                f"  {var} is an 88-level flag. "
+                f"Set {parent_name} = {activating_value!r} in input_state "
+                f"to activate it.\n"
+            )
+    if cond_88:
+        parts.append("88-level flag relationships:\n")
+        parts.extend(cond_88)
         parts.append("\n")
 
     if prior_feedback:
@@ -484,6 +545,23 @@ def _build_stub_architect_prompt(
             f"  {', '.join(bctx.stub_ops_in_slice)}\n\n"
         )
 
+    # Show the full ordered sequence — the program consumes stubs in
+    # this exact order, so ALL preceding operations must succeed before
+    # the target operation fires.
+    if bctx.stub_op_sequence and len(bctx.stub_op_sequence) > 1:
+        parts.append(
+            "IMPORTANT — these operations fire in this order (each must have "
+            "a stub_outcomes entry so the program does not abort early):\n"
+        )
+        for i, op in enumerate(bctx.stub_op_sequence, 1):
+            parts.append(f"  {i}. {op}\n")
+        parts.append(
+            "Provide stub_outcomes for ALL operations in this sequence, "
+            "not just the one that sets the target variable. Earlier "
+            "operations typically need status '00' (success) so the "
+            "program continues to the operation that matters.\n\n"
+        )
+
     # Show stub mapping for relevant ops.
     relevant_stubs: dict[str, list[str]] = {}
     for op in bctx.stub_ops_in_slice:
@@ -497,13 +575,16 @@ def _build_stub_architect_prompt(
 
     # Show domain info for stub-returned variables.
     stub_vars = {v for vs in relevant_stubs.values() for v in vs}
-    for var in stub_vars:
+    for var in sorted(stub_vars):
         info = bctx.var_domain_info.get(var.upper())
         if info:
-            parts.append(
-                f"  {var}: known_values={info.get('condition_literals', [])[:6]}, "
-                f"88-levels={info.get('valid_88_values', {})}\n"
-            )
+            lits = info.get("condition_literals", [])[:6]
+            v88 = info.get("valid_88_values", {})
+            parent_entry = bctx.parent_88_lookup.get(var.upper())
+            line = f"  {var}: known_values={lits}, 88-levels={v88}"
+            if parent_entry:
+                line += f" (88-flag of {parent_entry[0]}, activate with {parent_entry[1]!r})"
+            parts.append(line + "\n")
     if stub_vars:
         parts.append("\n")
 

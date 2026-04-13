@@ -148,6 +148,20 @@ class TestPromptBuilders(unittest.TestCase):
         self.assertIn("READ:FILE", prompt)
         self.assertIn("status_file", prompt)
 
+    def test_stub_architect_shows_operation_sequence(self):
+        """When multiple stubs fire in order, the prompt should list
+        the full sequence and instruct the LLM to provide stubs for all."""
+        bctx = self._bctx(
+            stub_ops_in_slice=["OPEN:ACCT-FILE", "READ:ACCT-REC", "REWRITE:ACCT-REC"],
+            stub_op_sequence=["OPEN:ACCT-FILE", "READ:ACCT-REC", "REWRITE:ACCT-REC"],
+        )
+        prompt = _build_stub_architect_prompt(bctx)
+        self.assertIn("fire in this order", prompt)
+        self.assertIn("1. OPEN:ACCT-FILE", prompt)
+        self.assertIn("2. READ:ACCT-REC", prompt)
+        self.assertIn("3. REWRITE:ACCT-REC", prompt)
+        self.assertIn("ALL operations", prompt)
+
     def test_history_miner_prompt(self):
         prompt = _build_history_miner_prompt(self._bctx())
         self.assertIn("mutation", prompt.lower())
@@ -161,6 +175,32 @@ class TestPromptBuilders(unittest.TestCase):
         prompt = _build_condition_cracker_prompt(self._bctx(), prior_feedback=fb)
         self.assertIn("Previous round", prompt)
         self.assertIn("fundamentally different", prompt)
+
+    def test_condition_cracker_shows_88_parent(self):
+        """When a condition variable is an 88-level child, the prompt
+        should tell the LLM to set the parent variable."""
+        bctx = self._bctx(
+            condition_text="IF APPL-AOK",
+            var_domain_info={"APPL-AOK": {
+                "classification": "flag", "data_type": "alpha",
+            }},
+            parent_88_lookup={"APPL-AOK": ("APPL-RESULT", 0)},
+        )
+        prompt = _build_condition_cracker_prompt(bctx)
+        self.assertIn("APPL-RESULT", prompt)
+        self.assertIn("88-level flag", prompt)
+
+    def test_condition_cracker_88_not_in_domain_info(self):
+        """88-level child may not have its own domain entry — the prompt
+        should still surface the parent from parent_88_lookup."""
+        bctx = self._bctx(
+            condition_text="IF END-OF-FILE",
+            var_domain_info={},  # no entry for END-OF-FILE
+            parent_88_lookup={"END-OF-FILE": ("FILE-STATUS", "10")},
+        )
+        prompt = _build_condition_cracker_prompt(bctx)
+        self.assertIn("FILE-STATUS", prompt)
+        self.assertIn("88-level flag", prompt)
 
     def test_path_finder_no_path(self):
         prompt = _build_path_finder_prompt(self._bctx(call_graph_path=[]))
