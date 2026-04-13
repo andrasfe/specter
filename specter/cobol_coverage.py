@@ -1999,7 +1999,17 @@ def run_cobol_coverage(
     var_report = extract_variables(program)
     call_graph = build_static_call_graph(program)
     gating_conds = extract_gating_conditions(program, call_graph)
-    stub_mapping = extract_stub_status_mapping(program, var_report)
+    # Build 88-level parent map for stub mapping expansion.
+    _level_88_parents: dict[str, tuple[str, Any]] = {}
+    if cobol_source:
+        try:
+            from .variable_domain import _extract_88_values_from_source
+            for parent, children in _extract_88_values_from_source(cobol_source).items():
+                for child, val in children.items():
+                    _level_88_parents.setdefault(child.upper(), (parent.upper(), val))
+        except Exception:
+            pass
+    stub_mapping = extract_stub_status_mapping(program, var_report, level_88_parents=_level_88_parents)
     paragraph_comments: dict[str, list[str]] = {}
     source_path = Path(cobol_source)
     if source_path.exists():
@@ -2812,7 +2822,17 @@ def run_coverage(
     var_report = extract_variables(program)
     call_graph = build_static_call_graph(program)
     gating_conds = extract_gating_conditions(program, call_graph)
-    stub_mapping = extract_stub_status_mapping(program, var_report)
+    # Build 88-level parent map for stub mapping expansion.
+    _level_88_parents: dict[str, tuple[str, Any]] = {}
+    if cobol_source:
+        try:
+            from .variable_domain import _extract_88_values_from_source
+            for parent, children in _extract_88_values_from_source(cobol_source).items():
+                for child, val in children.items():
+                    _level_88_parents.setdefault(child.upper(), (parent.upper(), val))
+        except Exception:
+            pass
+    stub_mapping = extract_stub_status_mapping(program, var_report, level_88_parents=_level_88_parents)
     paragraph_comments: dict[str, list[str]] = {}
     if cobol_source_path and Path(cobol_source_path).exists():
         try:

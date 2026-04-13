@@ -565,11 +565,16 @@ def extract_variables(program: Program) -> VariableReport:
 def extract_stub_status_mapping(
     program: Program,
     var_report: VariableReport,
+    level_88_parents: dict[str, tuple[str, Any]] | None = None,
 ) -> dict[str, list[str]]:
     """Map external operation keys to the status variables they affect.
 
     Walks paragraphs linearly: after each EXEC_SQL/EXEC_CICS/READ/WRITE,
     looks at the next IF statement to see which status variable it checks.
+
+    When *level_88_parents* is provided (child_name → (parent_name, value)),
+    any 88-level child found in a condition also adds its parent to the
+    mapping so the rewritten conditions (which check the parent) get stubs.
 
     Returns e.g. {"SQL": ["SQLCODE"], "READ:MY-FILE": ["MY-FILE-STATUS"]}.
     """
@@ -663,6 +668,17 @@ def extract_stub_status_mapping(
                             existing = mapping.setdefault(op_key, [])
                             existing_set = set(existing)
                             existing.extend(v for v in found if v not in existing_set)
+                            # When the found variable is an 88-level child,
+                            # also add its parent so the rewritten condition
+                            # (which checks the parent) gets stubs too.
+                            if level_88_parents:
+                                for v in found:
+                                    entry = level_88_parents.get(v.upper())
+                                    if entry:
+                                        parent_name = entry[0].upper()
+                                        if parent_name not in existing_set:
+                                            existing.append(parent_name)
+                                            existing_set.add(parent_name)
                     break
 
     # Apply fallback defaults for common operations
