@@ -627,6 +627,59 @@ def _group_errors_by_type(
     return groups
 
 
+def _fix_condition_name_moves(
+    errors: list[tuple[int, str]],
+    src_lines: list[str],
+) -> int:
+    """Fix 'condition-name not allowed here' errors deterministically.
+
+    When the mock generator produces ``MOVE MOCK-ALPHA-STATUS TO <88-FLAG>``,
+    GnuCOBOL rejects it because 88-level condition-names can't be MOVE
+    targets. This replaces the MOVE with ``SET <FLAG> TO TRUE``.
+
+    Modifies *src_lines* in place and returns the count of fixes applied.
+    """
+    _COND_NAME_RE = re.compile(
+        r"condition-name not allowed here:\s*'([^']+)'",
+        re.IGNORECASE,
+    )
+    fixed = 0
+    for err_line, msg in errors:
+        m = _COND_NAME_RE.search(msg)
+        if not m:
+            continue
+        flag_name = m.group(1).strip()
+        idx = err_line - 1
+        if idx < 0 or idx >= len(src_lines):
+            continue
+        line = src_lines[idx]
+        # Match: MOVE <anything> TO <FLAG-NAME>
+        move_re = re.compile(
+            r"^(\s+)MOVE\s+\S+\s+TO\s+" + re.escape(flag_name),
+            re.IGNORECASE,
+        )
+        m_move = move_re.match(line)
+        if m_move:
+            indent = m_move.group(1)
+            src_lines[idx] = f"{indent}SET {flag_name} TO TRUE\n"
+            fixed += 1
+            continue
+        # Also match: MOVE <anything> TO <FLAG-NAME> at the end of a
+        # continuation or multi-statement line.
+        if flag_name.upper() in line.upper() and "MOVE" in line.upper():
+            # Crude but safe: replace just the MOVE ... TO <FLAG> portion
+            replacement = re.sub(
+                r"MOVE\s+\S+\s+TO\s+" + re.escape(flag_name),
+                f"SET {flag_name} TO TRUE",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if replacement != line:
+                src_lines[idx] = replacement
+                fixed += 1
+    return fixed
+
+
 def _fix_group_item_pic(
     errors: list[tuple[int, str]],
     src_lines: list[str],
@@ -1876,6 +1929,27 @@ def _compile_and_fix(
                             source_path, copybook_dirs)
                         log.info("  Pre-fix: file stubs didn't help, keeping "
                                  "(no worse: %d errors)", len(errs_verify))
+
+    # --- Pre-fix: condition-name not allowed here (88-level MOVE errors) ---
+    # The mock generator may produce MOVE MOCK-ALPHA-STATUS TO <88-FLAG>
+    # from checkpoint-resumed builds or from copybook variables not in
+    # condition_names_88. Fix deterministically: replace with SET TO TRUE.
+    rc_cn, stderr_cn = _cobc_syntax_check(source_path, copybook_dirs)
+    if rc_cn != 0:
+        cn_errors = _parse_errors(stderr_cn, source_name)
+        cond_name_errors = [
+            (ln, msg) for ln, msg in cn_errors
+            if "condition-name not allowed here" in msg
+        ]
+        if cond_name_errors:
+            src_cn = source_path.read_text(errors="replace").splitlines(keepends=True)
+            n_cn_fixed = _fix_condition_name_moves(cond_name_errors, src_cn)
+            if n_cn_fixed > 0:
+                source_path.write_text("".join(src_cn))
+                log.info(
+                    "  Pre-fix: replaced %d MOVE-to-88-level with SET TO TRUE",
+                    n_cn_fixed,
+                )
 
     # Save checkpoint after pre-fix modifications so the hash stays in sync
     # even if the process is interrupted during the LLM fix loop.

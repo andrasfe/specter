@@ -18,6 +18,7 @@ from specter.incremental_mock import (
     _build_fix_prompt,
     _cluster_errors,
     _compile_and_fix,
+    _fix_condition_name_moves,
     _fix_missing_periods,
     _generate_missing_paragraph_stubs,
     _load_resolutions,
@@ -329,6 +330,61 @@ class TestMisplacedParagraphStubScaffolding:
 
         assert removed == 2
         assert all("WS-UNDEFINED-PARAGRAPH-STUB" not in line for line in cleaned)
+
+
+class TestFixConditionNameMoves:
+    """Test deterministic fix for 'condition-name not allowed here' errors."""
+
+    def test_replaces_move_with_set(self):
+        src = [
+            "           PERFORM SPECTER-NEXT-MOCK-RECORD\n",
+            "           MOVE MOCK-ALPHA-STATUS TO DTE-NO-ERRORS\n",
+            "           DISPLAY 'DONE'.\n",
+        ]
+        errors = [(2, "condition-name not allowed here: 'DTE-NO-ERRORS'")]
+        n = _fix_condition_name_moves(errors, src)
+        assert n == 1
+        assert "SET DTE-NO-ERRORS TO TRUE" in src[1]
+        assert "MOVE" not in src[1]
+
+    def test_handles_different_indent(self):
+        src = [
+            "                  MOVE MOCK-ALPHA-STATUS TO C-VSAM-FILE-OK\n",
+        ]
+        errors = [(1, "condition-name not allowed here: 'C-VSAM-FILE-OK'")]
+        n = _fix_condition_name_moves(errors, src)
+        assert n == 1
+        assert "SET C-VSAM-FILE-OK TO TRUE" in src[0]
+
+    def test_skips_non_matching_lines(self):
+        src = [
+            "           SET SOME-FLAG TO TRUE\n",
+        ]
+        errors = [(1, "condition-name not allowed here: 'SOME-FLAG'")]
+        n = _fix_condition_name_moves(errors, src)
+        # No MOVE on this line, so no fix applied
+        assert n == 0
+
+    def test_multiple_errors(self):
+        src = [
+            "           MOVE MOCK-ALPHA-STATUS TO FLAG-A\n",
+            "           DISPLAY 'X'\n",
+            "           MOVE MOCK-ALPHA-STATUS TO FLAG-B\n",
+        ]
+        errors = [
+            (1, "condition-name not allowed here: 'FLAG-A'"),
+            (3, "condition-name not allowed here: 'FLAG-B'"),
+        ]
+        n = _fix_condition_name_moves(errors, src)
+        assert n == 2
+        assert "SET FLAG-A TO TRUE" in src[0]
+        assert "SET FLAG-B TO TRUE" in src[2]
+
+    def test_out_of_range_line_ignored(self):
+        src = ["           DISPLAY 'X'\n"]
+        errors = [(999, "condition-name not allowed here: 'FOO'")]
+        n = _fix_condition_name_moves(errors, src)
+        assert n == 0
 
 
 class TestPayloadMockReplay:
