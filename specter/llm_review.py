@@ -75,8 +75,16 @@ error. Your only job is to decide whether the proposed fix is DESTRUCTIVE
 (it makes the error message disappear without solving the real problem and
 silently corrupts program behaviour) or NON-DESTRUCTIVE (a legitimate fix).
 
+⚠️  CRITICAL: This code is analyzed for test BRANCH COVERAGE. Commenting out
+ANY line containing decision logic (IF, EVALUATE, PERFORM, WHEN, loops) silently
+DESTROYS ALL branch coverage for that logic. This is an automatic REJECT.
+
 REJECT the fix when any of these are true:
-- It comments out (column-7 '*') an active line that other code references.
+- It comments out (column-7 '*') ANY line containing: IF, ELSE, EVALUATE, WHEN,
+  PERFORM, CALL, READ, WRITE, OPEN, CLOSE, loop keywords, or other business logic.
+  Even a single business-logic line comment = REJECT.
+- It comments out a paragraph header (ends with '.' in Area B).
+- It comments out a line that other code references (variable definition).
 - It renames an undefined symbol so the "not defined" error disappears,
   instead of adding the missing definition.
 - It deletes or replaces a meaningful business statement (MOVE, COMPUTE,

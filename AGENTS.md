@@ -500,6 +500,31 @@ Legacy single-agent loop retained as fallback when `SPECTER_BRANCH_SWARM=0`. Foc
 
 Configuration: `--agent-iterations N` (LLM turns per branch), `--no-branch-agent` (kill switch), `SPECTER_BRANCH_AGENT=0` (env var kill switch). Capped at `_BRANCH_AGENT_MAX_INVOCATIONS = 3` per coverage run.
 
+### `specter/compile_swarm.py` — 3-specialist swarm for compilation fixes (~320 lines)
+
+Invoked from `_compile_and_fix` (see `incremental_mock.py`) when the challenger reviewer (`llm_review.py`) rejects the scribe's first proposal. Instead of re-prompting the same scribe, three specialists run **in parallel** via `ThreadPoolExecutor(max_workers=3)` — each with a different focus.
+
+**Specialists** (each receives error line, error message, ±15-line code context):
+
+1. **Syntax Specialist** (`_syntax_prompt`): COBOL fixed-format rules — columns 8–72, Area A for section/paragraph headers, Area B for statements, periods, reserved words, literal formats, line continuation (col 7 = `-`).
+
+2. **Semantic Specialist** (`_semantic_prompt`): preserves business logic. Hard rules the specialist must follow: NEVER comment out referenced code, NEVER rename undefined symbols, NEVER insert GOBACK/EXIT to short-circuit, NEVER narrow PIC clauses, NEVER delete EVALUATE/WHEN clauses or IF branches. Prefer adding missing definitions over removing references.
+
+3. **Structure Specialist** (`_structure_prompt`): data definitions — 88-level condition-names (MOVE to 88-flag → `SET <flag> TO TRUE`), group items vs elementary PIC clauses, record structures, FILLER, REDEFINES, USAGE COMP/BINARY/DISPLAY, qualified names (`FIELD OF RECORD`).
+
+**Judge** (`_judge_proposals` + `_score_proposal`): rule-based scoring that **hard-rejects (-999 score)** any proposal taking the easy way out:
+
+- Commenting out a previously-active line (turning it into `*COMMENT`)
+- Replacing an active statement with `CONTINUE` / `EXIT` / `NEXT SENTENCE`
+- Whitespace-only replacement (line deletion)
+- Inserting `GOBACK` / `STOP RUN` / `EXIT PROGRAM` in a line that wasn't already one
+
+Soft scoring for acceptable fixes: +10 for addressing the error line, +5 per structural keyword (SET/PIC/01-level). A proposal must score above -100 to be accepted; otherwise the judge returns empty fixes and the scribe revision path takes over.
+
+`propose_compile_fix_swarm(error_line, error_msg, context, src_lines, llm_provider, llm_model)` — top-level entry. Returns `(fixes_dict, reasoning)`, signature-compatible with a single-scribe call.
+
+Configuration: `SPECTER_COMPILE_SWARM=0` to disable and fall back to single-scribe revision for all rejections.
+
 ### `specter/uncovered_report.py` — Post-run diagnostic report (~700 lines)
 
 Produces per-branch diagnostics for everything the coverage loop failed to hit, written next to the test store as `<stem>.uncovered.json` (tooling) and `<stem>.uncovered.md` (human review). Runs automatically at the end of `_run_agentic_loop`; can be disabled with `--uncovered-report off` or the `SPECTER_UNCOVERED_REPORT` env var.

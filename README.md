@@ -51,6 +51,14 @@ Four strategies run in rotation, managed by a heuristic selector that favours wh
 
 **Typical results**: branch coverage in the 90%+ range on real-world programs, with every accepted test case cross-validated against a GnuCOBOL binary.
 
+## Multi-Agent Swarms
+
+When the coverage loop plateaus or the compiler rejects a scribe-proposed fix, Specter escalates to parallel multi-specialist swarms instead of re-prompting a single LLM.
+
+**Branch swarm** (`branch_swarm.py`) — tackles uncovered branches the regular strategies can't reach. Four specialists propose in parallel (Condition Cracker, Path Finder, Stub Architect, History Miner), a hierarchical planner validates end-to-end via Python simulation (~3 ms with per-gate diagnosis), then executes directly against the COBOL binary. Iterative deepening: Phase 1 solves reachability (reach the target paragraph), Phase 2 flips the specific branch. Structured failure logs go to `<store>.swarm_failures.jsonl`. Disable with `SPECTER_BRANCH_SWARM=0`.
+
+**Compile swarm** (`compile_swarm.py`) — fixes COBOL compilation errors when the challenger reviewer rejects the scribe's first fix. Three specialists propose in parallel (Syntax, Semantic, Structure), a rule-based judge hard-rejects "easy way out" fixes: commenting out active lines, replacing statements with `CONTINUE`/`EXIT`/`NEXT SENTENCE`, whitespace deletion, or inserting `GOBACK` to short-circuit. Disable with `SPECTER_COMPILE_SWARM=0`.
+
 ## Output Modes
 
 **Test store** (`--synthesize`): The primary output. A JSONL file where each line is a test case with its coverage metadata. Crash-safe and resumable — interrupted runs continue from where they left off.
