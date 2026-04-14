@@ -278,6 +278,26 @@ def main(argv: list[str] | None = None) -> int:
         help="Generate Mockito integration tests (with --java)",
     )
     parser.add_argument(
+        "--pipeline",
+        action="store_true",
+        help=(
+            "Run the unified pipeline: cobol coverage → snapshot capture → "
+            "Java generation → docker compose up → mvn verify → equivalence "
+            "report. Requires --cobol-source and --copybook-dir; --java is "
+            "implied. Output goes under -o <dir>/."
+        ),
+    )
+    parser.add_argument(
+        "--pipeline-skip-docker",
+        action="store_true",
+        help="Pipeline: skip 'docker compose up' (only generate artifacts).",
+    )
+    parser.add_argument(
+        "--pipeline-skip-mvn",
+        action="store_true",
+        help="Pipeline: skip 'mvn install + verify' (only generate artifacts).",
+    )
+    parser.add_argument(
         "--multi",
         action="store_true",
         help="Multi-program XCTL routing: generate all AST files into one project (with --java)",
@@ -444,6 +464,88 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print(cov_report.summary())
         return 0
+
+    # --pipeline: unified end-to-end orchestrator (coverage + snapshot
+    # capture + Java generation + docker compose + mvn verify + report).
+    if args.pipeline:
+        if not args.cobol_source:
+            print("Error: --pipeline requires --cobol-source", file=sys.stderr)
+            return 2
+        if not args.copybook_dir:
+            print("Error: --pipeline requires at least one --copybook-dir", file=sys.stderr)
+            return 2
+        if not args.ast_file:
+            print("Error: --pipeline requires a COBOL AST as positional argument", file=sys.stderr)
+            return 2
+
+        logging.basicConfig(
+            level=logging.DEBUG if args.debug else logging.INFO,
+            format="%(asctime)s %(levelname)-7s %(message)s",
+            datefmt="%H:%M:%S",
+            stream=sys.stderr,
+            force=True,
+        )
+
+        from .pipeline import run_pipeline
+
+        # LLM provider for COBOL fix loop + coverage. --llm-provider on the
+        # CLI opts in; without it the compile-and-fix loop gives up on
+        # the first uncompilable mock phase.
+        llm_prov_for_pipeline = None
+        if args.llm_provider:
+            from .llm_coverage import get_llm_provider
+            try:
+                llm_prov_for_pipeline = get_llm_provider(
+                    provider_name=args.llm_provider, model=args.llm_model,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"Warning: LLM provider init failed: {exc}",
+                      file=sys.stderr)
+
+        ast_path = args.ast_file[0]
+        out_dir = Path(args.output) if args.output else Path(ast_path).with_suffix("")
+        try:
+            result = run_pipeline(
+                ast_path=ast_path,
+                cobol_source=args.cobol_source,
+                copybook_dirs=args.copybook_dir,
+                output_dir=str(out_dir),
+                coverage_budget=args.coverage_budget,
+                coverage_timeout=args.coverage_timeout,
+                execution_timeout=args.coverage_execution_timeout,
+                skip_docker=args.pipeline_skip_docker,
+                skip_mvn=args.pipeline_skip_mvn,
+                llm_provider=llm_prov_for_pipeline,
+                llm_model=args.llm_model,
+            )
+        except Exception as exc:
+            print(f"Pipeline error: {exc}", file=sys.stderr)
+            if args.debug:
+                import traceback
+                traceback.print_exc()
+            return 2
+
+        print()
+        if result.unique_tcs_total > 0:
+            print(
+                f"Unique test cases: {result.unique_tcs_passed}/{result.unique_tcs_total} "
+                f"pass strict equivalence ({result.unique_pass_rate:.1f}%)"
+            )
+        print(
+            f"JUnit runs: {result.tests_passed}/{result.tests_run} passed "
+            f"({result.tests_failed} failed, {result.tests_errors} errors, "
+            f"{result.tests_skipped} skipped)"
+        )
+        if result.category_counts:
+            cat_summary = ", ".join(
+                f"{cat}={n}" for cat, n in sorted(
+                    result.category_counts.items(), key=lambda kv: kv[1], reverse=True,
+                ) if n > 0
+            )
+            if cat_summary:
+                print(f"Divergence categories: {cat_summary}")
+        print(f"Report: {result.report_path}")
+        return 0 if result.all_tests_passed else 1
 
     # --extract-docs: needs generated .py (ast_file used as .py path) + JSONL
     if args.extract_docs:
@@ -965,24 +1067,31 @@ def main(argv: list[str] | None = None) -> int:
         java_dir = output_path.with_suffix("")  # e.g. examples/COPAUA0C
         test_store = Path(args.test_store) if args.test_store else None
         copybook_paths = [str(Path(d)) for d in args.copybook_dir] or None
+        # Defaults: docker + integration tests are always emitted for --java so
+        # the generated harness includes RabbitMQ + WireMock + per-test seed
+        # SQL out of the box. Explicit flags are still honored (no-op since
+        # both default True now).
+        docker = True if not hasattr(args, "docker") else (args.docker or True)
+        integration_tests = True if not hasattr(args, "integration_tests") else (
+            args.integration_tests or True
+        )
         print(f"Generating Java project → {java_dir}/ ...")
         project_path = generate_java_project(
             program, var_report, str(java_dir),
             instrument=args.analyze,
             test_store_path=str(test_store) if test_store else None,
             copybook_paths=copybook_paths,
-            docker=args.docker,
-            integration_tests=args.integration_tests,
+            docker=docker,
+            integration_tests=integration_tests,
         )
         n_paras = len(program.paragraphs)
         print(f"  {n_paras} paragraph classes generated")
         print(f"  Project: {project_path}")
-        if args.docker:
-            print("  Docker: Dockerfile + docker-compose.yml generated")
-        if args.integration_tests:
-            print("  Integration tests: integration-tests/ generated")
+        print("  Docker: Dockerfile + docker-compose.yml (RabbitMQ + WireMock) generated")
+        if test_store:
+            print("  Integration tests: integration-tests/ + per-test WireMock mappings generated")
         if copybook_paths:
-            print("  SQL: sql/init.sql generated from copybooks")
+            print("  SQL: sql/init.sql + per-test seed SQL generated from copybooks")
         return 0
 
     # Generate code

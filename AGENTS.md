@@ -740,8 +740,139 @@ python3 -m specter program.ast --cobol-validate-store tests.jsonl \
 ### Java Generation
 ```bash
 python3 -m specter program.ast --java -o project/ \
-    --java-package com.example [--docker] [--integration-tests]
+    --java-package com.example --test-store tests.jsonl --copybook-dir ./cpy
 ```
+
+### Unified Pipeline (end-to-end equivalence harness)
+
+```bash
+python3 -m specter program.ast --pipeline \
+    --cobol-source program.cbl --copybook-dir ./cpy -o out/
+```
+
+`--pipeline` runs six phases in sequence with no manual steps:
+
+1. **coverage** — `specter.cobol_coverage.run_cobol_coverage(...)` produces
+   `out/tests.jsonl` and an instrumented COBOL binary cached under
+   `<source>/.specter_build_<stem>/`.
+2. **snapshot** — `specter.cobol_snapshot.capture_snapshots(...)` replays
+   every test case through the same compiled binary (via
+   `cobol_executor.run_test_case`) and writes
+   `out/cobol_snapshots/<tc_id>.json` with `{abended, displays,
+   paragraphs_covered, branches, stub_log_keys, final_state}`. Values are
+   normalised in `specter.cobol_snapshot.normalize_value` (rstrip PIC X
+   trailing spaces; canonical numeric form for leading-zero ints/decimals).
+3. **java** — `generate_java_project(..., snapshot_dir=...)` emits the
+   Maven project + Docker compose (PostgreSQL + RabbitMQ + WireMock) +
+   per-test seed SQL + per-test WireMock mappings, and copies the
+   snapshots into `integration-tests/src/test/resources/cobol_snapshots/`.
+   Two new Java classes (`CobolSnapshot`, `EquivalenceAssert`) are emitted
+   alongside the IT class.
+4. **deploy** — `docker compose up -d db rabbitmq wiremock` (skippable via
+   `--pipeline-skip-docker`).
+5. **validate** — `mvn install -DskipTests` (parent) +
+   `mvn verify` (`integration-tests/`). Each parameterised test loads its
+   snapshot via `CobolSnapshot.loadFor(..., tc.id)` and calls
+   `EquivalenceAssert.assertEquivalent(snapshot, state)`. Strict checks:
+   `abended`, `displays`, paragraph trace order, and `final_state` values
+   for every key in the snapshot. Branches are NOT compared (IDs are
+   independently assigned by the COBOL probe inserter and the Java
+   generator). Skippable via `--pipeline-skip-mvn`.
+6. **report** — Surefire/Failsafe XML is parsed; tc IDs are extracted
+   from `EquivalenceAssert` failure messages; a markdown summary is
+   written to `out/equivalence-report.md` and a one-line summary printed
+   to stdout. Exit code is 0 only when every test case passes.
+
+Modules added for the unified pipeline:
+- `specter/pipeline.py` — `run_pipeline`, `_parse_test_reports`,
+  `_write_report`, `PipelineResult`.
+- `specter/cobol_snapshot.py` — `CobolSnapshot`, `capture_snapshots`,
+  `normalize_value`, `values_equivalent`, `iter_test_cases`.
+- `specter/java_templates/equivalence.py` — `COBOL_SNAPSHOT_JAVA`,
+  `EQUIVALENCE_ASSERT_JAVA`.
+
+`--java` now defaults to emitting a fully wired harness for batch jobs:
+- Maven POM swaps Jakarta JMS / ActiveMQ Artemis for `com.rabbitmq:amqp-client:5.21.0`
+  and adds Apache HttpClient5 (`5.3.1`) for outbound CALL routing.
+- `docker-compose.yml` runs three sidecars: `postgres:16-alpine`,
+  `rabbitmq:3-management`, and `wiremock/wiremock:3.5.4` (with
+  `./wiremock/mappings/` mounted into the container).
+- `JdbcStubExecutor` uses the typed RabbitMQ client (`Channel.queueDeclare` /
+  `basicGet` / `basicPublish`) for `mqOpen/Get/Put1/Close`, and routes every
+  non-MQ `CALL 'PROGNAME'` through `callProgram(...)` which POSTs JSON to
+  `${SPECTER_CALL_BASE_URL}/<progname-lowercase>` (default
+  `http://wiremock:8080`) and maps the JSON response back into `ProgramState`.
+- For each test case in the JSONL store, the generator emits:
+  - `wiremock/mappings/<tc_id>/<seq>_<progname>.json` — one stub per non-MQ
+    `CALL:*` outcome; multi-outcome chains use WireMock scenario state.
+  - `integration-tests/src/test/resources/seeds/<tc_id>.sql` — `TRUNCATE` +
+    `INSERT` per `CICS-READ` / `READ:<file>` / `DLI-GU` outcome, mapped to the
+    real application tables defined by copybook DDL in `sql/init.sql`.
+- The `MOCKITO_INTEGRATION_TEST_JAVA` template loads the per-test seed SQL in
+  the test body via `seedRealTables(tc)`, and `seedRabbitMq(tc)` publishes
+  `CALL:MQ*` outcomes to AMQP queues so a real `JdbcStubExecutor` exercises
+  the code paths end-to-end.
+
+Defaults are always-on; the legacy `--docker` and `--integration-tests` flags
+remain accepted for back-compat but are no-ops when `--java` is set.
+
+Generator modules added for this work:
+- `specter/java_templates/wiremock.py` — `render_mapping`, `write_mappings`,
+  `is_routable_call_key`.
+- `specter/java_templates/seed_sql.py` — `build_seed_sql`, `build_table_index`,
+  `is_seedable_op_key`.
+- `specter/java_code_generator.py::_extract_call_using_vars` — parses the
+  COBOL CALL USING clause to thread input variable names into `callProgram`.
+
+**File-status reset before I/O stubs** (`_emit_file_status_reset`). The COBOL
+mock for OPEN/READ/CLOSE unconditionally does `MOVE MOCK-ALPHA-STATUS TO
+<status-var>` inside each replaced I/O verb — on an exhausted FIFO this is
+SPACES, so the status variable is always freshly blanked. Java's
+`applyStubOutcome` only sets variables that appear in an outcome pair; with no
+outcome it leaves the status var at whatever value was there before (often an
+injected test-input). `_JavaCodeBuilder.file_status_map` (populated in
+`generate_java_project` via `cobol_mock._extract_file_status_map`) maps each
+file to its status-var. `_gen_open_java` / `_gen_read_java` / `_gen_close_java`
+emit `state.put("<status-var>", "")` before every `applyStubOutcome(...)` call
+so the Java runtime matches COBOL's "blanked by default, overwritten by
+outcome" semantics. Without this, tests with empty stub FIFOs produce
+systematic display divergences (e.g. `FILE STATUS IS: NNNN0000` instead of
+`FILE STATUS IS: NNNN 032` from an injected numeric zero in an alpha group).
+
+**Strict `isNumeric`** (`CobolRuntime.isNumeric`). Matches COBOL's `IS NUMERIC`
+class test: every character must be a digit (plus optional leading sign; one
+optional decimal point). No `trim()` — embedded or trailing spaces disqualify.
+Diverges from `Double.parseDouble` on e.g. `"0 "` (trailing space): strict
+returns false, parseDouble returns true. Matters for conditions like
+`IF IO-STATUS NOT NUMERIC OR IO-STAT1 = '9'` where the IS-less form of
+`NOT NUMERIC` now also parses correctly in `java_condition_parser` (both
+`IS NUMERIC` and bare `NUMERIC` are recognised).
+
+**Snapshot abend threshold**. `CobolSnapshot.abended = (result.return_code >= 8)`
+(not `!= 0`). GnuCOBOL emits rc=4 for runtime warnings (e.g. numeric overflow)
+even when the program completes all close paragraphs cleanly; Java's explicit
+`state.abended` flag only flips on ABEND paths, so matching the IBM/mainframe
+convention (rc=0 OK, rc=4 warning, rc>=8 fatal) keeps the two aligned.
+
+**ABEND routines terminate the program** (`cobol_mock._replace_call_stmts`
++ `java_code_generator._gen_call_java`). `CALL 'CEE3ABD'` (and the
+IBM-family `ILBOABN0`, `DSNTIAR`, `CICSABEND`, etc.) are program-termination
+routines on real z/OS. Under the mock, a naive replacement (consume stub +
+RETURN-CODE move) let them act as no-ops — batch programs' `9999-ABEND-
+PROGRAM` would return to the main loop, re-enter the failing path, and blow
+GnuCOBOL's call stack (rc=160) after thousands of retries. The COBOL mock
+now emits `STOP RUN` after the stub consume, and Java's `_gen_call_java`
+emits `state.abended = true; throw new GobackSignal();` — both terminate at
+the first abend, matching real-mainframe behaviour. Without this pairing,
+equivalence pass-rate on CBTRN02C was 13/31; with it, 31/32.
+
+**LLM provider threaded through pipeline** (`pipeline.run_pipeline`,
+`__main__`). `--pipeline` now accepts `--llm-provider` / `--llm-model` and
+threads them into both `run_cobol_coverage` and `prepare_context` so the
+incremental-mock compile-and-fix loop can actually repair the copybook
+resolution errors that only surface after COPY inlining. Without this,
+the pipeline stalls at "Phase 1 (COPY resolution) stalled with N errors"
+the moment a generated mock has any non-trivial syntax issue.
 
 ---
 

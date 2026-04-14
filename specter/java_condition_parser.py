@@ -131,16 +131,37 @@ def _is_string_expr(resolved: str) -> bool:
 
 
 def _java_eq(lhs: str, rhs: str) -> str:
-    """Build a Java equality expression, using Objects.equals for strings."""
-    if _is_numeric_literal_java(lhs) and _is_numeric_literal_java(rhs):
+    """Build a Java equality expression, using Objects.equals for strings.
+
+    When one operand is a numeric literal, coerce the other side via
+    ``CobolRuntime.toNum(...)`` so a COBOL ``IF X = 0`` matches whether
+    ``X`` is stored in ``ProgramState`` as a String (``"0"``, ``"00"``,
+    ``" "``) or a numeric (Integer/Long/BigDecimal). Mirrors how the
+    Python codegen wraps both sides in ``_to_num`` for var-vs-literal
+    numeric comparisons.
+    """
+    l_num = _is_numeric_literal_java(lhs)
+    r_num = _is_numeric_literal_java(rhs)
+    if l_num and r_num:
         return f"{lhs} == {rhs}"
+    if l_num:
+        return f"{lhs} == CobolRuntime.toNum({rhs})"
+    if r_num:
+        return f"CobolRuntime.toNum({lhs}) == {rhs}"
     return f'java.util.Objects.equals({lhs}, {rhs})'
 
 
 def _java_neq(lhs: str, rhs: str) -> str:
-    """Build a Java inequality expression."""
-    if _is_numeric_literal_java(lhs) and _is_numeric_literal_java(rhs):
+    """Build a Java inequality expression. See :func:`_java_eq` for the
+    var-vs-numeric-literal coercion rationale."""
+    l_num = _is_numeric_literal_java(lhs)
+    r_num = _is_numeric_literal_java(rhs)
+    if l_num and r_num:
         return f"{lhs} != {rhs}"
+    if l_num:
+        return f"{lhs} != CobolRuntime.toNum({rhs})"
+    if r_num:
+        return f"CobolRuntime.toNum({lhs}) != {rhs}"
     return f'!java.util.Objects.equals({lhs}, {rhs})'
 
 
@@ -320,11 +341,19 @@ class _JavaParser:
             else:
                 return f"CobolRuntime.isTruthy({lhs})"
 
-        # Comparison operators
+        # Comparison operators. COBOL allows the IS keyword to be omitted,
+        # so ``IO-STATUS NUMERIC`` / ``IO-STATUS NOT NUMERIC`` are both valid
+        # and must be recognised here (the IS-prefixed form is handled above).
         negated = False
         if self.match("NOT"):
             negated = True
             self.advance()
+
+        if self.match("NUMERIC"):
+            self.advance()
+            if negated:
+                return f"!CobolRuntime.isNumeric({lhs})"
+            return f"CobolRuntime.isNumeric({lhs})"
 
         op = self._parse_operator()
         if op is None:
@@ -490,8 +519,18 @@ class _JavaParser:
 # ---------------------------------------------------------------------------
 
 
-def cobol_condition_to_java(condition_text: str) -> str:
+def cobol_condition_to_java(
+    condition_text: str,
+    level_88_map: dict[str, tuple[str, object]] | None = None,
+) -> str:
     """Convert a COBOL condition string to a Java boolean expression.
+
+    When ``level_88_map`` is supplied, bare references to 88-level
+    condition-names (e.g. ``IF APPL-AOK`` where ``88 APPL-AOK VALUE 0``
+    is defined under ``APPL-RESULT``) are rewritten to their parent-value
+    comparison: ``CobolRuntime.toNum(state.get("APPL-RESULT")) == 0`` for
+    numeric parents, or ``state.get("APPL-RESULT").equals("…")`` for
+    alphanumeric parents. Mirrors :func:`specter.code_generator._rewrite_88_level_conditions`.
 
     Examples::
 
@@ -500,6 +539,9 @@ def cobol_condition_to_java(condition_text: str) -> str:
 
         >>> cobol_condition_to_java("ERR-FLG-ON")
         'CobolRuntime.isTruthy(state.get("ERR-FLG-ON"))'
+
+        >>> cobol_condition_to_java("APPL-AOK", {"APPL-AOK": ("APPL-RESULT", 0)})
+        'CobolRuntime.toNum(state.get("APPL-RESULT")) == 0'
     """
     text = condition_text.strip()
     if not text:
@@ -521,15 +563,93 @@ def cobol_condition_to_java(condition_text: str) -> str:
         return "true"
 
     parser = _JavaParser(tokens)
-    return parser.parse()
+    java_cond = parser.parse()
+    if level_88_map:
+        java_cond = _rewrite_88_level_conditions_java(java_cond, level_88_map)
+    return java_cond
 
 
-def resolve_when_value_java(value_text: str, is_evaluate_true: bool) -> str:
+# ---------------------------------------------------------------------------
+# 88-level condition rewriting (Java)
+# ---------------------------------------------------------------------------
+
+# Match either the bare wrapped form ``CobolRuntime.isTruthy(state.get("VAR"))``
+# emitted for bare identifiers, or a raw ``state.get("VAR")`` access. Group 1
+# is the COBOL variable name in both cases.
+_BARE_ISTRUTHY_RE = __import__("re").compile(
+    r'CobolRuntime\.isTruthy\(state\.get\("([A-Z][A-Z0-9-]*)"\)\)'
+)
+_BARE_STATE_GET_RE = __import__("re").compile(
+    r'state\.get\("([A-Z][A-Z0-9-]*)"\)'
+)
+
+
+def _rewrite_88_level_conditions_java(
+    java_cond: str,
+    level_88_map: dict[str, tuple[str, object]],
+) -> str:
+    """Replace bare 88-level references with parent-value comparisons.
+
+    Handles two source patterns produced by the Java condition parser for
+    bare identifiers:
+
+    1. ``CobolRuntime.isTruthy(state.get("APPL-AOK"))`` — the wrap the
+       parser uses when an identifier appears without a comparator.
+    2. ``state.get("APPL-AOK")`` — left over by other code paths if the
+       identifier was already partway through a comparison; only rewritten
+       when not adjacent to a comparator (``=``/``!``/``>``/``<``/``.``).
+    """
+    if not level_88_map:
+        return java_cond
+
+    def _emit(parent: str, value: object) -> str:
+        if isinstance(value, bool):
+            return f'CobolRuntime.isTruthy(state.get("{parent}")) == {str(value).lower()}'
+        if isinstance(value, (int, float)):
+            return f'CobolRuntime.toNum(state.get("{parent}")) == {value!r}'
+        # String/alpha value — escape any embedded double quote.
+        s = str(value).replace("\\", "\\\\").replace('"', '\\"')
+        return f'java.util.Objects.equals(state.get("{parent}"), "{s}")'
+
+    def _replace_truthy(match):
+        child = match.group(1)
+        entry = level_88_map.get(child)
+        if entry is None:
+            return match.group(0)
+        parent, value = entry
+        return _emit(parent, value)
+
+    out = _BARE_ISTRUTHY_RE.sub(_replace_truthy, java_cond)
+
+    def _replace_bare_get(match):
+        child = match.group(1)
+        entry = level_88_map.get(child)
+        if entry is None:
+            return match.group(0)
+        # Skip if already adjacent to a comparator/method (already in a
+        # comparison or member access — leave the parser's translation alone).
+        end = match.end()
+        rest = out[end:end + 8].lstrip()
+        if rest and rest[0] in ("=", "!", ">", "<", ".", ","):
+            return match.group(0)
+        parent, value = entry
+        return _emit(parent, value)
+
+    out = _BARE_STATE_GET_RE.sub(_replace_bare_get, out)
+    return out
+
+
+def resolve_when_value_java(
+    value_text: str,
+    is_evaluate_true: bool,
+    level_88_map: dict[str, tuple[str, object]] | None = None,
+) -> str:
     """Resolve a WHEN value to a Java expression.
 
-    If the EVALUATE subject is TRUE, the WHEN value is a full condition.
-    Otherwise it is a simple value to compare against the subject.
+    If the EVALUATE subject is TRUE, the WHEN value is a full condition
+    and 88-level rewriting is applied via ``level_88_map``. Otherwise the
+    value is a literal compared against the subject and the map is unused.
     """
     if is_evaluate_true:
-        return cobol_condition_to_java(value_text)
+        return cobol_condition_to_java(value_text, level_88_map)
     return _resolve_value_java(value_text)

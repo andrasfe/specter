@@ -1995,7 +1995,7 @@ def run_cobol_coverage(
 
     # --- INITIALIZE ---
     log.info("Parsing AST: %s", ast_file)
-    program = parse_ast(ast_file)
+    program = parse_ast(ast_file, cobol_source=cobol_source if cobol_source else None)
     var_report = extract_variables(program)
     call_graph = build_static_call_graph(program)
     gating_conds = extract_gating_conditions(program, call_graph)

@@ -30,7 +30,8 @@ POM_XML = """\
         <junit.version>5.10.2</junit.version>
         <lanterna.version>3.1.1</lanterna.version>
         <mockito.version>5.11.0</mockito.version>
-        <netty.version>4.2.9.Final</netty.version>
+        <amqp.client.version>5.21.0</amqp.client.version>
+        <httpclient5.version>5.3.1</httpclient5.version>
     </properties>
 
     <dependencies>
@@ -51,14 +52,6 @@ POM_XML = """\
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter-params</artifactId>
             <version>${{junit.version}}</version>
-            <scope>test</scope>
-        </dependency>
-
-        <!-- Gson (test scope - for loading test-store JSONL) -->
-        <dependency>
-            <groupId>com.google.code.gson</groupId>
-            <artifactId>gson</artifactId>
-            <version>2.10.1</version>
             <scope>test</scope>
         </dependency>
 
@@ -83,25 +76,25 @@ POM_XML = """\
             <version>5.1.0</version>
         </dependency>
 
-        <!-- Jakarta JMS API -->
+        <!-- RabbitMQ AMQP client (replaces ActiveMQ Artemis / JMS) -->
         <dependency>
-            <groupId>jakarta.jms</groupId>
-            <artifactId>jakarta.jms-api</artifactId>
-            <version>3.1.0</version>
+            <groupId>com.rabbitmq</groupId>
+            <artifactId>amqp-client</artifactId>
+            <version>${{amqp.client.version}}</version>
         </dependency>
 
-        <!-- ActiveMQ Artemis JMS client -->
+        <!-- Apache HttpClient 5 (synchronous outbound CALL -> REST routing) -->
         <dependency>
-            <groupId>org.apache.activemq</groupId>
-            <artifactId>artemis-jakarta-client</artifactId>
-            <version>2.31.2</version>
+            <groupId>org.apache.httpcomponents.client5</groupId>
+            <artifactId>httpclient5</artifactId>
+            <version>${{httpclient5.version}}</version>
         </dependency>
 
-        <!-- Pin Netty handler version explicitly -->
+        <!-- Gson at compile scope (used by JdbcStubExecutor for JSON bodies) -->
         <dependency>
-            <groupId>io.netty</groupId>
-            <artifactId>netty-handler</artifactId>
-            <version>${{netty.version}}</version>
+            <groupId>com.google.code.gson</groupId>
+            <artifactId>gson</artifactId>
+            <version>2.10.1</version>
         </dependency>
 
         <!-- Mockito (test scope) -->

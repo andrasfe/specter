@@ -2,44 +2,65 @@
 
 Specter can generate a complete Maven Java project from a COBOL AST. The generated project includes the translated program logic, a runtime framework, unit tests, optional Mockito integration tests, and optional Docker deployment.
 
+## Unified pipeline (recommended)
+
+The `--pipeline` flag runs the entire workflow end-to-end and asserts that the generated Java behaves identically to the original COBOL on every synthesized test case:
+
+```bash
+specter program.ast --pipeline \
+    --cobol-source program.cbl \
+    --copybook-dir ./cpy \
+    -o out/
+```
+
+What runs:
+
+1. `cobol coverage` produces `out/tests.jsonl` (synthesized inputs + stub outcomes) and an instrumented COBOL binary.
+2. `snapshot capture` replays each test case through the binary and writes `out/cobol_snapshots/<tc_id>.json` (final state + displays + abended + paragraph trace + branches).
+3. `java generation` emits the Maven project + Docker compose with PostgreSQL + RabbitMQ + WireMock sidecars + per-test seed SQL + per-test WireMock mappings, and copies the snapshots into the IT classpath.
+4. `docker compose up -d db rabbitmq wiremock` boots the sidecars.
+5. `mvn install -DskipTests` (parent) + `mvn verify` (`integration-tests/`) runs the JUnit5 + Mockito + `EquivalenceAssert` matrix.
+6. Surefire/Failsafe XML is parsed, an `out/equivalence-report.md` is written, and a one-line summary is printed.
+
+Use `--pipeline-skip-docker` or `--pipeline-skip-mvn` to stop short of execution. The pipeline returns exit `0` when every test case passes equivalence assertions.
+
 ## Quick Start
 
 ```bash
-# Generate Java project from AST + synthesized test store
-specter program.ast --java --test-store tests.jsonl -o output/
-
-# With integration tests and Docker support
-specter program.ast --java --test-store tests.jsonl \
-  --docker --integration-tests \
-  --copybook-dir ./cpy \
-  -o output/
+# Generate Java project from AST + synthesized test store.
+# Docker + integration-tests are emitted by default with --java; explicit
+# flags are still accepted for back-compat.
+specter program.ast --java --test-store tests.jsonl --copybook-dir ./cpy -o output/
 
 # Build and test
 cd output/ProgramName/
 mvn install                          # compile + unit tests
-cd integration-tests && mvn verify   # Mockito integration tests
+cd integration-tests && mvn verify   # Mockito + real-DB + RabbitMQ + WireMock
 
-# Run with Docker
-docker compose up -d db activemq     # start PostgreSQL + ActiveMQ
-docker compose build app             # build the app image
-docker compose run --rm app          # run the program
+# Run with Docker (PostgreSQL + RabbitMQ + WireMock + app)
+docker compose up -d db rabbitmq wiremock   # start all sidecars
+docker compose build app                    # build the app image
+docker compose run --rm app                 # run the program
 ```
 
 ## Generated Project Structure
 
 ```
 ProgramName/
-├── pom.xml                          Maven POM (JUnit, Gson, Lanterna, PG, HikariCP, JMS, Mockito)
+├── pom.xml                          Maven POM (JUnit, Gson, Lanterna, PG, HikariCP,
+│                                    RabbitMQ amqp-client, Apache HttpClient5, Mockito)
 ├── Dockerfile                       Multi-stage build (Maven → JRE Alpine)
-├── docker-compose.yml               PostgreSQL 16 + ActiveMQ Artemis + app
+├── docker-compose.yml               PostgreSQL 16 + RabbitMQ 3 + WireMock + app
 ├── sql/
 │   └── init.sql                     DDL from copybooks (if --copybook-dir provided)
+├── wiremock/
+│   └── mappings/<tc_id>/            Per-test-case stub mappings for outbound CALLs
 ├── src/main/java/.../
 │   ├── ProgramState.java            Flat key-value state (COBOL WORKING-STORAGE)
-│   ├── StubExecutor.java            Interface for external operations (CICS, DLI, MQ, SQL)
+│   ├── StubExecutor.java            Interface for external operations + callProgram default
 │   ├── DefaultStubExecutor.java     FIFO queue stub (for unit tests)
-│   ├── JdbcStubExecutor.java        Real JDBC + JMS connectivity (for Docker/production)
-│   ├── AppConfig.java               Environment variable configuration
+│   ├── JdbcStubExecutor.java        Real JDBC + RabbitMQ + HTTP for production/Docker
+│   ├── AppConfig.java               Environment variable configuration (DB / AMQP / REST)
 │   ├── Main.java                    Docker entrypoint (wires JdbcStubExecutor)
 │   ├── CobolRuntime.java            Numeric conversion, string ops, COBOL semantics
 │   ├── GobackSignal.java            GOBACK/STOP RUN control flow
@@ -53,8 +74,15 @@ ProgramName/
 │   └── <Program>ProgramTest.java    JUnit 5 parameterized tests from test store
 └── integration-tests/
     ├── pom.xml                      Separate Maven module (Mockito + failsafe)
-    └── src/test/java/.../
-        └── <Program>ProgramIT.java  Mockito spy-based integration tests
+    └── src/test/
+        ├── java/.../
+        │   ├── <Program>ProgramIT.java  Mockito spy + real DB / RabbitMQ tests
+        │   ├── CobolSnapshot.java       POJO + Gson loader for /cobol_snapshots/<tc_id>.json
+        │   └── EquivalenceAssert.java   Strict diff: abended + displays + trace + final state
+        └── resources/
+            ├── seeds/<tc_id>.sql        Per-test INSERTs into real app tables
+            ├── wiremock/mappings/...    Mirror of project-root mappings (for CI use)
+            └── cobol_snapshots/<tc_id>.json  COBOL ground truth (only when --pipeline used)
 ```
 
 ## Code Generation Approach
@@ -74,7 +102,8 @@ The translation handles:
 | STRING / UNSTRING | `StringBuilder` / `String.split()` operations |
 | DISPLAY | `state.addDisplay(text)` |
 | EXEC CICS / EXEC SQL / EXEC DLI | `stubs.applyStubOutcome(state, opKey)` |
-| CALL | `stubs.applyStubOutcome(state, "CALL:program")` |
+| CALL `'PROGNAME'` (non-MQ) | `stubs.callProgram(state, "PROGNAME", inputVars, outputVars)` (HTTP POST) |
+| CALL `'MQOPEN'` etc. | `stubs.mqOpen(...)` / `mqGet(...)` / `mqPut1(...)` / `mqClose(...)` (AMQP) |
 | GOBACK / STOP RUN | `throw new GobackSignal()` |
 
 All program state lives in `ProgramState`, a flat `Map<String, Object>` mirroring COBOL's WORKING-STORAGE. Internal bookkeeping uses underscore-prefixed keys (`_display`, `_calls`, `_abended`, `_stubLog`).
@@ -83,21 +112,22 @@ All program state lives in `ProgramState`, a flat `Map<String, Object>` mirrorin
 
 External operations (database, messaging, CICS) are abstracted behind the `StubExecutor` interface. Two implementations exist:
 
-**`DefaultStubExecutor`** — used by unit tests. Pops pre-configured values from FIFO queues (`stubOutcomes` map). Each test case provides the exact sequence of status codes and return values for every external call the program makes. When a queue is exhausted, falls back to `stubDefaults`.
+**`DefaultStubExecutor`** — used by unit tests. Pops pre-configured values from FIFO queues (`stubOutcomes` map). Each test case provides the exact sequence of status codes and return values for every external call the program makes. When a queue is exhausted, falls back to `stubDefaults`. The interface's `callProgram` default method delegates to `applyStubOutcome("CALL:" + name)` so unit tests behave identically to before this feature.
 
-**`JdbcStubExecutor`** — used in Docker/production. Connects to real PostgreSQL (via HikariCP) and ActiveMQ Artemis (via Jakarta JMS). Maps COBOL operations to actual database queries and message queue operations:
+**`JdbcStubExecutor`** — used in Docker/production. Connects to real PostgreSQL (via HikariCP), RabbitMQ (via the typed `com.rabbitmq:amqp-client` library), and an HTTP endpoint for CALL routing (via Apache HttpClient5). Maps COBOL operations to actual database / message-broker / REST operations:
 
 | Operation | JdbcStubExecutor Behavior |
 |---|---|
-| `CICS-READ` / `DLI-GU` | `SELECT` from mapped table |
+| `CICS-READ` / `DLI-GU` | `SELECT` from mapped table (per-test seed SQL primes the rows) |
 | `CICS-WRITE` / `DLI-ISRT` | `INSERT` into mapped table |
 | `CICS-REWRITE` / `DLI-REPL` | `UPDATE` mapped table |
 | `CICS-DELETE` / `DLI-DLET` | `DELETE` from mapped table |
-| `MQ-OPEN` | Open JMS session + consumer/producer for named queue |
-| `MQ-GET` | `MessageConsumer.receiveNoWait()` |
-| `MQ-PUT1` | `MessageProducer.send()` |
-| `MQ-CLOSE` | Close JMS session |
+| `MQ-OPEN` | `Channel.queueDeclare(qName, ...)` against RabbitMQ |
+| `MQ-GET` | `Channel.basicGet(qName, autoAck=true)` |
+| `MQ-PUT1` | `Channel.basicPublish("", qName, ...)` |
+| `MQ-CLOSE` | Close AMQP channel + connection |
 | `SQL-*` | Direct JDBC `PreparedStatement` execution |
+| `callProgram` (non-MQ CALL) | HTTP POST to `${{SPECTER_CALL_BASE_URL}}/<progname>`; JSON response body keys → `ProgramState` |
 
 ## Testing Methodology
 
@@ -124,12 +154,15 @@ The test class uses JUnit 5 `@ParameterizedTest` with `@MethodSource`. Each test
 
 ### Integration Tests (`mvn verify` in `integration-tests/`)
 
-Use Mockito spies wrapping `DefaultStubExecutor` to verify that the program interacts with external systems correctly:
+Use Mockito spies wrapping `DefaultStubExecutor` to verify that the program interacts with external systems correctly. When the appropriate sidecar env vars are set, the same tests also exercise real PostgreSQL + RabbitMQ + WireMock:
 
 1. `Mockito.spy(new DefaultStubExecutor())` — preserves proven FIFO queue behavior while adding verification
 2. Same test data as unit tests (identical JSONL source)
-3. After execution, verifies operations were actually invoked using `state.stubLog` (the runtime log of consumed stub keys)
-4. Only verifies operations that were actually consumed — avoids false failures when a test case doesn't exercise certain code paths
+3. `seedRealTables(tc)` — when `SPECTER_DB_URL` is set, loads `/seeds/<tc.id>.sql` from classpath into the real application tables so `JdbcStubExecutor.cicsRead()` SELECTs return the values each test case expects
+4. `seedRabbitMq(tc)` — when `SPECTER_AMQP_HOST` is set, publishes `CALL:MQ*` outcomes to RabbitMQ queues so `mqGet` receives real data
+5. WireMock (loaded from `wiremock/mappings/<tc_id>/`) responds to non-MQ `callProgram` HTTP POSTs with each test's expected JSON body
+6. After execution, verifies operations were actually invoked using `state.stubLog` (the runtime log of consumed stub keys)
+7. Only verifies operations that were actually consumed — avoids false failures when a test case doesn't exercise certain code paths
 
 The Mockito approach gives confidence that:
 - The program calls the expected external operations in the expected order
@@ -155,7 +188,8 @@ The store is incremental — re-running synthesis picks up where the last run le
 | Service | Image | Purpose |
 |---|---|---|
 | `db` | `postgres:16-alpine` | Application database (DDL from copybooks) |
-| `activemq` | `apache/activemq-artemis:2.31.2` | JMS message broker |
+| `rabbitmq` | `rabbitmq:3-management` | AMQP broker for MQ-style operations |
+| `wiremock` | `wiremock/wiremock:3.5.4` | Mocks REST endpoints for outbound CALLs |
 | `app` | Built from `Dockerfile` | The translated COBOL program |
 
 ### Configuration
@@ -167,9 +201,12 @@ The app reads configuration from environment variables (set in `docker-compose.y
 | `SPECTER_DB_URL` | `jdbc:postgresql://localhost:5432/specter` | JDBC connection URL |
 | `SPECTER_DB_USER` | `specter` | Database username |
 | `SPECTER_DB_PASSWORD` | `specter` | Database password |
-| `SPECTER_JMS_URL` | *(none — JMS disabled)* | ActiveMQ broker URL |
-| `SPECTER_JMS_USER` | `admin` | JMS username |
-| `SPECTER_JMS_PASSWORD` | `admin` | JMS password |
+| `SPECTER_AMQP_HOST` | `localhost` | RabbitMQ broker host |
+| `SPECTER_AMQP_PORT` | `5672` | RabbitMQ broker port |
+| `SPECTER_AMQP_USER` | `specter` | RabbitMQ username |
+| `SPECTER_AMQP_PASSWORD` | `specter` | RabbitMQ password |
+| `SPECTER_AMQP_VHOST` | `/` | RabbitMQ virtual host |
+| `SPECTER_CALL_BASE_URL` | `http://localhost:8080` | Base URL for outbound CALL HTTP routing (WireMock) |
 
 ### Build Pipeline
 
@@ -189,12 +226,15 @@ specter program.ast --java [options] -o output/
 
 | Flag | Description |
 |---|---|
-| `--java` | Generate Maven Java project instead of Python |
+| `--java` | Generate Maven Java project instead of Python (also implies `--docker` and `--integration-tests`) |
 | `--java-package PKG` | Java package name (default: `com.specter.generated`) |
-| `--test-store PATH` | Path to JSONL test store for unit/integration tests |
-| `--docker` | Generate `Dockerfile` + `docker-compose.yml` |
-| `--integration-tests` | Generate `integration-tests/` with Mockito tests |
-| `--copybook-dir DIR` | Copybook directory for SQL DDL generation (repeatable) |
+| `--test-store PATH` | Path to JSONL test store; required for per-test seed SQL + WireMock mappings |
+| `--docker` | (No-op when `--java` is set; enabled by default) |
+| `--integration-tests` | (No-op when `--java` is set; enabled by default) |
+| `--copybook-dir DIR` | Copybook directory for SQL DDL + per-test seed SQL (repeatable; without it `JdbcStubExecutor.cicsRead` will NOTFND) |
+| `--pipeline` | Run the unified end-to-end pipeline (coverage + snapshot capture + Java generation + docker + mvn verify + equivalence report). Requires `--cobol-source` and `--copybook-dir`. |
+| `--pipeline-skip-docker` | With `--pipeline`: stop after generating artifacts; do not start sidecars. |
+| `--pipeline-skip-mvn` | With `--pipeline`: stop after generating artifacts; do not run `mvn verify`. |
 
 ## Dependencies
 
@@ -203,12 +243,12 @@ The generated Maven project uses:
 | Dependency | Version | Scope | Purpose |
 |---|---|---|---|
 | JUnit Jupiter | 5.10.2 | test | Unit + integration test framework |
-| Gson | 2.10.1 | test | JSONL test store parsing |
+| Gson | 2.10.1 | compile | JSONL test store parsing + JSON CALL bodies |
 | Mockito | 5.11.0 | test | Spy-based integration test verification |
 | Lanterna | 3.1.1 | compile | Terminal UI (CICS screen emulation) |
 | PostgreSQL JDBC | 42.7.2 | compile | Database connectivity |
 | HikariCP | 5.1.0 | compile | JDBC connection pooling |
-| Jakarta JMS API | 3.1.0 | compile | JMS messaging API |
-| ActiveMQ Artemis | 2.31.2 | compile | JMS client implementation |
+| RabbitMQ amqp-client | 5.21.0 | compile | AMQP broker client for MQ ops |
+| Apache HttpClient5 | 5.3.1 | compile | HTTP client for non-MQ CALL routing |
 
 Build requires Java 17+ and Maven 3.9+.

@@ -3,10 +3,101 @@
 import unittest
 
 from specter.java_condition_parser import (
+    _rewrite_88_level_conditions_java,
     cobol_condition_to_java,
     resolve_when_value_java,
 )
 from specter.condition_parser import parse_when_value
+
+
+class TestRewrite88LevelConditionsJava(unittest.TestCase):
+    """The 88-level rewrite mirrors specter.code_generator's Python version."""
+
+    def test_no_map_returns_input_unchanged(self):
+        out = cobol_condition_to_java("APPL-AOK")
+        self.assertIn('CobolRuntime.isTruthy(state.get("APPL-AOK"))', out)
+
+    def test_numeric_88_level_rewritten_to_to_num_comparison(self):
+        m = {"APPL-AOK": ("APPL-RESULT", 0)}
+        out = cobol_condition_to_java("APPL-AOK", m)
+        self.assertEqual(out, 'CobolRuntime.toNum(state.get("APPL-RESULT")) == 0')
+
+    def test_string_88_level_rewritten_to_objects_equals(self):
+        m = {"END-OF-FILE": ("WS-EOF-FLAG", "Y")}
+        out = cobol_condition_to_java("END-OF-FILE", m)
+        self.assertEqual(out, 'java.util.Objects.equals(state.get("WS-EOF-FLAG"), "Y")')
+
+    def test_negation_of_88_level(self):
+        m = {"APPL-AOK": ("APPL-RESULT", 0)}
+        out = cobol_condition_to_java("NOT APPL-AOK", m)
+        # NOT wraps via the Java parser; the rewrite still fires inside.
+        self.assertIn('CobolRuntime.toNum(state.get("APPL-RESULT")) == 0', out)
+        self.assertIn("!", out)
+
+    def test_compound_condition_with_88_level(self):
+        m = {"APPL-AOK": ("APPL-RESULT", 0)}
+        out = cobol_condition_to_java("APPL-AOK AND WS-X = 1", m)
+        self.assertIn('CobolRuntime.toNum(state.get("APPL-RESULT")) == 0', out)
+        # AND collapses to Java &&; the comparator side is left alone.
+        self.assertIn("&&", out)
+        self.assertIn('state.get("WS-X")', out)
+
+    def test_explicit_comparison_on_88_var_not_rewritten(self):
+        # A user writing ``IF APPL-AOK = SOMETHING`` has already disambiguated.
+        m = {"APPL-AOK": ("APPL-RESULT", 0)}
+        out = cobol_condition_to_java('APPL-AOK = "Y"', m)
+        # The literal compare on APPL-AOK should not be rewritten to APPL-RESULT.
+        self.assertIn('"APPL-AOK"', out)
+        self.assertNotIn("APPL-RESULT", out)
+
+    def test_unknown_identifier_left_alone(self):
+        m = {"APPL-AOK": ("APPL-RESULT", 0)}
+        out = cobol_condition_to_java("OTHER-FLAG", m)
+        self.assertIn('CobolRuntime.isTruthy(state.get("OTHER-FLAG"))', out)
+        self.assertNotIn("APPL-RESULT", out)
+
+    def test_direct_helper_call_applied_to_raw_isTruthy(self):
+        # Sanity: the helper itself works on a hand-built input.
+        out = _rewrite_88_level_conditions_java(
+            'CobolRuntime.isTruthy(state.get("APPL-AOK"))',
+            {"APPL-AOK": ("APPL-RESULT", 0)},
+        )
+        self.assertEqual(out, 'CobolRuntime.toNum(state.get("APPL-RESULT")) == 0')
+
+    def test_resolve_when_value_threads_map_for_evaluate_true(self):
+        m = {"APPL-AOK": ("APPL-RESULT", 0)}
+        out = resolve_when_value_java("APPL-AOK", is_evaluate_true=True, level_88_map=m)
+        self.assertEqual(out, 'CobolRuntime.toNum(state.get("APPL-RESULT")) == 0')
+
+
+class TestNumericLiteralComparisonCoercion(unittest.TestCase):
+    """A numeric literal on either side of = / NOT = forces toNum() coercion
+    on the variable side. Otherwise Objects.equals("0", 0) returns false."""
+
+    def test_var_eq_zero_coerces_via_toNum(self):
+        out = cobol_condition_to_java("WS-X = 0")
+        self.assertEqual(out, 'CobolRuntime.toNum(state.get("WS-X")) == 0')
+
+    def test_var_eq_nonzero_int(self):
+        out = cobol_condition_to_java("WS-X = 16")
+        self.assertEqual(out, 'CobolRuntime.toNum(state.get("WS-X")) == 16')
+
+    def test_zero_eq_var_other_side_too(self):
+        out = cobol_condition_to_java("0 = WS-X")
+        self.assertEqual(out, '0 == CobolRuntime.toNum(state.get("WS-X"))')
+
+    def test_var_neq_numeric_literal(self):
+        out = cobol_condition_to_java("WS-X NOT = 0")
+        self.assertEqual(out, 'CobolRuntime.toNum(state.get("WS-X")) != 0')
+
+    def test_string_literal_still_uses_objects_equals(self):
+        out = cobol_condition_to_java("WS-STATUS = '00'")
+        self.assertIn("Objects.equals", out)
+        self.assertNotIn("toNum", out)
+
+    def test_two_literal_numerics_unchanged(self):
+        out = cobol_condition_to_java("0 = 0")
+        self.assertEqual(out, "0 == 0")
 
 
 class TestJavaConditionParser(unittest.TestCase):
@@ -22,10 +113,11 @@ class TestJavaConditionParser(unittest.TestCase):
         self.assertNotIn("!=", result)
 
     def test_simple_equality_numeric(self):
+        # State variables compared to a numeric literal must coerce via
+        # CobolRuntime.toNum so "0"/"00"/0 all match. Objects.equals would
+        # return false for the string-vs-int case.
         result = cobol_condition_to_java("X = 5")
-        self.assertIn('state.get("X")', result)
-        self.assertIn("5", result)
-        self.assertIn("java.util.Objects.equals", result)
+        self.assertEqual(result, 'CobolRuntime.toNum(state.get("X")) == 5')
 
     # -- Figurative constants ---------------------------------------------
 
@@ -289,11 +381,10 @@ class TestJavaConditionParser(unittest.TestCase):
     # -- Numeric literal equality -----------------------------------------
 
     def test_numeric_literal_equality(self):
-        """Comparing two numeric literals should use == not Objects.equals."""
-        # This is an edge case - both sides numeric
+        """A var compared to a numeric literal coerces both sides via
+        CobolRuntime.toNum (was incorrectly Objects.equals before)."""
         result = cobol_condition_to_java("SQLCODE = 0")
-        # state.get("SQLCODE") is not numeric literal, so Objects.equals
-        self.assertIn("java.util.Objects.equals", result)
+        self.assertEqual(result, 'CobolRuntime.toNum(state.get("SQLCODE")) == 0')
 
 
 class TestParseWhenValueJava(unittest.TestCase):

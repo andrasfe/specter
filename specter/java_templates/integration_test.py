@@ -29,7 +29,8 @@ INTEGRATION_POM_XML = """\
         <maven.compiler.target>17</maven.compiler.target>
         <junit.version>5.10.2</junit.version>
         <mockito.version>5.11.0</mockito.version>
-        <netty.version>4.2.9.Final</netty.version>
+        <amqp.client.version>5.21.0</amqp.client.version>
+        <httpclient5.version>5.3.1</httpclient5.version>
     </properties>
 
     <dependencies>
@@ -98,27 +99,19 @@ INTEGRATION_POM_XML = """\
             <scope>test</scope>
         </dependency>
 
-        <!-- Jakarta JMS API -->
+        <!-- RabbitMQ AMQP client (replaces ActiveMQ Artemis / JMS) -->
         <dependency>
-            <groupId>jakarta.jms</groupId>
-            <artifactId>jakarta.jms-api</artifactId>
-            <version>3.1.0</version>
+            <groupId>com.rabbitmq</groupId>
+            <artifactId>amqp-client</artifactId>
+            <version>${{amqp.client.version}}</version>
             <scope>test</scope>
         </dependency>
 
-        <!-- ActiveMQ Artemis JMS client -->
+        <!-- Apache HttpClient 5 (WireMock admin API + REST verification) -->
         <dependency>
-            <groupId>org.apache.activemq</groupId>
-            <artifactId>artemis-jakarta-client</artifactId>
-            <version>2.31.2</version>
-            <scope>test</scope>
-        </dependency>
-
-        <!-- Pin Netty handler version explicitly -->
-        <dependency>
-            <groupId>io.netty</groupId>
-            <artifactId>netty-handler</artifactId>
-            <version>${{netty.version}}</version>
+            <groupId>org.apache.httpcomponents.client5</groupId>
+            <artifactId>httpclient5</artifactId>
+            <version>${{httpclient5.version}}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
@@ -175,12 +168,14 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonArray;
 
+import com.rabbitmq.client.Channel;
+import com.rabbitmq.client.ConnectionFactory;
+
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.*;
 import java.util.stream.*;
 
@@ -188,14 +183,15 @@ import java.util.stream.*;
  * Mockito spy-based integration tests for {{@link {program_class_name}}}.
  *
  * <p>Uses {{@code Mockito.spy(new DefaultStubExecutor())}} to wrap the proven
- * FIFO queue behavior with Mockito verification.  After each test case
+ * FIFO queue behavior with Mockito verification. After each test case
  * executes, verifies that the expected stub operations were invoked.
  *
- * <p>When the environment variables {{@code SPECTER_DB_URL}} (or the system
- * property {{@code specter.db.url}}) are set, the test pre-populates the
- * database and optionally JMS queues with the same values that the stub
- * outcomes mock, so a {{@link JdbcStubExecutor}} connected to a real
- * PostgreSQL/ActiveMQ can also be exercised.
+ * <p>When the environment variable {{@code SPECTER_DB_URL}} (or system
+ * property {{@code specter.db.url}}) is set, the test loads the per-test-case
+ * seed SQL from {{@code /seeds/<tc_id>.sql}} into the real application
+ * tables (defined in {{@code sql/init.sql}}) so a {{@link JdbcStubExecutor}}
+ * connected to a real PostgreSQL can also be exercised. Similarly,
+ * {{@code SPECTER_AMQP_HOST}} enables RabbitMQ seeding for MQ-style ops.
  */
 @ExtendWith(MockitoExtension.class)
 class {program_class_name}IT {{
@@ -214,108 +210,84 @@ class {program_class_name}IT {{
     }}
 
     /**
-     * Seed the database with stub-outcome variable assignments so that a
-     * real JDBC read returns the same data that the FIFO queue would supply.
+     * Load the per-test-case seed SQL from {{@code /seeds/<tc.id>.sql}}
+     * (a classpath resource produced by Specter's Java generator) and
+     * execute each statement against the real application tables.
      *
-     * <p>For each stub outcome entry whose key looks like a CICS/DLI read
-     * (e.g. {{@code "CICS"}}, {{@code "DLI"}}), the variable assignments
-     * are inserted into a staging table keyed by the operation key.
-     * The table is created on-the-fly if it does not exist.
+     * <p>No-op when the seed file is absent — the test case has no
+     * read-style outcomes that map to known tables.
      */
-    private static void seedDatabase(javax.sql.DataSource ds, TestCaseData tc) {{
-        try (Connection conn = ds.getConnection()) {{
-            // Create the staging table if it doesn't exist
-            conn.createStatement().executeUpdate(
-                "CREATE TABLE IF NOT EXISTS specter_stub_seed ("
-                + "  op_key   VARCHAR(200),"
-                + "  seq      INTEGER,"
-                + "  var_name VARCHAR(200),"
-                + "  val      TEXT"
-                + ")"
-            );
-            // Clear previous seed data for this TC
-            try (PreparedStatement del = conn.prepareStatement(
-                    "DELETE FROM specter_stub_seed WHERE op_key LIKE ?")) {{
-                del.setString(1, "%");
-                del.executeUpdate();
-            }}
-            // Insert seed data from stub outcomes
-            try (PreparedStatement ins = conn.prepareStatement(
-                    "INSERT INTO specter_stub_seed (op_key, seq, var_name, val) VALUES (?, ?, ?, ?)")) {{
-                for (Map.Entry<String, List<List<Object[]>>> e : tc.stubOutcomes.entrySet()) {{
-                    int seq = 0;
-                    for (List<Object[]> entry : e.getValue()) {{
-                        for (Object[] pair : entry) {{
-                            ins.setString(1, e.getKey());
-                            ins.setInt(2, seq);
-                            ins.setString(3, pair[0].toString());
-                            ins.setString(4, pair[1] != null ? pair[1].toString() : "");
-                            ins.addBatch();
-                        }}
-                        seq++;
-                    }}
+    private static void seedRealTables(javax.sql.DataSource ds, TestCaseData tc) {{
+        String resource = "/seeds/" + tc.id + ".sql";
+        InputStream is = {program_class_name}IT.class.getResourceAsStream(resource);
+        if (is == null) return;
+        String sql;
+        try {{
+            sql = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+        }} catch (IOException ex) {{
+            System.err.println("Seed read failed: " + ex.getMessage());
+            return;
+        }}
+        try (Connection conn = ds.getConnection(); Statement st = conn.createStatement()) {{
+            for (String stmt : sql.split(";\\\\s*\\\\n")) {{
+                String trimmed = stmt.trim();
+                if (trimmed.isEmpty() || trimmed.startsWith("--")) continue;
+                try {{
+                    st.execute(trimmed);
+                }} catch (SQLException ex) {{
+                    System.err.println("Seed stmt warn: " + ex.getMessage()
+                        + " :: " + trimmed.substring(0, Math.min(120, trimmed.length())));
                 }}
-                // Also seed from stub defaults
-                for (Map.Entry<String, List<Object[]>> e : tc.stubDefaults.entrySet()) {{
-                    for (Object[] pair : e.getValue()) {{
-                        ins.setString(1, e.getKey() + ":DEFAULT");
-                        ins.setInt(2, 0);
-                        ins.setString(3, pair[0].toString());
-                        ins.setString(4, pair[1] != null ? pair[1].toString() : "");
-                        ins.addBatch();
-                    }}
-                }}
-                ins.executeBatch();
             }}
         }} catch (SQLException ex) {{
-            // Non-fatal: DB seeding is best-effort for integration tests
-            System.err.println("DB seed warning: " + ex.getMessage());
+            System.err.println("Seed connection warning: " + ex.getMessage());
         }}
     }}
 
     /**
-     * If ActiveMQ is available, publish stub-outcome messages to queues
-     * so that MQ operations can read real data.
+     * If a RabbitMQ broker is reachable (controlled by
+     * {{@code SPECTER_AMQP_HOST}}), publish one message per outcome entry
+     * for every {{@code CALL:MQ*}} stub_outcome key. Queue names are
+     * derived from the op_key (colon → dot) so the program's MQ GET
+     * receives real data.
      */
-    private static void seedJms(TestCaseData tc) {{
-        String jmsUrl = System.getenv("SPECTER_JMS_URL");
-        if (jmsUrl == null || jmsUrl.isBlank()) return;
+    private static void seedRabbitMq(TestCaseData tc) {{
+        String host = System.getenv("SPECTER_AMQP_HOST");
+        if (host == null || host.isBlank()) return;
+        ConnectionFactory factory = new ConnectionFactory();
+        factory.setHost(host);
+        String portStr = System.getenv("SPECTER_AMQP_PORT");
         try {{
-            Class<?> factoryClass = Class.forName(
-                "org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory");
-            Object factory = factoryClass.getConstructor(String.class).newInstance(jmsUrl);
-            Object jmsConn = factory.getClass().getMethod("createConnection").invoke(factory);
-            Object session = jmsConn.getClass()
-                .getMethod("createSession", boolean.class, int.class)
-                .invoke(jmsConn, false, 1);
-            // Publish stub outcomes for CALL:MQ* keys as JMS text messages
+            factory.setPort(portStr != null && !portStr.isBlank()
+                ? Integer.parseInt(portStr.trim()) : 5672);
+        }} catch (NumberFormatException ignored) {{
+            factory.setPort(5672);
+        }}
+        String user = System.getenv("SPECTER_AMQP_USER");
+        if (user != null && !user.isBlank()) factory.setUsername(user);
+        String pass = System.getenv("SPECTER_AMQP_PASSWORD");
+        if (pass != null && !pass.isBlank()) factory.setPassword(pass);
+        String vhost = System.getenv("SPECTER_AMQP_VHOST");
+        if (vhost != null && !vhost.isBlank()) factory.setVirtualHost(vhost);
+
+        try (com.rabbitmq.client.Connection conn = factory.newConnection();
+             Channel ch = conn.createChannel()) {{
             for (Map.Entry<String, List<List<Object[]>>> e : tc.stubOutcomes.entrySet()) {{
                 if (!e.getKey().startsWith("CALL:MQ")) continue;
                 String qName = "specter.test." + e.getKey().replace(":", ".");
-                Object queue = session.getClass()
-                    .getMethod("createQueue", String.class).invoke(session, qName);
-                Object producer = session.getClass()
-                    .getMethod("createProducer", Class.forName("jakarta.jms.Destination"))
-                    .invoke(session, queue);
+                ch.queueDeclare(qName, true, false, false, null);
                 for (List<Object[]> entry : e.getValue()) {{
                     StringBuilder body = new StringBuilder();
                     for (Object[] pair : entry) {{
                         if (body.length() > 0) body.append("|");
                         body.append(pair[0]).append("=").append(pair[1]);
                     }}
-                    Object msg = session.getClass()
-                        .getMethod("createTextMessage", String.class)
-                        .invoke(session, body.toString());
-                    producer.getClass()
-                        .getMethod("send", Class.forName("jakarta.jms.Message"))
-                        .invoke(producer, msg);
+                    ch.basicPublish("", qName, null,
+                        body.toString().getBytes(StandardCharsets.UTF_8));
                 }}
             }}
-            session.getClass().getMethod("close").invoke(session);
-            jmsConn.getClass().getMethod("close").invoke(jmsConn);
         }} catch (Exception ex) {{
-            // Non-fatal: JMS seeding is best-effort
-            System.err.println("JMS seed warning: " + ex.getMessage());
+            System.err.println("RabbitMQ seed warning: " + ex.getMessage());
         }}
     }}
 
@@ -327,17 +299,23 @@ class {program_class_name}IT {{
             return Stream.empty();
         }}
         BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
-        List<TestCaseData> cases = new ArrayList<>();
+        // Dedup by tc.id: cobol_coverage's test_store accumulates entries
+        // across iterations and many can share the same id. Running every
+        // duplicate as a separate JUnit case would inflate the apparent
+        // failure count without testing anything new.
+        java.util.LinkedHashMap<String, TestCaseData> uniq = new java.util.LinkedHashMap<>();
         String line;
         while ((line = reader.readLine()) != null) {{
             line = line.trim();
             if (line.isEmpty()) continue;
             JsonObject obj = GSON.fromJson(line, JsonObject.class);
-            if (!obj.has("input_state")) continue;
-            cases.add(TestCaseData.fromJson(obj));
+            if (!obj.has("input_state") || !obj.has("id")) continue;
+            String id = obj.get("id").getAsString();
+            if (uniq.containsKey(id)) continue;
+            uniq.put(id, TestCaseData.fromJson(obj));
         }}
         reader.close();
-        return cases.stream();
+        return uniq.values().stream();
     }}
 
     @ParameterizedTest(name = "IT#{{index}} layer={{0}} target={{1}}")
@@ -356,9 +334,9 @@ class {program_class_name}IT {{
                 ? System.getenv("SPECTER_DB_PASSWORD") : "specter");
             hc.setMaximumPoolSize(2);
             dataSource = new com.zaxxer.hikari.HikariDataSource(hc);
-            seedDatabase(dataSource, tc);
+            seedRealTables(dataSource, tc);
         }}
-        seedJms(tc);
+        seedRabbitMq(tc);
 
         // Create a spy wrapping the real DefaultStubExecutor
         DefaultStubExecutor realStubs = new DefaultStubExecutor();
@@ -367,10 +345,22 @@ class {program_class_name}IT {{
         {program_class_name} program = new {program_class_name}(spyStubs);
         Set<String> knownParagraphs = new LinkedHashSet<>(program.getRegistry().allNames());
 
-        // Build initial state
+        // Build initial state.
+        // 1. Filter input_state to the variables COBOL would actually accept
+        //    via its INIT-record dispatch (INJECTABLE_VARS). COBOL silently
+        //    drops INIT records for variables outside this set, so seeding
+        //    them on the Java side would diverge from COBOL's runtime state.
+        // 2. Apply COBOL PIC truncation to the surviving values so e.g.
+        //    ``MOVE 'NVGFYGWWQC' TO XXXX`` matches COBOL's truncation
+        //    rather than storing the whole 10-char string.
         ProgramState state = ProgramState.withDefaults();
         state.putAll({program_class_name}.defaultState());
-        state.putAll(tc.inputState);
+        java.util.Set<String> _injectable = {program_class_name}.INJECTABLE_VARS;
+        for (Map.Entry<String, Object> _e : tc.inputState.entrySet()) {{
+            String _k = _e.getKey();
+            if (!_injectable.isEmpty() && !_injectable.contains(_k)) continue;
+            state.put(_k, {program_class_name}.truncateForPic(_k, _e.getValue()));
+        }}
 
         // Wire stub outcomes
         for (Map.Entry<String, List<List<Object[]>>> e : tc.stubOutcomes.entrySet()) {{
@@ -380,26 +370,21 @@ class {program_class_name}IT {{
             state.stubDefaults.put(e.getKey(), new ArrayList<>(e.getValue()));
         }}
 
-        // Execute
-        String resolvedDirect = null;
-        if (tc.target != null && tc.target.startsWith("direct:")) {{
-            String para = tc.target.substring("direct:".length());
-            int pipe = para.indexOf('|');
-            if (pipe >= 0) para = para.substring(0, pipe);
-            resolvedDirect = resolveParagraphName(para, knownParagraphs);
-            Paragraph p = resolvedDirect == null ? null : program.getRegistry().get(resolvedDirect);
-            if (p != null) {{
-                p.execute(state);
-            }} else {{
-                program.run(state);
-            }}
-        }} else {{
-            program.run(state);
-        }}
+        // Execute the full program from main entry. The COBOL snapshot is
+        // always captured via full-program execution (cobol_executor runs
+        // the binary's entrypoint, no direct-paragraph invocation), so the
+        // Java side must do the same to keep traces and displays
+        // comparable.
+        program.run(state);
 
-        // --- Assertions ---
-        assertFalse(state.abended,
-            "TC " + tc.id.substring(0, Math.min(8, tc.id.length())) + " abended unexpectedly");
+        // --- Equivalence assertion (subsumes abended check when snapshot present) ---
+        CobolSnapshot snapshot = CobolSnapshot.loadFor({program_class_name}IT.class, tc.id);
+        if (snapshot != null) {{
+            EquivalenceAssert.assertEquivalent(snapshot, state);
+        }} else {{
+            assertFalse(state.abended,
+                "TC " + tc.id.substring(0, Math.min(8, tc.id.length())) + " abended unexpectedly");
+        }}
 
         // --- Mockito verification ---
         // Verify applyStubOutcome was called for each key that was actually
@@ -442,13 +427,13 @@ class {program_class_name}IT {{
 
     static class TestCaseData {{
         final String id;
-        final int layer;
+        final String layer;
         final String target;
         final Map<String, Object> inputState;
         final Map<String, List<List<Object[]>>> stubOutcomes;
         final Map<String, List<Object[]>> stubDefaults;
 
-        TestCaseData(String id, int layer, String target,
+        TestCaseData(String id, String layer, String target,
                      Map<String, Object> inputState,
                      Map<String, List<List<Object[]>>> stubOutcomes,
                      Map<String, List<Object[]>> stubDefaults) {{
@@ -462,7 +447,12 @@ class {program_class_name}IT {{
 
         static TestCaseData fromJson(JsonObject obj) {{
             String id = obj.has("id") ? obj.get("id").getAsString() : "";
-            int layer = obj.has("layer") ? obj.get("layer").getAsInt() : 0;
+            // layer may be either an int (TestStore.append format) or a
+            // string strategy name (cobol_coverage._save_test_case format).
+            String layer = "";
+            if (obj.has("layer") && !obj.get("layer").isJsonNull()) {{
+                layer = obj.get("layer").getAsString();
+            }}
             String target = obj.has("target") ? obj.get("target").getAsString() : "";
 
             Map<String, Object> inputState = new LinkedHashMap<>();
@@ -473,27 +463,36 @@ class {program_class_name}IT {{
             }}
 
             Map<String, List<List<Object[]>>> stubOutcomes = new LinkedHashMap<>();
-            if (obj.has("stub_outcomes")) {{
-                for (Map.Entry<String, JsonElement> e : obj.getAsJsonObject("stub_outcomes").entrySet()) {{
-                    JsonArray queue = e.getValue().getAsJsonArray();
-                    List<List<Object[]>> entries = new ArrayList<>();
-                    for (JsonElement qe : queue) {{
-                        List<Object[]> pairs = new ArrayList<>();
-                        for (JsonElement pe : qe.getAsJsonArray()) {{
-                            JsonArray pair = pe.getAsJsonArray();
-                            String var = pair.get(0).getAsString();
-                            Object val = jsonToJava(pair.get(1));
-                            pairs.add(new Object[]{{var, val}});
+            if (obj.has("stub_outcomes") && !obj.get("stub_outcomes").isJsonNull()) {{
+                JsonElement so = obj.get("stub_outcomes");
+                if (so.isJsonObject()) {{
+                    // dict-of-FIFO shape: {{op_key: [entry, entry, ...]}}
+                    for (Map.Entry<String, JsonElement> e : so.getAsJsonObject().entrySet()) {{
+                        JsonArray queue = e.getValue().getAsJsonArray();
+                        List<List<Object[]>> entries = new ArrayList<>();
+                        for (JsonElement qe : queue) {{
+                            entries.add(parsePairs(qe));
                         }}
-                        entries.add(pairs);
+                        stubOutcomes.put(e.getKey(), entries);
                     }}
-                    stubOutcomes.put(e.getKey(), entries);
+                }} else if (so.isJsonArray()) {{
+                    // list-of-pairs shape: [[op_key, entry], [op_key, entry], ...]
+                    // (cobol_coverage._save_test_case format, execution-ordered).
+                    for (JsonElement el : so.getAsJsonArray()) {{
+                        JsonArray pair = el.getAsJsonArray();
+                        if (pair.size() < 2) continue;
+                        String opKey = pair.get(0).getAsString();
+                        List<Object[]> pairs = parsePairs(pair.get(1));
+                        stubOutcomes.computeIfAbsent(opKey, k -> new ArrayList<>()).add(pairs);
+                    }}
                 }}
             }}
 
             Map<String, List<Object[]>> stubDefaults = new LinkedHashMap<>();
-            if (obj.has("stub_defaults")) {{
+            if (obj.has("stub_defaults") && !obj.get("stub_defaults").isJsonNull()
+                    && obj.get("stub_defaults").isJsonObject()) {{
                 for (Map.Entry<String, JsonElement> e : obj.getAsJsonObject("stub_defaults").entrySet()) {{
+                    if (e.getValue().isJsonNull() || !e.getValue().isJsonArray()) continue;
                     List<Object[]> pairs = new ArrayList<>();
                     for (JsonElement pe : e.getValue().getAsJsonArray()) {{
                         JsonArray pair = pe.getAsJsonArray();
@@ -507,6 +506,18 @@ class {program_class_name}IT {{
 
             return new TestCaseData(id, layer, target, inputState,
                                     stubOutcomes, stubDefaults);
+        }}
+
+        private static List<Object[]> parsePairs(JsonElement queueElement) {{
+            List<Object[]> pairs = new ArrayList<>();
+            if (queueElement == null || queueElement.isJsonNull()) return pairs;
+            for (JsonElement pe : queueElement.getAsJsonArray()) {{
+                JsonArray pair = pe.getAsJsonArray();
+                String var = pair.get(0).getAsString();
+                Object val = jsonToJava(pair.get(1));
+                pairs.add(new Object[]{{var, val}});
+            }}
+            return pairs;
         }}
 
         private static Object jsonToJava(JsonElement e) {{

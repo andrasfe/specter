@@ -1097,6 +1097,17 @@ def _replace_call_stmts(lines: list[str], max_count: int = 0) -> tuple[list[str]
     Args:
         max_count: Maximum blocks to replace (0 = unlimited).
     """
+    # IBM abend routines terminate the program on real z/OS. Under our
+    # mock they would otherwise become a no-op (read next mock record),
+    # which lets batch programs enter an unbounded retry loop after
+    # ``PERFORM 9999-ABEND-PROGRAM`` until GnuCOBOL's call stack blows
+    # (rc=160). Emit ``STOP RUN`` after the mock read so the mocked
+    # program terminates at the first abend, matching Java's Goback-
+    # Signal-based abend path.
+    _ABEND_ROUTINES = {
+        "CEE3ABD", "CEE3DMP", "ILBOABN0", "CICSABEND",
+        "ABEND", "DSNTIAR", "CBLTDLI-ABND",
+    }
     result: list[str] = []
     count = 0
     call_re = re.compile(
@@ -1156,6 +1167,15 @@ def _replace_call_stmts(lines: list[str], max_count: int = 0) -> tuple[list[str]
             result.append(f"{_B}END-IF\n")
             result.append(f"{_B}PERFORM SPECTER-APPLY-MOCK-PAYLOAD\n")
             result.append(f"{_B}MOVE MOCK-NUM-STATUS TO RETURN-CODE{dot}\n")
+            # Real-z/OS abend routines (CEE3ABD, ILBOABN0, etc.) terminate
+            # the program. Under the mock they would just read the next
+            # record and return; with no outcome the caller re-enters the
+            # failing path and retries forever, burning the call stack
+            # until GnuCOBOL aborts with rc=160. Emit STOP RUN here so
+            # the COBOL binary terminates cleanly on first abend, exactly
+            # matching Java's GobackSignal-based ``state.abended`` path.
+            if prog in _ABEND_ROUTINES:
+                result.append(f"{_B}STOP RUN.\n")
 
             count += 1
             i = j

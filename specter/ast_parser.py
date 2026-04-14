@@ -30,10 +30,19 @@ def _parse_paragraph(raw: dict) -> Paragraph:
     )
 
 
-def parse_ast(source: str | Path | dict) -> Program:
+def parse_ast(
+    source: str | Path | dict,
+    cobol_source: str | Path | None = None,
+) -> Program:
     """Parse a JSON AST into a Program.
 
     *source* can be a file path (str or Path), or an already-loaded dict.
+
+    *cobol_source*: optional path to the original ``.cbl`` source. When the
+    AST JSON has no ``entry_statements`` (the cobalt parser drops the
+    unlabeled PROCEDURE DIVISION top-level statements that drive the main
+    flow in batch programs), this fills the gap by parsing the source
+    text directly via :mod:`specter.entry_extractor`.
     """
     if isinstance(source, dict):
         data = source
@@ -48,6 +57,14 @@ def parse_ast(source: str | Path | dict) -> Program:
     entry_stmts = None
     if "entry_statements" in data:
         entry_stmts = [_parse_statement(s) for s in data["entry_statements"]]
+    elif cobol_source is not None:
+        try:
+            from .entry_extractor import extract_entry_statements
+            inferred = extract_entry_statements(cobol_source)
+            if inferred:
+                entry_stmts = inferred
+        except Exception:
+            entry_stmts = None
 
     return Program(
         program_id=data.get("program_id", "UNKNOWN"),

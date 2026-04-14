@@ -31,6 +31,10 @@ from .code_generator import (
 from .condition_parser import parse_when_value
 from .java_condition_parser import cobol_condition_to_java, resolve_when_value_java
 from .java_templates.docker import DOCKER_COMPOSE_YML, DOCKERFILE
+from .java_templates.equivalence import (
+    COBOL_SNAPSHOT_JAVA,
+    EQUIVALENCE_ASSERT_JAVA,
+)
 from .java_templates.integration_test import (
     INTEGRATION_POM_XML,
     MOCKITO_INTEGRATION_TEST_JAVA,
@@ -417,6 +421,25 @@ class _JavaCodeBuilder:
         self._temp_counter: int = 0
         self.branch_meta: dict[int, dict] = {}
         self.current_para: str = ""
+        # Maps each 88-level child name to (parent_var, activating_value)
+        # so bare COBOL conditions like ``IF APPL-AOK`` can be rewritten to
+        # parent-value comparisons. Mirrors ``_CodeBuilder.level_88_map`` in
+        # the Python generator.
+        self.level_88_map: dict[str, tuple[str, object]] = {}
+        # Maps each variable name to its PIC info (length + kind) so the
+        # generated Java can truncate input values to COBOL field widths.
+        # Built in generate_java_project from copybooks + inline source.
+        self.pic_info: dict[str, dict[str, object]] = {}
+        # Maps each FD file name to its ``FILE STATUS IS <var>`` variable
+        # name. The COBOL mock's OPEN/READ/WRITE/CLOSE stubs always do
+        # ``MOVE MOCK-ALPHA-STATUS TO <status-var>`` — including on EOF,
+        # when MOCK-ALPHA-STATUS is SPACES. Java's applyStubOutcome can
+        # only set variables named in the outcome pairs; with no outcome,
+        # the status var keeps its stale value. Emitting an explicit
+        # ``state.put(status-var, "")`` BEFORE applyStubOutcome mirrors
+        # the COBOL "move SPACES when exhausted" behaviour so the two
+        # runtimes stay aligned even for tests with empty stub FIFOs.
+        self.file_status_map: dict[str, str] = {}
 
     # -- Branch / loop counters -------------------------------------------
 
@@ -491,6 +514,18 @@ def _gen_move_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
             cb.comment(f"MOVE: {_oneline(stmt.text)}")
             return
 
+    # The cobalt parser strips reference modifiers (``Y(1:1)``) when it
+    # records ``targets`` in the AST attributes — it preserves the full
+    # form only in ``stmt.text``. Re-attach any ``(start:length)`` suffix
+    # from the raw text so the substring branch below fires correctly.
+    if "(" not in targets and stmt.text:
+        m_full = re.search(
+            r"\bTO\s+([A-Z][A-Z0-9-]*\([\d:,\s]+\)(?:\s+[A-Z][A-Z0-9-]*(?:\([\d:,\s]+\))?)*)",
+            stmt.text, re.IGNORECASE,
+        )
+        if m_full:
+            targets = m_full.group(1).strip()
+
     is_move_all = bool(re.search(r"MOVE\s+ALL\s+", stmt.text, re.IGNORECASE))
     if is_move_all:
         source = re.sub(r"^ALL\s+", "", source, flags=re.IGNORECASE).strip()
@@ -505,8 +540,9 @@ def _gen_move_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
             continue
         tname = _var_name(target_tok)
 
-        # Subscript targets
-        m = re.match(r"([A-Z][A-Z0-9-]*)\((\d+):(\d+)\)", tname)
+        # Subscript targets — check the *raw* target_tok before
+        # ``_var_name`` strips the ``(start:length)`` reference modifier.
+        m = re.match(r"([A-Z][A-Z0-9-]*)\((\d+):(\d+)\)", target_tok, re.IGNORECASE)
         if m:
             varname = m.group(1)
             start = int(m.group(2)) - 1
@@ -991,7 +1027,7 @@ def _gen_if_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
     if not condition:
         cb.open_block(f"if (true) /* IF: {_oneline(stmt.text)} */")
     else:
-        java_cond = cobol_condition_to_java(condition)
+        java_cond = cobol_condition_to_java(condition, cb.level_88_map)
         cb.open_block(f"if ({java_cond})")
 
     cb.stmt(f"state.addBranch({bid})")
@@ -1081,7 +1117,7 @@ def _gen_evaluate_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
             parts: list[str] = []
             for wc in group:
                 vt, _ = parse_when_value(wc.text)
-                resolved = resolve_when_value_java(vt, is_true)
+                resolved = resolve_when_value_java(vt, is_true, cb.level_88_map)
                 if is_true:
                     parts.append(f"({resolved})")
                 else:
@@ -1158,7 +1194,7 @@ def _gen_perform_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
         from_val = _resolve_source_java(m_vary.group(2).strip())
         by_val = _resolve_source_java(m_vary.group(3).strip())
         until_cond = m_vary.group(4).strip().rstrip(".")
-        java_until = cobol_condition_to_java(until_cond)
+        java_until = cobol_condition_to_java(until_cond, cb.level_88_map)
         bid = cb.next_branch_id()
         cb.branch_meta[bid] = {
             "condition": until_cond,
@@ -1179,8 +1215,12 @@ def _gen_perform_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
             f"CobolRuntime.toNum({by_val}))"
         )
         cb.stmt(f"{lv}++")
-        cb.open_block(f"if ({lv} >= 100)")
-        cb.line("break;")
+        cb.open_block(f"if ({lv} >= 10000)")
+        # Loop didn't terminate naturally — mirror COBOL's mid-error-loop
+        # abort by setting abended + throwing GobackSignal so the closes
+        # never run (matching the COBOL binary's truncated trace).
+        cb.stmt("state.abended = true")
+        cb.line("throw new GobackSignal();")
         cb.close_block()
         cb.close_block()
         cb.open_block(f"if ({lv} == 0)")
@@ -1210,7 +1250,7 @@ def _gen_perform_thru_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
         range_paras = [target]
 
     if condition:
-        java_cond = cobol_condition_to_java(condition)
+        java_cond = cobol_condition_to_java(condition, cb.level_88_map)
         bid = cb.next_branch_id()
         cb.branch_meta[bid] = {
             "condition": condition,
@@ -1224,8 +1264,12 @@ def _gen_perform_thru_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
         for para_name in range_paras:
             cb.stmt(f'perform(state, "{para_name}")')
         cb.stmt(f"{lv}++")
-        cb.open_block(f"if ({lv} >= 100)")
-        cb.line("break;")
+        cb.open_block(f"if ({lv} >= 10000)")
+        # Loop didn't terminate naturally — mirror COBOL's mid-error-loop
+        # abort by setting abended + throwing GobackSignal so the closes
+        # never run (matching the COBOL binary's truncated trace).
+        cb.stmt("state.abended = true")
+        cb.line("throw new GobackSignal();")
         cb.close_block()
         cb.close_block()
         cb.open_block(f"if ({lv} == 0)")
@@ -1246,7 +1290,7 @@ def _gen_perform_inline_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
     loop_bid = None
 
     if condition:
-        java_cond = cobol_condition_to_java(condition)
+        java_cond = cobol_condition_to_java(condition, cb.level_88_map)
         loop_bid = cb.next_branch_id()
         cb.branch_meta[loop_bid] = {
             "condition": condition,
@@ -1267,7 +1311,7 @@ def _gen_perform_inline_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
             from_val = _resolve_source_java(m_vary.group(2).strip())
             by_val = _resolve_source_java(m_vary.group(3).strip())
             until_cond = m_vary.group(4).strip()
-            java_until = cobol_condition_to_java(until_cond)
+            java_until = cobol_condition_to_java(until_cond, cb.level_88_map)
             loop_bid = cb.next_branch_id()
             cb.branch_meta[loop_bid] = {
                 "condition": until_cond,
@@ -1302,8 +1346,9 @@ def _gen_perform_inline_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
             f"CobolRuntime.toNum({by_val}))"
         )
     cb.stmt(f"{lv}++")
-    cb.open_block(f"if ({lv} >= 100)")
-    cb.line("break;")
+    cb.open_block(f"if ({lv} >= 10000)")
+    cb.stmt("state.abended = true")
+    cb.line("throw new GobackSignal();")
     cb.close_block()
     cb.close_block()
 
@@ -1390,10 +1435,21 @@ def _gen_display_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
             while end < len(content) and content[end] not in (" ", "\t", "'"):
                 end += 1
             token = content[pos:end]
-            if _vk(token) not in ("UPON", "CONSOLE", "SYSIN", "SYSOUT"):
-                parts.append(
-                    f'String.valueOf(state.get("{_vk(token)}"))'
-                )
+            var = _vk(token)
+            if var not in ("UPON", "CONSOLE", "SYSIN", "SYSOUT"):
+                # Numeric PIC variables that haven't been initialised should
+                # render as ``0`` (COBOL's PIC 9 default) rather than
+                # ``" "`` (the runtime's missing-key default for alpha).
+                pic = cb.pic_info.get(var) if cb.pic_info else None
+                kind = (pic or {}).get("kind") if pic else None
+                if kind in ("numeric", "packed", "comp"):
+                    parts.append(
+                        f'String.valueOf((long) CobolRuntime.toNum(state.get("{var}")))'
+                    )
+                else:
+                    parts.append(
+                        f'String.valueOf(state.get("{var}"))'
+                    )
             pos = end
 
     if parts:
@@ -1439,6 +1495,38 @@ def _extract_where_clause(raw: str) -> tuple[str, str]:
     return "", ""
 
 
+def _extract_call_using_vars(stmt: Statement) -> list[str]:
+    """Pull COBOL variable names from a CALL ... USING ... clause.
+
+    Looks first at ``stmt.attributes["using"]`` (preferred — list[str]),
+    then at any USING child statements, then falls back to scanning
+    ``stmt.attributes["raw_text"]`` for a ``USING <name> [<name> ...]``
+    pattern. Returns an empty list when no USING clause is detected.
+    """
+    raw_using = stmt.attributes.get("using")
+    if isinstance(raw_using, (list, tuple)):
+        return [str(x) for x in raw_using if x]
+    if isinstance(raw_using, str) and raw_using.strip():
+        return [raw_using.strip()]
+    for child in stmt.children:
+        if child.type and child.type.upper() == "USING":
+            names = [c.text for c in child.children if c.text]
+            if names:
+                return names
+    raw = stmt.attributes.get("raw_text", "") or stmt.text or ""
+    m = re.search(r"\bUSING\s+(.+)", raw, re.IGNORECASE)
+    if not m:
+        return []
+    tail = m.group(1).strip().rstrip(".")
+    parts = re.split(r"[\s,]+|\bBY\s+(?:CONTENT|REFERENCE|VALUE)\b",
+                     tail, flags=re.IGNORECASE)
+    return [p.strip() for p in parts if p and p.strip().upper()
+            not in {"BY", "CONTENT", "REFERENCE", "VALUE", "RETURNING"}]
+
+
+_ABEND_ROUTINES = {"CEE3ABD", "ILBOABN0", "ILBOABNS"}
+
+
 def _gen_call_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
     target = stmt.attributes.get("target", "UNKNOWN")
     upper = target.upper()
@@ -1450,8 +1538,33 @@ def _gen_call_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
         cb.stmt('stubs.mqPut1(state, "WS-REPLY-QNAME", "W02-PUT-BUFFER", "W02-BUFLEN")')
     elif upper == "MQCLOSE":
         cb.stmt("stubs.mqClose(state)")
+    elif upper in _ABEND_ROUTINES:
+        # CEE3ABD and friends are the standard IBM ABEND routines. The
+        # COBOL mock (cobol_mock._replace_call_stmts) emits ``STOP RUN``
+        # after the stub consume so the binary terminates at the first
+        # abend — otherwise a batch program's 9999-ABEND-PROGRAM would
+        # return to the main loop, re-enter the failing path, and blow
+        # GnuCOBOL's call stack (rc=160) after thousands of retries.
+        # Java mirrors that by setting ``state.abended`` AND throwing
+        # GobackSignal so the run()'s try/catch unwinds cleanly to the
+        # program's exit point (closes are skipped — same as COBOL's
+        # STOP RUN which bypasses the PROCEDURE DIVISION's end).
+        cb.stmt(
+            f'stubs.callProgram(state, "{_dq(target)}", '
+            "java.util.Collections.<String>emptyList(), "
+            "java.util.Collections.<String>emptyList())"
+        )
+        cb.stmt("state.abended = true")
+        cb.line("throw new GobackSignal();")
     else:
-        cb.stmt(f'stubs.dummyCall(state, "{_dq(target)}")')
+        using = _extract_call_using_vars(stmt)
+        in_list = ", ".join(f'"{_dq(v)}"' for v in using) if using else ""
+        in_arg = f"java.util.List.of({in_list})" if in_list else "java.util.Collections.emptyList()"
+        # outputVars left empty: WireMock decides which keys to set on the response.
+        cb.stmt(
+            f'stubs.callProgram(state, "{_dq(target)}", {in_arg}, '
+            f'java.util.Collections.<String>emptyList())'
+        )
 
 
 def _gen_exec_java(
@@ -1717,6 +1830,7 @@ def _gen_read_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
     if m:
         fname = m.group(1).upper()
         cb.stmt(f'state.reads.add("{fname}")')
+        _emit_file_status_reset(cb, fname)
         cb.stmt(f'stubs.applyStubOutcome(state, "READ:{fname}")')
     else:
         cb.stmt('state.reads.add("UNKNOWN")')
@@ -1744,6 +1858,22 @@ def _gen_rewrite_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
         cb.stmt('state.writes.add("UNKNOWN")')
 
 
+def _emit_file_status_reset(cb: _JavaCodeBuilder, file_token: str) -> None:
+    """Emit ``state.put("<status-var>", "")`` so OPEN/READ/etc. stubs see
+    a freshly blanked status field.
+
+    Mirrors the COBOL mock's unconditional ``MOVE MOCK-ALPHA-STATUS TO
+    <status-var>`` (which is SPACES on FIFO/EOF). Without this, Java
+    stub calls with empty FIFOs leave the status var holding whatever
+    value was last stored (often an injected test input), diverging from
+    COBOL's behaviour where the status is always re-seeded.
+    """
+    status_var = cb.file_status_map.get(file_token.upper())
+    if not status_var:
+        return
+    cb.stmt(f'state.put("{status_var}", "")')
+
+
 def _gen_open_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
     m = re.search(
         r"OPEN\s+(?:INPUT|OUTPUT|I-O|EXTEND)\s+(.+)",
@@ -1755,6 +1885,7 @@ def _gen_open_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
         for tok in re.split(r"\s+", files_str):
             tok = _vk(tok.strip())
             if tok and tok not in ("INPUT", "OUTPUT", "I-O", "EXTEND"):
+                _emit_file_status_reset(cb, tok)
                 cb.stmt(
                     f'stubs.applyStubOutcome(state, "OPEN:{tok}")'
                 )
@@ -1768,6 +1899,7 @@ def _gen_close_java(cb: _JavaCodeBuilder, stmt: Statement) -> None:
         for tok in re.split(r"\s+", files_str):
             tok = _vk(tok.strip())
             if tok:
+                _emit_file_status_reset(cb, tok)
                 cb.stmt(
                     f'stubs.applyStubOutcome(state, "CLOSE:{tok}")'
                 )
@@ -2136,6 +2268,9 @@ def _generate_paragraph_java(
     body_cb._temp_counter = cb._temp_counter
     body_cb.branch_meta = cb.branch_meta
     body_cb.current_para = para_name
+    body_cb.level_88_map = cb.level_88_map
+    body_cb.pic_info = cb.pic_info
+    body_cb.file_status_map = cb.file_status_map
 
     if not statements:
         body_cb.comment("empty paragraph")
@@ -2185,6 +2320,9 @@ def _generate_paragraph_method(
     body_cb._temp_counter = cb._temp_counter
     body_cb.branch_meta = cb.branch_meta
     body_cb.current_para = para_name
+    body_cb.level_88_map = cb.level_88_map
+    body_cb.pic_info = cb.pic_info
+    body_cb.file_status_map = cb.file_status_map
 
     if not statements:
         # Known copybook implementations for empty paragraphs
@@ -2313,6 +2451,12 @@ def _generate_program_class(
     is_terminal: bool = False,
     screen_layout_class: str = "ScreenLayout",
     lit_defaults: dict[str, str] | None = None,
+    level_88_map: dict[str, tuple[str, object]] | None = None,
+    pic_info: dict[str, dict[str, object]] | None = None,
+    injectable_vars: set[str] | None = None,
+    group_layouts: dict[str, list[dict]] | None = None,
+    redefines_groups: dict[str, dict] | None = None,
+    file_status_map: dict[str, str] | None = None,
 ) -> str:
     """Generate the top-level <ProgramId>Program.java source.
 
@@ -2376,7 +2520,8 @@ def _generate_program_class(
     lines.append("    }")
     lines.append("")
 
-    # defaultState()
+    # defaultState() — uses COBOL VALUE clauses from pic_info when available;
+    # falls back to classification heuristics otherwise.
     lines.append(
         "    public static Map<String, Object> defaultState() {"
     )
@@ -2385,31 +2530,36 @@ def _generate_program_class(
     )
     for name in sorted(var_report.variables.keys()):
         info = var_report.variables[name]
-        if info.classification == "flag":
-            default = "false"
-        elif info.classification == "status":
-            if "SQLCODE" in name.upper():
+        # 1. Source VALUE clause wins (most accurate to COBOL semantics).
+        pic_entry = (pic_info or {}).get(name) if pic_info else None
+        default: str | None = None
+        if pic_entry is not None and "value" in pic_entry:
+            v = pic_entry["value"]
+            if isinstance(v, bool):
+                default = "true" if v else "false"
+            elif isinstance(v, (int, float)):
+                default = repr(v)
+            else:
+                default = '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+        # 2. Classification + naming heuristics.
+        if default is None:
+            if info.classification == "flag":
+                default = '" "'
+            elif info.classification == "status":
+                if "SQLCODE" in name.upper():
+                    default = "0"
+                else:
+                    default = '" "'
+            elif any(
+                kw in name.upper()
+                for kw in (
+                    "CNT", "COUNT", "AMT", "AMOUNT", "FREQ", "DAYS",
+                    "TIME", "9C", "CODE", "LEN",
+                )
+            ):
                 default = "0"
             else:
-                default = '" "'
-        elif any(
-            kw in name.upper()
-            for kw in (
-                "CNT",
-                "COUNT",
-                "AMT",
-                "AMOUNT",
-                "FREQ",
-                "DAYS",
-                "TIME",
-                "9C",
-                "CODE",
-                "LEN",
-            )
-        ):
-            default = "0"
-        else:
-            default = '""'
+                default = '""'
         lines.append(f'        state.put("{_dq(name)}", {default});')
     lines.append("        return state;")
     lines.append("    }")
@@ -2433,10 +2583,22 @@ def _generate_program_class(
         # Generate entry statements inline -- use a temporary code builder
         entry_cb = _JavaCodeBuilder()
         entry_cb._indent = 3
+        if level_88_map:
+            entry_cb.level_88_map = level_88_map
+        if pic_info:
+            entry_cb.pic_info = pic_info
+        if file_status_map:
+            entry_cb.file_status_map = file_status_map
         for s in entry_stmts:
             _gen_statement_java(entry_cb, s)
         lines.extend(entry_cb.lines)
     else:
+        # Fallback when the AST lacks ``entry_statements`` (the cobalt
+        # parser drops the PROCEDURE DIVISION top-level statements). Call
+        # every labeled paragraph in source order. This is approximate —
+        # it can re-execute paragraphs already reached via PERFORM and
+        # exercise CLOSE paragraphs the COBOL only reaches after a normal
+        # loop exit. See AGENTS.md for the limitation.
         for para in program.paragraphs:
             lines.append(
                 f'            registry.get("{para.name}").execute(state);'
@@ -2468,10 +2630,22 @@ def _generate_program_class(
     if entry_stmts:
         entry_cb2 = _JavaCodeBuilder()
         entry_cb2._indent = 3
+        if level_88_map:
+            entry_cb2.level_88_map = level_88_map
+        if pic_info:
+            entry_cb2.pic_info = pic_info
+        if file_status_map:
+            entry_cb2.file_status_map = file_status_map
         for s in entry_stmts:
             _gen_statement_java(entry_cb2, s)
         lines.extend(entry_cb2.lines)
     else:
+        # Fallback when the AST lacks ``entry_statements`` (the cobalt
+        # parser drops the PROCEDURE DIVISION top-level statements). Call
+        # every labeled paragraph in source order. This is approximate —
+        # it can re-execute paragraphs already reached via PERFORM and
+        # exercise CLOSE paragraphs the COBOL only reaches after a normal
+        # loop exit. See AGENTS.md for the limitation.
         for para in program.paragraphs:
             lines.append(
                 f'            registry.get("{para.name}").execute(state);'
@@ -2497,6 +2671,221 @@ def _generate_program_class(
     lines.append("        return stubs;")
     lines.append("    }")
     lines.append("")
+
+    # Helper methods so entry_statements code emitted by the section
+    # statement generator (which assumes a SectionBase context with
+    # ``perform``/``display``/``goback`` helpers) compiles in this class
+    # too. Inlined to avoid pulling SectionBase into the program's parent.
+    lines.append("    private void perform(ProgramState state, String paraName) {")
+    lines.append("        Paragraph p = registry.get(paraName);")
+    lines.append("        if (p != null) p.execute(state);")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    private void performThru(ProgramState state, String from, String thru) {")
+    lines.append("        for (Paragraph p : registry.getThruRange(from, thru)) p.execute(state);")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    private void performTimes(ProgramState state, String paraName, int n) {")
+    lines.append("        Paragraph p = registry.get(paraName);")
+    lines.append("        if (p != null) for (int i = 0; i < n; i++) p.execute(state);")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    private void display(ProgramState state, String... parts) {")
+    lines.append('        state.addDisplay(String.join("", parts));')
+    lines.append("    }")
+    lines.append("")
+    lines.append("    private void goback() { throw new GobackSignal(); }")
+    lines.append("")
+
+    # PIC info map — used by the integration-test harness (and any caller
+    # that stages user input) to truncate values to COBOL field widths so
+    # ``MOVE 'NVGFYGWWQC' TO END-OF-FILE`` matches COBOL's PIC X(1)
+    # truncation behaviour.
+    if pic_info:
+        lines.append(
+            "    /** Per-variable PIC info: ``length`` is the COBOL field "
+            "width; ``kind`` is one of {{alpha,numeric,packed,comp}}. */"
+        )
+        lines.append(
+            "    public static final java.util.Map<String, int[]> PIC_INFO ="
+        )
+        lines.append("        java.util.Map.<String, int[]>ofEntries(")
+        # Map<String, int[]> where int[] is [length]. Kind isn't strictly
+        # needed for truncation (alpha-only), but we keep length-only to
+        # stay under the Map.ofEntries 10-arg limit by using ofEntries.
+        entries = []
+        for var, info in sorted(pic_info.items()):
+            length = int(info.get("length", 0) or 0)
+            kind = (info.get("kind") or "alpha")
+            # Only truncate alpha; numeric/packed/comp are precision-typed
+            # and best handled at numeric coercion time.
+            kind_code = 0 if kind == "alpha" else 1
+            if length <= 0:
+                continue
+            v_escaped = var.replace("\\", "\\\\").replace('"', '\\"')
+            entries.append(
+                f'            java.util.Map.entry("{v_escaped}", new int[]{{{length}, {kind_code}}})'
+            )
+        if entries:
+            lines.append(",\n".join(entries))
+        lines.append("        );")
+        lines.append("")
+        lines.append(
+            "    /** Apply COBOL PIC truncation to a single value. */"
+        )
+        lines.append(
+            "    public static Object truncateForPic(String key, Object val) {"
+        )
+        lines.append("        if (val == null) return null;")
+        lines.append("        int[] info = PIC_INFO.get(key);")
+        lines.append("        if (info == null) return val;")
+        lines.append("        int length = info[0];")
+        lines.append("        int kind = info[1];")
+        lines.append(
+            "        if (kind == 0 && val instanceof String) {"
+        )
+        lines.append(
+            "            String s = (String) val;"
+        )
+        lines.append(
+            "            if (length > 0 && s.length() > length) return s.substring(0, length);"
+        )
+        lines.append("        }")
+        lines.append("        return val;")
+        lines.append("    }")
+        lines.append("")
+    else:
+        # Always emit the symbols so callers can reference them safely.
+        lines.append(
+            "    public static final java.util.Map<String, int[]> PIC_INFO = java.util.Map.of();"
+        )
+        lines.append(
+            "    public static Object truncateForPic(String key, Object val) { return val; }"
+        )
+        lines.append("")
+
+    # INJECTABLE_VARS: the set of variables COBOL would actually accept
+    # from the INIT records. The IT filters input_state by this set so
+    # both runtimes see the same starting state — without it, Java seeds
+    # variables (e.g. END-OF-FILE) that COBOL silently leaves at their
+    # source ``VALUE`` clause, diverging from loop entry onward.
+    if injectable_vars:
+        sorted_vars = sorted(injectable_vars)
+        lines.append("    /** COBOL-injectable variables (mirrors cobol_coverage filter). */")
+        lines.append("    public static final java.util.Set<String> INJECTABLE_VARS =")
+        lines.append("        java.util.Set.of(")
+        var_lines = ['            "' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+                     for v in sorted_vars]
+        lines.append(",\n".join(var_lines))
+        lines.append("        );")
+        lines.append("")
+    else:
+        lines.append("    public static final java.util.Set<String> INJECTABLE_VARS = java.util.Set.of();")
+        lines.append("")
+
+    # GROUP_LAYOUTS — registered on ProgramState so get/put for parent
+    # group items composes/splits across the children's PIC widths.
+    # Each layout is ``Object[][]{{{name,kind,length}, ...}}``.
+    lines.append("    /** GROUP-item layouts: parent → ordered children with PIC widths. */")
+    if group_layouts:
+        lines.append(
+            "    public static final java.util.Map<String, Object[][]> GROUP_LAYOUTS_INIT ="
+        )
+        lines.append("        java.util.Map.<String, Object[][]>ofEntries(")
+        entries = []
+        for parent, children in sorted(group_layouts.items()):
+            child_arr = []
+            for ch in children:
+                cname = str(ch.get("name", "")).replace("\\", "\\\\").replace('"', '\\"')
+                ckind = str(ch.get("kind", "alpha")).replace("\\", "\\\\").replace('"', '\\"')
+                clen = int(ch.get("length", 0) or 0)
+                if not cname or clen <= 0:
+                    continue
+                child_arr.append(
+                    f'                new Object[]{{"{cname}", "{ckind}", {clen}}}'
+                )
+            if not child_arr:
+                continue
+            p_escaped = parent.replace("\\", "\\\\").replace('"', '\\"')
+            entries.append(
+                f'            java.util.Map.entry("{p_escaped}", new Object[][]{{\n'
+                + ",\n".join(child_arr) + "\n            })"
+            )
+        if entries:
+            lines.append(",\n".join(entries))
+        lines.append("        );")
+        lines.append("")
+        lines.append("    static {")
+        lines.append("        ProgramState.registerGroupLayouts(GROUP_LAYOUTS_INIT);")
+        lines.append("    }")
+        lines.append("")
+    else:
+        lines.append(
+            "    public static final java.util.Map<String, Object[][]> GROUP_LAYOUTS_INIT ="
+        )
+        lines.append("        java.util.Collections.emptyMap();")
+        lines.append("")
+
+    # REDEFINES layouts: byte-buffer storage for memory-aliased fields.
+    # Two static maps: group widths + per-field membership/offset/kind.
+    lines.append("    /** REDEFINES groups: group_id → byte-buffer width. */")
+    if redefines_groups:
+        lines.append(
+            "    public static final java.util.Map<String, Integer> REDEFINES_GROUP_WIDTH_INIT ="
+        )
+        lines.append("        java.util.Map.<String, Integer>ofEntries(")
+        width_entries = []
+        for gid, info in sorted(redefines_groups.items()):
+            g_escaped = gid.replace("\\", "\\\\").replace('"', '\\"')
+            width_entries.append(
+                f'            java.util.Map.entry("{g_escaped}", {int(info["width"])})'
+            )
+        lines.append(",\n".join(width_entries))
+        lines.append("        );")
+        lines.append("")
+        lines.append(
+            "    /** REDEFINES fields: name → {group, offset, length, kind, signed, digits}. */"
+        )
+        lines.append(
+            "    public static final java.util.Map<String, Object[]> REDEFINES_FIELD_INIT ="
+        )
+        lines.append("        java.util.Map.<String, Object[]>ofEntries(")
+        field_entries = []
+        for gid, info in sorted(redefines_groups.items()):
+            g_escaped = gid.replace("\\", "\\\\").replace('"', '\\"')
+            for fname, fent in info["members"].items():
+                f_escaped = fname.replace("\\", "\\\\").replace('"', '\\"')
+                k_escaped = str(fent["kind"]).replace("\\", "\\\\").replace('"', '\\"')
+                signed = "true" if fent.get("signed") else "false"
+                field_entries.append(
+                    f'            java.util.Map.entry("{f_escaped}", new Object[]{{'
+                    f'"{g_escaped}", '
+                    f'{int(fent["offset"])}, '
+                    f'{int(fent["length"])}, '
+                    f'"{k_escaped}", '
+                    f'{signed}, '
+                    f'{int(fent.get("digits", 0))}}})'
+                )
+        lines.append(",\n".join(field_entries))
+        lines.append("        );")
+        lines.append("")
+        lines.append("    static {")
+        lines.append(
+            "        ProgramState.registerRedefinesLayouts("
+            "REDEFINES_GROUP_WIDTH_INIT, REDEFINES_FIELD_INIT);"
+        )
+        lines.append("    }")
+        lines.append("")
+    else:
+        lines.append(
+            "    public static final java.util.Map<String, Integer> REDEFINES_GROUP_WIDTH_INIT ="
+        )
+        lines.append("        java.util.Collections.emptyMap();")
+        lines.append(
+            "    public static final java.util.Map<String, Object[]> REDEFINES_FIELD_INIT ="
+        )
+        lines.append("        java.util.Collections.emptyMap();")
+        lines.append("")
 
     # CicsProgram interface methods
     if is_terminal:
@@ -3283,6 +3672,8 @@ def generate_java_project(
     copybook_paths: list[str] | None = None,
     docker: bool = False,
     integration_tests: bool = False,
+    snapshot_dir: str | None = None,
+    cobol_source: str | None = None,
 ) -> str:
     """Generate a complete Maven project from a COBOL Program AST.
 
@@ -3365,6 +3756,97 @@ def generate_java_project(
     # Shared code builder for tracking branch/loop IDs across paragraphs
     shared_cb = _JavaCodeBuilder()
 
+    # Build the 88-level child→(parent, value) map so bare condition-name
+    # references like ``IF APPL-AOK`` get rewritten to a parent-value
+    # comparison (mirrors specter.code_generator.generate_code's level_88_map).
+    if copybook_paths:
+        from .copybook_parser import parse_copybook
+        import os as _os
+        for d in copybook_paths:
+            if not _os.path.isdir(d):
+                continue
+            for fname in sorted(_os.listdir(d)):
+                if not fname.lower().endswith(".cpy"):
+                    continue
+                with open(_os.path.join(d, fname)) as fh:
+                    rec = parse_copybook(fh.read(), copybook_file=fname)
+                if not rec.fields:
+                    continue
+                for fld in rec.fields:
+                    if not fld.values_88:
+                        continue
+                    parent_name = fld.name.upper() if fld.name else ""
+                    if not parent_name:
+                        continue
+                    for child_name, child_value in fld.values_88.items():
+                        shared_cb.level_88_map.setdefault(
+                            child_name.upper(),
+                            (parent_name, child_value),
+                        )
+    if cobol_source:
+        try:
+            from .variable_domain import _extract_88_values_from_source
+            for parent_name, children in _extract_88_values_from_source(cobol_source).items():
+                for child_name, child_value in children.items():
+                    shared_cb.level_88_map.setdefault(
+                        child_name.upper(),
+                        (parent_name.upper(), child_value),
+                    )
+        except Exception as exc:  # noqa: BLE001
+            print(f"  Warning: 88-level inline extract failed: {exc}")
+
+    # Build the PIC info map (var_name → {length, kind}) so the generated
+    # Java can truncate input values to COBOL field widths. Sources: parsed
+    # copybooks + inline DATA DIVISION fields scanned from cobol_source.
+    shared_injectable: set[str] = set()
+    shared_group_layouts: dict = {}
+    shared_redefines: dict = {}
+    try:
+        from .pic_extractor import (
+            build_pic_info,
+            group_layouts_from_source,
+            injectable_var_names,
+        )
+        from .redefines_extractor import extract_redefines_groups
+        from .copybook_parser import parse_copybook as _parse_cpy
+        import os as _os
+        _pic_records = []
+        if copybook_paths:
+            for d in copybook_paths:
+                if not _os.path.isdir(d):
+                    continue
+                for fname in sorted(_os.listdir(d)):
+                    if not fname.lower().endswith(".cpy"):
+                        continue
+                    with open(_os.path.join(d, fname)) as fh:
+                        rec = _parse_cpy(fh.read(), copybook_file=fname)
+                    if rec.fields:
+                        _pic_records.append(rec)
+        shared_cb.pic_info = build_pic_info(_pic_records, cobol_source)
+        shared_injectable = injectable_var_names(
+            program, var_report, _pic_records, cobol_source,
+        )
+        if cobol_source:
+            shared_group_layouts = group_layouts_from_source(cobol_source)
+            shared_redefines = extract_redefines_groups(cobol_source)
+            # File → status-var map (SELECT ... FILE STATUS IS <var>) so
+            # OPEN/READ/CLOSE codegen can emit ``state.put(status-var, "")``
+            # before each stub call, matching the COBOL mock's unconditional
+            # ``MOVE MOCK-ALPHA-STATUS TO <status-var>`` (which is SPACES on
+            # empty FIFO). Without this, Java tests with no stub outcomes
+            # inherit the injected input value for the status var instead of
+            # COBOL's freshly-blanked "  ", producing systematic display
+            # divergences like ``FILE STATUS IS: NNNN0000`` vs snapshot's
+            # ``FILE STATUS IS: NNNN 032``.
+            try:
+                from .cobol_mock import _extract_file_status_map as _fsm
+                with open(cobol_source, "r") as _fh:
+                    shared_cb.file_status_map = _fsm(_fh.readlines())
+            except Exception as _exc:  # noqa: BLE001
+                print(f"  Warning: file_status_map extract failed: {_exc}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  Warning: PIC / injectable / group / redefines extract failed: {exc}")
+
     # Collect all PERFORM targets to detect missing paragraphs
     defined_paras = {p.name for p in program.paragraphs}
     referenced_paras: set[str] = set()
@@ -3440,6 +3922,12 @@ def generate_java_project(
         is_terminal=is_terminal,
         screen_layout_class="ScreenLayout",
         lit_defaults=_lit_defaults_for_class,
+        level_88_map=shared_cb.level_88_map,
+        pic_info=shared_cb.pic_info,
+        injectable_vars=shared_injectable,
+        group_layouts=shared_group_layouts,
+        redefines_groups=shared_redefines,
+        file_status_map=shared_cb.file_status_map,
     )
     (src_main / f"{prog_class_name}.java").write_text(
         prog_src, encoding="utf-8"
@@ -3460,18 +3948,39 @@ def generate_java_project(
         test_resources.mkdir(parents=True, exist_ok=True)
         shutil.copy2(test_store_path, test_resources / "test_store.jsonl")
 
-    # SQL init script from copybooks
+    # Parse copybooks once -- shared between init.sql and per-test seed SQL.
+    copybook_records: list = []
     if copybook_paths:
-        from .copybook_parser import generate_init_sql
+        import os as _os
+
+        from .copybook_parser import (
+            generate_init_sql,
+            parse_copybook,
+        )
 
         sql_dir = out / "sql"
         sql_dir.mkdir(parents=True, exist_ok=True)
         ddl = generate_init_sql(copybook_paths, dialect="postgresql")
         (sql_dir / "init.sql").write_text(ddl, encoding="utf-8")
 
-    # Integration tests (Mockito spy-based)
+        for d in copybook_paths:
+            if not _os.path.isdir(d):
+                continue
+            for fname in sorted(_os.listdir(d)):
+                if not fname.lower().endswith(".cpy"):
+                    continue
+                with open(_os.path.join(d, fname)) as fh:
+                    rec = parse_copybook(fh.read(), copybook_file=fname)
+                if rec.name and rec.fields:
+                    copybook_records.append(rec)
+
+    # Integration tests (Mockito spy-based) + per-test-case WireMock + seed SQL.
     if integration_tests and test_store_path is not None:
+        import json as _json
         import shutil
+
+        from .java_templates.seed_sql import build_seed_sql, build_table_index
+        from .java_templates.wiremock import write_mappings
 
         it_dir = out / "integration-tests"
         it_src = (
@@ -3500,10 +4009,90 @@ def generate_java_project(
             it_test_src, encoding="utf-8"
         )
 
+        # Equivalence support classes (always emitted so the IT compiles
+        # even when no snapshots are present — assertEquivalent no-ops on
+        # missing snapshot resources).
+        (it_src / "CobolSnapshot.java").write_text(
+            COBOL_SNAPSHOT_JAVA.format(package_name=package_name),
+            encoding="utf-8",
+        )
+        (it_src / "EquivalenceAssert.java").write_text(
+            EQUIVALENCE_ASSERT_JAVA.format(package_name=package_name),
+            encoding="utf-8",
+        )
+
         # Copy test store JSONL into integration test resources
         it_resources = it_dir / "src" / "test" / "resources"
         it_resources.mkdir(parents=True, exist_ok=True)
         shutil.copy2(test_store_path, it_resources / "test_store.jsonl")
+
+        # Copy COBOL ground-truth snapshots if provided.
+        if snapshot_dir is not None:
+            snap_src = Path(snapshot_dir)
+            if snap_src.is_dir():
+                snap_dst = it_resources / "cobol_snapshots"
+                snap_dst.mkdir(parents=True, exist_ok=True)
+                copied = 0
+                for f in sorted(snap_src.glob("*.json")):
+                    shutil.copy2(f, snap_dst / f.name)
+                    copied += 1
+                print(f"  COBOL snapshots: {copied} files copied for equivalence assertions")
+
+        # Per-test-case artifacts: WireMock mappings + seed SQL.
+        wm_root_run = out / "wiremock" / "mappings"
+        wm_root_it = it_resources / "wiremock" / "mappings"
+        seeds_dir = it_resources / "seeds"
+        seeds_dir.mkdir(parents=True, exist_ok=True)
+        wm_root_run.mkdir(parents=True, exist_ok=True)
+        wm_root_it.mkdir(parents=True, exist_ok=True)
+
+        table_index = build_table_index(copybook_records) if copybook_records else {}
+        seeds_written = 0
+        wm_count = 0
+        from .cobol_snapshot import normalize_stub_outcomes
+
+        with open(test_store_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = _json.loads(line)
+                except _json.JSONDecodeError:
+                    continue
+                if "input_state" not in obj or "id" not in obj:
+                    continue
+                tc_id = str(obj["id"])
+                stub_outcomes = normalize_stub_outcomes(obj.get("stub_outcomes"))
+
+                # WireMock mappings (always emit when there are routable CALLs;
+                # written under both project root and IT test resources).
+                files_run = write_mappings(tc_id, stub_outcomes, wm_root_run)
+                files_it = write_mappings(tc_id, stub_outcomes, wm_root_it)
+                wm_count += len(files_run) + len(files_it)
+
+                # Seed SQL only when copybook DDL is available.
+                if table_index:
+                    sql = build_seed_sql(
+                        tc_id,
+                        obj.get("input_state") or {},
+                        stub_outcomes,
+                        table_index,
+                    )
+                    if sql:
+                        (seeds_dir / f"{tc_id}.sql").write_text(
+                            sql, encoding="utf-8"
+                        )
+                        seeds_written += 1
+
+        if not table_index:
+            print(
+                "  Warning: no copybook DDL provided; seed SQL skipped. "
+                "JdbcStubExecutor reads will return NOTFND."
+            )
+        else:
+            print(f"  Seed SQL written for {seeds_written} test cases")
+        print(f"  WireMock mappings: {wm_count} files written")
 
     # Docker deployment files
     if docker:
@@ -3804,6 +4393,8 @@ def generate_multi_program_project(
             is_terminal=is_terminal,
             screen_layout_class=screen_layout_class,
             lit_defaults=_lit_defaults_for_class,
+            level_88_map=shared_cb.level_88_map,
+            file_status_map=shared_cb.file_status_map,
         )
         (src_main / f"{prog_class_name}.java").write_text(
             prog_src, encoding="utf-8"

@@ -80,20 +80,305 @@ public class ProgramState extends HashMap<String, Object> {{
      */
     public Map<String, List<Object[]>> stubDefaults = new LinkedHashMap<>();
 
+    /**
+     * GROUP-item layouts: maps a parent name to the ordered list of its
+     * leaf children, each described as {{@code String[]{{name, kind, length}}}}.
+     * When a parent is read via {{@link #get}} the value is recomposed
+     * by concatenating each child's PIC-padded current value; when a
+     * parent is written the value is split back into the children. This
+     * mirrors COBOL's flat-storage layout for groups so reference
+     * modifiers and DISPLAYs of group items match the COBOL binary.
+     *
+     * <p>Populated by the generated program class via
+     * {{@link #registerGroupLayouts}}.
+     */
+    public static final Map<String, Object[][]> GROUP_LAYOUTS = new LinkedHashMap<>();
+
+    /** Install GROUP layouts (called once per JVM by the generated Program). */
+    public static void registerGroupLayouts(Map<String, Object[][]> layouts) {{
+        GROUP_LAYOUTS.putAll(layouts);
+    }}
+
+    // -----------------------------------------------------------------------
+    // REDEFINES groups (byte-buffer storage for memory aliasing)
+    // -----------------------------------------------------------------------
+
+    /** Field → buffer membership for REDEFINES routing. ``Object[5]``:
+     *  ``{{groupId(String), offset(Integer), length(Integer), kind(String),
+     *  signed(Boolean), digits(Integer)}}``. The kind is one of ``binary``,
+     *  ``alpha``, ``numeric`` (display), ``packed``, ``group``. */
+    public static final Map<String, Object[]> REDEFINES_FIELD = new LinkedHashMap<>();
+
+    /** Group id → byte buffer width. */
+    public static final Map<String, Integer> REDEFINES_GROUP_WIDTH = new LinkedHashMap<>();
+
+    /** Per-state byte buffers — lazily allocated on first access of any
+     *  member of a REDEFINES group. */
+    private final Map<String, byte[]> redefinesBuffers = new LinkedHashMap<>();
+
+    /** Install REDEFINES layouts (called once per JVM by the generated
+     *  Program class). Layouts are static; per-state buffers are lazy. */
+    public static void registerRedefinesLayouts(
+            Map<String, Integer> groupWidths,
+            Map<String, Object[]> fieldEntries) {{
+        REDEFINES_GROUP_WIDTH.putAll(groupWidths);
+        REDEFINES_FIELD.putAll(fieldEntries);
+    }}
+
+    private byte[] bufferFor(String groupId) {{
+        byte[] buf = redefinesBuffers.get(groupId);
+        if (buf != null) return buf;
+        Integer width = REDEFINES_GROUP_WIDTH.get(groupId);
+        if (width == null) return null;
+        buf = new byte[width];
+        // Initialise alpha-style with spaces (COBOL default) — for binary
+        // members the value reads as a small integer (likely 0x202020...).
+        java.util.Arrays.fill(buf, (byte) ' ');
+        redefinesBuffers.put(groupId, buf);
+        return buf;
+    }}
+
+    /** Read a REDEFINES member from its backing byte buffer. */
+    private Object redefinesGet(Object[] entry) {{
+        String groupId = (String) entry[0];
+        int offset = (Integer) entry[1];
+        int length = (Integer) entry[2];
+        String kind = (String) entry[3];
+        boolean signed = (Boolean) entry[4];
+        byte[] buf = bufferFor(groupId);
+        if (buf == null || length <= 0) return " ";
+        int end = Math.min(offset + length, buf.length);
+        if ("alpha".equals(kind) || "group".equals(kind)) {{
+            char[] out = new char[end - offset];
+            for (int i = 0; i < out.length; i++) {{
+                out[i] = (char) (buf[offset + i] & 0xFF);
+            }}
+            return new String(out);
+        }}
+        if ("binary".equals(kind)) {{
+            long n = 0;
+            for (int i = offset; i < end; i++) {{
+                n = (n << 8) | (buf[i] & 0xFF);
+            }}
+            if (signed && length > 0 && (buf[offset] & 0x80) != 0) {{
+                long mask = (1L << (8 * length)) - 1L;
+                n = n - mask - 1L;
+            }}
+            return n;
+        }}
+        // "numeric" (DISPLAY): bytes are ASCII digits. Return the digit
+        // string as-is so DISPLAY emits zero-padded numbers naturally.
+        char[] out = new char[end - offset];
+        for (int i = 0; i < out.length; i++) {{
+            out[i] = (char) (buf[offset + i] & 0xFF);
+        }}
+        return new String(out);
+    }}
+
+    /** Write a REDEFINES member into its backing byte buffer. */
+    private void redefinesPut(Object[] entry, Object value) {{
+        String groupId = (String) entry[0];
+        int offset = (Integer) entry[1];
+        int length = (Integer) entry[2];
+        String kind = (String) entry[3];
+        boolean signed = (Boolean) entry[4];
+        byte[] buf = bufferFor(groupId);
+        if (buf == null || length <= 0) return;
+        if ("alpha".equals(kind) || "group".equals(kind)) {{
+            String s = value == null ? "" : value.toString();
+            for (int i = 0; i < length; i++) {{
+                int dst = offset + i;
+                if (dst >= buf.length) break;
+                buf[dst] = (byte) (i < s.length() ? s.charAt(i) : ' ');
+            }}
+            return;
+        }}
+        if ("binary".equals(kind)) {{
+            long n;
+            if (value instanceof Number) {{
+                n = ((Number) value).longValue();
+            }} else {{
+                try {{
+                    n = (long) Double.parseDouble(String.valueOf(value).trim());
+                }} catch (NumberFormatException e) {{
+                    n = 0;
+                }}
+            }}
+            // Encode as big-endian, two's-complement for signed.
+            for (int i = length - 1; i >= 0; i--) {{
+                int dst = offset + i;
+                if (dst >= buf.length) {{
+                    n >>= 8;
+                    continue;
+                }}
+                buf[dst] = (byte) (n & 0xFF);
+                n >>= 8;
+            }}
+            return;
+        }}
+        // "numeric" (DISPLAY): write zero-padded ASCII digits.
+        long n;
+        if (value instanceof Number) {{
+            n = ((Number) value).longValue();
+        }} else {{
+            try {{
+                n = (long) Double.parseDouble(String.valueOf(value).trim());
+            }} catch (NumberFormatException e) {{
+                n = 0;
+            }}
+        }}
+        n = Math.abs(n);
+        for (int i = length - 1; i >= 0; i--) {{
+            int dst = offset + i;
+            if (dst >= buf.length) {{
+                n /= 10;
+                continue;
+            }}
+            buf[dst] = (byte) ('0' + (n % 10));
+            n /= 10;
+        }}
+    }}
+
     // -----------------------------------------------------------------------
     // Overrides
     // -----------------------------------------------------------------------
 
     /**
      * Returns the value mapped to {{@code key}}, or a single space {{@code " "}}
-     * if the key is absent.  This mirrors COBOL's default-spaces behavior
-     * for uninitialised alphanumeric variables (PIC X fields are filled
-     * with spaces).
+     * if the key is absent. For GROUP items the value is composed from
+     * the children's current values (PIC-padded). This mirrors COBOL's
+     * default-spaces behavior for uninitialised alphanumeric variables.
      */
     @Override
     public Object get(Object key) {{
+        if (key instanceof String) {{
+            // REDEFINES routing wins (most specific): fields registered in
+            // a byte-aliased group always read from the buffer.
+            Object[] redef = REDEFINES_FIELD.get(key);
+            if (redef != null) {{
+                return redefinesGet(redef);
+            }}
+            Object[][] layout = GROUP_LAYOUTS.get(key);
+            if (layout != null && layout.length > 0) {{
+                StringBuilder sb = new StringBuilder();
+                for (Object[] child : layout) {{
+                    String name = (String) child[0];
+                    String kind = (String) child[1];
+                    int length = (Integer) child[2];
+                    sb.append(formatChild(name, kind, length));
+                }}
+                return sb.toString();
+            }}
+        }}
         Object v = super.get(key);
         return v != null ? v : " ";
+    }}
+
+    /** Format one child for group composition: numeric → zero-padded
+     *  unless the stored value already contains non-digit characters (a
+     *  legitimate side effect of COBOL's MOVE-alpha-to-numeric, which
+     *  stores raw bytes); alpha → space-padded right. */
+    private String formatChild(String name, String kind, int length) {{
+        Object raw = super.get(name);
+        if (raw == null) {{
+            // Missing child: alpha → spaces, numeric → zeros.
+            char fill = "alpha".equals(kind) ? ' ' : '0';
+            char[] buf = new char[length];
+            java.util.Arrays.fill(buf, fill);
+            return new String(buf);
+        }}
+        String s;
+        boolean isNumeric = "numeric".equals(kind) || "packed".equals(kind) || "comp".equals(kind);
+        if (isNumeric) {{
+            // Numbers: format zero-padded. Strings: if the string is all
+            // digits (possibly with leading sign / spaces COBOL would have
+            // truncated), parse-and-format; otherwise the bytes are
+            // literal (e.g. MOVE 'X' TO PIC 9 leaves byte 'X' in place).
+            if (raw instanceof Number) {{
+                long n = Math.abs(((Number) raw).longValue());
+                s = String.format("%0" + length + "d", n % (long) Math.pow(10, length));
+            }} else {{
+                String rawStr = String.valueOf(raw);
+                String trimmed = rawStr.trim();
+                boolean digitsOnly = !trimmed.isEmpty()
+                        && trimmed.chars().allMatch(c -> Character.isDigit(c)
+                                || c == '+' || c == '-');
+                if (digitsOnly) {{
+                    long n;
+                    try {{
+                        n = Math.abs(Long.parseLong(trimmed));
+                    }} catch (NumberFormatException e) {{
+                        n = 0;
+                    }}
+                    s = String.format("%0" + length + "d", n % (long) Math.pow(10, length));
+                }} else {{
+                    // Non-numeric content stored in a numeric field: keep
+                    // the bytes verbatim, padded/truncated to width.
+                    s = rawStr;
+                    if (s.length() < length) {{
+                        StringBuilder sb = new StringBuilder(s);
+                        for (int i = s.length(); i < length; i++) sb.append(' ');
+                        s = sb.toString();
+                    }} else if (s.length() > length) {{
+                        s = s.substring(0, length);
+                    }}
+                }}
+            }}
+        }} else {{
+            // Alpha: trim trailing spaces, right-pad with spaces.
+            s = String.valueOf(raw);
+            if (s.length() < length) {{
+                StringBuilder sb = new StringBuilder(s);
+                for (int i = s.length(); i < length; i++) sb.append(' ');
+                s = sb.toString();
+            }} else if (s.length() > length) {{
+                s = s.substring(0, length);
+            }}
+        }}
+        return s;
+    }}
+
+    /**
+     * Override put: when the key is a GROUP parent, split the new value
+     * across the children using the registered layout.
+     */
+    @Override
+    public Object put(String key, Object value) {{
+        // REDEFINES routing wins.
+        Object[] redef = REDEFINES_FIELD.get(key);
+        if (redef != null) {{
+            redefinesPut(redef, value);
+            return null;
+        }}
+        Object[][] layout = GROUP_LAYOUTS.get(key);
+        if (layout != null && layout.length > 0 && value != null) {{
+            String s = String.valueOf(value);
+            int offset = 0;
+            for (Object[] child : layout) {{
+                String name = (String) child[0];
+                String kind = (String) child[1];
+                int length = (Integer) child[2];
+                String chunk;
+                if (offset >= s.length()) {{
+                    char fill = "alpha".equals(kind) ? ' ' : '0';
+                    char[] buf = new char[length];
+                    java.util.Arrays.fill(buf, fill);
+                    chunk = new String(buf);
+                }} else if (offset + length <= s.length()) {{
+                    chunk = s.substring(offset, offset + length);
+                }} else {{
+                    chunk = s.substring(offset);
+                    StringBuilder sb = new StringBuilder(chunk);
+                    char fill = "alpha".equals(kind) ? ' ' : '0';
+                    for (int i = chunk.length(); i < length; i++) sb.append(fill);
+                    chunk = sb.toString();
+                }}
+                super.put(name, chunk);
+                offset += length;
+            }}
+            return null;
+        }}
+        return super.put(key, value);
     }}
 
     /**
@@ -231,7 +516,19 @@ public final class CobolRuntime {{
     }}
 
     /**
-     * Check whether a value is numeric (parseable as a number).
+     * Check whether a value is numeric per COBOL's IS NUMERIC class test:
+     * every character must be a digit (plus optionally a leading sign).
+     *
+     * <p>This is STRICTER than {{@link Double#parseDouble}}: embedded or
+     * trailing spaces make the value NOT NUMERIC, matching GnuCOBOL's
+     * runtime behaviour. Examples:
+     * <ul>
+     *   <li>{{@code "123"}} → true
+     *   <li>{{@code "+42"}} → true
+     *   <li>{{@code "0 "}} (trailing space) → <b>false</b> (mainframe divergence)
+     *   <li>{{@code " 42"}} (leading space) → <b>false</b>
+     *   <li>{{@code ""}} → false
+     * </ul>
      */
     public static boolean isNumeric(Object v) {{
         if (v == null) {{
@@ -240,16 +537,27 @@ public final class CobolRuntime {{
         if (v instanceof Number) {{
             return true;
         }}
-        String s = String.valueOf(v).trim();
+        String s = String.valueOf(v);
         if (s.isEmpty()) {{
             return false;
         }}
-        try {{
-            Double.parseDouble(s);
-            return true;
-        }} catch (NumberFormatException e) {{
-            return false;
+        int start = 0;
+        if (s.charAt(0) == '+' || s.charAt(0) == '-') {{
+            if (s.length() == 1) return false;
+            start = 1;
         }}
+        boolean dotSeen = false;
+        for (int i = start; i < s.length(); i++) {{
+            char c = s.charAt(i);
+            if (c == '.' && !dotSeen) {{
+                dotSeen = true;
+                continue;
+            }}
+            if (c < '0' || c > '9') {{
+                return false;
+            }}
+        }}
+        return true;
     }}
 
     /**
@@ -530,6 +838,34 @@ public interface StubExecutor {{
      */
     void dummyExec(ProgramState state, String kind, String rawText);
 
+    /**
+     * Route a synchronous outbound CALL to an external program through
+     * an implementation-specific channel.
+     *
+     * <p>The default implementation delegates to
+     * {{@link #applyStubOutcome(ProgramState, String)}} with key
+     * {{@code "CALL:" + programName}} (FIFO semantics). The JDBC-backed
+     * implementation overrides this to issue an HTTP POST to the
+     * configured REST endpoint (e.g. WireMock) and map the JSON response
+     * keys back into {{@link ProgramState}}.
+     *
+     * @param state       the current program state
+     * @param programName the COBOL program name being called (e.g. {{@code "CUSTAPI"}})
+     * @param inputVars   COBOL variable names to serialize as the request body
+     * @param outputVars  COBOL variable names the response is expected to populate
+     *                    (informational; the response keys are used as-is)
+     */
+    default void callProgram(
+            ProgramState state,
+            String programName,
+            List<String> inputVars,
+            List<String> outputVars) {{
+        Map<String, Object> entry = new java.util.LinkedHashMap<>();
+        entry.put("name", programName);
+        state.calls.add(entry);
+        applyStubOutcome(state, "CALL:" + programName);
+    }}
+
     // -------------------------------------------------------------------
     // CICS typed operations
     // -------------------------------------------------------------------
@@ -600,6 +936,14 @@ import java.util.Map;
  */
 public class DefaultStubExecutor implements StubExecutor {{
 
+    /**
+     * Per-key memory of the most recently observed status variable. On
+     * FIFO + defaults exhaustion for a read-style op (READ:* / CICS-READ /
+     * DLI-G*), this var gets set to "10" to mirror the COBOL binary's
+     * MOCK-EOF behaviour and let PERFORM UNTIL loops terminate naturally.
+     */
+    private final Map<String, String> stubStatusVars = new LinkedHashMap<>();
+
     @Override
     public List<Object[]> applyStubOutcome(ProgramState state, String key) {{
         List<Object[]> applied = null;
@@ -619,7 +963,24 @@ public class DefaultStubExecutor implements StubExecutor {{
         // Apply variable assignments.
         if (applied != null) {{
             for (Object[] pair : applied) {{
-                state.put(pair[0].toString(), pair[1]);
+                if (pair == null || pair.length < 2 || pair[0] == null) continue;
+                String var = pair[0].toString();
+                state.put(var, pair[1]);
+                // Remember the var for MOCK-EOF emission on later exhaustion.
+                stubStatusVars.put(key, var);
+            }}
+        }} else {{
+            // Both FIFO and defaults exhausted. Mirror COBOL's MOCK-EOF
+            // for read-style ops so PERFORM UNTIL <eof> can terminate.
+            String upper = key.toUpperCase();
+            boolean isRead = upper.startsWith("READ:")
+                    || upper.startsWith("CICS-READ")
+                    || upper.startsWith("DLI-G");
+            if (isRead) {{
+                String sv = stubStatusVars.get(key);
+                if (sv != null) {{
+                    state.put(sv, "10");
+                }}
             }}
         }}
 
@@ -893,6 +1254,24 @@ public abstract class SectionBase {{
 JDBC_STUB_EXECUTOR_JAVA = """\
 package {package_name};
 
+import com.google.gson.Gson;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import com.rabbitmq.client.Channel;
+import com.rabbitmq.client.ConnectionFactory;
+import com.rabbitmq.client.GetResponse;
+
+import org.apache.hc.client5.http.classic.methods.HttpPost;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
+import org.apache.hc.client5.http.impl.classic.CloseableHttpResponse;
+import org.apache.hc.client5.http.impl.classic.HttpClients;
+import org.apache.hc.core5.http.ContentType;
+import org.apache.hc.core5.http.io.entity.EntityUtils;
+import org.apache.hc.core5.http.io.entity.StringEntity;
+
+import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -907,11 +1286,15 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * {{@link StubExecutor}} implementation backed by real JDBC and JMS connections.
+ * {{@link StubExecutor}} implementation backed by real JDBC, RabbitMQ (AMQP),
+ * and HTTP (for CALL-to-REST routing) connections.
  *
  * <p>CICS READ / DLI GU / ISRT / REPL operations are translated to SQL
- * statements via JDBC.  MQ CALL operations are translated to JMS
- * operations.  Other operations fall back to the default stub behaviour.
+ * statements via JDBC. MQ CALL operations are translated to RabbitMQ
+ * AMQP basicGet/basicPublish on a queue named after the COBOL queue
+ * variable. Synchronous CALLs to external programs are routed through
+ * {{@link #callProgram(ProgramState, String, List, List)}} as HTTP POSTs
+ * to {{@link AppConfig#getCallBaseUrl()}}.
  *
  * <p>Implements {{@link AutoCloseable}} so it can be used in
  * try-with-resources blocks.
@@ -921,22 +1304,26 @@ public class JdbcStubExecutor implements StubExecutor, AutoCloseable {{
     private final javax.sql.DataSource dataSource;
     private Connection conn;
 
-    /* JMS fields -- nullable (JMS is optional at runtime). */
-    private Object jmsFactory;   // jakarta.jms.ConnectionFactory
-    private Object jmsConn;      // jakarta.jms.Connection
-    private Object jmsSession;   // jakarta.jms.Session
-    private Object jmsConsumer;  // jakarta.jms.MessageConsumer
-    private Object jmsProducer;  // jakarta.jms.MessageProducer
+    /* RabbitMQ fields -- nullable (broker is optional at runtime). */
+    private final ConnectionFactory amqpFactory;
+    private com.rabbitmq.client.Connection amqpConn;
+    private Channel amqpChannel;
+    private String amqpCurrentQueue;
+
+    /* HTTP client for synchronous outbound CALL routing. */
+    private final CloseableHttpClient http = HttpClients.createDefault();
+    private final Gson gson = new Gson();
 
     /**
      * Create a JdbcStubExecutor.
      *
-     * @param dataSource JDBC DataSource for database operations
-     * @param jmsFactory JMS ConnectionFactory (may be {{@code null}})
+     * @param dataSource  JDBC DataSource for database operations
+     * @param amqpFactory RabbitMQ ConnectionFactory (may be {{@code null}}
+     *                    to disable MQ — operations will fall back to FIFO stubs)
      */
-    public JdbcStubExecutor(javax.sql.DataSource dataSource, Object jmsFactory) {{
+    public JdbcStubExecutor(javax.sql.DataSource dataSource, ConnectionFactory amqpFactory) {{
         this.dataSource = dataSource;
-        this.jmsFactory = jmsFactory;
+        this.amqpFactory = amqpFactory;
     }}
 
     private Connection getConnection() throws SQLException {{
@@ -946,8 +1333,21 @@ public class JdbcStubExecutor implements StubExecutor, AutoCloseable {{
         return conn;
     }}
 
+    private Channel ensureAmqpChannel() throws Exception {{
+        if (amqpFactory == null) {{
+            return null;
+        }}
+        if (amqpConn == null || !amqpConn.isOpen()) {{
+            amqpConn = amqpFactory.newConnection();
+        }}
+        if (amqpChannel == null || !amqpChannel.isOpen()) {{
+            amqpChannel = amqpConn.createChannel();
+        }}
+        return amqpChannel;
+    }}
+
     /**
-     * Close all held connections (JDBC and JMS).
+     * Close all held connections (JDBC, AMQP, HTTP).
      */
     @Override
     public void close() {{
@@ -957,29 +1357,36 @@ public class JdbcStubExecutor implements StubExecutor, AutoCloseable {{
             }}
         }} catch (SQLException ignored) {{
         }}
-        // Close JMS resources via reflection (optional dependency)
-        closeJms();
+        closeAmqp();
+        try {{
+            http.close();
+        }} catch (Exception ignored) {{
+        }}
     }}
 
-    private void closeJms() {{
+    private void closeAmqp() {{
         try {{
-            if (jmsSession != null) {{
-                jmsSession.getClass().getMethod("close").invoke(jmsSession);
-            }}
-            if (jmsConn != null) {{
-                jmsConn.getClass().getMethod("close").invoke(jmsConn);
+            if (amqpChannel != null && amqpChannel.isOpen()) {{
+                amqpChannel.close();
             }}
         }} catch (Exception ignored) {{
         }}
-        jmsSession = null;
-        jmsConn = null;
-        jmsConsumer = null;
-        jmsProducer = null;
+        try {{
+            if (amqpConn != null && amqpConn.isOpen()) {{
+                amqpConn.close();
+            }}
+        }} catch (Exception ignored) {{
+        }}
+        amqpChannel = null;
+        amqpConn = null;
+        amqpCurrentQueue = null;
     }}
 
     // -------------------------------------------------------------------
     // Stub outcome support (delegates to DefaultStubExecutor logic)
     // -------------------------------------------------------------------
+
+    private final Map<String, String> stubStatusVars = new LinkedHashMap<>();
 
     @Override
     public List<Object[]> applyStubOutcome(ProgramState state, String key) {{
@@ -995,7 +1402,19 @@ public class JdbcStubExecutor implements StubExecutor, AutoCloseable {{
         }}
         if (applied != null) {{
             for (Object[] pair : applied) {{
-                state.put(pair[0].toString(), pair[1]);
+                if (pair == null || pair.length < 2 || pair[0] == null) continue;
+                String var = pair[0].toString();
+                state.put(var, pair[1]);
+                stubStatusVars.put(key, var);
+            }}
+        }} else {{
+            String upper = key.toUpperCase();
+            boolean isRead = upper.startsWith("READ:")
+                    || upper.startsWith("CICS-READ")
+                    || upper.startsWith("DLI-G");
+            if (isRead) {{
+                String sv = stubStatusVars.get(key);
+                if (sv != null) state.put(sv, "10");
             }}
         }}
         state.stubLog.add(new Object[]{{key, applied}});
@@ -1058,20 +1477,21 @@ public class JdbcStubExecutor implements StubExecutor, AutoCloseable {{
 
     @Override
     public void cicsRetrieve(ProgramState state, String intoVar) {{
-        if (jmsConsumer == null) {{
-            Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("kind", "CICS");
-            entry.put("text", "RETRIEVE INTO(" + (intoVar != null ? intoVar : "") + ")");
-            state.execs.add(entry);
-            applyStubOutcome(state, "CICS");
-            return;
-        }}
         try {{
-            java.lang.reflect.Method recv = jmsConsumer.getClass().getMethod("receive", long.class);
-            Object msg = recv.invoke(jmsConsumer, 5000L);
-            if (msg != null && intoVar != null) {{
-                java.lang.reflect.Method getText = msg.getClass().getMethod("getText");
-                state.put(intoVar, getText.invoke(msg));
+            Channel ch = ensureAmqpChannel();
+            if (ch == null) {{
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("kind", "CICS");
+                entry.put("text", "RETRIEVE INTO(" + (intoVar != null ? intoVar : "") + ")");
+                state.execs.add(entry);
+                applyStubOutcome(state, "CICS");
+                return;
+            }}
+            String qName = (amqpCurrentQueue != null) ? amqpCurrentQueue : "specter.cics.retrieve";
+            ch.queueDeclare(qName, true, false, false, null);
+            GetResponse resp = ch.basicGet(qName, true);
+            if (resp != null && intoVar != null) {{
+                state.put(intoVar, new String(resp.getBody(), StandardCharsets.UTF_8));
             }}
         }} catch (Exception e) {{
             throw new RuntimeException(e);
@@ -1115,22 +1535,20 @@ public class JdbcStubExecutor implements StubExecutor, AutoCloseable {{
 
     @Override
     public void cicsWriteqTd(ProgramState state, String queue, String fromRecord) {{
-        if (jmsProducer == null) {{
-            Map<String, Object> entry = new LinkedHashMap<>();
-            entry.put("kind", "CICS");
-            entry.put("text", "WRITEQ TD QUEUE(" + (queue != null ? queue : "") + ")");
-            state.execs.add(entry);
-            applyStubOutcome(state, "CICS");
-            return;
-        }}
         try {{
-            java.lang.reflect.Method createText = jmsSession.getClass()
-                .getMethod("createTextMessage", String.class);
-            Object msg = createText.invoke(jmsSession,
-                fromRecord != null ? state.get(fromRecord).toString() : "");
-            java.lang.reflect.Method send = jmsProducer.getClass()
-                .getMethod("send", Class.forName("jakarta.jms.Message"));
-            send.invoke(jmsProducer, msg);
+            Channel ch = ensureAmqpChannel();
+            if (ch == null) {{
+                Map<String, Object> entry = new LinkedHashMap<>();
+                entry.put("kind", "CICS");
+                entry.put("text", "WRITEQ TD QUEUE(" + (queue != null ? queue : "") + ")");
+                state.execs.add(entry);
+                applyStubOutcome(state, "CICS");
+                return;
+            }}
+            String qName = (queue != null && !queue.isBlank()) ? queue : "specter.cics.td";
+            ch.queueDeclare(qName, true, false, false, null);
+            String body = (fromRecord != null) ? state.get(fromRecord).toString() : "";
+            ch.basicPublish("", qName, null, body.getBytes(StandardCharsets.UTF_8));
         }} catch (Exception e) {{
             throw new RuntimeException(e);
         }}
@@ -1228,29 +1646,16 @@ public class JdbcStubExecutor implements StubExecutor, AutoCloseable {{
 
     @Override
     public void mqOpen(ProgramState state, String queueNameVar) {{
-        if (jmsFactory == null) {{
+        if (amqpFactory == null) {{
             dummyCall(state, "MQOPEN");
             return;
         }}
         try {{
-            java.lang.reflect.Method createConn = jmsFactory.getClass()
-                .getMethod("createConnection", String.class, String.class);
-            jmsConn = createConn.invoke(jmsFactory,
-                AppConfig.getJmsUser(), AppConfig.getJmsPassword());
-            java.lang.reflect.Method createSess = jmsConn.getClass()
-                .getMethod("createSession", boolean.class, int.class);
-            jmsSession = createSess.invoke(jmsConn, false, 1);
-            String qName = queueNameVar != null ? state.get(queueNameVar).toString().trim() : "";
+            Channel ch = ensureAmqpChannel();
+            String qName = (queueNameVar != null) ? state.get(queueNameVar).toString().trim() : "";
             if (qName.isEmpty()) qName = "SPECTER.DEFAULT";
-            java.lang.reflect.Method createQueue = jmsSession.getClass()
-                .getMethod("createQueue", String.class);
-            Object queue = createQueue.invoke(jmsSession, qName);
-            java.lang.reflect.Method createConsumer = jmsSession.getClass()
-                .getMethod("createConsumer", Class.forName("jakarta.jms.Destination"));
-            jmsConsumer = createConsumer.invoke(jmsSession, queue);
-            java.lang.reflect.Method createProducer = jmsSession.getClass()
-                .getMethod("createProducer", Class.forName("jakarta.jms.Destination"));
-            jmsProducer = createProducer.invoke(jmsSession, queue);
+            ch.queueDeclare(qName, true, false, false, null);
+            amqpCurrentQueue = qName;
             state.put("WS-COMPLETION-CODE", 0);  // MQCC_OK
         }} catch (Exception e) {{
             System.err.println("MQ OPEN failed: " + e.getMessage());
@@ -1261,22 +1666,15 @@ public class JdbcStubExecutor implements StubExecutor, AutoCloseable {{
 
     @Override
     public void mqGet(ProgramState state, String bufferVar, String datalenVar, String waitIntervalVar) {{
-        if (jmsConsumer == null) {{
+        if (amqpFactory == null || amqpCurrentQueue == null) {{
             dummyCall(state, "MQGET");
             return;
         }}
         try {{
-            long timeout = 5000;
-            if (waitIntervalVar != null) {{
-                Object wv = state.get(waitIntervalVar);
-                if (wv instanceof Number) timeout = ((Number) wv).longValue();
-            }}
-            java.lang.reflect.Method recv = jmsConsumer.getClass()
-                .getMethod("receive", long.class);
-            Object msg = recv.invoke(jmsConsumer, timeout);
-            if (msg != null && bufferVar != null) {{
-                java.lang.reflect.Method getText = msg.getClass().getMethod("getText");
-                String text = (String) getText.invoke(msg);
+            Channel ch = ensureAmqpChannel();
+            GetResponse resp = ch.basicGet(amqpCurrentQueue, true);
+            if (resp != null && bufferVar != null) {{
+                String text = new String(resp.getBody(), StandardCharsets.UTF_8);
                 state.put(bufferVar, text);
                 if (datalenVar != null) state.put(datalenVar, text.length());
                 state.put("WS-COMPLETION-CODE", 0);
@@ -1293,18 +1691,17 @@ public class JdbcStubExecutor implements StubExecutor, AutoCloseable {{
 
     @Override
     public void mqPut1(ProgramState state, String replyQueueVar, String bufferVar, String buflenVar) {{
-        if (jmsProducer == null) {{
+        if (amqpFactory == null) {{
             dummyCall(state, "MQPUT1");
             return;
         }}
         try {{
-            java.lang.reflect.Method createText = jmsSession.getClass()
-                .getMethod("createTextMessage", String.class);
-            String body = bufferVar != null ? state.get(bufferVar).toString() : "";
-            Object msg = createText.invoke(jmsSession, body);
-            java.lang.reflect.Method send = jmsProducer.getClass()
-                .getMethod("send", Class.forName("jakarta.jms.Message"));
-            send.invoke(jmsProducer, msg);
+            Channel ch = ensureAmqpChannel();
+            String qName = (replyQueueVar != null) ? state.get(replyQueueVar).toString().trim() : "";
+            if (qName.isEmpty()) qName = (amqpCurrentQueue != null) ? amqpCurrentQueue : "SPECTER.DEFAULT";
+            ch.queueDeclare(qName, true, false, false, null);
+            String body = (bufferVar != null) ? state.get(bufferVar).toString() : "";
+            ch.basicPublish("", qName, null, body.getBytes(StandardCharsets.UTF_8));
             state.put("WS-COMPLETION-CODE", 0);
         }} catch (Exception e) {{
             System.err.println("MQ PUT1 failed: " + e.getMessage());
@@ -1315,8 +1712,82 @@ public class JdbcStubExecutor implements StubExecutor, AutoCloseable {{
 
     @Override
     public void mqClose(ProgramState state) {{
-        closeJms();
+        closeAmqp();
         state.put("WS-COMPLETION-CODE", 0);
+    }}
+
+    // -------------------------------------------------------------------
+    // Synchronous outbound CALL routing -> REST
+    // -------------------------------------------------------------------
+
+    @Override
+    public void callProgram(
+            ProgramState state,
+            String programName,
+            List<String> inputVars,
+            List<String> outputVars) {{
+        // Record the call for trace / Mockito verification
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("name", programName);
+        state.calls.add(entry);
+
+        String url = AppConfig.getCallBaseUrl() + "/" + programName.toLowerCase();
+        Map<String, Object> payload = new LinkedHashMap<>();
+        if (inputVars != null) {{
+            for (String v : inputVars) {{
+                payload.put(v, state.get(v));
+            }}
+        }}
+
+        HttpPost req = new HttpPost(url);
+        req.setEntity(new StringEntity(gson.toJson(payload), ContentType.APPLICATION_JSON));
+
+        boolean restOk = false;
+        try (CloseableHttpResponse resp = http.execute(req)) {{
+            int status = resp.getCode();
+            String body = resp.getEntity() != null
+                ? EntityUtils.toString(resp.getEntity(), StandardCharsets.UTF_8)
+                : "";
+            if (status >= 200 && status < 300 && body != null && !body.isBlank()) {{
+                JsonElement parsed = JsonParser.parseString(body);
+                if (parsed.isJsonObject()) {{
+                    JsonObject obj = parsed.getAsJsonObject();
+                    for (Map.Entry<String, JsonElement> e : obj.entrySet()) {{
+                        state.put(e.getKey(), jsonToJava(e.getValue()));
+                    }}
+                    restOk = true;
+                }}
+            }}
+        }} catch (Exception e) {{
+            System.err.println("CALL " + programName + " HTTP failure: " + e.getMessage());
+        }}
+
+        // Always update the stub log so Mockito spies + uncovered-report can
+        // see that this CALL was reached, regardless of HTTP success.
+        if (restOk) {{
+            state.stubLog.add(new Object[]{{"CALL:" + programName, null}});
+        }} else {{
+            applyStubOutcome(state, "CALL:" + programName);
+        }}
+    }}
+
+    private static Object jsonToJava(JsonElement e) {{
+        if (e == null || e.isJsonNull()) return "";
+        if (e.isJsonPrimitive()) {{
+            com.google.gson.JsonPrimitive p = e.getAsJsonPrimitive();
+            if (p.isBoolean()) return p.getAsBoolean();
+            if (p.isNumber()) {{
+                double d = p.getAsDouble();
+                if (d == Math.floor(d) && !Double.isInfinite(d)) {{
+                    long l = p.getAsLong();
+                    if (l >= Integer.MIN_VALUE && l <= Integer.MAX_VALUE) return (int) l;
+                    return l;
+                }}
+                return d;
+            }}
+            return p.getAsString();
+        }}
+        return e.toString();
     }}
 }}
 """
@@ -1329,11 +1800,12 @@ APP_CONFIG_JAVA = """\
 package {package_name};
 
 /**
- * Environment-variable-based configuration for database and JMS connections.
+ * Environment-variable-based configuration for database, AMQP (RabbitMQ),
+ * and the REST base URL used for outbound CALL routing.
  *
- * <p>Reads {{@code SPECTER_DB_URL}}, {{@code SPECTER_DB_USER}},
- * {{@code SPECTER_DB_PASSWORD}}, and {{@code SPECTER_JMS_URL}} from the
- * environment with sensible localhost defaults.
+ * <p>Reads {{@code SPECTER_DB_*}}, {{@code SPECTER_AMQP_*}}, and
+ * {{@code SPECTER_CALL_BASE_URL}} from the environment with sensible
+ * localhost defaults suitable for the generated docker-compose.
  */
 public final class AppConfig {{
 
@@ -1352,17 +1824,37 @@ public final class AppConfig {{
         return env("SPECTER_DB_PASSWORD", "specter");
     }}
 
-    /** Returns the JMS broker URL, or {{@code null}} if not configured. */
-    public static String getJmsBrokerUrl() {{
-        return env("SPECTER_JMS_URL", null);
+    public static String getAmqpHost() {{
+        return env("SPECTER_AMQP_HOST", "localhost");
     }}
 
-    public static String getJmsUser() {{
-        return env("SPECTER_JMS_USER", "admin");
+    public static int getAmqpPort() {{
+        String v = env("SPECTER_AMQP_PORT", "5672");
+        try {{
+            return Integer.parseInt(v.trim());
+        }} catch (NumberFormatException e) {{
+            return 5672;
+        }}
     }}
 
-    public static String getJmsPassword() {{
-        return env("SPECTER_JMS_PASSWORD", "admin");
+    public static String getAmqpUser() {{
+        return env("SPECTER_AMQP_USER", "specter");
+    }}
+
+    public static String getAmqpPassword() {{
+        return env("SPECTER_AMQP_PASSWORD", "specter");
+    }}
+
+    public static String getAmqpVirtualHost() {{
+        return env("SPECTER_AMQP_VHOST", "/");
+    }}
+
+    /**
+     * Base URL for synchronous outbound CALLs (e.g. WireMock sidecar).
+     * Defaults to {{@code http://localhost:8080}} for local dev.
+     */
+    public static String getCallBaseUrl() {{
+        return env("SPECTER_CALL_BASE_URL", "http://localhost:8080");
     }}
 
     private static String env(String key, String defaultValue) {{
@@ -1379,6 +1871,7 @@ public final class AppConfig {{
 MAIN_JAVA = """\
 package {package_name};
 
+import com.rabbitmq.client.ConnectionFactory;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 
@@ -1386,8 +1879,9 @@ import com.zaxxer.hikari.HikariDataSource;
  * Docker / standalone entrypoint for {{@link {program_class_name}}}.
  *
  * <p>Creates a {{@link HikariDataSource}} from {{@link AppConfig}},
- * optionally creates a JMS {{@code ConnectionFactory}}, wires a
- * {{@link JdbcStubExecutor}}, runs the program, and prints results.
+ * configures a RabbitMQ {{@link ConnectionFactory}} for MQ-style
+ * operations, wires a {{@link JdbcStubExecutor}}, runs the program,
+ * and prints results.
  */
 public class Main {{
 
@@ -1400,23 +1894,16 @@ public class Main {{
         hikari.setMaximumPoolSize(5);
         HikariDataSource dataSource = new HikariDataSource(hikari);
 
-        // JMS factory (nullable)
-        Object jmsFactory = null;
-        String jmsUrl = AppConfig.getJmsBrokerUrl();
-        if (jmsUrl != null) {{
-            try {{
-                Class<?> factoryClass = Class.forName(
-                    "org.apache.activemq.artemis.jms.client.ActiveMQConnectionFactory");
-                jmsFactory = factoryClass
-                    .getConstructor(String.class, String.class, String.class)
-                    .newInstance(jmsUrl, AppConfig.getJmsUser(), AppConfig.getJmsPassword());
-            }} catch (Exception e) {{
-                System.err.println("JMS unavailable: " + e.getMessage());
-            }}
-        }}
+        // RabbitMQ connection factory (lazy connect inside the executor)
+        ConnectionFactory amqpFactory = new ConnectionFactory();
+        amqpFactory.setHost(AppConfig.getAmqpHost());
+        amqpFactory.setPort(AppConfig.getAmqpPort());
+        amqpFactory.setUsername(AppConfig.getAmqpUser());
+        amqpFactory.setPassword(AppConfig.getAmqpPassword());
+        amqpFactory.setVirtualHost(AppConfig.getAmqpVirtualHost());
 
         // Wire and run
-        try (JdbcStubExecutor stubs = new JdbcStubExecutor(dataSource, jmsFactory)) {{
+        try (JdbcStubExecutor stubs = new JdbcStubExecutor(dataSource, amqpFactory)) {{
             {program_class_name} program = new {program_class_name}(stubs);
             ProgramState result = program.run();
 

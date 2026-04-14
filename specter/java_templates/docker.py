@@ -51,16 +51,30 @@ services:
       timeout: 3s
       retries: 10
 
-  activemq:
-    image: apache/activemq-artemis:2.31.2
+  rabbitmq:
+    image: rabbitmq:3-management
     environment:
-      ARTEMIS_USER: admin
-      ARTEMIS_PASSWORD: admin
+      RABBITMQ_DEFAULT_USER: specter
+      RABBITMQ_DEFAULT_PASS: specter
     ports:
-      - "61616:61616"
-      - "8161:8161"
+      - "5672:5672"
+      - "15672:15672"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8161 || exit 1"]
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  wiremock:
+    image: wiremock/wiremock:3.5.4
+    command: ["--global-response-templating", "--verbose"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./wiremock/mappings:/home/wiremock/mappings
+      - ./wiremock/__files:/home/wiremock/__files
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8080/__admin/health || exit 0"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -70,13 +84,20 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      activemq:
+      rabbitmq:
         condition: service_healthy
+      wiremock:
+        condition: service_started
     environment:
       SPECTER_DB_URL: jdbc:postgresql://db:5432/specter
       SPECTER_DB_USER: specter
       SPECTER_DB_PASSWORD: specter
-      SPECTER_JMS_URL: tcp://activemq:61616
+      SPECTER_AMQP_HOST: rabbitmq
+      SPECTER_AMQP_PORT: "5672"
+      SPECTER_AMQP_USER: specter
+      SPECTER_AMQP_PASSWORD: specter
+      SPECTER_AMQP_VHOST: "/"
+      SPECTER_CALL_BASE_URL: http://wiremock:8080
 
   terminal:
     build: .
@@ -86,11 +107,18 @@ services:
     depends_on:
       db:
         condition: service_healthy
-      activemq:
+      rabbitmq:
         condition: service_healthy
+      wiremock:
+        condition: service_started
     environment:
       SPECTER_DB_URL: jdbc:postgresql://db:5432/specter
       SPECTER_DB_USER: specter
       SPECTER_DB_PASSWORD: specter
-      SPECTER_JMS_URL: tcp://activemq:61616
+      SPECTER_AMQP_HOST: rabbitmq
+      SPECTER_AMQP_PORT: "5672"
+      SPECTER_AMQP_USER: specter
+      SPECTER_AMQP_PASSWORD: specter
+      SPECTER_AMQP_VHOST: "/"
+      SPECTER_CALL_BASE_URL: http://wiremock:8080
 """
