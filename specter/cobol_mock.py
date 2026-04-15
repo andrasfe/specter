@@ -2537,42 +2537,50 @@ def _add_mock_file_handling(
     if not has_apply_payload:
         final.append(f"\n")
         final.append(f"{_CMT} SPECTER: apply trailing SET:<var> payload records for the current mock op\n")
+        # Structured with nested IFs rather than ``GO TO SPECTER-PAYLOAD-DONE``
+        # on EOF: when GnuCOBOL's ``PERFORM SPECTER-APPLY-MOCK-PAYLOAD``
+        # executes a GO TO to a later paragraph (SPECTER-PAYLOAD-DONE), control
+        # falls past the PERFORM's implicit return boundary, the second
+        # paragraph's body runs, and then execution falls off the end of the
+        # program — a silent rc=0 exit mid-batch. The only safe pattern for
+        # PERFORM-with-early-exit is plain fall-through to the paragraph's
+        # period, which returns to the caller naturally.
         final.append(f"{_A}SPECTER-APPLY-MOCK-PAYLOAD.\n")
         final.append(f"{_B}PERFORM SPECTER-NEXT-MOCK-RECORD\n")
-        final.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
-        final.append(f"{_CONT}GO TO SPECTER-PAYLOAD-DONE\n")
-        final.append(f"{_B}END-IF\n")
-        final.append(f"{_B}IF MOCK-OP-KEY(1:4) = 'SET:'\n")
+        final.append(f"{_B}IF MOCK-EOF-FLAG NOT = 'Y'\n")
+        final.append(f"{_B}  IF MOCK-OP-KEY(1:4) = 'SET:'\n")
         if config.payload_variables:
-            final.append(f"{_B}  EVALUATE MOCK-OP-KEY(5:26)\n")
+            final.append(f"{_B}    EVALUATE MOCK-OP-KEY(5:26)\n")
             for var, kind in config.payload_variables.items():
                 padded = f"{var:<26}"
-                final.append(f"{_B}    WHEN '{padded}'\n")
+                final.append(f"{_B}      WHEN '{padded}'\n")
                 if kind == "numeric":
-                    final.append(f"{_B}      MOVE MOCK-NUM-STATUS TO {var}\n")
+                    final.append(f"{_B}        MOVE MOCK-NUM-STATUS TO {var}\n")
                 elif var.upper() in config.condition_names_88:
                     act_val = config.condition_names_88[var.upper()]
                     final.append(
-                        f"{_B}      IF MOCK-ALPHA-STATUS = '{act_val}'\n"
-                        f"{_B}        SET {var} TO TRUE\n"
-                        f"{_B}      END-IF\n"
+                        f"{_B}        IF MOCK-ALPHA-STATUS = '{act_val}'\n"
+                        f"{_B}          SET {var} TO TRUE\n"
+                        f"{_B}        END-IF\n"
                     )
                 else:
-                    final.append(f"{_B}      MOVE MOCK-ALPHA-STATUS TO {var}\n")
-            final.append(f"{_B}    WHEN OTHER\n")
-            final.append(f"{_B}      CONTINUE\n")
-            final.append(f"{_B}  END-EVALUATE\n")
+                    final.append(f"{_B}        MOVE MOCK-ALPHA-STATUS TO {var}\n")
+            final.append(f"{_B}      WHEN OTHER\n")
+            final.append(f"{_B}        CONTINUE\n")
+            final.append(f"{_B}    END-EVALUATE\n")
         else:
             # No payload variables configured — consume the SET: record
             # without dispatching. GnuCOBOL rejects EVALUATE with only a
             # WHEN OTHER clause, so we can't emit an empty EVALUATE.
-            final.append(f"{_B}  CONTINUE\n")
-        final.append(f"{_B}  GO TO SPECTER-APPLY-MOCK-PAYLOAD\n")
-        final.append(f"{_B}END-IF\n")
-        final.append(f"{_B}MOVE MOCK-RECORD TO MOCK-PENDING-RECORD\n")
-        final.append(f"{_B}MOVE 'Y' TO MOCK-PENDING-FLAG.\n")
-        final.append(f"{_A}SPECTER-PAYLOAD-DONE.\n")
-        final.append(f"{_B}CONTINUE.\n")
+            final.append(f"{_B}    CONTINUE\n")
+        # Intra-paragraph GO TO is safe (we're still inside the PERFORM's
+        # range). Loops until EOF or a non-SET: record is read.
+        final.append(f"{_B}    GO TO SPECTER-APPLY-MOCK-PAYLOAD\n")
+        final.append(f"{_B}  ELSE\n")
+        final.append(f"{_B}    MOVE MOCK-RECORD TO MOCK-PENDING-RECORD\n")
+        final.append(f"{_B}    MOVE 'Y' TO MOCK-PENDING-FLAG\n")
+        final.append(f"{_B}  END-IF\n")
+        final.append(f"{_B}END-IF.\n")
 
     return final
 
