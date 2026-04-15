@@ -3998,7 +3998,22 @@ def _format_mock_record(op_key: str, alpha_status: object = "", num_status: obje
 
 
 def _encode_mock_entry(entry: object) -> tuple[str, int, list[str]]:
-    """Encode one stub entry into a primary record summary plus SET records."""
+    """Encode one stub entry into a primary record summary plus SET records.
+
+    The PRIMARY record's alpha_status is taken from the FIRST (var, val)
+    pair, not the last. The COBOL mock's I/O verb replacement does
+    ``MOVE MOCK-ALPHA-STATUS TO <file-status-var>`` for the primary
+    record, where <file-status-var> is hardcoded per file (e.g.
+    ``ACCTFILE-STATUS`` for ``READ ACCOUNT-FILE``). Synthesised stub
+    outcomes typically lead with the file status pair (e.g.
+    ``[(DALYTRAN-STATUS, '00'), (WS-VALIDATION-FAIL-REASON, '0')]``)
+    and follow with downstream side-effects. Picking the LAST pair's
+    value would route the side-effect value into the file status var,
+    flipping a successful read into an apparent error and triggering a
+    spurious ABEND. Subsequent pairs still flow through as SET payload
+    records, so all variables get updated; only the primary alpha
+    selection changes.
+    """
     alpha_status = ""
     num_status = 0
     payload_records: list[str] = []
@@ -4010,14 +4025,21 @@ def _encode_mock_entry(entry: object) -> tuple[str, int, list[str]]:
     else:
         pairs = []
 
+    primary_set = False
     for pair in pairs:
         if not isinstance(pair, (list, tuple)) or len(pair) != 2:
             continue
         var, val = pair
-        alpha_status = str(val)
-        num_status = _coerce_mock_numeric(val)
+        if not primary_set:
+            alpha_status = str(val)
+            num_status = _coerce_mock_numeric(val)
+            primary_set = True
         payload_records.append(
-            _format_mock_record(f"SET:{str(var).upper():<26}", alpha_status, num_status)
+            _format_mock_record(
+                f"SET:{str(var).upper():<26}",
+                str(val),
+                _coerce_mock_numeric(val),
+            )
         )
 
     return alpha_status, num_status, payload_records
