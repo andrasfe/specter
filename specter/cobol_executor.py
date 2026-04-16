@@ -618,10 +618,13 @@ def run_test_case(
             if entry is _OPEN_SUCCESS_SENTINEL or entry is None:
                 records.append(_format_mock_record(op_key, "00", 0))
             elif isinstance(entry, list) and entry:
-                # Extract alpha from the last pair (same as _encode_mock_entry)
-                last_pair = entry[-1]
-                if isinstance(last_pair, (list, tuple)) and len(last_pair) == 2:
-                    alpha = str(last_pair[1])
+                # Extract alpha from the first pair (same as _encode_mock_entry
+                # — file-status-leading stubs must route the status literal
+                # into the primary record's MOCK-ALPHA-STATUS, not a later
+                # side-effect value).
+                first_pair = entry[0]
+                if isinstance(first_pair, (list, tuple)) and len(first_pair) == 2:
+                    alpha = str(first_pair[1])
                 else:
                     alpha = "00"
                 try:

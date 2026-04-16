@@ -1303,6 +1303,17 @@ def _replace_call_stmts(lines: list[str], max_count: int = 0) -> tuple[list[str]
     Args:
         max_count: Maximum blocks to replace (0 = unlimited).
     """
+    # IBM abend routines terminate the program on real z/OS. Under our
+    # mock they would otherwise become a no-op (read next mock record),
+    # which lets batch programs enter an unbounded retry loop after
+    # ``PERFORM 9999-ABEND-PROGRAM`` until GnuCOBOL's call stack blows
+    # (rc=160). Emit ``STOP RUN`` after the mock read so the mocked
+    # program terminates at the first abend, matching Java's Goback-
+    # Signal-based abend path.
+    _ABEND_ROUTINES = {
+        "CEE3ABD", "CEE3DMP", "ILBOABN0", "CICSABEND",
+        "ABEND", "DSNTIAR", "CBLTDLI-ABND",
+    }
     result: list[str] = []
     count = 0
     call_literal_re = re.compile(
@@ -1382,6 +1393,15 @@ def _replace_call_stmts(lines: list[str], max_count: int = 0) -> tuple[list[str]
             # Default success values for USING-clause output vars
             result.append(f"{_B}PERFORM SPECTER-APPLY-MOCK-PAYLOAD\n")
             result.append(f"{_B}MOVE MOCK-NUM-STATUS TO RETURN-CODE{dot}\n")
+            # Real-z/OS abend routines (CEE3ABD, ILBOABN0, etc.) terminate
+            # the program. Under the mock they would just read the next
+            # record and return; with no outcome the caller re-enters the
+            # failing path and retries forever, burning the call stack
+            # until GnuCOBOL aborts with rc=160. Emit STOP RUN here so
+            # the COBOL binary terminates cleanly on first abend, exactly
+            # matching Java's GobackSignal-based ``state.abended`` path.
+            if prog in _ABEND_ROUTINES:
+                result.append(f"{_B}STOP RUN.\n")
 
             count += 1
             i = j
@@ -4323,7 +4343,22 @@ def _format_mock_record(op_key: str, alpha_status: object = "", num_status: obje
 
 
 def _encode_mock_entry(entry: object) -> tuple[str, int, list[str]]:
-    """Encode one stub entry into a primary record summary plus SET records."""
+    """Encode one stub entry into a primary record summary plus SET records.
+
+    The PRIMARY record's alpha_status is taken from the FIRST (var, val)
+    pair, not the last. The COBOL mock's I/O verb replacement does
+    ``MOVE MOCK-ALPHA-STATUS TO <file-status-var>`` for the primary
+    record, where <file-status-var> is hardcoded per file (e.g.
+    ``ACCTFILE-STATUS`` for ``READ ACCOUNT-FILE``). Synthesised stub
+    outcomes typically lead with the file status pair (e.g.
+    ``[(DALYTRAN-STATUS, '00'), (WS-VALIDATION-FAIL-REASON, '0')]``)
+    and follow with downstream side-effects. Picking the LAST pair's
+    value would route the side-effect value into the file status var,
+    flipping a successful read into an apparent error and triggering a
+    spurious ABEND. Subsequent pairs still flow through as SET payload
+    records, so all variables get updated; only the primary alpha
+    selection changes.
+    """
     alpha_status = ""
     num_status = 0
     payload_records: list[str] = []
@@ -4335,14 +4370,21 @@ def _encode_mock_entry(entry: object) -> tuple[str, int, list[str]]:
     else:
         pairs = []
 
+    primary_set = False
     for pair in pairs:
         if not isinstance(pair, (list, tuple)) or len(pair) != 2:
             continue
         var, val = pair
-        alpha_status = str(val)
-        num_status = _coerce_mock_numeric(val)
+        if not primary_set:
+            alpha_status = str(val)
+            num_status = _coerce_mock_numeric(val)
+            primary_set = True
         payload_records.append(
-            _format_mock_record(f"SET:{str(var).upper():<26}", alpha_status, num_status)
+            _format_mock_record(
+                f"SET:{str(var).upper():<26}",
+                str(val),
+                _coerce_mock_numeric(val),
+            )
         )
 
     return alpha_status, num_status, payload_records
