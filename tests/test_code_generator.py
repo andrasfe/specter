@@ -202,7 +202,7 @@ class TestCodeGenerator(unittest.TestCase):
         exec(code, ns)
         result = ns["run"]()
         self.assertEqual(len(result["_execs"]), 1)
-        self.assertEqual(result["_execs"][0]["kind"], "SQL")
+        self.assertEqual(result["_execs"][0]["kind"], "SQL-SELECT")
 
     def test_add(self):
         program = self._make_program([

@@ -611,7 +611,53 @@ def _build_history_miner_prompt(bctx: BranchContext, prior_feedback: list[JudgeF
     return "".join(parts)
 
 
-def _parse_specialist_response(text: str | None, specialist_name: str) -> SpecialistProposal:
+def _sanitize_input_state(raw_input: dict | None, bctx: BranchContext | None) -> dict:
+    """Keep only plausible COBOL variables from a swarm proposal."""
+    if not isinstance(raw_input, dict):
+        return {}
+    if bctx is None:
+        return dict(raw_input)
+
+    allowed: set[str] = set()
+    allowed.update(str(name).upper() for name in bctx.var_domain_info)
+    allowed.update(str(name).upper() for name in _extract_condition_vars(bctx.condition_text))
+    allowed.update(str(name).upper() for name in (bctx.nearest_hit or {}).get("input_state", {}))
+    allowed.update(str(name).upper() for name in bctx.parent_88_lookup)
+    allowed.update(str(parent).upper() for parent, _ in bctx.parent_88_lookup.values())
+    allowed.update(str(name).upper() for name in bctx.stub_mapping.values())
+    for status_vars in bctx.stub_mapping.values():
+        allowed.update(str(name).upper() for name in status_vars)
+    for gate in bctx.gating_conditions:
+        gate_var = str(gate.get("variable", "") or "").upper()
+        if gate_var:
+            allowed.add(gate_var)
+
+    sanitized: dict = {}
+    for key, value in raw_input.items():
+        key_text = str(key or "").strip()
+        if not key_text:
+            continue
+        if key_text.upper() in allowed:
+            sanitized[key_text] = value
+    return sanitized
+
+
+def _sanitize_stub_outcomes(raw_stubs: dict | None, bctx: BranchContext | None) -> dict:
+    """Keep only valid stub operation keys from a swarm proposal."""
+    if not isinstance(raw_stubs, dict):
+        return {}
+    if bctx is None:
+        return dict(raw_stubs)
+    allowed_ops = set(bctx.stub_mapping)
+    allowed_ops.update(bctx.stub_op_sequence)
+    return {key: value for key, value in raw_stubs.items() if key in allowed_ops}
+
+
+def _parse_specialist_response(
+    text: str | None,
+    specialist_name: str,
+    bctx: BranchContext | None = None,
+) -> SpecialistProposal:
     """Parse a specialist LLM response into a SpecialistProposal."""
     if not text:
         return SpecialistProposal(specialist=specialist_name, reasoning="empty response", confidence=0.0, raw_response="")
@@ -633,8 +679,10 @@ def _parse_specialist_response(text: str | None, specialist_name: str) -> Specia
     if obj is None:
         return SpecialistProposal(specialist=specialist_name, reasoning=f"could not parse: {cleaned[:150]}", confidence=0.0, raw_response=text[:500])
     return SpecialistProposal(
-        specialist=specialist_name, input_state=obj.get("input_state") or {},
-        stub_outcomes=obj.get("stub_outcomes") or {}, stub_defaults=obj.get("stub_defaults"),
+        specialist=specialist_name,
+        input_state=_sanitize_input_state(obj.get("input_state") or {}, bctx),
+        stub_outcomes=_sanitize_stub_outcomes(obj.get("stub_outcomes") or {}, bctx),
+        stub_defaults=obj.get("stub_defaults"),
         reasoning=str(obj.get("reasoning", ""))[:300],
         confidence=float(obj.get("confidence", 0.5) or 0.5),
         target_paragraph=obj.get("target_paragraph"), raw_response=text[:500],
@@ -649,7 +697,7 @@ def _run_specialist(name, prompt_fn, bctx, prior_feedback, llm_provider, llm_mod
         response, _ = _query_llm_sync(llm_provider, prompt, llm_model)
     except Exception as exc:
         return SpecialistProposal(specialist=name, reasoning=f"LLM call failed: {exc}", confidence=0.0)
-    return _parse_specialist_response(response, name)
+    return _parse_specialist_response(response, name, bctx)
 
 
 def _run_specialists_parallel(bctx, prior_feedback, llm_provider, llm_model):
@@ -836,7 +884,10 @@ def _build_gate_solver_prompt(
     return "".join(parts)
 
 
-def _parse_gate_solver_response(text: str | None) -> tuple[dict, dict, str]:
+def _parse_gate_solver_response(
+    text: str | None,
+    bctx: BranchContext | None = None,
+) -> tuple[dict, dict, str]:
     """Parse the Gate Solver LLM response.
 
     Returns ``(input_state, stub_outcomes, reasoning)``.
@@ -870,8 +921,8 @@ def _parse_gate_solver_response(text: str | None) -> tuple[dict, dict, str]:
         return {}, {}, f"could not parse: {cleaned[:200]}"
 
     return (
-        obj.get("input_state") or {},
-        obj.get("stub_outcomes") or {},
+        _sanitize_input_state(obj.get("input_state") or {}, bctx),
+        _sanitize_stub_outcomes(obj.get("stub_outcomes") or {}, bctx),
         str(obj.get("reasoning", ""))[:300] or "(no reasoning)",
     )
 
@@ -893,7 +944,7 @@ def _solve_gates(
         log.warning("  Gate solver LLM call failed: %s", exc)
         return {}, {}, f"LLM call failed: {exc}"
 
-    return _parse_gate_solver_response(response)
+    return _parse_gate_solver_response(response, bctx)
 
 
 # ---------------------------------------------------------------------------
@@ -987,9 +1038,30 @@ def _build_tape(
     # Merge Gate Solver's input_state with nearest-hit for warm-start.
     merged_input = dict(input_state)
 
+    # **CRITICAL FIX**: Augment merged_input with missing gating variables from domains.
+    domains = getattr(ctx, "domains", {})
+    if bctx.gating_conditions and domains:
+        for gc in bctx.gating_conditions:
+            var = gc.get("variable", "").upper()
+            if var and var not in merged_input:
+                domain = domains.get(var)
+                if domain:
+                    values = gc.get("values", [])
+                    negated = gc.get("negated", False)
+                    if values and not negated:
+                        merged_input[var] = values[0]
+
     # Run the full Python program from entry with the proposed
     # stub_outcomes to get the execution-ordered stub_log.
     stub_log = _python_pre_run(module, merged_input, stub_outcomes)
+
+    # Keep only the operations that matter for this branch attempt.
+    allowed_ops: set[str] = set(stub_outcomes)
+    allowed_ops.update(bctx.stub_op_sequence)
+    if allowed_ops:
+        filtered_log = [(op, entry) for op, entry in stub_log if op in allowed_ops]
+        if filtered_log:
+            stub_log = filtered_log
 
     # If the stub_log is very short but stub_outcomes has entries,
     # the program may have aborted early.  Try padding with success
@@ -1141,6 +1213,7 @@ def _run_swarm_round(
     llm_provider,
     llm_model: str | None,
     round_num: int,
+    validate_branch: bool = True,
 ) -> tuple[SwarmRound, int, JudgeFeedback]:
     """Execute one swarm round: specialists → merge → validate → tape → execute."""
     proposals = _run_specialists_parallel(
@@ -1162,23 +1235,26 @@ def _run_swarm_round(
         rnd = SwarmRound(round_num=round_num, proposals=proposals, feedback=[fb])
         return rnd, tc_count, fb
 
-    # Python forward validation.
-    module = getattr(ctx, "module", None)
-    py_ok, py_diagnosis = _validate_python(module, bctx, input_state, stub_outcomes)
-    if py_ok:
-        log.info("  Swarm: Python validation PASSED for %s", bctx.branch_key)
-    else:
-        log.info("  Swarm: Python validation failed — %s", (py_diagnosis or "unknown")[:150])
+    if validate_branch:
+        # Python forward validation.
+        module = getattr(ctx, "module", None)
+        py_ok, py_diagnosis = _validate_python(module, bctx, input_state, stub_outcomes)
+        if py_ok:
+            log.info("  Swarm: Python validation PASSED for %s", bctx.branch_key)
+        else:
+            log.info("  Swarm: Python validation failed — %s", (py_diagnosis or "unknown")[:150])
 
-    # Gate Solver refinement (only if Python failed).
-    if not py_ok and py_diagnosis:
-        refined_input, refined_stubs, reasoning = _solve_gates(
-            bctx, route, llm_provider, llm_model, py_diagnosis,
-        )
-        if refined_input or refined_stubs:
-            input_state.update(refined_input)
-            stub_outcomes.update(refined_stubs)
-            log.info("  Swarm: gate solver refined — %s", reasoning[:80])
+        # Gate Solver refinement (only if Python failed).
+        if not py_ok and py_diagnosis:
+            refined_input, refined_stubs, reasoning = _solve_gates(
+                bctx, route, llm_provider, llm_model, py_diagnosis,
+            )
+            if refined_input or refined_stubs:
+                input_state.update(refined_input)
+                stub_outcomes.update(refined_stubs)
+                log.info("  Swarm: gate solver refined — %s", reasoning[:80])
+    else:
+        log.info("  Swarm: skipping Python branch validation during reachability phase")
 
     # Tape Builder + Direct COBOL execution.
     final_input, stub_log = _build_tape(bctx, ctx, input_state, stub_outcomes)
@@ -1262,13 +1338,14 @@ def investigate_branch_swarm(
         # Temporarily modify bctx to focus specialists on reachability.
         # Clear condition_text so they don't try to satisfy the branch.
         saved_condition = bctx.condition_text
-        bctx.condition_text = f"(Phase 1: just reach paragraph {bctx.paragraph})"
+        bctx.condition_text = ""
 
         for r in range(phase1_rounds):
             log.info("  Swarm: reach %s round %d/%d", branch_key, r + 1, phase1_rounds)
             rnd, tc_count, feedback = _run_swarm_round(
                 bctx, route, ctx, cov, report, tc_count,
                 prior_feedback, llm_provider, llm_model, round_idx,
+                validate_branch=False,
             )
             journal.rounds.append(rnd)
             round_idx += 1

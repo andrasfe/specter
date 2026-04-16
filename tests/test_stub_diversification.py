@@ -46,7 +46,7 @@ class TestApplyStubOutcome(unittest.TestCase):
 
         # With stub outcomes - SQLCODE should be set
         result = ns["run"]({
-            "_stub_outcomes": {"SQL": [("SQLCODE", -803)]},
+            "_stub_outcomes": {"SQL-SELECT": [("SQLCODE", -803)]},
         })
         self.assertEqual(result.get("SQLCODE"), -803)
 
@@ -204,11 +204,11 @@ class TestApplyStubOutcome(unittest.TestCase):
 
         result = ns["run"]({
             "_stub_outcomes": {
-                "SQL": [("SQLCODE", 0), ("SQLCODE", -803)],
+                "SQL-SELECT": [("SQLCODE", 0), ("SQLCODE", -803)],
             },
         })
-        # First EXEC SQL sets SQLCODE=0, saved to WS-SAVE1
-        # Second EXEC SQL sets SQLCODE=-803
+        # First EXEC SQL SELECT sets SQLCODE=0, saved to WS-SAVE1
+        # Second EXEC SQL SELECT sets SQLCODE=-803
         self.assertEqual(result.get("WS-SAVE1"), 0)
         self.assertEqual(result.get("SQLCODE"), -803)
 

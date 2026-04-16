@@ -1178,7 +1178,7 @@ def _gen_perform(cb: _CodeBuilder, stmt: Statement):
         cb.line(f"{func_name}(state)")
         cb.line(f"state['{loop_var}'] = _to_num(state.get('{loop_var}', 0)) + _to_num({by_val})")
         cb.line(f"{lv} += 1")
-        cb.line(f"if {lv} >= 10000:")
+        cb.line(f"if {lv} >= 100:")
         cb.indent()
         cb.line("break")
         cb.dedent()
@@ -1247,7 +1247,7 @@ def _gen_perform_thru(cb: _CodeBuilder, stmt: Statement):
         for para_name in range_paras:
             cb.line(f"{_sanitize_name(para_name)}(state)")
         cb.line(f"{lv} += 1")
-        cb.line(f"if {lv} >= 10000:")
+        cb.line(f"if {lv} >= 100:")
         cb.indent()
         cb.line("break")
         cb.dedent()
@@ -1319,7 +1319,7 @@ def _gen_perform_inline(cb: _CodeBuilder, stmt: Statement):
         loop_var, by_val = vary_increment
         cb.line(f"state['{loop_var}'] = _to_num(state.get('{loop_var}', 0)) + _to_num({by_val})")
     cb.line(f"{lv} += 1")
-    cb.line(f"if {lv} >= 10000:")
+    cb.line(f"if {lv} >= 100:")
     cb.indent()
     cb.line("break")
     cb.dedent()
@@ -1400,17 +1400,9 @@ def _gen_display(cb: _CodeBuilder, stmt: Statement):
         cb.line(f"state['_display'].append('')")
 
 
-_PY_ABEND_ROUTINES = {"CEE3ABD", "ILBOABN0", "ILBOABNS"}
-
-
 def _gen_call(cb: _CodeBuilder, stmt: Statement):
     target = stmt.attributes.get("target", "UNKNOWN")
     cb.line(f"_dummy_call('{_sq(target)}', state)")
-    # Standard COBOL ABEND routines: in the COBOL test mock these return
-    # to the caller (no termination). Match that by setting _abended and
-    # continuing — control flows back, subsequent error paths execute.
-    if target.upper() in _PY_ABEND_ROUTINES:
-        cb.line("state['_abended'] = True")
 
 
 def _gen_exec(cb: _CodeBuilder, stmt: Statement, kind: str):
@@ -1419,7 +1411,20 @@ def _gen_exec(cb: _CodeBuilder, stmt: Statement, kind: str):
     escaped = raw.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
     if len(escaped) > 200:
         escaped = escaped[:200] + "..."
-    cb.line(f"_dummy_exec('{kind}', '{escaped}', state)")
+
+    # For SQL: extract the specific SQL verb to generate op keys that
+    # match the COBOL mock (SQL-FETCH, SQL-OPEN, SQL-CLOSE, etc.).
+    op_key = kind
+    if kind == "SQL":
+        import re as _re_exec
+        for verb in ["FETCH", "OPEN", "CLOSE", "SELECT", "INSERT",
+                      "UPDATE", "DELETE", "PREPARE", "EXECUTE",
+                      "COMMIT", "ROLLBACK"]:
+            if _re_exec.search(rf"\b{verb}\b", raw.upper()):
+                op_key = f"SQL-{verb}"
+                break
+
+    cb.line(f"_dummy_exec('{op_key}', '{escaped}', state)")
     # For EXEC CICS: RESP(var) means var receives EIBRESP value after the call
     if kind == "CICS":
         m = _RESP_RE.search(raw)
@@ -2157,14 +2162,7 @@ def generate_code(
 
     cb.line("def _apply_stub_outcome(state, key):")
     cb.indent()
-    cb.line('"""Apply a queued stub outcome (set status variables after external op).')
-    cb.line("")
-    cb.line("On FIFO + defaults exhaustion, simulates COBOL's MOCK-EOF behavior:")
-    cb.line("for read-style ops (READ:* / CICS-READ / DLI-G*), sets the most")
-    cb.line("recently observed status variable to '10' (EOF), letting the main")
-    cb.line("PERFORM UNTIL loop terminate the same way the COBOL binary does")
-    cb.line("when MOCKDATA is exhausted.")
-    cb.line('"""')
+    cb.line('"""Apply a queued stub outcome (set status variables after external op)."""')
     cb.line("_applied = None")
     cb.line("_ol = state.get('_stub_outcomes', {}).get(key, [])")
     cb.line("if _ol:")
@@ -2176,17 +2174,13 @@ def generate_code(
     cb.line("for _var, _val in _entry:")
     cb.indent()
     cb.line("state[_var] = _val")
-    cb.line("# Track the most recent status var for MOCK-EOF emission")
-    cb.line("state.setdefault('_stub_status_vars', {})[key] = _var")
     cb.dedent()
     cb.dedent()
-    cb.line("elif isinstance(_entry, tuple) and len(_entry) == 2:")
+    cb.line("else:")
     cb.indent()
     cb.line("_var, _val = _entry")
     cb.line("state[_var] = _val")
-    cb.line("state.setdefault('_stub_status_vars', {})[key] = _var")
     cb.dedent()
-    cb.line("# else: _entry is None or unrecognised - no-op (no var assignments)")
     cb.dedent()
     cb.line("else:")
     cb.indent()
@@ -2198,26 +2192,6 @@ def generate_code(
     cb.line("for _var, _val in _dm:")
     cb.indent()
     cb.line("state[_var] = _val")
-    cb.line("state.setdefault('_stub_status_vars', {})[key] = _var")
-    cb.dedent()
-    cb.dedent()
-    cb.line("else:")
-    cb.indent()
-    cb.line("# Simulate COBOL MOCK-EOF for read-style ops.")
-    cb.line("_kup = key.upper()")
-    cb.line("_is_read = (_kup.startswith('READ:') or _kup.startswith('CICS-READ')")
-    cb.line("            or _kup.startswith('DLI-G'))")
-    cb.line("if _is_read:")
-    cb.indent()
-    cb.line("_sv = state.get('_stub_status_vars', {}).get(key)")
-    cb.line("if _sv is not None:")
-    cb.indent()
-    cb.line("state[_sv] = '10'")
-    cb.line("# Synthesize a stub entry so the COBOL replay's mock data file")
-    cb.line("# also delivers '10' for this op (otherwise the next mock")
-    cb.line("# record's blank status routes COBOL into the abend path).")
-    cb.line("_applied = [(_sv, '10')]")
-    cb.dedent()
     cb.dedent()
     cb.dedent()
     cb.dedent()
@@ -2345,40 +2319,14 @@ def generate_code(
         cb.blank()
 
     # Default state
-    # Pull VALUE clauses from the COBOL source so the default state
-    # matches what COBOL does at startup (e.g. ``01 END-OF-FILE PIC X(1)
-    # VALUE 'N'`` initializes END-OF-FILE to 'N', not False).
-    _src_values: dict[str, object] = {}
-    if cobol_source:
-        try:
-            from .pic_extractor import build_pic_info
-            from .copybook_parser import parse_copybook as _parse_cpy_local
-            import os as _os_local
-            _records_local = list(copybook_records or [])
-            _pic_local = build_pic_info(_records_local, str(cobol_source))
-            for _vn, _entry in _pic_local.items():
-                if isinstance(_entry, dict) and "value" in _entry:
-                    _src_values[_vn] = _entry["value"]
-        except Exception:
-            pass
-
     cb.line("def _default_state():")
     cb.indent()
     cb.line('"""Return default state dict with all discovered variables."""')
     cb.line("return {")
     cb.indent()
     for name, info in sorted(var_report.variables.items()):
-        # Source VALUE wins (matches COBOL startup state exactly).
-        if name in _src_values:
-            v = _src_values[name]
-            if isinstance(v, bool):
-                default = "True" if v else "False"
-            elif isinstance(v, (int, float)):
-                default = repr(v)
-            else:
-                default = repr(str(v))
-        elif info.classification == "flag":
-            default = "' '"
+        if info.classification == "flag":
+            default = "False"
         elif info.classification == "status":
             if "SQLCODE" in name.upper():
                 default = "0"

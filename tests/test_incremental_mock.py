@@ -20,6 +20,7 @@ from specter.incremental_mock import (
     _compile_and_fix,
     _fix_condition_name_moves,
     _fix_missing_periods,
+    _generate_record_stubs,
     _generate_missing_paragraph_stubs,
     _load_resolutions,
     _parse_errors,
@@ -283,6 +284,39 @@ class TestQualifiedSubfieldFixer:
 
         assert n == 0
         assert out == src
+
+    def test_adds_child_under_nested_parent_level(self):
+        src = [
+            "       WORKING-STORAGE SECTION.\n",
+            "       01  OUTER-REC.\n",
+            "           05  DCLTAX-TYPE.\n",
+            "               10  FILLER PIC X.\n",
+            "       PROCEDURE DIVISION.\n",
+            "           MOVE WS-TAX TO TAX-TYPE-CD OF DCLTAX-TYPE.\n",
+        ]
+        errs = [(100, "'TAX-TYPE-CD IN DCLTAX-TYPE' is not defined")]
+
+        out, n = _add_missing_qualified_subfields(errs, src)
+
+        assert n == 1
+        assert any("10  TAX-TYPE-CD PIC X(02)." in ln for ln in out)
+        assert not any("10  FILLER PIC X." in ln for ln in out)
+
+
+class TestRecordStubGeneration:
+    def test_does_not_flatten_missing_qualified_child_into_orphan_01(self):
+        src = [
+            "       WORKING-STORAGE SECTION.\n",
+            "       01  DCLTAX-TYPE.\n",
+            "           05  FILLER PIC X.\n",
+            "       PROCEDURE DIVISION.\n",
+            "           MOVE WS-TAX TO TAX-TYPE-CD OF DCLTAX-TYPE.\n",
+        ]
+        errs = [(100, "'TAX-TYPE-CD IN DCLTAX-TYPE' is not defined")]
+
+        stubs = _generate_record_stubs(errs, src)
+
+        assert not any("01  TAX-TYPE-CD" in line for line in stubs)
 
 
 class TestMissingPeriodsFixer:
@@ -706,6 +740,73 @@ class TestPhaseFunctions:
             and not l.strip().startswith("*")
         )
         assert remaining == 1
+
+    def test_variable_call_replacement(self):
+        """Variable-based CALL (CALL WS-PARAM) should be replaced with mock."""
+        from specter.cobol_mock import _replace_call_stmts
+        lines = [
+            "       PROCEDURE DIVISION.\n",
+            "       PARA-1.\n",
+            "           CALL WS-PARAM USING DATA-AREA.\n",
+            "\n",
+            "       PARA-2.\n",
+            "           CALL AARSEVS1 USING SE-RECORD.\n",
+        ]
+        result, count = _replace_call_stmts(lines)
+        assert count == 2
+        # Original CALL lines should be commented out
+        commented = [l for l in result if l.strip().startswith("*") and "CALL" in l]
+        assert len(commented) >= 2
+        # Mock DISPLAY should reference the variable name
+        mock_displays = [l for l in result if "SPECTER-MOCK:CALL:" in l]
+        assert len(mock_displays) == 2
+        # Variable calls should use DISPLAY ... <VARNAME> (space-separated)
+        assert any("WS-PARAM" in l for l in mock_displays)
+        assert any("AARSEVS1" in l for l in mock_displays)
+
+    def test_call_replacement_injects_gate_defaults(self):
+        """CALL mock injects default success value for post-CALL IF gate."""
+        from specter.cobol_mock import _replace_call_stmts
+        lines = [
+            "       PROCEDURE DIVISION.\n",
+            "       PARA-1.\n",
+            "           CALL WS-PARAM USING PL10-PROD-DETAILS.\n",
+            "           IF PL10-O-RETURN-CODE NOT EQUAL '0000'\n",
+            "              GOBACK\n",
+            "           END-IF.\n",
+        ]
+        result, count = _replace_call_stmts(lines)
+        assert count == 1
+        joined = "\n".join(result)
+        # Should inject MOVE '0000' TO PL10-O-RETURN-CODE
+        assert "MOVE '0000' TO PL10-O-RETURN-CODE" in joined
+        # The MOVE should appear BEFORE SPECTER-APPLY-MOCK-PAYLOAD
+        move_idx = joined.index("MOVE '0000' TO PL10-O-RETURN-CODE")
+        payload_idx = joined.index("PERFORM SPECTER-APPLY-MOCK-PAYLOAD")
+        assert move_idx < payload_idx
+
+    def test_scan_post_call_gates_helper(self):
+        """_scan_post_call_gates extracts IF NOT EQUAL gate variables."""
+        from specter.cobol_mock import _scan_post_call_gates
+        lines = [
+            "           MOVE MOCK-NUM-STATUS TO RETURN-CODE.\n",
+            "           IF PL10-O-RETURN-CODE NOT EQUAL '0000'\n",
+            "              GOBACK\n",
+            "           END-IF.\n",
+        ]
+        moves = _scan_post_call_gates(lines, 0)
+        assert moves == ["MOVE '0000' TO PL10-O-RETURN-CODE"]
+
+    def test_scan_post_call_gates_skips_return_code(self):
+        """_scan_post_call_gates skips RETURN-CODE since it is already set."""
+        from specter.cobol_mock import _scan_post_call_gates
+        lines = [
+            "           IF RETURN-CODE NOT EQUAL ZERO\n",
+            "              GOBACK\n",
+            "           END-IF.\n",
+        ]
+        moves = _scan_post_call_gates(lines, 0)
+        assert moves == []
 
     def test_phase_paragraph_tracing(self):
         from specter.incremental_mock import _phase_paragraph_tracing

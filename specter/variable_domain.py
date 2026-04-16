@@ -40,6 +40,8 @@ class VariableDomain:
     semantic_type: str = "generic"
     # Stub relationship
     set_by_stub: str | None = None
+    # Initial VALUE clause from COBOL source (non-88 variables)
+    initial_value: str | int | float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +190,57 @@ def _extract_88_values_from_source(
             parsed = _parse_88_literal(raw_value)
             if parsed is not None:
                 result.setdefault(current_parent, {})[child_name] = parsed
+
+    return result
+
+
+def _extract_initial_values_from_source(
+    cobol_source: str | Path,
+) -> dict[str, str | int | float]:
+    """Scan a COBOL source for non-88-level VALUE clauses on named fields.
+
+    Returns ``{VAR_NAME: initial_value}`` for variables whose DATA
+    DIVISION definitions include an explicit ``VALUE`` clause.  This lets
+    the coverage engine preserve startup constants instead of
+    overwriting them with random INIT injection.
+
+    Only captures leaf-level fields (with PIC clauses) — group items and
+    FILLER are skipped.  88-level items are handled separately by
+    ``_extract_88_values_from_source``.
+    """
+    result: dict[str, str | int | float] = {}
+    path = Path(cobol_source)
+    if not path.exists():
+        return result
+
+    # Match: "nn VARNAME PIC ... VALUE <literal>." on a single line.
+    # Level 01..49, 66, 77.  Must have PIC clause (leaf), must NOT be
+    # FILLER, and must have VALUE keyword.
+    val_re = re.compile(
+        r"^\s+(0[1-9]|[1-4][0-9]|66|77)\s+"
+        r"([A-Z][A-Z0-9-]*)\s+"      # variable name (not FILLER)
+        r".*?\bPIC\b.*?"              # must have PIC clause
+        r"\bVALUES?\s+(.+?)\s*\.?\s*$",  # VALUE clause
+        re.IGNORECASE,
+    )
+
+    for raw in path.read_text(errors="replace").splitlines():
+        # Skip fixed-format comment lines.
+        if len(raw) > 6 and raw[6] in ("*", "/"):
+            continue
+        stripped = raw.rstrip()
+        if not stripped:
+            continue
+        m = val_re.match(stripped)
+        if not m:
+            continue
+        var_name = m.group(2).upper()
+        if var_name == "FILLER":
+            continue
+        raw_val = m.group(3).strip()
+        parsed = _parse_88_literal(raw_val)
+        if parsed is not None:
+            result[var_name] = parsed
 
     return result
 
@@ -365,6 +418,17 @@ def build_variable_domains(
             for child, value in child_values.items():
                 dom.valid_88_values.setdefault(child, value)
 
+    # Source 5: Initial VALUE clauses for non-88 variables scanned from
+    # the COBOL source.  This captures startup constants so the coverage
+    # engine can preserve them instead of overwriting with random INIT
+    # injection.
+    if cobol_source:
+        source_values = _extract_initial_values_from_source(cobol_source)
+        for var_name, init_val in source_values.items():
+            dom = domains.get(var_name)
+            if dom is not None:
+                dom.initial_value = init_val
+
     return domains
 
 
@@ -526,6 +590,10 @@ def generate_value(
 
 def _generate_boundary(domain: VariableDomain, rng: random.Random) -> str | int | float:
     """Generate boundary values for numeric types."""
+    # Flag variables should get domain-aware values, not junk boundaries.
+    if domain.semantic_type == "flag_bool":
+        return _generate_semantic(domain, rng)
+
     if domain.data_type in ("alpha", "unknown"):
         choices = ["", " " * domain.max_length, "A" * domain.max_length]
         return rng.choice(choices)
@@ -603,6 +671,12 @@ def _generate_semantic(domain: VariableDomain, rng: random.Random) -> str | int 
 
 def _generate_random_valid(domain: VariableDomain, rng: random.Random) -> str | int | float:
     """Generate a random value within PIC constraints."""
+    # Flag variables need domain-aware generation even in "random_valid" mode.
+    # Without this, flags with data_type=unknown get random alpha garbage
+    # which breaks gating conditions that check for boolean-like values.
+    if domain.semantic_type == "flag_bool":
+        return _generate_semantic(domain, rng)
+
     if domain.data_type in ("alpha", "unknown"):
         length = max(domain.max_length, 1)
         chars = "".join(rng.choice("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ") for _ in range(length))

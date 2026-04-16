@@ -130,7 +130,7 @@ def _generate_domain_value(
     target_paragraph: str | None = None,
 ) -> str | int | float:
     comment_hints = ctx.paragraph_comments.get(target_paragraph, []) if target_paragraph else []
-    if ctx.jit_inference is not None:
+    if ctx.jit_inference is not None and strategy == "semantic":
         target_key = ctx.current_target_key
         if not target_key and target_paragraph:
             target_key = f"para:{target_paragraph}"
@@ -195,6 +195,22 @@ def _generate_domain_value(
                     req_delta,
                 )
     return generate_value(dom, strategy, ctx.rng)
+
+
+def _preferred_target_paragraph(ctx: StrategyContext) -> str | None:
+    """Return the paragraph name for the round's preferred target, if any."""
+    ptk = str(getattr(ctx, "preferred_target_key", "") or "").strip()
+    if not ptk:
+        return None
+    if ptk.startswith("para:"):
+        return ptk[5:] or None
+    if ptk.startswith("branch:"):
+        parts = ptk.split(":", 2)
+        if len(parts) >= 2:
+            bid = parts[1]
+            branch_meta = getattr(ctx, "branch_meta", {}) or {}
+            return (branch_meta.get(bid) or {}).get("paragraph") or None
+    return None
 
 
 def _set_target_key_for_paragraph(ctx: StrategyContext, paragraph: str | None) -> None:
@@ -327,7 +343,8 @@ class BaselineStrategy(Strategy):
 
         try:
             # Phase 1: one case per value-generation strategy
-            strategies = ["condition_literal", "semantic", "random_valid", "88_value", "boundary"]
+            _para_hint = _preferred_target_paragraph(ctx)
+            strategies = ["condition_literal", "random_valid", "88_value", "boundary"]
             for strat in strategies:
                 input_state = _build_input_state(
                     ctx.domains,
@@ -335,19 +352,22 @@ class BaselineStrategy(Strategy):
                     ctx.rng,
                     jit_inference=ctx.jit_inference,
                     paragraph_comments=ctx.paragraph_comments,
+                    target_paragraph=_para_hint,
                 )
                 yield input_state, ctx.success_stubs, ctx.success_defaults, "baseline"
 
             # Phase 2: condition_literal values per input variable
+            base_strategy = "random_valid"
             for name, dom in ctx.domains.items():
                 if dom.condition_literals and dom.classification == "input":
                     for lit in dom.condition_literals[:3]:
                         base = _build_input_state(
                             ctx.domains,
-                            "semantic",
+                            base_strategy,
                             ctx.rng,
                             jit_inference=ctx.jit_inference,
                             paragraph_comments=ctx.paragraph_comments,
+                            target_paragraph=_para_hint,
                         )
                         base[name] = format_value_for_cobol(dom, lit)
                         yield base, ctx.success_stubs, ctx.success_defaults, f"lit:{name}"
@@ -380,10 +400,11 @@ class BaselineStrategy(Strategy):
                         continue
                     base = _build_input_state(
                         ctx.domains,
-                        "semantic",
+                        "random_valid",
                         ctx.rng,
                         jit_inference=ctx.jit_inference,
                         paragraph_comments=ctx.paragraph_comments,
+                        target_paragraph=_para_hint,
                     )
                     try:
                         base[name] = format_value_for_cobol(dom, value_88)
@@ -956,7 +977,7 @@ class DirectParagraphStrategy(Strategy):
                     elif r < 0.7:
                         dom = ctx.domains.get(var)
                         if dom:
-                            strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
+                            strat = ctx.rng.choice(["condition_literal", "boundary", "random_valid"])
                             state[var] = _generate_domain_value(ctx, var, dom, strat, para)
                         else:
                             info = ctx.var_report.variables.get(var)
@@ -974,7 +995,7 @@ class DirectParagraphStrategy(Strategy):
                     if v not in cond_vars:
                         dom = ctx.domains.get(v)
                         if dom:
-                            strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
+                            strat = ctx.rng.choice(["condition_literal", "boundary", "random_valid"])
                             state[v] = _generate_domain_value(ctx, v, dom, strat, para)
                         else:
                             dv = ds.get(v)
@@ -1393,7 +1414,7 @@ class DirectParagraphStrategy(Strategy):
                     elif r < 0.7:
                         dom = ctx.domains.get(var)
                         if dom:
-                            strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
+                            strat = ctx.rng.choice(["condition_literal", "boundary", "random_valid"])
                             state[var] = _generate_domain_value(ctx, var, dom, strat, para)
                         else:
                             info = ctx.var_report.variables.get(var)
@@ -1411,7 +1432,7 @@ class DirectParagraphStrategy(Strategy):
                     if v not in cond_vars:
                         dom = ctx.domains.get(v)
                         if dom:
-                            strat = ctx.rng.choice(["semantic", "boundary", "random_valid"])
+                            strat = ctx.rng.choice(["condition_literal", "boundary", "random_valid"])
                             state[v] = _generate_domain_value(ctx, v, dom, strat, para)
                         else:
                             dv = ds.get(v)
@@ -2018,7 +2039,7 @@ class FaultInjectionStrategy(Strategy):
     """
 
     name = "fault_injection"
-    priority = 50
+    priority = 25
 
     # Full GnuCOBOL file status code list. The old set truncated at 5 entries
     # which is why branches like ``IF STATUS = '22'`` or ``'34'`` were never
@@ -2134,27 +2155,49 @@ class FaultInjectionStrategy(Strategy):
         flag_88_added = getattr(ctx, "flag_88_added", None) or set()
         siblings_88 = getattr(ctx, "siblings_88", None) or {}
 
+        # Build a pool of diverse base states from existing test cases.
+        # This ensures fault codes are applied across different execution
+        # paths instead of always using the same random starting point.
+        _base_pool: list[dict] = []
+        if cov.test_cases:
+            ranked = sorted(
+                cov.test_cases,
+                key=lambda tc: len(tc.get("paragraphs_hit", [])),
+                reverse=True,
+            )
+            seen_para_sets: list[frozenset] = []
+            for tc in ranked:
+                pset = frozenset(tc.get("paragraphs_hit", []))
+                if not any(pset <= existing for existing in seen_para_sets):
+                    _base_pool.append(
+                        {k: v for k, v in tc.get("input_state", {}).items()
+                         if not str(k).startswith("_")}
+                    )
+                    seen_para_sets.append(pset)
+                if len(_base_pool) >= 10:
+                    break
+
+        def _pick_base() -> dict:
+            if _base_pool:
+                return dict(ctx.rng.choice(_base_pool))
+            return _build_input_state(
+                ctx.domains, "random_valid", ctx.rng,
+            )
+
         try:
+            _fault_para = _preferred_target_paragraph(ctx)
             for op_key, status_vars in ctx.stub_mapping.items():
                 pair = (op_key, target_key)
                 if pair in self._attacked:
                     continue
                 if not self._relevant_to_target(ctx, status_vars):
-                    # Mark attacked so we don't re-evaluate the same op key
-                    # repeatedly for this target.
                     self._attacked.add(pair)
                     continue
 
                 fault_values = self._fault_values_for(op_key, status_vars, ctx)
 
                 for fv in fault_values:
-                    base = _build_input_state(
-                        ctx.domains,
-                        "semantic",
-                        ctx.rng,
-                        jit_inference=ctx.jit_inference,
-                        paragraph_comments=ctx.paragraph_comments,
-                    )
+                    base = _pick_base()
                     fault_stubs, fault_defaults = _build_fault_stubs(
                         ctx.stub_mapping, ctx.domains,
                         target_op=op_key, fault_value=fv, rng=ctx.rng,
@@ -2166,13 +2209,7 @@ class FaultInjectionStrategy(Strategy):
                 for var in status_vars:
                     var_upper = var.upper()
                     if var_upper in flag_88_added:
-                        base = _build_input_state(
-                            ctx.domains,
-                            "semantic",
-                            ctx.rng,
-                            jit_inference=ctx.jit_inference,
-                            paragraph_comments=ctx.paragraph_comments,
-                        )
+                        base = _pick_base()
                         fault_stubs, fault_defaults = _build_fault_stubs(
                             ctx.stub_mapping, ctx.domains,
                             target_op=op_key, fault_value=var_upper, rng=ctx.rng,
@@ -2183,8 +2220,6 @@ class FaultInjectionStrategy(Strategy):
                 self._attacked.add(pair)
         finally:
             ctx.current_target_key = prev_target_key
-
-
 class TranscriptSearchStrategy(Strategy):
     """Mutate ordered READ transcripts with domain-aware payload assignments."""
 
@@ -2224,16 +2259,18 @@ class TranscriptSearchStrategy(Strategy):
                     if not values and domain is not None:
                         values = build_payload_value_candidates(domain, rng=ctx.rng)
 
+                    _transcript_para = _preferred_target_paragraph(ctx)
                     for raw_value in values[:4]:
                         if yielded >= batch_size:
                             break
 
                         state = _build_input_state(
                             ctx.domains,
-                            "semantic",
+                            "random_valid",
                             ctx.rng,
                             jit_inference=ctx.jit_inference,
                             paragraph_comments=ctx.paragraph_comments,
+                            target_paragraph=_transcript_para,
                         )
                         encoded_value = (
                             format_value_for_cobol(domain, raw_value)
@@ -2550,7 +2587,19 @@ class HeuristicSelector(StrategySelector):
             if not eligible:
                 eligible = strategies[:1]
 
-        best = min(eligible, key=lambda s: self._score(s, cov, round_num))
+        # Force round-robin for the first pass: each strategy gets at least
+        # one round before the heuristic scoring kicks in.  This prevents
+        # high-yield strategies from starving others (e.g. corpus_fuzz,
+        # transcript_search never getting a chance).
+        untried = [s for s in eligible
+                   if s.name not in cov.strategy_yields
+                   or cov.strategy_yields[s.name].rounds == 0]
+        if untried:
+            # Pick the untried strategy with lowest priority (most important)
+            best = min(untried, key=lambda s: s.priority)
+        else:
+            best = min(eligible, key=lambda s: self._score(s, cov, round_num))
+
         batch_size = self._compute_batch_size(best, cov)
         log.debug("Selector picked %s (score=%.1f, batch=%d)",
                   best.name, self._score(best, cov, round_num), batch_size)
@@ -2572,10 +2621,11 @@ class HeuristicSelector(StrategySelector):
         return score
 
     def _compute_batch_size(self, strategy: Strategy, cov) -> int:
+        base = self.default_batch_size
         if strategy.name in ("baseline",):
-            return 500
+            return min(500, max(base, 50))
         if strategy.name == "direct_paragraph":
-            return min(self.default_batch_size * 25, 5000)
+            return min(base * 25, 5000)
         if strategy.name == "corpus_fuzz":
-            return min(self.default_batch_size * 5, 2000)
-        return self.default_batch_size
+            return min(base * 5, 2000)
+        return base

@@ -563,6 +563,14 @@ def _python_pre_run(
         }
     if stub_defaults:
         state["_stub_defaults"] = dict(stub_defaults)
+    # Ensure SQL cursor FETCH loops terminate in the Python pre-run.
+    # Without this, FETCH returns SQLCODE=0 (success) on every call,
+    # causing PERFORM UNTIL loops to hit the 100-iteration guard and
+    # generating thousands of FETCH stubs that overwhelm the COBOL
+    # mock data stream.  Default SQLCODE=100 (end of cursor) lets
+    # cursor loops exit after the explicit stub_outcomes are exhausted.
+    _defaults = state.setdefault("_stub_defaults", {})
+    _defaults.setdefault("SQL-FETCH", [("SQLCODE", 100)])
     state["_stub_log"] = []
 
     try:
@@ -674,6 +682,35 @@ def _is_replay_injectable_var(name: str, dom, eib_names: set) -> bool:
     return bool(getattr(dom, 'valid_88_values', None))
 
 
+def _fd_field_default(name: str, kind: str) -> str | int:
+    """Return a sensible default for an FD record field based on naming.
+
+    Date fields get valid dates, time fields get valid times, indicator
+    fields get common defaults.  Falls back to 0 / "00".
+
+    Numeric-kind fields return int(0) so Python-sim conditions like
+    ``<field> EQUAL ZERO`` (translated to ``state[...] == 0``) compare
+    correctly.  Alpha-kind fields remain strings since they're compared
+    with ``==`` against string literals.
+    """
+    upper = name.upper()
+    if "DD" in upper and "DATE" in upper:
+        return 15 if kind == "numeric" else "15"
+    if "MM" in upper and "DATE" in upper and "TIME" not in upper:
+        return 6 if kind == "numeric" else "06"
+    if "YY" in upper and "DATE" in upper:
+        return 26 if kind == "numeric" else "26"
+    if "HH" in upper and "TIME" in upper:
+        return 0 if kind == "numeric" else "00"
+    if "MM" in upper and "TIME" in upper:
+        return 0 if kind == "numeric" else "00"
+    if "IND" in upper or "FLAG" in upper:
+        return 0 if kind == "numeric" else "0"
+    if kind == "numeric":
+        return 0
+    return "00"
+
+
 def _build_input_state(
     domains: dict[str, VariableDomain],
     strategy: str,
@@ -683,16 +720,52 @@ def _build_input_state(
     jit_inference: object | None = None,
     target_paragraph: str | None = None,
     paragraph_comments: dict[str, list[str]] | None = None,
+    fd_record_fields: dict[str, str] | None = None,
 ) -> dict[str, object]:
     """Build an input state dict using the domain model."""
     state: dict[str, object] = {}
+    _RC_KW = ("ERROR", "RETURN", "STATUS", "RETCODE", "RESP", "RESULT", "RC-")
     for name, dom in domains.items():
         if dom.classification not in ("input", "status", "flag"):
             continue
         if dom.set_by_stub:
-            continue  # stub-controlled, not input
+            # Pre-seed stub-return variables whose names suggest error/
+            # return/status codes with their success value.  The INIT
+            # record acts as a safe fallback: the stub mock overwrites
+            # it when the mock data aligns correctly; when alignment
+            # is off the pre-seeded success value prevents early abend.
+            #
+            # Use the raw literal string instead of format_value_for_cobol
+            # because status fields like FILE-STATUS-FTAXRIOS-WS are
+            # PIC X(02) compared as strings ('00') but the domain may
+            # report data_type=numeric, causing format_value_for_cobol
+            # to truncate '00' → '0' which fails the COBOL check.
+            upper = name.upper()
+            if any(kw in upper for kw in _RC_KW) and dom.condition_literals:
+                success_candidates = [
+                    lit for lit in dom.condition_literals
+                    if str(lit).strip() in ("00", "0", "0000", "  ", "")
+                ]
+                if success_candidates:
+                    state[name] = str(success_candidates[0])
+            continue  # skip normal generation for stub-controlled vars
+        # Preserve COBOL VALUE clause constants for input-classified
+        # variables.  Variables with a non-trivial VALUE clause are
+        # read-before-write (classified as 'input') but their VALUE
+        # clause sets a meaningful constant at program startup.  Random
+        # INIT injection would overwrite it, breaking comparisons that
+        # depend on the original value.  Skip figurative constants
+        # (SPACES/ZEROS) that are just default padding.
+        if (
+            dom.classification == "input"
+            and dom.initial_value is not None
+            and dom.initial_value not in (0, " ", "", "N")
+        ):
+            state[name] = str(dom.initial_value)
+            continue
         val = None
-        if jit_inference is not None:
+        _success_biased = False
+        if jit_inference is not None and strategy == "semantic":
             comment_hints = []
             if paragraph_comments and target_paragraph:
                 comment_hints = paragraph_comments.get(target_paragraph, [])
@@ -706,8 +779,159 @@ def _build_input_state(
                 op_key=dom.set_by_stub,
             )
         if val is None:
-            val = generate_value(dom, strategy, rng)
-        state[name] = format_value_for_cobol(dom, val)
+            # Bias status/flag vars toward success-path values so
+            # initialization file-open checks (IF FS NOT = '00' AND '04')
+            # pass and the program reaches main processing.  Phase 2/3
+            # of BaselineStrategy will explore error values individually.
+            #
+            # When a success literal is picked, store it as a raw string
+            # to bypass format_value_for_cobol — file-status fields are
+            # PIC X(02) but the domain may say data_type=numeric, causing
+            # '00' → '0' which fails COBOL string comparison.
+            _success_biased = False
+            if dom.classification in ("status", "flag") and dom.condition_literals:
+                success_candidates = [
+                    lit for lit in dom.condition_literals
+                    if str(lit) in ("00", "0", "0000", "  ", "")
+                ]
+                if success_candidates:
+                    val = success_candidates[0]
+                    _success_biased = True
+            # Status/flag vars with FILE-STATUS in their name but no
+            # condition_literals should still default to '00' — they
+            # are almost certainly file-status variables that gate
+            # early program flow.  Also apply to input-classified vars
+            # with file-status names (some are mis-classified as input).
+            if val is None and dom.classification in ("status", "flag", "input"):
+                upper = name.upper()
+                if "FILE-STATUS" in upper or "FS-" in upper:
+                    val = "00"
+                    _success_biased = True
+            # Also bias input vars with error-code/return-code names
+            # toward their success values so early gatekeeping checks
+            # pass.
+            if val is None and dom.classification == "input" and dom.condition_literals:
+                upper = name.upper()
+                if "ERROR" in upper or "RETURN" in upper or "STATUS" in upper:
+                    success_candidates = [
+                        lit for lit in dom.condition_literals
+                        if str(lit) in ("00", "0", "0000", "  ", "")
+                    ]
+                    if success_candidates:
+                        val = success_candidates[0]
+                        _success_biased = True
+            # Bias flag_bool vars whose names suggest failure (ERROR,
+            # ABORT, EXCEPTION, ABEND, EOF, NO-MORE) toward the
+            # no-error value ('N' / False / SPACES) so the program
+            # stays on the happy path during initialization.
+            if val is None and dom.semantic_type == "flag_bool":
+                upper = name.upper()
+                _neg_keywords = ("ERROR", "ABORT", "EXCEPTION", "ABEND",
+                                 "EOF", "NO-MORE", "END-OF", "INVALID",
+                                 "FAIL", "NOT-FOUND", "NOTFND")
+                if any(kw in upper for kw in _neg_keywords):
+                    val = "N"
+            # Bias data_type=unknown input vars whose names suggest
+            # numeric content toward '0' instead of random alpha strings.
+            # Moving random alpha into COMP-3 or PIC 9 fields produces
+            # garbage that causes fatal comparison failures at runtime.
+            if val is None and dom.data_type == "unknown":
+                upper = name.upper()
+                _NUMERIC_NAME_KW = (
+                    "DATE", "AMOUNT", "AMT", "TOTAL", "TOT",
+                    "COUNT", "CNT", "NBR", "NUM", "QTY", "BALANCE",
+                    "RATE", "PERC", "CREDIT", "DEBIT",
+                )
+                if any(kw in upper for kw in _NUMERIC_NAME_KW):
+                    val = "0"
+                    _success_biased = True
+            if val is None:
+                val = generate_value(dom, strategy, rng)
+        # Use raw string for success-biased literals so '00' stays '00'
+        # (format_value_for_cobol may truncate to '0' for numeric domains).
+        if _success_biased:
+            state[name] = str(val)
+        else:
+            state[name] = format_value_for_cobol(dom, val)
+
+    # Inject FD record field defaults so the COBOL binary can read config
+    # files (e.g. PROCDATE) that are mocked.  Without these defaults, the
+    # FD buffer stays blank after a mocked READ and date/param validation
+    # causes early abend.
+    #
+    # Use _fd_field_default() which applies name-based heuristics: date
+    # sub-fields get valid date components (DD→15, MM→06, YY→26),
+    # indicator fields get '0', and other alpha fields default to '00'.
+    if fd_record_fields:
+        for name, kind in fd_record_fields.items():
+            if name not in state:
+                state[name] = _fd_field_default(name, kind)
+
+        # Cross-reference FD indicator fields against matching WORKING-
+        # STORAGE variables.  The Python simulator does NOT populate FD
+        # buffers from mock READ payloads — FD fields stay at their
+        # input_state value for the entire run.  When the COBOL source
+        # compares an FD field to a WS field, the Python sim needs them
+        # to match.  Without this, the comparison fails and the program
+        # takes the error/EOF branch.
+        #
+        # Strategy: for each FD field containing 'IND' or 'FLAG', find a
+        # non-FD variable that shares the longest prefix.  If found and
+        # the WS value is non-trivial, copy it into the FD field.
+        non_fd_vars = {
+            n: v for n, v in state.items()
+            if n not in fd_record_fields
+        }
+        for fd_name in fd_record_fields:
+            fu = fd_name.upper()
+            if "IND" not in fu and "FLAG" not in fu:
+                continue
+            # Find best matching non-FD variable by shared prefix length
+            best_match = ""
+            best_len = 0
+            parts_fd = fu.split("-")
+            for ws_name in non_fd_vars:
+                parts_ws = ws_name.upper().split("-")
+                # Count matching leading segments
+                match_len = 0
+                for a, b in zip(parts_fd, parts_ws):
+                    if a == b:
+                        match_len += 1
+                    else:
+                        break
+                if match_len > best_len:
+                    best_len = match_len
+                    best_match = ws_name
+            if best_len >= 2 and best_match:
+                ws_val = str(non_fd_vars[best_match])
+                if ws_val and ws_val not in ("0", "", " ", "00"):
+                    state[fd_name] = ws_val
+
+        # Coerce numeric FD fields to Python int/float so the generated
+        # Python simulator's ``== 0`` / ``== ZERO`` comparisons work.
+        # The domain loop above produces *string* values via
+        # format_value_for_cobol(), but the condition parser emits
+        # ``state['X'] == 0``  (integer).  Without this coercion
+        # ``'0' == 0`` → False and numeric FD gate conditions are
+        # never True.
+        for name, kind in fd_record_fields.items():
+            if kind != "numeric":
+                continue
+            val = state.get(name)
+            if val is None:
+                continue
+            if isinstance(val, (int, float)):
+                continue
+            try:
+                s = str(val).strip()
+                if not s:
+                    state[name] = 0
+                elif "." in s:
+                    state[name] = float(s)
+                else:
+                    state[name] = int(s)
+            except (ValueError, TypeError):
+                pass  # leave as-is for non-numeric content
 
     # CICS-aware defaults: ensure key EIB fields enable deeper execution
     upper_names = {n.upper(): n for n in state}
@@ -982,8 +1206,24 @@ def _build_success_stubs(
                 success_entries.append((var, 0))      # MQCC-OK = 0 (integer)
                 eof_entries.append((var, 2))           # MQCC-FAILED = 2
             else:
-                success_entries.append((var, "00"))
-                eof_entries.append((var, "10"))
+                # Use domain condition_literals to pick a success value
+                # that matches the program's checks (e.g. '0000' for a
+                # PIC X(04) CALL return code instead of generic '00').
+                success_val = "00"
+                eof_val = "10"
+                if dom and dom.condition_literals:
+                    for lit in dom.condition_literals:
+                        s = str(lit).strip()
+                        if s in ("00", "0", "0000", "  ", ""):
+                            success_val = lit
+                            break
+                    # Pick a non-success literal for EOF if available
+                    for lit in dom.condition_literals:
+                        if lit != success_val:
+                            eof_val = lit
+                            break
+                success_entries.append((var, success_val))
+                eof_entries.append((var, eof_val))
 
         if success_entries:
             if is_read:
@@ -1535,6 +1775,13 @@ def _execute_and_save(
         merged_input.update(input_state)
         input_state = merged_input
 
+    # Inject FD record field defaults so the COBOL binary can get past
+    # initialization (e.g. date validation from PROCDATE FD record).
+    if ctx.context and ctx.context.fd_record_fields:
+        for name, kind in ctx.context.fd_record_fields.items():
+            if name not in input_state:
+                input_state[name] = _fd_field_default(name, kind)
+
     cobol_mode = ctx.context is not None
 
     if ctx.context is not None:
@@ -1562,11 +1809,19 @@ def _execute_and_save(
             # the caller is the branch swarm (which specifically targets
             # COBOL-uncovered branches — the py: versions may already be
             # covered by earlier strategies while the COBOL versions are not).
+            # Also replay when Python hits py: branches whose COBOL
+            # counterparts (without py: prefix) haven't been covered yet.
             # Project the direct-execution state down to entry-safe injected
             # variables so COBOL replays are not polluted by Python locals.
             py_new = {b for b in result.branches_hit if b.startswith("py:")} - cov.branches_hit
+            # Check if any py: branches have uncovered COBOL equivalents
+            cobol_missing = {
+                b[3:]  # strip 'py:' prefix
+                for b in result.branches_hit
+                if b.startswith("py:") and b[3:] not in cov.branches_hit
+            }
             force_cobol_replay = strategy_name == "branch_swarm" and stub_outcomes
-            if py_new or force_cobol_replay:
+            if py_new or cobol_missing or force_cobol_replay:
                 seed_state = _best_memory_seed_input(getattr(ctx, "memory_state", None), canonical_target)
                 if not seed_state:
                     seed_state = _best_cobol_seed_input(cov)
@@ -1726,7 +1981,15 @@ def _execute_and_save(
             cov.consecutive_timeouts = 0
         return False, tc_count
 
-    cov.consecutive_timeouts = 0
+    # Track timeouts: rc == -1 means COBOL execution timed out.  Even if
+    # the TC produced valid output (paragraphs/branches), it burned the
+    # full timeout window.  Programs stuck in infinite main-processing
+    # loops always time out with the same coverage — consecutive_timeouts
+    # lets the strategy selector detect this and move on faster.
+    if getattr(result, "return_code", 0) == -1:
+        cov.consecutive_timeouts += 1
+    else:
+        cov.consecutive_timeouts = 0
 
     # Normalize paragraph coverage to AST-known labels. Keep runtime-only labels
     # in a side channel for diagnostics/reporting.
@@ -1995,7 +2258,7 @@ def run_cobol_coverage(
 
     # --- INITIALIZE ---
     log.info("Parsing AST: %s", ast_file)
-    program = parse_ast(ast_file, cobol_source=cobol_source if cobol_source else None)
+    program = parse_ast(ast_file)
     var_report = extract_variables(program)
     call_graph = build_static_call_graph(program)
     gating_conds = extract_gating_conditions(program, call_graph)
@@ -2066,6 +2329,31 @@ def run_cobol_coverage(
     _EIB_NAMES = {"EIBCALEN", "EIBAID", "EIBTRNID", "EIBTIME", "EIBDATE",
                   "EIBTASKN", "EIBTRMID", "EIBCPOSN", "EIBFN", "EIBRCODE",
                   "EIBDS", "EIBREQID", "EIBRSRCE", "EIBRESP", "EIBRESP2"}
+    # Bare COBOL reserved words that would break MOVE targets in the
+    # generated SPECTER-READ-INIT-VARS dispatcher.  Only exact matches —
+    # hyphenated names like ``CLOSE-BAL`` are valid COBOL identifiers.
+    _COBOL_RESERVED_WORDS = {
+        "IF", "ELSE", "END", "PERFORM", "MOVE", "ADD", "SUBTRACT",
+        "MULTIPLY", "DIVIDE", "COMPUTE", "GO", "STOP", "CALL",
+        "DISPLAY", "READ", "WRITE", "OPEN", "CLOSE", "ACCEPT", "SET",
+        "WHEN", "EVALUATE", "STRING", "UNSTRING", "INSPECT", "SEARCH",
+        "DELETE", "REWRITE", "RETURN", "EXIT", "CONTINUE", "NOT", "AND",
+        "OR", "ALSO", "UNTIL", "VARYING", "THRU", "THROUGH", "TRUE",
+        "FALSE", "ZERO", "ZEROS", "ZEROES", "SPACE", "SPACES",
+        "CORRESPONDING", "SECTION", "DIVISION", "PROGRAM", "DATA",
+        "WORKING", "STORAGE", "PROCEDURE", "FILE", "COPY", "VALUE",
+    }
+
+    # Build set of 88-level condition names — these are NOT real storage
+    # items and must not be injected as INIT records.  An INIT record
+    # would MOVE a string into the parent's PIC 9 field, corrupting it
+    # (e.g. SCHEDULE-FILE-ERROR is ``88 VALUE 1`` under PIC 9 parent —
+    # MOVE 'Y' TO SCHEDULE-FILE-ERROR-FLAG-WS is gibberish).
+    _88_level_child_names: set[str] = set(_level_88_parents.keys())
+    for _d in domains.values():
+        if _d.valid_88_values:
+            for _child in _d.valid_88_values:
+                _88_level_child_names.add(_child.upper())
 
     def _is_safe_to_inject(name: str, dom) -> bool:
         """Return True if injecting a value at startup is safe.
@@ -2084,14 +2372,35 @@ def run_cobol_coverage(
           * EIB registers — CICS control block fields.
           * Stub-return variables — their values come from stubs, not
             from startup injection.
+          * COBOL reserved words — variables whose name is exactly a
+            reserved word (e.g. ``IF``, ``WHEN``, ``END``) would
+            produce invalid ``MOVE MOCK-ALPHA-STATUS TO IF`` in the
+            generated INIT dispatcher.
         """
         upper = name.upper()
         if upper == "FILLER" or upper.startswith("FILLER-"):
             return False
         if upper in _EIB_NAMES:
             return False
-        if dom.set_by_stub:
+        if upper in _COBOL_RESERVED_WORDS:
             return False
+        if upper in _88_level_child_names:
+            return False
+        if dom.set_by_stub:
+            # Allow stub-return variables whose names suggest error/return/
+            # status codes — they need INIT records as a safe fallback
+            # because mock data alignment issues can prevent the stub
+            # mechanism from setting them.  The INIT record pre-seeds the
+            # success value; the stub mock overwrites it if it executes
+            # correctly.
+            _RC_KEYWORDS = ("ERROR", "RETURN", "STATUS", "RETCODE",
+                            "RESP", "RESULT", "RC-")
+            if not any(kw in upper for kw in _RC_KEYWORDS):
+                return False
+            # Only if they carry a recognisable success literal.
+            if not any(str(lit).strip() in ("00", "0", "0000", "  ", "")
+                       for lit in (dom.condition_literals or [])):
+                return False
         if dom.classification == "internal-no-inject":
             return False
         # Must carry actionable signal.
@@ -2114,11 +2423,24 @@ def run_cobol_coverage(
         name for name, dom in domains.items()
         if _is_safe_to_inject(name, dom)
     ]
+
+    # Sort injectable vars by priority so the bounded dispatch includes
+    # the most impactful variables first:
+    #   1. status/flag classified vars (gate early program flow)
+    #   2. vars with more condition_literals (richer gating signal)
+    #   3. alphabetical tiebreak for determinism
+    def _injectable_priority(name: str) -> tuple:
+        dom = domains[name]
+        cls_rank = 0 if dom.classification in ("status", "flag") else 1
+        lit_count = -(len(dom.condition_literals) + len(dom.valid_88_values))
+        return (cls_rank, lit_count, name)
+
+    injectable.sort(key=_injectable_priority)
     log.info("Injectable variables: %d", len(injectable))
 
     # Prepare COBOL context (instrument + compile)
     log.info("Instrumenting and compiling COBOL ...")
-    replay_injectable = injectable[:40]
+    replay_injectable = injectable
     payload_variables, payload_candidates = _build_transcript_payload_candidates(
         domains,
         stub_mapping,
@@ -2305,7 +2627,7 @@ def run_cobol_coverage(
             jit_inference.summary_every_requests = max(1, int(jit_cfg.summary_every_requests))
             jit_inference.debug_min_interval_sec = max(0.0, float(jit_cfg.debug_min_interval_ms) / 1000.0)
             jit_inference.require_target_paragraph_context = bool(
-                getattr(jit_cfg, "require_target_paragraph_context", True)
+                getattr(jit_cfg, "require_target_paragraph_context", False)
             )
             if not bool(jit_cfg.enabled):
                 # Keep counters active for suffix reporting, silence periodic INFO summaries.
@@ -2448,6 +2770,7 @@ def _run_agentic_loop(
         )
 
         cases_tried = 0
+        consecutive_no_gain = 0
         for input_state, stubs, defaults, target in strategy.generate_cases(ctx, cov, batch_size):
             if tc_count >= budget or (time.time() - start_time) >= timeout:
                 break
@@ -2461,8 +2784,19 @@ def _run_agentic_loop(
             )
             if saved:
                 round_new += 1
+                consecutive_no_gain = 0
+            else:
+                consecutive_no_gain += 1
 
             cases_tried += 1
+
+            # Early exit if many consecutive cases produce no new coverage
+            if consecutive_no_gain >= 15 and cases_tried >= 5:
+                log.info(
+                    "Round %d: early exit — %d consecutive no-gain cases for %s",
+                    round_num, consecutive_no_gain, strategy.name,
+                )
+                break
 
             if cases_tried % 200 == 0:
                 counted_now = len(_counted_branches_for_mode(cov.branches_hit, ctx.context is not None))

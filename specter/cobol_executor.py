@@ -29,6 +29,56 @@ from .cobol_mock import (
 
 log = logging.getLogger(__name__)
 
+# Regex for extracting SPECTER-MOCK operation keys from instrumented source
+_SPECTER_MOCK_RE = re.compile(r"DISPLAY\s+'SPECTER-MOCK:([^']+)'")
+
+# Extended regex that also captures a trailing COBOL variable (dynamic CALL)
+_SPECTER_MOCK_DYNAMIC_RE = re.compile(
+    r"DISPLAY\s+'SPECTER-MOCK:([^']+)'\s+([A-Z0-9][-A-Z0-9]*)",
+    re.IGNORECASE,
+)
+
+
+def _extract_mock_operations(source_text: str) -> list[str]:
+    """Extract ordered mock-operation keys from instrumented COBOL source.
+
+    Handles both static ops (``DISPLAY 'SPECTER-MOCK:CALL:RGLCONV'``) and
+    dynamic ops (``DISPLAY 'SPECTER-MOCK:CALL:' WS-PARAM``).  For dynamic
+    targets, appends the COBOL variable name as the op suffix (matching the
+    Python pre-run's stub_log convention, e.g. ``CALL:WS-PARAM``).
+    """
+    lines = source_text.splitlines()
+
+    ops: list[str] = []
+    for line_idx, line in enumerate(lines):
+        # Quick pre-filter
+        if "SPECTER-MOCK:" not in line:
+            continue
+        upper = line.upper().strip()
+        if upper.startswith("*"):
+            continue
+
+        # Try dynamic pattern first (has trailing variable)
+        m_dyn = _SPECTER_MOCK_DYNAMIC_RE.search(line)
+        if m_dyn:
+            op_key = m_dyn.group(1)   # e.g. "CALL:"
+            var_name = m_dyn.group(2).upper()  # e.g. "WS-PARAM"
+            ops.append(op_key + var_name)
+            continue
+
+        # Static pattern
+        m_static = _SPECTER_MOCK_RE.search(line)
+        if m_static:
+            ops.append(m_static.group(1))
+
+    return ops
+
+# Sentinel object used as the *entry* value for padded OPEN/CLOSE records.
+# ``generate_mock_data_ordered`` recognises this and emits a bare primary
+# record with alpha='00' / num=0  — no SET: payload records — so the mock
+# record stream stays aligned.
+_OPEN_SUCCESS_SENTINEL = object()
+
 
 # ---------------------------------------------------------------------------
 # IBM → GnuCOBOL source-level fixups
@@ -166,6 +216,8 @@ class CobolExecutionContext:
     total_branches: int = 0
     hardened_mode: bool = False
     coverage_mode: bool = False
+    mock_operations: list[str] = field(default_factory=list)  # ordered SPECTER-MOCK op keys
+    fd_record_fields: dict[str, str] = field(default_factory=dict)  # FD field -> "alpha"|"numeric"
 
 
 @dataclass
@@ -257,17 +309,52 @@ def prepare_context(
             if payload_variables and "SPECTER-APPLY-MOCK-PAYLOAD" not in source_text:
                 log.info("Cached compiled COBOL is missing payload helpers; rebuilding")
             else:
+                # -- Precompiled SQL patch: EXEC SQL already commented out by
+                # DB2 precompiler, active EVALUATE SQLCODE remains without
+                # mock reads.  Insert mock reads and recompile if needed.
+                if "EVALUATE SQLCODE" in source_text and "SPECTER-MOCK:SQL" not in source_text:
+                    from .cobol_mock import _mock_precompiled_sql_evaluates
+                    src_lines = source_text.splitlines(keepends=True)
+                    patched, n_patched = _mock_precompiled_sql_evaluates(src_lines)
+                    if n_patched > 0:
+                        log.info("Patching %d precompiled SQL EVALUATE blocks; recompiling",
+                                 n_patched)
+                        instrumented_path.write_text("".join(patched))
+                        import subprocess
+                        compile_cmd = [
+                            "cobc", "-x",
+                            "-std=ibm", "-Wno-dialect",
+                            "-frelax-syntax-checks", "-frelax-level-hierarchy",
+                            "-o", str(executable_path),
+                            str(instrumented_path),
+                        ]
+                        for cpd in (copybook_dirs or []):
+                            compile_cmd.extend(["-I", str(cpd)])
+                        cp = subprocess.run(compile_cmd, capture_output=True, text=True)
+                        if cp.returncode != 0:
+                            log.warning("Recompile after SQL patch failed: %s", cp.stderr[:500])
+                            # Restore original and proceed with the existing binary
+                            instrumented_path.write_text(source_text)
+                        else:
+                            source_text = instrumented_path.read_text()
+                            log.info("Recompile successful after SQL patch")
+
                 log.info("Using cached compiled COBOL: %s", executable_path)
                 hardened_mode = "SPECTER-HARDENED-ENTRY" in source_text
                 branch_meta: dict = {}
                 total_branches = 0
                 total_paragraphs = 0
                 if enable_branch_tracing:
-                    # Count @@B: probes already in the source (from LLM or rule-based insertion)
+                    # Count @@B: probes and extract conditions from the source
                     import re as _re
                     _para_re = _re.compile(r"^\s{7}([A-Z0-9][A-Z0-9_-]*)\s*\.\s*$", _re.IGNORECASE)
+                    _if_re = _re.compile(r"^.{6}\s+IF\s+(.+)", _re.IGNORECASE)
+                    _eval_re = _re.compile(r"^.{6}\s+EVALUATE\s+(.+)", _re.IGNORECASE)
+                    source_lines = source_text.splitlines()
                     current_para = ""
-                    for line in source_text.splitlines():
+                    # First pass: map each @@B: line number to bid
+                    probe_line_map: dict[int, str] = {}
+                    for li, line in enumerate(source_lines):
                         m_para = _para_re.match(line)
                         if m_para:
                             current_para = m_para.group(1).upper()
@@ -277,16 +364,52 @@ def prepare_context(
                             total_branches += 1
                             if bid not in branch_meta:
                                 branch_meta[bid] = {"paragraph": current_para}
+                                probe_line_map[li] = bid
+                    # Second pass: extract IF/EVALUATE conditions for each probe
+                    for probe_li, bid in probe_line_map.items():
+                        # Scan backward from the probe to find the IF or EVALUATE
+                        for scan_i in range(probe_li - 1, max(probe_li - 30, -1), -1):
+                            scan_line = source_lines[scan_i]
+                            m_if = _if_re.match(scan_line)
+                            if m_if:
+                                cond_parts = [m_if.group(1).strip().rstrip(".")]
+                                # Gather continuation lines
+                                for k in range(scan_i + 1, probe_li):
+                                    cl = source_lines[k]
+                                    if len(cl) > 6 and cl[6] in ("*", "/"):
+                                        continue
+                                    ct = cl[7:].strip().upper() if len(cl) > 7 else ""
+                                    if not ct or ct.startswith("DISPLAY"):
+                                        break
+                                    cond_parts.append(ct.rstrip("."))
+                                branch_meta[bid]["condition"] = " ".join(cond_parts)
+                                branch_meta[bid]["type"] = "IF"
+                                break
+                            m_eval = _eval_re.match(scan_line)
+                            if m_eval:
+                                branch_meta[bid]["condition"] = m_eval.group(1).strip().rstrip(".")
+                                branch_meta[bid]["type"] = "EVALUATE"
+                                break
+                            # Stop scanning if we hit another paragraph header
+                            if _para_re.match(scan_line):
+                                break
                 total_paragraphs = source_text.count("SPECTER-TRACE:")
+                mock_ops = _extract_mock_operations(source_text)
+                from .incremental_mock import _extract_fd_record_fields
+                fd_fields = _extract_fd_record_fields(
+                    source_text.splitlines(keepends=True)
+                )
                 return CobolExecutionContext(
                     executable_path=executable_path,
                     instrumented_source_path=instrumented_path,
                     branch_meta=branch_meta,
-                    injectable_vars=list(injectable_vars or []),
+                    injectable_vars=list(set(injectable_vars or []) | set(fd_fields.keys())),
                     total_paragraphs=total_paragraphs,
                     total_branches=total_branches,
                     hardened_mode=hardened_mode,
                     coverage_mode=coverage_mode,
+                    mock_operations=mock_ops,
+                    fd_record_fields=fd_fields,
                 )
 
     # No pre-clean — the incremental pipeline handles errors via LLM.
@@ -339,18 +462,36 @@ def prepare_context(
         if "SPECTER-TRACE:" in l and not l.strip().startswith("*")
     )
 
-    log.info("Compiled COBOL: %s (%d paragraphs traced, %d branch probes)",
-             executable_path, total_paragraphs, total_branches)
+    mock_ops = _extract_mock_operations(source_text)
+
+    # Discover FD record fields from the instrumented source so the
+    # coverage engine can inject values for file-buffer variables.
+    from .incremental_mock import _extract_fd_record_fields
+    fd_fields = _extract_fd_record_fields(
+        source_text.splitlines(keepends=True)
+    )
+    log.info("Compiled COBOL: %s (%d paragraphs traced, %d branch probes, %d mock ops, %d FD fields)",
+             executable_path, total_paragraphs, total_branches, len(mock_ops), len(fd_fields))
 
     return CobolExecutionContext(
         executable_path=executable_path,
         instrumented_source_path=instrumented_path,
         branch_meta=branch_meta,
-        injectable_vars=list(injectable_vars or []),
+        # Include FD record fields in injectable_vars — these are added
+        # to the SPECTER-READ-INIT-VARS WHEN dispatch during
+        # incremental_instrument() (enriched from _extract_fd_record_fields)
+        # but are NOT in the original injectable_vars list because they
+        # don't appear in the AST's variable_extractor domains.  Without
+        # them, the run_test_case INIT filter drops critical records
+        # like PROCESS-DATE-DD-FD and DIFF-IND-FD, causing the program
+        # to crash on date validation at startup.
+        injectable_vars=list(set(injectable_vars or []) | set(fd_fields.keys())),
         total_paragraphs=total_paragraphs,
         total_branches=total_branches,
         hardened_mode=hardened_mode,
         coverage_mode=coverage_mode,
+        mock_operations=mock_ops,
+        fd_record_fields=fd_fields,
     )
 
 
@@ -389,54 +530,246 @@ def run_test_case(
     work_dir = Path(work_dir)
 
     # Build mock data: init records + stub records
+    #
+    # CRITICAL: Only emit INIT records for variables that have matching
+    # WHEN clauses in the COBOL binary's SPECTER-READ-INIT-VARS dispatch.
+    # The input_state may contain 1500+ variables (all status/flag/input
+    # domains), but the COBOL binary only recognises ~1065 of them.
+    # Unrecognised INIT records still loop through the full EVALUATE
+    # (1065 WHEN comparisons each) adding massive overhead — 1895 records
+    # takes >5 seconds just for INIT processing, causing every baseline
+    # test case to timeout before reaching application code.
     init_values = {k: str(v) for k, v in input_state.items()
                    if not str(k).startswith("_")}
+    if context.injectable_vars:
+        injectable_set = set(context.injectable_vars)
+        init_values = {k: v for k, v in init_values.items()
+                       if k in injectable_set}
     init_data = generate_init_records(init_values) if init_values else ""
 
-    # The Python pre-run's run() function calls paragraphs in SOURCE
-    # DECLARATION order (1000-GET-NEXT before 0000-ACCTFILE-OPEN),
-    # but the COBOL binary runs them in EXECUTION order (OPEN before
-    # GET-NEXT, per the main program's PERFORM sequence). This means
-    # the stub_log has READ/WRITE/CALL records first and OPEN records
-    # later, while the COBOL binary expects OPEN records first.
+    # The COBOL binary reads mock records SEQUENTIALLY — each
+    # PERFORM SPECTER-NEXT-MOCK-RECORD reads the next record from
+    # the file.  The Python pre-run captures operations in EXECUTION
+    # order, which is the order the COBOL binary will consume them.
     #
-    # If we write the mock data in stub_log order, the COBOL OPEN
-    # paragraph reads a READ record (wrong status — SPACES instead
-    # of '00'), and the success path is never exercised. This is the
-    # root cause of the APPL-AOK/STATUS='00' plateau on every batch
-    # program.
+    # IMPORTANT: We keep stub_log in Python pre-run execution order
+    # (NOT source-line order from mock_operations).  Source-line order
+    # does NOT match execution order due to PERFORM calls — a utility
+    # paragraph late in the source may be PERFORMed early during
+    # initialization.  Reordering to source-line order caused severe
+    # misalignment where SET: payload records from one operation were
+    # consumed by a different operation, cascading into bad file-status
+    # values and abends.
     #
-    # Fix: reorder the stub_log so OPEN entries appear at the front
-    # (matching COBOL execution order), followed by everything else
-    # in their original order.
-    open_close_pad = ""
-    if stub_log:
-        open_entries = [(k, e) for k, e in stub_log if k.startswith("OPEN:")]
-        close_entries = [(k, e) for k, e in stub_log if k.startswith("CLOSE:")]
-        other_entries = [(k, e) for k, e in stub_log
-                         if not k.startswith("OPEN:") and not k.startswith("CLOSE:")]
-        # COBOL order: OPEN first, then main logic (READ/WRITE/CALL), then CLOSE
-        stub_log = open_entries + other_entries + close_entries
-        if open_entries:
+    # We also FILTER stub_log to only include operations that exist in
+    # the COBOL source's mock_operations.  The Python simulator often
+    # generates extra operations (e.g. individual OPEN for a grouped
+    # OPEN statement, or per-iteration CLOSE entries) that have no
+    # no corresponding DISPLAY 'SPECTER-MOCK:...' in the COBOL binary.
+    # Those extra records shift the entire mock data alignment.
+    #
+    # For operations the Python pre-run didn't cover (executed by
+    # COBOL but not the simulator), generous padding records at the
+    # end ensure the binary never hits EOF.  These padding records
+    # have alpha='00' and no SET: payloads, so they safely satisfy
+    # any file-status or return-code check.
+    if context.mock_operations and stub_log:
+        mock_op_set = set(context.mock_operations)
+        filtered_log: list[tuple[str, list]] = []
+        dropped = 0
+        for op_key, entry in stub_log:
+            if op_key in mock_op_set:
+                filtered_log.append((op_key, entry))
+            else:
+                dropped += 1
+        if dropped:
             log.debug(
-                "Reordered stub_log: %d OPEN + %d other + %d CLOSE (moved %d OPEN entries to front)",
-                len(open_entries), len(other_entries), len(close_entries), len(open_entries),
+                "Mock data: filtered %d Python-only stub entries "
+                "(kept %d entries matching %d COBOL ops)",
+                dropped, len(filtered_log), len(mock_op_set),
             )
+        # Keep stubs in Python execution order (closest to COBOL order).
+        # All entries are emitted as single primary records (no SET:
+        # payloads).  The COBOL mock infrastructure defaults status
+        # variables before SPECTER-APPLY-MOCK-PAYLOAD, so SET: records
+        # are redundant for baseline values.  Eliminating multi-record
+        # entries prevents APPLY-MOCK-PAYLOAD read-ahead from consuming
+        # records meant for subsequent operations when uncovered mock
+        # ops shift the alignment by one or more positions.
+        stub_log = filtered_log
+    elif stub_log:
+        pass  # no mock_operations available — keep stub_log as-is
 
-    stub_data = generate_mock_data_ordered(stub_log) if stub_log else ""
+    # Generate mock data — every entry becomes a single primary record
+    # (no SET: payload records).  This ensures each mock operation
+    # consumes exactly one record from the stream, preventing the
+    # cascading misalignment that occurs when uncovered COBOL operations
+    # shift the stream position and cause APPLY-MOCK-PAYLOAD to consume
+    # SET: records meant for completely different operations.
+    #
+    # For entries with payloads, the primary alpha is extracted from the
+    # last pair value (matching _encode_mock_entry convention).  Status
+    # variables are set via INIT records and/or the COBOL code's own
+    # MOVE defaults before SPECTER-APPLY-MOCK-PAYLOAD, so omitting SET:
+    # records is safe for baseline coverage.
+    if stub_log:
+        records: list[str] = []
+        for op_key, entry in stub_log:
+            if entry is _OPEN_SUCCESS_SENTINEL or entry is None:
+                records.append(_format_mock_record(op_key, "00", 0))
+            elif isinstance(entry, list) and entry:
+                # Extract alpha from the last pair (same as _encode_mock_entry)
+                last_pair = entry[-1]
+                if isinstance(last_pair, (list, tuple)) and len(last_pair) == 2:
+                    alpha = str(last_pair[1])
+                else:
+                    alpha = "00"
+                try:
+                    num = int(alpha)
+                except (ValueError, TypeError):
+                    num = 0
+                records.append(_format_mock_record(op_key, alpha, num))
+            else:
+                records.append(_format_mock_record(op_key, "00", 0))
+
+        # SQL cursor termination: after each run of SQL-FETCH records,
+        # inject a PAIRED FETCH record with SQLCODE=100 so cursor loops
+        # exit cleanly.  Each COBOL mock operation consumes 2 records:
+        # 1 primary (NEXT-MOCK-RECORD) + 1 lookahead (APPLY-MOCK-PAYLOAD).
+        # SQLCODE is set from the lookahead's MOCK-NUM-STATUS, so we need
+        # 2 records with num=100: one consumed as primary, one as lookahead.
+        patched: list[str] = []
+        for i, rec in enumerate(records):
+            patched.append(rec)
+            if stub_log[i][0].upper().startswith("SQL-FETCH"):
+                # Check if next entry is NOT a FETCH (end of cursor loop)
+                next_is_fetch = (
+                    i + 1 < len(stub_log)
+                    and stub_log[i + 1][0].upper().startswith("SQL-FETCH")
+                )
+                if not next_is_fetch:
+                    # Inject paired EOF FETCH: primary + lookahead both 100
+                    eof_rec = _format_mock_record("SQL-FETCH", "00", 100)
+                    patched.append(eof_rec)
+                    patched.append(eof_rec)
+        records = patched
+
+        stub_data = "\n".join(records) + "\n" if records else "\n"
+    else:
+        stub_data = ""
 
     # In coverage mode (RETURN/XCTL don't terminate), the COBOL program
     # consumes more mock records than the Python pre-run produces.
     # Pad with extra success records so the COBOL doesn't hit EOF early.
+    # Use enough padding to cover operations the Python pre-run missed
+    # (e.g. utility paragraphs, report writer I/O, and extra operations
+    # reached via coverage-mode fall-through).
+    #
+    # Padding uses all '00' (success) primary records.  Older '10' (EOF)
+    # padding records caused hard GOBACKs on programs with strict
+    # file-status checks (e.g. IF FILE-STATUS NOT EQUAL '00' AND '04'
+    # AND '05' → U-FILE-EXCEPTION → GOBACK), terminating the entire
+    # program instead of just the current READ loop.
+    #
+    # To break READ loops cleanly, every Nth primary record is followed
+    # by SET: payload records for FD fields whose names indicate loop-
+    # control (IND, FLAG, END-OF, MORE, CUT-OFF).  APPLY-MOCK-PAYLOAD
+    # consumes these SET: records and populates the FD record buffer
+    # with values that differ from the loop-continuation defaults,
+    # causing the COBOL loop-exit checks to fire naturally.
     pad_data = ""
     if context.coverage_mode:
-        pad_record = f"{'CICS':<30}{'00':<20}{'0':>9}{' ' * 21}"[:80]
-        pad_data = "\n".join([pad_record] * 50) + "\n"
+        n_mock_ops = len(context.mock_operations) if context.mock_operations else 0
+        # Generous padding: at least 60 records, or 2x the known mock ops.
+        # Keep padding modest so SQL cursor FETCH loops hit mock-EOF
+        # quickly (mock-EOF sets SQLCODE=100 for FETCH, terminating
+        # cursor loops naturally).  The SET: loop-break records provide
+        # control-flag variation for READ loops.
+        pad_count = max(60, n_mock_ops * 2)
+        ok_record = f"{'CICS':<30}{'00':<20}{'0':>9}{' ' * 21}"[:80]
 
-    # Concatenate: init records first, then stub records (now reordered
-    # with OPEN at front), then optional coverage padding.
+        # Build SET: records for loop-control FD fields.
+        # These are injected after every LOOP_BREAK_INTERVAL-th primary
+        # record so READ loops inside the program encounter changed FD
+        # buffers and hit their exit conditions.
+        _LOOP_BREAK_INTERVAL = 5  # inject SET: after every 5th primary
+        loop_break_phase_a: list[str] = []
+        loop_break_phase_b: list[str] = []
+        if context.fd_record_fields:
+            _LOOP_CTL = {"IND", "FLAG", "END-OF", "MORE", "CUT-OFF", "CUTOFF"}
+            # Only alpha fields whose names match loop-control keywords
+            # are treated as loop flags.  Numeric fields that happen to
+            # contain these keywords (e.g. a COMP-3 date field whose name
+            # includes "CUTOFF") must NOT be treated as loop flags —
+            # setting them to 1 corrupts packed-decimal values.
+            loop_ctl_fields: set[str] = set()
+            for fname, fkind in sorted(context.fd_record_fields.items()):
+                fu = fname.upper()
+                if (fkind != "numeric"
+                        and any(kw in fu for kw in _LOOP_CTL)):
+                    loop_ctl_fields.add(fu)
+                    padded_name = f"{fname.upper()[:26]:<26}"
+                    # Alpha loop-control: Phase A = continuation ('0'),
+                    # Phase B = termination ('1')
+                    loop_break_phase_a.append(
+                        _format_mock_record(f"SET:{padded_name}", "0", 0))
+                    loop_break_phase_b.append(
+                        _format_mock_record(f"SET:{padded_name}", "1", 1))
+            # Also zero-initialize ALL remaining FD fields so mock READs
+            # leave predictable buffer contents.  Without this, numeric
+            # COMP-3 / PIC 9 fields contain binary garbage that causes
+            # fatal comparison failures at runtime.
+            #
+            # This adds ~648 SET: records per block (100 blocks → ~65K
+            # records) but the COBOL binary handles the volume fine
+            # because APPLY-MOCK-PAYLOAD reads them sequentially
+            # and SET: dispatches are fast WHEN jumps.
+            for fname, fkind in sorted(context.fd_record_fields.items()):
+                fu = fname.upper()
+                if fu in loop_ctl_fields:
+                    continue  # already handled above
+                padded_name = f"{fname.upper()[:26]:<26}"
+                # File-status fields are PIC X(02) and must be '00' for
+                # success — a single '0' becomes '0 ' which fails the
+                # typical ``IF FILE-STATUS-xxx EQUAL '00'`` check and
+                # sends the program into U-FILE-EXCEPTION → GOBACK.
+                if "FILE-STATUS" in fu or fu.startswith("FS-"):
+                    zero_rec = _format_mock_record(
+                        f"SET:{padded_name}", "00", 0)
+                else:
+                    zero_rec = _format_mock_record(
+                        f"SET:{padded_name}", "0", 0)
+                loop_break_phase_a.append(zero_rec)
+                loop_break_phase_b.append(zero_rec)
+
+        pad_lines: list[str] = []
+        # Phase A occupies the first 40% of padding (loop-entry values),
+        # Phase B occupies the remaining 60% (loop-termination values).
+        # A moderate Phase A gives the program enough success
+        # records to enter processing loops and execute business
+        # paragraphs, then Phase B signals loop termination via
+        # changed indicators.
+        phase_switch = int(pad_count * 0.40)
+        for i in range(pad_count):
+            pad_lines.append(ok_record)
+            if (i + 1) % _LOOP_BREAK_INTERVAL == 0:
+                if i < phase_switch and loop_break_phase_a:
+                    pad_lines.extend(loop_break_phase_a)
+                elif loop_break_phase_b:
+                    pad_lines.extend(loop_break_phase_b)
+        pad_data = "\n".join(pad_lines) + "\n"
+
+    # Concatenate: init records first, then stub records (now in COBOL
+    # execution order with defaults for missing ops), then padding.
+    # CRITICAL: Do NOT use "\n".join() — each part may or may not end
+    # with a newline.  An extra newline between parts creates a BLANK
+    # LINE record in the LINE SEQUENTIAL file.  The INIT loop exits on
+    # the first non-INIT record, and a blank line (80 spaces) is not
+    # 'INIT:'.  This shifts every subsequent mock operation by one
+    # record, causing cascading misalignment and early crashes.
     parts = [p for p in [init_data, stub_data, pad_data] if p]
-    mock_data = "\n".join(parts) if parts else "\n"
+    # Ensure each part ends with exactly one newline before concatenation
+    mock_data = "".join(p if p.endswith("\n") else p + "\n" for p in parts) if parts else "\n"
 
     # Write temp data file
     with tempfile.NamedTemporaryFile(

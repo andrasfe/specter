@@ -22,8 +22,8 @@ class TestLoadConfig:
         assert cfg.rounds is None
         assert cfg.strategies is None
         assert cfg.jit_logging.enabled is True
-        assert cfg.jit_logging.periodic_interval_ms == 10000
-        assert cfg.jit_logging.summary_every_requests == 50
+        assert cfg.jit_logging.periodic_interval_ms == 60000
+        assert cfg.jit_logging.summary_every_requests == 5000
         assert cfg.jit_logging.require_target_paragraph_context is True
         assert cfg.jit_logging.jit_scope_policy == "target_gates_plus_slice"
 

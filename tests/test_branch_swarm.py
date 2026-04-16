@@ -406,6 +406,32 @@ class TestBuildTape(unittest.TestCase):
         self.assertEqual(inp, {"X": "1"})
         self.assertEqual(log, [])
 
+    def test_filters_tape_to_relevant_stub_ops(self):
+        bctx = BranchContext(
+            bid=1, direction="T", branch_key="1:T", paragraph="P",
+            condition_text="", backward_slice_code="", var_domain_info={},
+            nearest_hit=None, call_graph_path=[], gating_conditions=[],
+            stub_ops_in_slice=[], stub_mapping={}, fault_tables={},
+            test_case_count=0, solution_patterns=[],
+            stub_op_sequence=["START:RVLTABLE"],
+        )
+        ctx = SimpleNamespace(module=object(), domains={})
+
+        with patch("specter.cobol_coverage._python_pre_run", return_value=[
+            ("OPEN:FILE", []),
+            ("START:RVLTABLE", [("FILE-STATUS-RVLTABLE-WS", "35")]),
+            ("READ:FILE", []),
+        ]):
+            inp, log = _build_tape(
+                bctx,
+                ctx,
+                {"X": "1"},
+                {"START:RVLTABLE": [[("FILE-STATUS-RVLTABLE-WS", "35")]]},
+            )
+
+        self.assertEqual(inp, {"X": "1"})
+        self.assertEqual(log, [("START:RVLTABLE", [("FILE-STATUS-RVLTABLE-WS", "35")])])
+
 
 # ---------------------------------------------------------------------------
 # SwarmJournal backward compatibility

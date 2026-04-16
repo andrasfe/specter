@@ -695,6 +695,125 @@ def _replace_exec_blocks(
     return result, count
 
 
+def _mock_precompiled_sql_evaluates(
+    lines: list[str],
+) -> tuple[list[str], int]:
+    """Insert mock reads before EVALUATE SQLCODE preceded by commented-out EXEC SQL.
+
+    DB2-precompiled COBOL sources have EXEC SQL blocks already commented out
+    (``*`` in col 7) but retain the active ``EVALUATE SQLCODE`` that follows.
+    Without a mock read, SQLCODE stays at its initial value (0) and cursor
+    loops never terminate.
+
+    This function scans for the pattern:
+        *    EXEC SQL ...
+        *    END-EXEC
+        (optional blank/comment lines)
+             EVALUATE SQLCODE
+
+    and inserts a mock SQL read (PERFORM SPECTER-NEXT-MOCK-RECORD + MOVE
+    MOCK-NUM-STATUS TO SQLCODE) immediately before the EVALUATE.
+    """
+    result: list[str] = []
+    count = 0
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        content = _get_cobol_content(line).upper().strip()
+
+        # Detect active EVALUATE SQLCODE (not itself commented)
+        if content.startswith("EVALUATE SQLCODE") or content == "EVALUATE SQLCODE":
+            # Look backwards for a commented-out END-EXEC within the last 20 lines
+            end_exec_idx = None
+            for back in range(1, min(21, i + 1)):
+                prev = lines[i - back]
+                # Must be a comment line (col 7 = '*')
+                if len(prev) > 6 and prev[6] == '*':
+                    prev_body = prev[7:72].strip().upper() if len(prev) > 7 else ""
+                    if "END-EXEC" in prev_body:
+                        end_exec_idx = i - back
+                        break
+                    # Skip blank lines, comment-only lines, dashes
+                    if prev_body and not prev_body.startswith("-") and not prev_body.startswith("*"):
+                        continue
+                elif prev.strip() == "":
+                    continue
+                else:
+                    # Hit an active code line — stop looking
+                    break
+
+            if end_exec_idx is not None:
+                # Now find the EXEC SQL start going further back from END-EXEC
+                exec_start_idx = None
+                block_text_parts = []
+                for back2 in range(end_exec_idx, max(end_exec_idx - 30, -1), -1):
+                    prev2 = lines[back2]
+                    if len(prev2) > 6 and prev2[6] == '*':
+                        prev2_body = prev2[7:72].strip().upper() if len(prev2) > 7 else ""
+                        block_text_parts.insert(0, prev2_body)
+                        if re.search(r"\bEXEC\s+SQL\b", prev2_body):
+                            exec_start_idx = back2
+                            break
+                    elif prev2.strip() == "":
+                        continue
+                    else:
+                        break
+
+                if exec_start_idx is not None:
+                    block_text = " ".join(block_text_parts)
+                    # Determine SQL verb — DECLARE/INCLUDE checked first
+                    # because DECLARE CURSOR FOR SELECT contains SELECT.
+                    op = "SQL"
+                    for verb in ["DECLARE", "INCLUDE", "FETCH", "OPEN",
+                                 "CLOSE", "SELECT", "INSERT", "UPDATE",
+                                 "DELETE", "PREPARE", "EXECUTE",
+                                 "COMMIT", "ROLLBACK"]:
+                        if re.search(rf"\b{verb}\b", block_text):
+                            op = f"SQL-{verb}"
+                            break
+
+                    # DECLARE and INCLUDE are compile-time — no mock needed
+                    if op not in ("SQL-DECLARE", "SQL-INCLUDE"):
+                        mock_lines = []
+                        mock_lines.append(f"{_B}DISPLAY 'SPECTER-MOCK:{op}'\n")
+                        mock_lines.append(f"{_B}PERFORM SPECTER-NEXT-MOCK-RECORD\n")
+                        mock_lines.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
+                        mock_lines.append(f"{_CONT}MOVE '00' TO MOCK-ALPHA-STATUS\n")
+                        # FETCH on EOF → SQLCODE 100 (end of cursor)
+                        if op == "SQL-FETCH":
+                            mock_lines.append(f"{_CONT}MOVE 100 TO MOCK-NUM-STATUS\n")
+                        else:
+                            mock_lines.append(f"{_CONT}MOVE 0 TO MOCK-NUM-STATUS\n")
+                        mock_lines.append(f"{_B}END-IF\n")
+                        mock_lines.append(f"{_B}PERFORM SPECTER-APPLY-MOCK-PAYLOAD\n")
+                        mock_lines.append(f"{_B}MOVE MOCK-NUM-STATUS TO SQLCODE\n")
+                        # FETCH: APPLY-MOCK-PAYLOAD may read another
+                        # record and reset MOCK-NUM-STATUS to 0 on EOF,
+                        # overwriting the 100 we set above.  Re-check.
+                        if op == "SQL-FETCH":
+                            mock_lines.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
+                            mock_lines.append(f"{_CONT}MOVE 100 TO SQLCODE\n")
+                            mock_lines.append(f"{_B}END-IF\n")
+                            # Safety: auto-terminate cursor loops after
+                            # a total FETCH count threshold.  The counter
+                            # is NOT reset so nested cursors (C1 × C2)
+                            # accumulate towards the limit.  Once hit,
+                            # all subsequent FETCHes get SQLCODE=100.
+                            mock_lines.append(f"{_B}ADD 1 TO SPECTER-FETCH-CTR\n")
+                            mock_lines.append(f"{_B}IF SPECTER-FETCH-CTR > 100\n")
+                            mock_lines.append(f"{_CONT}MOVE 100 TO SQLCODE\n")
+                            mock_lines.append(f"{_B}END-IF\n")
+                        # Insert mock reads before the EVALUATE
+                        result.extend(mock_lines)
+                        count += 1
+
+        result.append(line)
+        i += 1
+
+    return result, count
+
+
 def _generate_exec_mock(
     block_text: str,
     indent: str,
@@ -817,9 +936,9 @@ def _mock_sql(block_text: str, ind: str, has_period: bool = False) -> list[str]:
     dot = "." if has_period else ""
 
     op = "SQL"
-    for verb in ["SELECT", "INSERT", "UPDATE", "DELETE", "OPEN",
-                  "CLOSE", "FETCH", "DECLARE", "PREPARE", "EXECUTE",
-                  "INCLUDE", "COMMIT", "ROLLBACK"]:
+    for verb in ["DECLARE", "INCLUDE", "FETCH", "OPEN",
+                  "CLOSE", "SELECT", "INSERT", "UPDATE", "DELETE",
+                  "PREPARE", "EXECUTE", "COMMIT", "ROLLBACK"]:
         if re.search(rf"\b{verb}\b", block_text):
             op = f"SQL-{verb}"
             break
@@ -833,10 +952,24 @@ def _mock_sql(block_text: str, ind: str, has_period: bool = False) -> list[str]:
     lines.append(f"{_B}PERFORM SPECTER-NEXT-MOCK-RECORD\n")
     lines.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
     lines.append(f"{_CONT}MOVE '00' TO MOCK-ALPHA-STATUS\n")
-    lines.append(f"{_CONT}MOVE 0 TO MOCK-NUM-STATUS\n")
+    # FETCH on EOF → SQLCODE 100 (end of cursor); other SQL ops → 0
+    if op == "SQL-FETCH":
+        lines.append(f"{_CONT}MOVE 100 TO MOCK-NUM-STATUS\n")
+    else:
+        lines.append(f"{_CONT}MOVE 0 TO MOCK-NUM-STATUS\n")
     lines.append(f"{_B}END-IF\n")
     lines.append(f"{_B}PERFORM SPECTER-APPLY-MOCK-PAYLOAD\n")
     lines.append(f"{_B}MOVE MOCK-NUM-STATUS TO SQLCODE{dot}\n")
+    # FETCH: APPLY-MOCK-PAYLOAD may overwrite MOCK-NUM-STATUS on EOF
+    if op == "SQL-FETCH":
+        lines.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
+        lines.append(f"{_CONT}MOVE 100 TO SQLCODE{dot}\n")
+        lines.append(f"{_B}END-IF\n")
+        # Safety: auto-terminate cursor loops after total FETCH count
+        lines.append(f"{_B}ADD 1 TO SPECTER-FETCH-CTR\n")
+        lines.append(f"{_B}IF SPECTER-FETCH-CTR > 100\n")
+        lines.append(f"{_CONT}MOVE 100 TO SQLCODE{dot}\n")
+        lines.append(f"{_B}END-IF\n")
 
     return lines
 
@@ -968,20 +1101,54 @@ def _replace_io_verbs(lines: list[str], max_count: int = 0, condition_names_88: 
                             upper_next, re.IGNORECASE):
                     needs_end_verb = True
                 # If inside a scoped clause, collect everything until END-verb
+                # **or** a period (old COBOL uses period instead of END-READ).
                 if needs_end_verb:
+                    # Paragraph header in area A = we've overshot the block
+                    if (len(lines[j]) > 7 and lines[j][7:8].strip()
+                            and re.match(
+                                r"^\s{7}[A-Z0-9][A-Z0-9_-]*\s*\.\s*$",
+                                lines[j], re.IGNORECASE)):
+                        break  # don't include this line
                     block.append(lines[j])
                     if upper_next.startswith(end_verb):
+                        j += 1
+                        break
+                    # Period terminates the scope in old-style COBOL
+                    if next_content.rstrip().endswith("."):
                         j += 1
                         break
                     j += 1
                     continue
                 # Check if this is a new statement (not a known continuation)
+                # Also check for paragraph headers (area A) which should
+                # never be collected as part of an I/O block.
+                if (len(lines[j]) > 7 and lines[j][7:8].strip()
+                        and re.match(
+                            r"^\s{7}[A-Z0-9][A-Z0-9_-]*\s*\.\s*$",
+                            lines[j], re.IGNORECASE)):
+                    break
+                # For OPEN/CLOSE the continuation lines are file names
+                # (not COBOL verbs). Only break on recognized verbs.
+                _known_verbs_re = (
+                    r"^(IF|ELSE|END-IF|MOVE|PERFORM|EVALUATE|DISPLAY"
+                    r"|ADD|SUBTRACT|COMPUTE|GO|READ|WRITE|OPEN|CLOSE"
+                    r"|CALL|EXEC|SET|INITIALIZE|STRING|UNSTRING|INSPECT"
+                    r"|ACCEPT|STOP|GOBACK|EXIT|CONTINUE|SEARCH|DELETE"
+                    r"|REWRITE|START|MULTIPLY|DIVIDE|ALTER)\b"
+                ) if verb in ("OPEN", "CLOSE") else None
                 if re.match(r"^[A-Z]", next_content) and not re.match(
                     r"^(AT|END-READ|END-WRITE|END-START|END-DELETE"
                     r"|INTO|FROM|INVALID|NOT|GIVING|STATUS|KEY|RECORD)",
                     next_content, re.IGNORECASE
                 ):
-                    break
+                    # OPEN/CLOSE: continuation lines are file names,
+                    # only break on known COBOL verbs
+                    if _known_verbs_re and not re.match(
+                        _known_verbs_re, next_content, re.IGNORECASE
+                    ):
+                        pass  # file name continuation — keep collecting
+                    else:
+                        break
                 block.append(lines[j])
                 # Check for end-of-statement period at end of line
                 if next_content.rstrip().endswith("."):
@@ -1091,27 +1258,59 @@ def _replace_io_verbs(lines: list[str], max_count: int = 0, condition_names_88: 
 # Phase 5: Replace CALL statements
 # ---------------------------------------------------------------------------
 
+def _scan_post_call_gates(
+    lines: list[str], start: int, max_look: int = 10
+) -> list[str]:
+    """Scan lines after a CALL block for IF gates on USING-clause variables.
+
+    Returns MOVE statements that set variables to their success (pass-gate)
+    values.  These are emitted *before* ``SPECTER-APPLY-MOCK-PAYLOAD`` so
+    that SET payload records from mock data can still override them.
+    """
+    import re as _re
+    gate_re = _re.compile(
+        r"IF\s+([A-Z][A-Z0-9-]*)\s+NOT\s+EQUAL\s+(.+?)(?:\s|$)",
+        _re.IGNORECASE,
+    )
+    moves: list[str] = []
+    skip_vars = {
+        "RETURN-CODE", "MOCK-NUM-STATUS", "MOCK-ALPHA-STATUS",
+        "MOCK-EOF-FLAG",
+    }
+    for k in range(start, min(start + max_look, len(lines))):
+        content_line = _get_cobol_content(lines[k]).strip()
+        if content_line.startswith("*") or not content_line:
+            continue
+        m = gate_re.search(content_line)
+        if m:
+            var = m.group(1).upper()
+            val = m.group(2).strip().rstrip(".")
+            if var not in skip_vars:
+                moves.append(f"MOVE {val} TO {var}")
+            break
+        # Stop scanning at paragraph labels or structurally unrelated lines
+        if _re.match(r"^[A-Z0-9][A-Z0-9-]*\.", content_line):
+            break
+    return moves
+
+
 def _replace_call_stmts(lines: list[str], max_count: int = 0) -> tuple[list[str], int]:
-    """Replace CALL 'program' USING ... with mock reads.
+    """Replace CALL 'program' and CALL <variable> with mock reads.
+
+    Handles both literal CALLs (``CALL 'PLB0010S'``) and variable-based
+    CALLs (``CALL WS-PARAM``).
 
     Args:
         max_count: Maximum blocks to replace (0 = unlimited).
     """
-    # IBM abend routines terminate the program on real z/OS. Under our
-    # mock they would otherwise become a no-op (read next mock record),
-    # which lets batch programs enter an unbounded retry loop after
-    # ``PERFORM 9999-ABEND-PROGRAM`` until GnuCOBOL's call stack blows
-    # (rc=160). Emit ``STOP RUN`` after the mock read so the mocked
-    # program terminates at the first abend, matching Java's Goback-
-    # Signal-based abend path.
-    _ABEND_ROUTINES = {
-        "CEE3ABD", "CEE3DMP", "ILBOABN0", "CICSABEND",
-        "ABEND", "DSNTIAR", "CBLTDLI-ABND",
-    }
     result: list[str] = []
     count = 0
-    call_re = re.compile(
+    call_literal_re = re.compile(
         r"^(\s{6}\s+)CALL\s+'([^']+)'",
+        re.IGNORECASE,
+    )
+    call_variable_re = re.compile(
+        r"^(\s{6}\s+)CALL\s+([A-Z][A-Z0-9-]*)\b",
         re.IGNORECASE,
     )
 
@@ -1119,7 +1318,12 @@ def _replace_call_stmts(lines: list[str], max_count: int = 0) -> tuple[list[str]
     while i < len(lines):
         line = lines[i]
         content = _get_cobol_content(line)
-        m = call_re.match(line)
+        m = call_literal_re.match(line)
+        is_variable_call = False
+        if not m:
+            m = call_variable_re.match(line)
+            if m:
+                is_variable_call = True
 
         if m and not content.strip().startswith("*"):
             ind = m.group(1)
@@ -1157,25 +1361,27 @@ def _replace_call_stmts(lines: list[str], max_count: int = 0) -> tuple[list[str]
             has_period = block_text.endswith(".")
             dot = "." if has_period else ""
 
+
+            # Scan ahead for post-CALL IF gates on USING-clause vars
+            gate_defaults = _scan_post_call_gates(lines, j)
             for bl in block:
                 result.append(_comment_line(bl))
 
-            result.append(f"{_B}DISPLAY 'SPECTER-MOCK:CALL:{prog}'\n")
+            if is_variable_call:
+                result.append(
+                    f"{_B}DISPLAY 'SPECTER-MOCK:CALL:' {prog}\n"
+                )
+            else:
+                result.append(f"{_B}DISPLAY 'SPECTER-MOCK:CALL:{prog}'\n")
             result.append(f"{_B}PERFORM SPECTER-NEXT-MOCK-RECORD\n")
             result.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
             result.append(f"{_CONT}MOVE 0 TO MOCK-NUM-STATUS\n")
             result.append(f"{_B}END-IF\n")
+            for gm in gate_defaults:
+                result.append(f"{_B}{gm}\n")
+            # Default success values for USING-clause output vars
             result.append(f"{_B}PERFORM SPECTER-APPLY-MOCK-PAYLOAD\n")
             result.append(f"{_B}MOVE MOCK-NUM-STATUS TO RETURN-CODE{dot}\n")
-            # Real-z/OS abend routines (CEE3ABD, ILBOABN0, etc.) terminate
-            # the program. Under the mock they would just read the next
-            # record and return; with no outcome the caller re-enters the
-            # failing path and retries forever, burning the call stack
-            # until GnuCOBOL aborts with rc=160. Emit STOP RUN here so
-            # the COBOL binary terminates cleanly on first abend, exactly
-            # matching Java's GobackSignal-based ``state.abended`` path.
-            if prog in _ABEND_ROUTINES:
-                result.append(f"{_B}STOP RUN.\n")
 
             count += 1
             i = j
@@ -1383,6 +1589,7 @@ def _add_branch_tracing(
     id_stack: list[str] = []
     needs_else: dict[str, bool] = {}
     eval_stack: list[tuple[str, int]] = []
+    search_depth = 0  # depth of SEARCH blocks — their WHEN clauses are not EVALUATE WHEN
 
     para_re = re.compile(
         r"^(\s{7})([A-Z0-9][A-Z0-9_-]*)\s*\.\s*$",
@@ -1405,12 +1612,13 @@ def _add_branch_tracing(
             i += 1
             continue
 
-        # Track current paragraph — also reset skip_depth since a new
-        # paragraph exits any pending period-delimited IF scope
+        # Track current paragraph — also reset skip_depth and search_depth
+        # since a new paragraph exits any pending scope
         m_para = para_re.match(line)
         if m_para:
             current_para = m_para.group(2).upper()
             skip_depth = 0
+            search_depth = 0
 
         # Detect IF statement (starts with IF, not END-IF)
         content = _get_cobol_content(line).strip().upper() if len(line) > 7 else ""
@@ -1571,6 +1779,20 @@ def _add_branch_tracing(
             i += 1
             continue
 
+        # Detect SEARCH — track depth so SEARCH WHEN is not confused with EVALUATE WHEN
+        if content.startswith("SEARCH ") and not content.startswith("SEARCH-"):
+            search_depth += 1
+            result.append(line)
+            i += 1
+            continue
+
+        # Detect END-SEARCH
+        if content.startswith("END-SEARCH"):
+            search_depth = max(0, search_depth - 1)
+            result.append(line)
+            i += 1
+            continue
+
         # Detect EVALUATE
         if content.startswith("EVALUATE "):
             branch_id += 1
@@ -1587,8 +1809,8 @@ def _add_branch_tracing(
             i += 1
             continue
 
-        # Detect WHEN inside EVALUATE
-        if content.startswith("WHEN ") and eval_stack:
+        # Detect WHEN inside EVALUATE (skip WHEN from nested SEARCH blocks)
+        if content.startswith("WHEN ") and eval_stack and search_depth == 0:
             base_bid, when_count = eval_stack[-1]
             when_count += 1
             eval_stack[-1] = (base_bid, when_count)
@@ -1598,7 +1820,35 @@ def _add_branch_tracing(
             else:
                 direction = f"W{when_count}"
 
+            # Consume multi-line WHEN condition before inserting probe.
+            # A WHEN condition can span multiple lines (e.g.,
+            #   WHEN WS-PROD-CODE =
+            #        SOME-OTHER-VARIABLE
+            # Inserting a probe between those lines would split the expression.
             result.append(line)
+            j = i + 1
+            while j < len(lines):
+                next_line = lines[j]
+                next_content = (
+                    _get_cobol_content(next_line).strip().upper()
+                    if len(next_line) > 7 else ""
+                )
+                is_comment = len(next_line) > 6 and next_line[6] in ("*", "/")
+                if not next_content or is_comment:
+                    result.append(next_line)
+                    j += 1
+                    continue
+                # Condition is complete when we see a verb, another WHEN,
+                # END-EVALUATE, or END-SEARCH.
+                if (_is_body_start(next_content)
+                        or next_content.startswith("WHEN ")
+                        or next_content.startswith("END-EVALUATE")
+                        or next_content.startswith("END-SEARCH")):
+                    break
+                # Otherwise it's a continuation of the WHEN condition
+                result.append(next_line)
+                j += 1
+
             result.append(
                 f"{_B}DISPLAY '@@B:{base_bid}:{direction}'\n"
             )
@@ -1608,7 +1858,7 @@ def _add_branch_tracing(
             vs = _gen_var_snapshot(base_bid, cond_vars)
             if vs:
                 result.append(vs)
-            i += 1
+            i = j
             continue
 
         # Detect END-EVALUATE
@@ -1812,6 +2062,10 @@ def _add_mock_infrastructure(
         f"{_A}01 MOCK-PENDING-FLAG     PIC X VALUE 'N'.\n",
         f"{_A}01 MOCK-EOF-FLAG         PIC X VALUE 'N'.\n",
         f"{_A}01 MOCK-FILE-STATUS      PIC XX VALUE '00'.\n",
+        f"{_CMT} SPECTER: consecutive SQL-FETCH counter for cursor\n",
+        f"{_CMT}         loop termination (auto-set SQLCODE=100\n",
+        f"{_CMT}         after threshold to break infinite loops).\n",
+        f"{_A}01 SPECTER-FETCH-CTR     PIC 9(04) COMP VALUE 0.\n",
         "\n",
     ]
     # Only add common stubs if not already defined (avoids "ambiguous" errors)
@@ -2448,24 +2702,92 @@ def _add_mock_file_handling(
 
         result.append(line)
 
-    # Replace STOP RUN and GOBACK with close + stop
-    # Skip if previous non-empty line already has CLOSE MOCK-FILE
+    # Replace STOP RUN and GOBACK with close + continue.
+    # Keep ONE GOBACK — the first one that appears at the top-level
+    # program exit (typically after 5000-TERMINATION in 0000-MX-EXIT).
+    # All other GOBACKs/STOP RUNs inside error-handler paragraphs are
+    # commented out so that PERFORM returns normally and coverage can
+    # continue past error paths.
+    first_goback_kept = False
     final: list[str] = []
     for line in result:
         content = _get_cobol_content(line).upper().strip()
         if (content == "STOP RUN" or content == "STOP RUN."
                 or content == "GOBACK" or content == "GOBACK."):
-            # Check if we already have a CLOSE MOCK-FILE right before
-            already_closed = False
-            for prev in reversed(final):
-                pc = _get_cobol_content(prev).upper().strip()
-                if pc:
-                    if "CLOSE MOCK-FILE" in pc:
-                        already_closed = True
-                    break
-            if not already_closed:
-                final.append(f"{_B}CLOSE MOCK-FILE\n")
-        final.append(line)
+            if not first_goback_kept:
+                # Keep the first GOBACK (main program exit) with CLOSE
+                already_closed = False
+                for prev in reversed(final):
+                    pc = _get_cobol_content(prev).upper().strip()
+                    if pc:
+                        if "CLOSE MOCK-FILE" in pc:
+                            already_closed = True
+                        break
+                if not already_closed:
+                    final.append(f"{_B}CLOSE MOCK-FILE\n")
+                final.append(line)
+                first_goback_kept = True
+            else:
+                # Comment out subsequent GOBACKs so error handlers
+                # return from PERFORM instead of terminating.
+                final.append(f"{_CMT} SPECTER: neutralized for coverage\n")
+                final.append(f"{_B}CONTINUE\n")
+        else:
+            final.append(line)
+
+    # Neutralize exception-handler paragraphs that call termination
+    # then GOBACK.  These create infinite recursion in coverage mode
+    # because 5000-TERMINATION itself calls U-FILE-EXCEPTION which
+    # calls 5000-TERMINATION again.  Replace the termination PERFORM
+    # with CONTINUE so the handler returns cleanly from its caller.
+    _exception_para_re = re.compile(
+        r"^.{6} (U-FILE-EXCEPTION|U-DB-EXCEPTION|U-ABEND|ERROR-HANDLER)\.",
+        re.IGNORECASE,
+    )
+    _term_perform_re = re.compile(
+        r"^\s+PERFORM\s+(5000-TERMINATION|[A-Z0-9-]*TERMINATION[A-Z0-9-]*"
+        r"|[A-Z0-9-]*ABEND[A-Z0-9-]*)\b",
+        re.IGNORECASE,
+    )
+    in_exception = False
+    skip_thru = False  # True after neutralizing a PERFORM — eat THRU lines
+    neutralized: list[str] = []
+    for line in final:
+        if _exception_para_re.match(line):
+            in_exception = True
+            skip_thru = False
+        elif in_exception:
+            # If we just neutralized a PERFORM, comment out continuation
+            # lines that start with THRU / THROUGH (multi-line PERFORM).
+            if skip_thru:
+                content = _get_cobol_content(line).strip().upper()
+                if content.startswith("THRU") or content.startswith("THROUGH"):
+                    neutralized.append(
+                        f"{_CMT} SPECTER: neutralized THRU continuation\n")
+                    continue
+                skip_thru = False  # non-THRU line — stop eating
+
+            content = _get_cobol_content(line).strip()
+            # Exit exception paragraph on next paragraph header or EXIT
+            if content and not content.startswith("*"):
+                upper = content.upper()
+                if (upper.endswith(".") and not upper.startswith("PERFORM")
+                        and not upper.startswith("MOVE")
+                        and not upper.startswith("DISPLAY")
+                        and not upper.startswith("IF")
+                        and not upper.startswith("CLOSE")
+                        and not upper.startswith("CONTINUE")
+                        and len(upper.split()) <= 2):
+                    in_exception = False  # paragraph header or EXIT
+            # Comment out termination PERFORMs inside exception handlers
+            if in_exception and _term_perform_re.match(_get_cobol_content(line)):
+                neutralized.append(
+                    f"{_CMT} SPECTER: neutralized termination in exception handler\n")
+                neutralized.append(f"{_B}CONTINUE\n")
+                skip_thru = True  # eat any THRU continuation on next line(s)
+                continue
+        neutralized.append(line)
+    final = neutralized
 
     # Append SPECTER-EXIT-PARA at the very end — target for GO TO
     # from mocked CICS RETURN/XCTL blocks
@@ -2489,7 +2811,7 @@ def _add_mock_file_handling(
         # Evaluate variable name (cols 6-30 of op-key) and set value
         final.append(f"{_B}  EVALUATE MOCK-OP-KEY(6:25)\n")
         for var, val in config.initial_values.items():
-            padded = f"{var:<25}"
+            padded = f"{var[:25]:<25}"
             if val.isdigit() or (val.startswith("-") and val[1:].isdigit()):
                 final.append(f"{_B}    WHEN '{padded}'\n")
                 final.append(f"{_B}      MOVE {val} TO {var}\n")
@@ -2505,6 +2827,10 @@ def _add_mock_file_handling(
                         f"{_B}        SET {var} TO TRUE\n"
                         f"{_B}      END-IF\n"
                     )
+                elif config.payload_variables.get(var, "") == "numeric":
+                    # Use numeric status for COMP/COMP-3 fields to avoid
+                    # alpha-to-packed-decimal corruption.
+                    final.append(f"{_B}      MOVE MOCK-NUM-STATUS TO {var}\n")
                 else:
                     final.append(f"{_B}      MOVE MOCK-ALPHA-STATUS TO {var}\n")
         final.append(f"{_B}  END-EVALUATE\n")
@@ -2537,50 +2863,42 @@ def _add_mock_file_handling(
     if not has_apply_payload:
         final.append(f"\n")
         final.append(f"{_CMT} SPECTER: apply trailing SET:<var> payload records for the current mock op\n")
-        # Structured with nested IFs rather than ``GO TO SPECTER-PAYLOAD-DONE``
-        # on EOF: when GnuCOBOL's ``PERFORM SPECTER-APPLY-MOCK-PAYLOAD``
-        # executes a GO TO to a later paragraph (SPECTER-PAYLOAD-DONE), control
-        # falls past the PERFORM's implicit return boundary, the second
-        # paragraph's body runs, and then execution falls off the end of the
-        # program — a silent rc=0 exit mid-batch. The only safe pattern for
-        # PERFORM-with-early-exit is plain fall-through to the paragraph's
-        # period, which returns to the caller naturally.
         final.append(f"{_A}SPECTER-APPLY-MOCK-PAYLOAD.\n")
         final.append(f"{_B}PERFORM SPECTER-NEXT-MOCK-RECORD\n")
-        final.append(f"{_B}IF MOCK-EOF-FLAG NOT = 'Y'\n")
-        final.append(f"{_B}  IF MOCK-OP-KEY(1:4) = 'SET:'\n")
+        final.append(f"{_B}IF MOCK-EOF-FLAG = 'Y'\n")
+        final.append(f"{_CONT}GO TO SPECTER-PAYLOAD-DONE\n")
+        final.append(f"{_B}END-IF\n")
+        final.append(f"{_B}IF MOCK-OP-KEY(1:4) = 'SET:'\n")
         if config.payload_variables:
-            final.append(f"{_B}    EVALUATE MOCK-OP-KEY(5:26)\n")
+            final.append(f"{_B}  EVALUATE MOCK-OP-KEY(5:26)\n")
             for var, kind in config.payload_variables.items():
-                padded = f"{var:<26}"
-                final.append(f"{_B}      WHEN '{padded}'\n")
+                padded = f"{var[:26]:<26}"
+                final.append(f"{_B}    WHEN '{padded}'\n")
                 if kind == "numeric":
-                    final.append(f"{_B}        MOVE MOCK-NUM-STATUS TO {var}\n")
+                    final.append(f"{_B}      MOVE MOCK-NUM-STATUS TO {var}\n")
                 elif var.upper() in config.condition_names_88:
                     act_val = config.condition_names_88[var.upper()]
                     final.append(
-                        f"{_B}        IF MOCK-ALPHA-STATUS = '{act_val}'\n"
-                        f"{_B}          SET {var} TO TRUE\n"
-                        f"{_B}        END-IF\n"
+                        f"{_B}      IF MOCK-ALPHA-STATUS = '{act_val}'\n"
+                        f"{_B}        SET {var} TO TRUE\n"
+                        f"{_B}      END-IF\n"
                     )
                 else:
-                    final.append(f"{_B}        MOVE MOCK-ALPHA-STATUS TO {var}\n")
-            final.append(f"{_B}      WHEN OTHER\n")
-            final.append(f"{_B}        CONTINUE\n")
-            final.append(f"{_B}    END-EVALUATE\n")
+                    final.append(f"{_B}      MOVE MOCK-ALPHA-STATUS TO {var}\n")
+            final.append(f"{_B}    WHEN OTHER\n")
+            final.append(f"{_B}      CONTINUE\n")
+            final.append(f"{_B}  END-EVALUATE\n")
         else:
             # No payload variables configured — consume the SET: record
             # without dispatching. GnuCOBOL rejects EVALUATE with only a
             # WHEN OTHER clause, so we can't emit an empty EVALUATE.
-            final.append(f"{_B}    CONTINUE\n")
-        # Intra-paragraph GO TO is safe (we're still inside the PERFORM's
-        # range). Loops until EOF or a non-SET: record is read.
-        final.append(f"{_B}    GO TO SPECTER-APPLY-MOCK-PAYLOAD\n")
-        final.append(f"{_B}  ELSE\n")
-        final.append(f"{_B}    MOVE MOCK-RECORD TO MOCK-PENDING-RECORD\n")
-        final.append(f"{_B}    MOVE 'Y' TO MOCK-PENDING-FLAG\n")
-        final.append(f"{_B}  END-IF\n")
-        final.append(f"{_B}END-IF.\n")
+            final.append(f"{_B}  CONTINUE\n")
+        final.append(f"{_B}  GO TO SPECTER-APPLY-MOCK-PAYLOAD\n")
+        final.append(f"{_B}END-IF\n")
+        final.append(f"{_B}MOVE MOCK-RECORD TO MOCK-PENDING-RECORD\n")
+        final.append(f"{_B}MOVE 'Y' TO MOCK-PENDING-FLAG.\n")
+        final.append(f"{_A}SPECTER-PAYLOAD-DONE.\n")
+        final.append(f"{_B}CONTINUE.\n")
 
     return final
 
@@ -3993,27 +4311,19 @@ def _format_mock_record(op_key: str, alpha_status: object = "", num_status: obje
     """Format one fixed-width mock record."""
     alpha = str(alpha_status)[:20]
     num = _coerce_mock_numeric(num_status)
-    record = f"{op_key[:30]:<30}{alpha:<20}{num:>9}"
+    # Zero-fill numeric field to match PIC S9(09) DISPLAY format.
+    # Space-fill caused COMP-3 corruption: spaces (x'20') in the
+    # numeric field produced garbage when MOVEd to packed-decimal fields.
+    if num >= 0:
+        num_str = f"{num:09d}"[:9]
+    else:
+        num_str = f"{num:>9}"  # negative: keep space-padded (rare)
+    record = f"{op_key[:30]:<30}{alpha:<20}{num_str}"
     return f"{record:<80}"[:80]
 
 
 def _encode_mock_entry(entry: object) -> tuple[str, int, list[str]]:
-    """Encode one stub entry into a primary record summary plus SET records.
-
-    The PRIMARY record's alpha_status is taken from the FIRST (var, val)
-    pair, not the last. The COBOL mock's I/O verb replacement does
-    ``MOVE MOCK-ALPHA-STATUS TO <file-status-var>`` for the primary
-    record, where <file-status-var> is hardcoded per file (e.g.
-    ``ACCTFILE-STATUS`` for ``READ ACCOUNT-FILE``). Synthesised stub
-    outcomes typically lead with the file status pair (e.g.
-    ``[(DALYTRAN-STATUS, '00'), (WS-VALIDATION-FAIL-REASON, '0')]``)
-    and follow with downstream side-effects. Picking the LAST pair's
-    value would route the side-effect value into the file status var,
-    flipping a successful read into an apparent error and triggering a
-    spurious ABEND. Subsequent pairs still flow through as SET payload
-    records, so all variables get updated; only the primary alpha
-    selection changes.
-    """
+    """Encode one stub entry into a primary record summary plus SET records."""
     alpha_status = ""
     num_status = 0
     payload_records: list[str] = []
@@ -4025,21 +4335,14 @@ def _encode_mock_entry(entry: object) -> tuple[str, int, list[str]]:
     else:
         pairs = []
 
-    primary_set = False
     for pair in pairs:
         if not isinstance(pair, (list, tuple)) or len(pair) != 2:
             continue
         var, val = pair
-        if not primary_set:
-            alpha_status = str(val)
-            num_status = _coerce_mock_numeric(val)
-            primary_set = True
+        alpha_status = str(val)
+        num_status = _coerce_mock_numeric(val)
         payload_records.append(
-            _format_mock_record(
-                f"SET:{str(var).upper():<26}",
-                str(val),
-                _coerce_mock_numeric(val),
-            )
+            _format_mock_record(f"SET:{str(var).upper():<26}", alpha_status, num_status)
         )
 
     return alpha_status, num_status, payload_records

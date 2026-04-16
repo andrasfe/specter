@@ -1251,12 +1251,9 @@ def _generate_record_stubs(
                 stubs.append(f"{_B}05  FILLER PIC X.\n")
             log.debug("  Stub: 01 %s with %d fields", parent, len(fields))
         elif any(f in actually_undefined for f in fields):
-            # Parent exists but some fields are undefined — add just the fields
-            for field in sorted(fields):
-                if field in actually_undefined:
-                    pic = _infer_pic(field)
-                    stubs.append(f"{_A}01  {field} {pic}.\n")
-                    log.debug("  Stub: 01 %s (orphan field of %s)", field, parent)
+            # Parent exists; let qualified-subfield repair add children under
+            # that parent instead of flattening them into orphan 01-level items.
+            continue
 
     # Generate standalone stubs
     for var in sorted(standalone):
@@ -1279,7 +1276,11 @@ def _add_missing_qualified_subfields(
     errors: list[tuple[int, str]],
     src_lines: list[str],
 ) -> tuple[list[str], int]:
-    """Add missing 05-level fields under existing qualified parent records."""
+    """Add missing subordinate fields for qualified undefined-name errors.
+
+    Example: "'TAX-TYPE-CD IN DCLTAX-TYPE' is not defined" where
+    `01 DCLTAX-TYPE.` already exists but lacks `05 TAX-TYPE-CD ...`.
+    """
     qualified: dict[str, set[str]] = {}
     for _, msg in errors:
         m = re.match(
@@ -1307,63 +1308,61 @@ def _add_missing_qualified_subfields(
             return "PIC X(20)"
         return "PIC X(256)"
 
-    level_name_re = re.compile(
-        r"^\s{6}\s+(\d{2})\s+([A-Z0-9_-]+)\b",
-        re.IGNORECASE,
-    )
+    level_name_re = re.compile(r"^\s{6}\s+(\d{2})\s+([A-Z0-9_-]+)\b", re.IGNORECASE)
     out = list(src_lines)
     fixes = 0
 
-    parent_indices: dict[str, int] = {}
+    items: list[tuple[int, int, str]] = []
     for i, line in enumerate(out):
         if len(line) > 6 and line[6:7] == "*":
             continue
         m = level_name_re.match(line)
         if not m:
             continue
-        level, name = int(m.group(1)), m.group(2).upper()
-        if level == 1:
-            parent_indices[name] = i
+        items.append((i, int(m.group(1)), m.group(2).upper()))
+
+    parent_items = {name: (idx, level) for idx, level, name in items}
 
     for parent, want_fields in qualified.items():
-        start = parent_indices.get(parent)
-        if start is None:
+        parent_entry = parent_items.get(parent)
+        if parent_entry is None:
             continue
 
+        start, parent_level = parent_entry
+        child_level = 5 if parent_level <= 1 else min(parent_level + 5, 49)
+
         end = len(out)
-        for j in range(start + 1, len(out)):
-            if len(out[j]) > 6 and out[j][6:7] == "*":
+        for idx, level, _name in items:
+            if idx <= start:
                 continue
-            m = level_name_re.match(out[j])
-            if m and int(m.group(1)) == 1:
-                end = j
+            if level <= parent_level:
+                end = idx
                 break
 
         existing_fields: set[str] = set()
         filler_at: int | None = None
-        for j in range(start + 1, end):
-            if len(out[j]) > 6 and out[j][6:7] == "*":
+        for idx, level, name in items:
+            if idx <= start or idx >= end:
                 continue
-            m = level_name_re.match(out[j])
-            if not m:
-                continue
-            level, name = int(m.group(1)), m.group(2).upper()
-            if level >= 2:
+            if level > parent_level:
                 existing_fields.add(name)
-            if level == 5 and name == "FILLER" and "PIC X" in out[j].upper():
-                filler_at = j
+            if level == child_level and name == "FILLER" and "PIC X" in out[idx].upper():
+                filler_at = idx
 
-        missing = [f for f in sorted(want_fields) if f not in existing_fields]
+        missing = [field for field in sorted(want_fields) if field not in existing_fields]
         if not missing:
             continue
 
         if filler_at is not None and len(missing) == 1:
-            f = missing[0]
-            out[filler_at] = f"{_B}05  {f} {_infer_pic(f)}.\n"
+            field = missing[0]
+            out[filler_at] = f"{_B}{child_level:02d}  {field} {_infer_pic(field)}.\n"
             fixes += 1
             continue
 
-        insert_lines = [f"{_B}05  {f} {_infer_pic(f)}.\n" for f in missing]
+        insert_lines = [
+            f"{_B}{child_level:02d}  {field} {_infer_pic(field)}.\n"
+            for field in missing
+        ]
         out[end:end] = insert_lines
         fixes += len(insert_lines)
 
@@ -2981,6 +2980,101 @@ def _phase_copy_resolution(
     return new_lines, desc
 
 
+def _extract_fd_record_fields(lines: list[str]) -> dict[str, str]:
+    """Scan FILE SECTION FD records and return leaf field names with types.
+
+    Returns a dict mapping ``FIELD-NAME`` → ``"alpha"`` | ``"numeric"``
+    for every non-FILLER leaf field found in FD record definitions.
+    This lets the mock infrastructure include FD record fields in the
+    ``SPECTER-APPLY-MOCK-PAYLOAD`` dispatch so that mocked READ operations
+    can populate the fields that the program reads from the FD buffer.
+    """
+    import re as _re
+
+    result: dict[str, str] = {}
+    in_file_section = False
+    in_fd = False
+    fd_name = ""
+
+    _fd_re = _re.compile(r"^\s+FD\s+(\S+)", _re.IGNORECASE)
+    _field_re = _re.compile(
+        r"^\s+(\d{2})\s+([A-Z0-9][A-Z0-9_-]*)\s+",
+        _re.IGNORECASE,
+    )
+    _pic_re = _re.compile(r"\bPIC(?:TURE)?\s+IS\s+(\S+)|\bPIC(?:TURE)?\s+(\S+)", _re.IGNORECASE)
+    _redefines_re = _re.compile(r"\bREDEFINES\b", _re.IGNORECASE)
+
+    # Track REDEFINES groups: when a field has REDEFINES, all its children
+    # (deeper levels) overlap with the original definition's memory.
+    # Writing to both the original and redefining fields corrupts COMP-3
+    # data that shares the same bytes — writing a display character to a
+    # field that overlaps a packed-decimal field produces garbage values.
+    skip_redefines_level: int | None = None
+
+    for raw_line in lines:
+        upper = raw_line.upper().strip()
+        # Skip comments
+        if len(raw_line) > 6 and raw_line[6] in ("*", "/"):
+            continue
+
+        if "FILE SECTION" in upper:
+            in_file_section = True
+            continue
+        if in_file_section and (
+            "WORKING-STORAGE SECTION" in upper
+            or "LINKAGE SECTION" in upper
+            or "LOCAL-STORAGE SECTION" in upper
+            or "PROCEDURE DIVISION" in upper
+        ):
+            break
+
+        if not in_file_section:
+            continue
+
+        m_fd = _fd_re.match(raw_line)
+        if m_fd:
+            fd_name = m_fd.group(1).upper()
+            in_fd = fd_name != "MOCK-FILE"
+            continue
+
+        if not in_fd:
+            continue
+
+        m_field = _field_re.match(raw_line)
+        if not m_field:
+            continue
+
+        level = int(m_field.group(1))
+        name = m_field.group(2).upper()
+
+        # Track REDEFINES scope: skip all children of a redefining group
+        # to avoid overlapping SET: dispatches that corrupt COMP-3 fields.
+        if skip_redefines_level is not None:
+            if level > skip_redefines_level:
+                continue  # inside REDEFINES group — skip
+            else:
+                skip_redefines_level = None  # exited REDEFINES group
+
+        if _redefines_re.search(raw_line):
+            skip_redefines_level = level
+            continue  # skip the REDEFINES field itself too
+
+        if name == "FILLER" or level == 88:
+            continue
+
+        m_pic = _pic_re.search(raw_line)
+        if not m_pic:
+            continue  # group item — skip
+
+        pic = (m_pic.group(1) or m_pic.group(2)).upper()
+        if pic.startswith("9") or pic.startswith("S9") or "COMP" in upper:
+            result[name] = "numeric"
+        else:
+            result[name] = "alpha"
+
+    return result
+
+
 def _phase_mock_infrastructure(
     lines: list[str],
     config,
@@ -3285,6 +3379,32 @@ def incremental_instrument(
         log.info("Phase 1: COPY resolution (skipped — resuming)")
 
     # -----------------------------------------------------------------------
+    # Enrich payload_variables AND initial_values with FD record fields
+    # discovered from the resolved source.  This ensures both
+    # SPECTER-APPLY-MOCK-PAYLOAD and SPECTER-READ-INIT-VARS (generated in
+    # Phase 2) include dispatchers for FD fields so that mocked READ
+    # operations can populate the FD buffer through SET:<var> records and
+    # the coverage engine can set initial values for date/config fields
+    # read from SEQUENTIAL data files.
+    # -----------------------------------------------------------------------
+    if start_phase <= 2:
+        resolved_lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+        fd_fields = _extract_fd_record_fields(resolved_lines)
+        if fd_fields:
+            before_pv = len(config.payload_variables)
+            before_iv = len(config.initial_values)
+            for name, kind in fd_fields.items():
+                config.payload_variables.setdefault(name, kind)
+                # Also register in initial_values so SPECTER-READ-INIT-VARS
+                # can dispatch INIT:<var> records for FD fields.
+                config.initial_values.setdefault(name, "__DYNAMIC__")
+            added_pv = len(config.payload_variables) - before_pv
+            added_iv = len(config.initial_values) - before_iv
+            if added_pv or added_iv:
+                log.info("  Auto-discovered %d FD record fields (payload=%d, init=%d)",
+                         len(fd_fields), added_pv, added_iv)
+
+    # -----------------------------------------------------------------------
     # Phase 2: Mock infrastructure
     # -----------------------------------------------------------------------
     cp_name = _load_checkpoint(output_dir).get("last_completed_phase", "")
@@ -3367,6 +3487,23 @@ def incremental_instrument(
                         )
                         resolutions.extend(one_res)
                         _save_resolutions(resolutions, resolution_log_path)
+
+        # --- Precompiled SQL: insert mock reads before orphaned EVALUATE SQLCODE ---
+        from .cobol_mock import _mock_precompiled_sql_evaluates
+        lines = mock_path.read_text(errors="replace").splitlines(keepends=True)
+        precomp_lines, precomp_count = _mock_precompiled_sql_evaluates(lines)
+        if precomp_count > 0:
+            log.info("  Precompiled SQL: inserted %d mock reads before EVALUATE SQLCODE",
+                     precomp_count)
+            mock_path.write_text("".join(precomp_lines))
+            precomp_res = _compile_and_fix(
+                mock_path, "exec_replacement", batch_num + 1, resolutions,
+                copybook_dirs=copybook_dirs,
+                llm_provider=llm_provider, llm_model=llm_model,
+                baseline_errors=baseline_errors,
+            )
+            resolutions.extend(precomp_res)
+            _save_resolutions(resolutions, resolution_log_path)
 
         log.info("  Phase 3 complete (%d batches)", batch_num)
         _assert_clean(mock_path, "Phase 3 (EXEC replacement)",

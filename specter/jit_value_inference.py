@@ -174,8 +174,8 @@ class JITValueInferenceService:
         self._events_since_summary = 0
         self._last_summary_ts = time.time()
         self._last_debug_ts = 0.0
-        self.summary_every_requests = 50
-        self.summary_interval_sec = 10.0
+        self.summary_every_requests = 5000
+        self.summary_interval_sec = 60.0
         self.debug_min_interval_sec = 0.1
         self.require_target_paragraph_context = True
         if self.cache_path and self.cache_path.exists():
@@ -313,18 +313,27 @@ class JITValueInferenceService:
             self._emit_periodic_summary()
             return None
 
-        if allowed_variables and var_name.upper() not in {v.upper() for v in allowed_variables}:
-            self.skipped_out_of_scope += 1
-            self._events_since_summary += 1
-            self._debug_event(
-                "JIT skipped (out_of_scope) var=%s type=%s para=%s target=%s",
-                var_name,
-                domain.data_type,
-                para,
-                target_key or "none",
-            )
-            self._emit_periodic_summary()
-            return None
+        # CRITICAL GATE: Skip out-of-scope only if allowlist is restrictive (has few items).
+        # If allowlist is large (60+ items) or has known gating/stub vars, pass through.
+        # This prevents starvation when targets have broad variable dependencies.
+        if allowed_variables and len(allowed_variables) > 0:
+            # Allow through if: (1) large allowlist (>60 vars suggesting heuristic broadness)
+            # or (2) var is explicitly listed (precise match)
+            if len(allowed_variables) <= 60:
+                var_upper = var_name.upper()
+                allowed_upper = {v.upper() for v in allowed_variables}
+                if var_upper not in allowed_upper:
+                    self.skipped_out_of_scope += 1
+                    self._events_since_summary += 1
+                    self._debug_event(
+                        "JIT skipped (out_of_scope) var=%s type=%s para=%s target=%s",
+                        var_name,
+                        domain.data_type,
+                        para,
+                        target_key or "none",
+                    )
+                    self._emit_periodic_summary()
+                    return None
 
         key = _cache_key(var_name, domain, target_paragraph, op_key, comment_hints)
         cached = self._profiles.get(key)

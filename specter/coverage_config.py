@@ -86,8 +86,8 @@ class JITLoggingConfig:
     """Configuration for JIT observability in coverage logs."""
 
     enabled: bool = True
-    periodic_interval_ms: int = 10000
-    summary_every_requests: int = 50
+    periodic_interval_ms: int = 60000
+    summary_every_requests: int = 5000
     debug_min_interval_ms: int = 100
     require_target_paragraph_context: bool = True
     jit_scope_policy: str = "target_gates_plus_slice"
@@ -178,8 +178,8 @@ def _build_config(data: dict) -> CoverageConfig:
     jit_data = data.get("jit_logging", {})
     jit_logging = JITLoggingConfig(
         enabled=bool(jit_data.get("enabled", True)),
-        periodic_interval_ms=int(jit_data.get("periodic_interval_ms", 10000)),
-        summary_every_requests=int(jit_data.get("summary_every_requests", 50)),
+        periodic_interval_ms=int(jit_data.get("periodic_interval_ms", 60000)),
+        summary_every_requests=int(jit_data.get("summary_every_requests", 5000)),
         debug_min_interval_ms=int(jit_data.get("debug_min_interval_ms", 100)),
         require_target_paragraph_context=bool(
             jit_data.get("require_target_paragraph_context", True)
