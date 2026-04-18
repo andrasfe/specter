@@ -28,6 +28,11 @@ from pathlib import Path
 
 from .persistence_utils import atomic_write_json
 from .run_manifest import ensure_manifest, record_phase_checkpoint
+from .supervisor_channel import (
+    SupervisorAbort,
+    SupervisorChannel,
+    SupervisorRestart,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1088,6 +1093,39 @@ def _fix_long_lines(src_lines: list[str]) -> tuple[list[str], int]:
     return result, fixed
 
 
+# Well-known CICS/EIB identifiers that `cobol_mock._add_common_stubs` will
+# emit (as children of DFHEIBLK / DFHAID-CONSTANTS / DFHBMSCA-CONSTANTS)
+# later in the pipeline. `_generate_record_stubs` must NOT emit standalone
+# 01-level stubs for these names, or we end up with two definitions in
+# scope — at best a "duplicate" error, at worst an "ambiguous; needs
+# qualification" error when the name is used in OCCURS ... DEPENDING ON.
+#
+# Discovered via the CORPT00C teacher/student round where EIBCALEN was
+# stubbed both here and inside DFHEIBLK, which broke LINKAGE SECTION
+# `OCCURS 1 TO 32767 TIMES DEPENDING ON EIBCALEN` on the real DFHCOMMAREA.
+_WELL_KNOWN_CICS_STUB_NAMES: frozenset[str] = frozenset({
+    # DFHEIBLK fields (from cobol_mock._add_common_stubs EIB stub)
+    "EIBTIME", "EIBDATE", "EIBTRNID", "EIBTASKN", "EIBTRMID", "EIBCPOSN",
+    "EIBCALEN", "EIBAID", "EIBFN", "EIBRCODE", "EIBDS", "EIBREQID",
+    "EIBRSRCE", "EIBSYNC", "EIBFREE", "EIBRECV", "EIBSIG", "EIBCONF",
+    "EIBERR", "EIBERRCD", "EIBSYNRB", "EIBNODAT", "EIBRESP", "EIBRESP2",
+    "DFHEIBLK",
+    # DFHAID constants
+    "DFHAID", "DFHAID-CONSTANTS",
+    "DFHENTER", "DFHCLEAR", "DFHPA1", "DFHPA2", "DFHPA3",
+    "DFHPF1", "DFHPF2", "DFHPF3", "DFHPF4", "DFHPF5", "DFHPF6",
+    "DFHPF7", "DFHPF8", "DFHPF9", "DFHPF10", "DFHPF11", "DFHPF12",
+    "DFHPF13", "DFHPF14", "DFHPF15", "DFHPF16", "DFHPF17", "DFHPF18",
+    "DFHPF19", "DFHPF20", "DFHPF21", "DFHPF22", "DFHPF23", "DFHPF24",
+    # DFHBMSCA constants
+    "DFHBMSCA", "DFHBMSCA-CONSTANTS",
+    "DFHBMPRO", "DFHBMUNP", "DFHBMUNN", "DFHBMPRF", "DFHBMASF",
+    "DFHBMASK", "DFHBMFSE", "DFHRED", "DFHBLUE", "DFHGREEN",
+    "DFHWHITE", "DFHYELLO", "DFHTURQ", "DFHPINK", "DFHDFCOL",
+    "DFHNEUTR", "DFHBMDAR", "DFHBMBRY",
+})
+
+
 def _generate_record_stubs(
     errors: list[tuple[int, str]],
     src_lines: list[str],
@@ -1098,6 +1136,10 @@ def _generate_record_stubs(
     instead of flat PIC X(256) stubs that the LLM keeps trying.
 
     Returns COBOL lines to insert into WORKING-STORAGE.
+
+    Skips names in ``_WELL_KNOWN_CICS_STUB_NAMES`` — those are emitted by
+    ``cobol_mock._add_common_stubs`` later in the pipeline, and emitting
+    them here too creates duplicate definitions.
     """
     # Collect all undefined variable names
     undefined: set[str] = set()
@@ -1162,6 +1204,19 @@ def _generate_record_stubs(
 
     # Remove already-defined variables from undefined set
     actually_undefined = undefined - already_defined
+    # Also skip well-known CICS/EIB names: `_add_common_stubs` will emit
+    # them as children of DFHEIBLK / DFHAID-CONSTANTS / DFHBMSCA-CONSTANTS
+    # later, so a standalone 01-level here would duplicate the definition
+    # and trigger "ambiguous; needs qualification" on any reference (e.g.
+    # DFHCOMMAREA `OCCURS ... DEPENDING ON EIBCALEN`).
+    _cics_skipped = actually_undefined & _WELL_KNOWN_CICS_STUB_NAMES
+    if _cics_skipped:
+        actually_undefined = actually_undefined - _WELL_KNOWN_CICS_STUB_NAMES
+        log.debug(
+            "  Stub: skipping %d well-known CICS name(s) (deferred to "
+            "_add_common_stubs): %s",
+            len(_cics_skipped), sorted(_cics_skipped),
+        )
     if not actually_undefined:
         return []
 
@@ -1612,6 +1667,197 @@ def _find_file_section_end(src_lines: list[str]) -> int | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Pre-Phase-3 error deferral
+#
+# EXEC CICS / EXEC SQL / EXEC DLI blocks are syntactically invalid to
+# GnuCOBOL but are intentionally preserved through the copy_resolution and
+# mock_infrastructure phases so that Phase 3 (_replace_exec_blocks) can
+# transform each block into a mock-read. Any attempt to "fix" such an
+# error in the earlier phases invariably produces destructive LLM
+# proposals (comment-out, GOBACK short-circuit) that the reviewer
+# correctly blocks, leaving the run stalled against an error the pipeline
+# was always going to resolve three phases later.
+#
+# These helpers mark such errors as "deferred" in pre-Phase-3 phases so
+# the fix loop skips them entirely and the phase gate lets them through.
+
+_EXEC_CLASS_MSG_TOKENS: tuple[str, ...] = (
+    "'EXEC' is a reserved word",
+    "unexpected PROGRAM",
+    "unexpected MAP",
+    "unexpected MAPSET",
+    "unexpected END-EXEC",
+    "'END-EXEC'",
+)
+
+_PHASES_BEFORE_EXEC_REPLACEMENT: frozenset[str] = frozenset({
+    "baseline",
+    "copy_resolution",
+    "mock_infrastructure",
+})
+
+# Phases that run before `_add_common_stubs` emits the DFHEIBLK /
+# DFHAID-CONSTANTS / DFHBMSCA-CONSTANTS structures in Phase 7
+# (normalization). Any ``'<name>' is not defined`` error whose name is in
+# ``_WELL_KNOWN_CICS_STUB_NAMES`` is deferred in these phases — the
+# definition is on its way.
+_PHASES_BEFORE_COMMON_STUBS: frozenset[str] = frozenset({
+    "baseline",
+    "copy_resolution",
+    "mock_infrastructure",
+    "exec_replacement",
+    "io_replacement",
+    "call_replacement",
+    "paragraph_tracing",
+})
+
+# Regex to pull the undefined symbol name out of cobc's error text.
+_UNDEFINED_NAME_RE = re.compile(
+    r"^'?([A-Z0-9_-]+)'?\s+is\s+not\s+defined\b", re.IGNORECASE,
+)
+
+
+def _is_deferred_to_later_phase(
+    line_no: int,
+    msg: str,
+    src_lines: list[str],
+    phase: str,
+) -> bool:
+    """Return True if ``msg`` at ``line_no`` should be left for a later phase.
+
+    Two deferral classes, both applied only in the appropriate pre-phase
+    window so later phases still get to act on the same errors:
+
+    1. **EXEC CICS / SQL / DLI syntax errors** in ``copy_resolution`` /
+       ``mock_infrastructure`` — owned by Phase 3's ``_replace_exec_blocks``.
+    2. **``'<name>' is not defined`` where name is in
+       ``_WELL_KNOWN_CICS_STUB_NAMES``** in any phase before Phase 7
+       (``normalization``) — owned by
+       ``cobol_mock._add_common_stubs`` which emits these as children of
+       DFHEIBLK / DFHAID-CONSTANTS / DFHBMSCA-CONSTANTS. Reporting them as
+       deferred here eliminates the whole class of EIBCALEN/EIBAID/DFHPF*/
+       DFHGREEN/... escalations observed on CICS programs (CORPT00C demo).
+    """
+    # Class 1: EXEC CICS/SQL/DLI in early phases.
+    if phase in _PHASES_BEFORE_EXEC_REPLACEMENT:
+        for token in _EXEC_CLASS_MSG_TOKENS:
+            if token in msg:
+                return True
+        low = max(0, line_no - 5)
+        high = min(len(src_lines), line_no + 2)
+        for src in src_lines[low:high]:
+            if len(src) >= 7 and src[6] == "*":
+                continue
+            stripped_upper = src.lstrip().upper()
+            if (
+                stripped_upper.startswith("EXEC CICS")
+                or stripped_upper.startswith("EXEC SQL")
+                or stripped_upper.startswith("EXEC DLI")
+            ):
+                return True
+
+    # Class 2: Undefined well-known CICS names pre-Phase-7.
+    if phase in _PHASES_BEFORE_COMMON_STUBS:
+        match = _UNDEFINED_NAME_RE.match(msg.lstrip())
+        if match and match.group(1).upper() in _WELL_KNOWN_CICS_STUB_NAMES:
+            return True
+
+    return False
+
+
+# Canonical phase aliases — maps checkpoint-name stems to the phase token
+# used by the deferral set. The pipeline abbreviates some checkpoint names
+# (``mock_infra`` for ``mock_infrastructure``) which would otherwise
+# miss the canonical lookup.
+_PHASE_ALIASES: dict[str, str] = {
+    "mock_infra": "mock_infrastructure",
+    "copy": "copy_resolution",
+    "exec": "exec_replacement",
+    "io": "io_replacement",
+    "call": "call_replacement",
+    "para": "paragraph_tracing",
+    "norm": "normalization",
+}
+
+
+def _normalize_phase_token(phase: str | None) -> str:
+    """Map ad-hoc checkpoint names back to canonical phase tokens.
+
+    The pipeline uses suffixed checkpoint names like ``copy_resolution_transformed``
+    to distinguish a phase's transform-complete sub-checkpoint from its
+    finalized checkpoint, and abbreviations like ``mock_infra_transformed``
+    for ``mock_infrastructure``. The deferral set keys on the canonical
+    token so we strip suffixes and apply aliases here.
+    """
+    if not phase:
+        return ""
+    p = phase.lower()
+    for suffix in ("_transformed", "_resumed", "_done"):
+        if p.endswith(suffix):
+            p = p[: -len(suffix)]
+    return _PHASE_ALIASES.get(p, p)
+
+
+def _count_actionable_errors(
+    source_path: Path,
+    copybook_dirs: list[Path] | None,
+    phase: str | None,
+    baseline_errors: set[str] | None = None,
+) -> int:
+    """Error count after subtracting deferred-to-later-phase errors.
+
+    Deferred by either (a) hardcoded pre-Phase-3 EXEC-class rules,
+    (b) durable teacher rules loaded from ``teacher_rules.jsonl`` via
+    ``SupervisorChannel`` (no-op if the channel is disabled), or
+    (c) pre-existing errors from ``baseline_errors`` — errors that
+    were already present in the original source (Phase 0 snapshot)
+    are not "introduced" by the mock pipeline and must not trip the
+    phase gate.
+    """
+    rc, stderr = _cobc_syntax_check(source_path, copybook_dirs)
+    if rc == 0:
+        return 0
+    errors = _parse_errors(stderr, source_path.name)
+    # Subtract baseline errors (same text match used by the fix loop).
+    if baseline_errors:
+        errors = [(ln, msg) for ln, msg in errors if msg not in baseline_errors]
+        if not errors:
+            return 0
+    canonical = _normalize_phase_token(phase)
+    src_lines = source_path.read_text(errors="replace").splitlines(keepends=True)
+
+    # Hardcoded deferral only applies to pre-Phase-3 phases.
+    def _hardcoded_defer(ln: int, msg: str) -> bool:
+        if not canonical or canonical not in _PHASES_BEFORE_EXEC_REPLACEMENT:
+            return False
+        return _is_deferred_to_later_phase(ln, msg, src_lines, canonical)
+
+    # Teacher rules apply to any phase the teacher has configured.
+    rules_store = None
+    _sup = SupervisorChannel.from_env()
+    if _sup.enabled and _sup.rules_store is not None:
+        rules_store = _sup.rules_store
+        rules_store.reload()
+
+    def _rule_defer(ln: int, msg: str) -> bool:
+        if rules_store is None:
+            return False
+        low = max(0, ln - 4)
+        high = min(len(src_lines), ln + 2)
+        return rules_store.match(
+            phase=canonical or "",
+            msg=msg,
+            source_window=src_lines[low:high],
+        ) is not None
+
+    actionable = [
+        (ln, msg) for ln, msg in errors
+        if not _hardcoded_defer(ln, msg) and not _rule_defer(ln, msg)
+    ]
+    return len(actionable)
+
+
 def _assert_clean(
     source_path: Path,
     phase_name: str,
@@ -1621,14 +1867,29 @@ def _assert_clean(
     output_dir: Path | None = None,
     checkpoint_name: str | None = None,
     checkpoint_phase_number: int | None = None,
+    baseline_errors: set[str] | None = None,
 ) -> None:
     """Raise RuntimeError if compilation errors remain after a phase.
 
     Saves resolutions AND re-saves the checkpoint with the current
     mock.cbl hash before raising, so restart resumes from here
     instead of starting from scratch.
+
+    Errors classified as deferred-to-a-later-phase (EXEC CICS/SQL/DLI
+    blocks during copy_resolution or mock_infrastructure), matched by
+    durable teacher rules, or already present in ``baseline_errors``
+    (pre-existing in the original source) are not counted against the
+    gate; they are either owned by a later phase or were never the
+    mock pipeline's responsibility to fix.
     """
-    remaining = _count_current_errors(source_path, copybook_dirs)
+    # Derive the internal phase token from the human-facing name by
+    # stripping the "Phase N (" prefix and "...) ..." suffix. We only
+    # use this for deferral filtering, so a best-effort parse is fine.
+    phase_token = checkpoint_name or ""
+    remaining = _count_actionable_errors(
+        source_path, copybook_dirs, phase_token,
+        baseline_errors=baseline_errors,
+    )
     if remaining > 0:
         if resolutions and resolution_log_path:
             _save_resolutions(resolutions, resolution_log_path)
@@ -1698,6 +1959,16 @@ def _compile_and_fix(
 
     new_resolutions: list[Resolution] = []
     source_name = source_path.name
+
+    # Teacher/student channel: no-op unless SPECTER_SUPERVISOR is set.
+    # Used to escalate reviewer deadlocks (scribe rejected >= 3 revisions)
+    # to a human-in-the-loop or supervisory agent session.
+    supervisor = SupervisorChannel.from_env()
+    # Refresh durable teacher rules at entry so a previously-persisted
+    # `skip_error_class` rule applies on the very next compile pass,
+    # without waiting for another escalation round-trip.
+    if supervisor.enabled and supervisor.rules_store is not None:
+        supervisor.rules_store.reload()
 
     # --- Pre-fix: fix lines extending past column 72 ---
     # In fixed-format COBOL, cols 73-80 are ignored. If a period or
@@ -1984,6 +2255,12 @@ def _compile_and_fix(
 
     while attempt < max_fix_attempts:
         attempt += 1
+        # Reset per-iteration flags. `is_teacher_patch` is set True by the
+        # supervisor escalation hook below when the teacher returns a
+        # `patch` verdict, and is consumed in the apply-verify block so
+        # teacher-authored fixes don't get reverted by the strict
+        # decrease-only gate the scribe is held to.
+        is_teacher_patch = False
         rc, stderr = _cobc_syntax_check(source_path, copybook_dirs)
         if rc == 0:
             log.info("  Phase %s batch %d: compiles clean", phase, batch)
@@ -2002,6 +2279,69 @@ def _compile_and_fix(
                 return new_resolutions
         else:
             new_errors = errors
+
+        # Defer errors that later phases are designed to handle.
+        #
+        # Two independent sources of deferral:
+        #   1. Hardcoded: `_is_deferred_to_later_phase` — EXEC CICS/SQL/DLI
+        #      errors in pre-Phase-3 phases are owned by `_replace_exec_blocks`.
+        #   2. Teacher-taught: durable rules from `teacher_rules.jsonl`
+        #      (via SupervisorChannel.rules_store) cover new patterns the
+        #      student doesn't know about yet. A rule says "skip this error
+        #      class" based on phase + message substring + optional source
+        #      context token. Rules are persisted by teacher `skip` verdicts
+        #      that carry `save_rule`, so a teacher only has to answer each
+        #      class once.
+        #
+        # When all remaining actionable errors are covered by either source,
+        # the phase is effectively clean and we return early.
+        if new_errors:
+            _src_defer = source_path.read_text(errors="replace").splitlines(keepends=True)
+            _rules_store = supervisor.rules_store if supervisor.enabled else None
+
+            def _is_covered(ln: int, msg: str) -> tuple[bool, str]:
+                """Return (deferred, reason) for this error."""
+                if (
+                    phase in _PHASES_BEFORE_EXEC_REPLACEMENT
+                    and _is_deferred_to_later_phase(ln, msg, _src_defer, phase)
+                ):
+                    return True, "hardcoded-exec-deferral"
+                if _rules_store is not None:
+                    low = max(0, ln - 4)
+                    high = min(len(_src_defer), ln + 2)
+                    window = _src_defer[low:high]
+                    rule = _rules_store.match(
+                        phase=phase, msg=msg, source_window=window,
+                    )
+                    if rule is not None:
+                        return True, f"teacher-rule: {rule.reason[:80]}"
+                return False, ""
+
+            _deferred_items: list[tuple[int, str, str]] = []
+            _kept: list[tuple[int, str]] = []
+            for _ln, _msg in new_errors:
+                covered, reason = _is_covered(_ln, _msg)
+                if covered:
+                    _deferred_items.append((_ln, _msg, reason))
+                else:
+                    _kept.append((_ln, _msg))
+
+            if _deferred_items:
+                new_errors = _kept
+                log.info(
+                    "  Phase %s batch %d: deferred %d error(s): %s",
+                    phase, batch, len(_deferred_items),
+                    "; ".join(
+                        sorted({reason for _, _, reason in _deferred_items})
+                    )[:160],
+                )
+                if not new_errors:
+                    log.info(
+                        "  Phase %s batch %d: no actionable errors remain — "
+                        "all %d deferred",
+                        phase, batch, len(_deferred_items),
+                    )
+                    return new_resolutions
 
         # Deterministic rescue for newly surfaced missing paragraph targets.
         # These can appear late in a batch without reducing total error count,
@@ -2750,6 +3090,80 @@ def _compile_and_fix(
                 tried_fix_fingerprints.add(revised_fingerprint)
                 fixes = revised_fixes
 
+        if review_blocked and supervisor.enabled:
+            # Teacher escalation: the challenger rejected every scribe
+            # proposal for this error. Ask the supervisory session for
+            # advice before we abandon. On "patch" we swap in the
+            # teacher's fix and fall through to the apply+recompile
+            # block below. On "skip"/timeout/None we proceed with the
+            # normal abandonment path. On "abort"/"restart" we raise.
+            _ctx_start = max(0, chosen_line - 15)
+            _ctx_end = min(len(src_lines), chosen_line + 15)
+            _ctx_snippet = "".join(
+                f"{i+1:5}: {line}"
+                for i, line in enumerate(src_lines[_ctx_start:_ctx_end],
+                                         start=_ctx_start)
+            )
+            _resolution = supervisor.escalate(
+                kind="compile_fix_exhausted",
+                summary=(
+                    f"phase={phase} batch={batch} line={chosen_line} "
+                    f"revs={scribe_attempt}: "
+                    f"{review_block_reason[:160]}"
+                ),
+                context={
+                    "phase": phase,
+                    "batch": batch,
+                    "attempt": attempt + 1,
+                    "error_line": chosen_line,
+                    "error_msg": chosen_msg,
+                    "batch_mode": use_batch_mode,
+                    "batch_error_type": largest_group_type if use_batch_mode else None,
+                    "scribe_revisions": scribe_attempt,
+                    "last_reviewer_reason": review_block_reason,
+                    "last_proposed_fix": {str(k): v for k, v in fixes.items()},
+                    "source_snippet": _ctx_snippet,
+                    "snippet_start_line": _ctx_start + 1,
+                    "snippet_end_line": _ctx_end,
+                },
+                artifacts=[
+                    str(source_path),
+                    str(audit_path) if audit_path else "",
+                ],
+                student_hints=[
+                    "specter/incremental_mock.py:_compile_and_fix",
+                    "specter/llm_review.py:review_fix",
+                    "specter/compile_swarm.py:propose_compile_fix_swarm",
+                ],
+            )
+            if _resolution is not None:
+                if _resolution.verdict == "abort":
+                    # SupervisorAbort inherits from BaseException so defensive
+                    # except-RuntimeError blocks further out in the pipeline
+                    # cannot swallow it and retry — this verdict is terminal
+                    # by contract.
+                    raise SupervisorAbort(
+                        f"Supervisor aborted run: {_resolution.notes}"
+                    )
+                if _resolution.verdict == "restart":
+                    raise SupervisorRestart(
+                        "Supervisor requested restart (teacher will "
+                        f"edit source): {_resolution.notes}"
+                    )
+                if _resolution.verdict == "patch" and _resolution.fix:
+                    log.warning(
+                        "  [%d/%d] Supervisor patch accepted "
+                        "(%d line%s): %s",
+                        attempt + 1, max_fix_attempts,
+                        len(_resolution.fix),
+                        "" if len(_resolution.fix) == 1 else "s",
+                        _resolution.notes[:120],
+                    )
+                    fixes = _resolution.fix
+                    review_blocked = False
+                    is_teacher_patch = True
+                # "skip" / unknown-verdict: fall through to abandonment.
+
         if review_blocked:
             log.warning(
                 "  [%d/%d] ✗ Skipped: %s",
@@ -2908,6 +3322,49 @@ def _compile_and_fix(
                                     source_path.write_text("".join(re_src))
 
             # Don't return — keep going to fix remaining errors
+            continue
+
+        # Teacher patches are authoritative. If a supervisor-provided
+        # patch leaves the error count unchanged (n_errors == new), we
+        # still keep it — the teacher is making a structural call the
+        # scribe can't see, and reverting would land us in the same loop
+        # that caused the escalation in the first place. We only revert
+        # when the teacher's patch demonstrably makes things WORSE
+        # (new > n_errors), in which case we don't trust it.
+        if is_teacher_patch and new_error_count <= n_errors:
+            fix_lines_dict = {str(k): v for k, v in fixes.items()}
+            desc = f"line {next(iter(targeted_lines))}"
+            new_resolutions.append(Resolution(
+                phase=phase, batch=batch,
+                transformation=f"Teacher patch in phase {phase}",
+                error=largest_group_type if use_batch_mode else chosen_msg,
+                fix=(
+                    f"supervisor patch ({len(fixes)} lines) — "
+                    f"{n_errors} → {new_error_count} errors "
+                    f"(accepted at parity via teacher authority)"
+                ),
+                fix_lines=fix_lines_dict,
+                verified=True,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            ))
+            successful_fixes.append(
+                f"Teacher-patched {desc}: {n_errors}→{new_error_count} errors "
+                f"(kept by teacher authority)"
+            )
+            if audit_path:
+                _audit_fix(audit_path, phase, batch, attempt, fixes, snapshot,
+                           largest_group_type if use_batch_mode else chosen_msg,
+                           "ACCEPTED — teacher patch kept at parity "
+                           f"({n_errors}→{new_error_count})")
+            log.warning(
+                "  [%d/%d] ✓ Teacher patch kept at parity (%d → %d errors)",
+                attempt, max_fix_attempts, n_errors, new_error_count,
+            )
+            _save_progress()
+            # Mark the targeted error line as "handled" so the inner
+            # loop doesn't immediately re-pick it.
+            for tl in targeted_lines:
+                failed_error_lines.add(tl)
             continue
 
         # Error count same or worse — revert
@@ -3373,7 +3830,8 @@ def incremental_instrument(
 
         _assert_clean(mock_path, "Phase 1 (COPY resolution)",
                       copybook_dirs, resolutions, resolution_log_path,
-                      output_dir, "copy_resolution_transformed", 0)
+                      output_dir, "copy_resolution_transformed", 0,
+                      baseline_errors=baseline_errors)
         _save_checkpoint(output_dir, "copy_resolution", 1, mock_path)
     else:
         log.info("Phase 1: COPY resolution (skipped — resuming)")
@@ -3434,7 +3892,8 @@ def incremental_instrument(
 
         _assert_clean(mock_path, "Phase 2 (mock infrastructure)",
                       copybook_dirs, resolutions, resolution_log_path,
-                      output_dir, "mock_infra_transformed", 1)
+                      output_dir, "mock_infra_transformed", 1,
+                      baseline_errors=baseline_errors)
         _save_checkpoint(output_dir, "mock_infrastructure", 2, mock_path)
     else:
         log.info("Phase 2: Mock infrastructure (skipped — resuming)")
@@ -3508,7 +3967,8 @@ def incremental_instrument(
         log.info("  Phase 3 complete (%d batches)", batch_num)
         _assert_clean(mock_path, "Phase 3 (EXEC replacement)",
                       copybook_dirs, resolutions, resolution_log_path,
-                      output_dir, "exec_replacement", 2)
+                      output_dir, "exec_replacement", 2,
+                      baseline_errors=baseline_errors)
         _save_checkpoint(output_dir, "exec_replacement", 3, mock_path)
     else:
         log.info("Phase 3: EXEC replacement (skipped — resuming)")
@@ -3565,7 +4025,8 @@ def incremental_instrument(
         log.info("  Phase 4 complete (%d batches)", batch_num)
         _assert_clean(mock_path, "Phase 4 (I/O replacement)",
                       copybook_dirs, resolutions, resolution_log_path,
-                      output_dir, "io_replacement", 3)
+                      output_dir, "io_replacement", 3,
+                      baseline_errors=baseline_errors)
         _save_checkpoint(output_dir, "io_replacement", 4, mock_path)
     else:
         log.info("Phase 4: I/O replacement (skipped — resuming)")
@@ -3627,7 +4088,8 @@ def incremental_instrument(
         log.info("  Phase 5 complete (%d batches)", batch_num)
         _assert_clean(mock_path, "Phase 5 (CALL replacement)",
                       copybook_dirs, resolutions, resolution_log_path,
-                      output_dir, "call_replacement", 4)
+                      output_dir, "call_replacement", 4,
+                      baseline_errors=baseline_errors)
         _save_checkpoint(output_dir, "call_replacement", 5, mock_path)
     else:
         log.info("Phase 5: CALL replacement (skipped — resuming)")
@@ -3658,7 +4120,8 @@ def incremental_instrument(
         _save_resolutions(resolutions, resolution_log_path)
         _assert_clean(mock_path, "Phase 6 (paragraph tracing)",
                       copybook_dirs, resolutions, resolution_log_path,
-                      output_dir, "para_tracing_transformed", 5)
+                      output_dir, "para_tracing_transformed", 5,
+                      baseline_errors=baseline_errors)
         _save_checkpoint(output_dir, "paragraph_tracing", 6, mock_path)
     else:
         log.info("Phase 6: Paragraph tracing (skipped — resuming)")
@@ -3689,7 +4152,8 @@ def incremental_instrument(
         _save_resolutions(resolutions, resolution_log_path)
         _assert_clean(mock_path, "Phase 7 (normalization)",
                       copybook_dirs, resolutions, resolution_log_path,
-                      output_dir, "normalization_transformed", 6)
+                      output_dir, "normalization_transformed", 6,
+                      baseline_errors=baseline_errors)
         _save_checkpoint(output_dir, "normalization", 7, mock_path)
     else:
         log.info("Phase 7: Normalization (skipped — resuming)")
@@ -3723,7 +4187,8 @@ def incremental_instrument(
         _save_resolutions(resolutions, resolution_log_path)
         _assert_clean(mock_path, "Phase 8 (compile fix)",
                       copybook_dirs, resolutions, resolution_log_path,
-                      output_dir, "compile_fix", 7)
+                      output_dir, "compile_fix", 7,
+                      baseline_errors=baseline_errors)
         _save_checkpoint(output_dir, "compile_fix", 8, mock_path)
     else:
         log.info("Phase 8: Auto-stub (skipped — resuming)")
@@ -3754,7 +4219,8 @@ def incremental_instrument(
         _save_resolutions(resolutions, resolution_log_path)
         _assert_clean(mock_path, "Phase 9 (final fix)",
                       copybook_dirs, resolutions, resolution_log_path,
-                      output_dir, "gnucobol_fixups", 8)
+                      output_dir, "gnucobol_fixups", 8,
+                      baseline_errors=baseline_errors)
         _save_checkpoint(output_dir, "gnucobol_fixups", 9, mock_path)
     else:
         log.info("GnuCOBOL fixups (skipped — resuming)")

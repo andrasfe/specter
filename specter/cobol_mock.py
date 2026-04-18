@@ -255,6 +255,63 @@ def instrument_cobol(
 # Phase 1: COPY resolution
 # ---------------------------------------------------------------------------
 
+# CICS DFHRESP response-code table. Mirrors `_DFHRESP` in
+# `specter/condition_parser.py`; kept module-local here so the source-
+# level substitution in the mock pipeline does not depend on the
+# condition parser at import time.
+_DFHRESP_CODES: dict[str, str] = {
+    "NORMAL": "0", "ERROR": "1", "TERMIDERR": "11", "FILENOTFOUND": "12",
+    "NOTFND": "13", "DUPREC": "14", "DUPKEY": "15", "INVREQ": "16",
+    "IOERR": "17", "NOSPACE": "18", "NOTOPEN": "19", "ENDFILE": "20",
+    "ILLOGIC": "21", "LENGERR": "22", "QZERO": "23", "SIGNAL": "24",
+    "QBUSY": "25", "ITEMERR": "26", "PGMIDERR": "27", "TRANSIDERR": "28",
+    "ENDDATA": "29", "INVTSREQ": "30", "EXPIRED": "31", "MAPFAIL": "36",
+    "ENQBUSY": "55", "DISABLED": "84", "NOTAUTH": "70",
+}
+
+_DFHRESP_MACRO_RE = re.compile(r"\bDFHRESP\(\s*([A-Z][A-Z0-9_-]*)\s*\)",
+                               re.IGNORECASE)
+
+
+def _substitute_dfhresp_macros(lines: list[str]) -> tuple[list[str], int]:
+    """Replace ``DFHRESP(NAME)`` macros with their numeric response code.
+
+    DFHRESP is a CICS translator macro that the COBOL compiler (cobc)
+    cannot expand on its own. Leaving ``WHEN DFHRESP(NORMAL)`` in an
+    EVALUATE clause produces ``'NORMAL' cannot be used here``. This pass
+    replaces every ``DFHRESP(NAME)`` token with the numeric code from
+    ``_DFHRESP_CODES``, preserving line indentation. Unknown names are
+    left alone (rather than guessed) so the compile error still surfaces
+    and is actionable.
+
+    Returns ``(new_lines, n_substitutions)``. Idempotent: running twice
+    produces the same output as running once.
+
+    Discovered via the CORPT00C teacher/student round 3 escalation:
+    ``WHEN DFHRESP(NORMAL)`` in a preserved EVALUATE after Phase 3's
+    EXEC replacement broke the whole pipeline.
+    """
+    count = 0
+
+    def _repl(match: re.Match[str]) -> str:
+        nonlocal count
+        name = match.group(1).upper()
+        code = _DFHRESP_CODES.get(name)
+        if code is None:
+            return match.group(0)
+        count += 1
+        return code
+
+    out: list[str] = []
+    for line in lines:
+        # Skip COBOL comment lines — don't mutate documentation.
+        if len(line) >= 7 and line[6] == "*":
+            out.append(line)
+            continue
+        out.append(_DFHRESP_MACRO_RE.sub(_repl, line))
+    return out, count
+
+
 def _resolve_copies(
     lines: list[str],
     copybook_dirs: list[Path],
@@ -473,6 +530,16 @@ def _resolve_copies(
             warnings.append(f"Copybook not found: {copyname}")
 
         i += 1
+
+    # Post-pass: substitute DFHRESP(NAME) macros now that all COPY
+    # content has been inlined. Runs here so every copybook-originated
+    # WHEN DFHRESP(...) arm also gets substituted before cobc sees it.
+    result, n_dfhresp = _substitute_dfhresp_macros(result)
+    if n_dfhresp:
+        log.info(
+            "Resolved %d DFHRESP(NAME) macro reference(s) into numeric codes",
+            n_dfhresp,
+        )
 
     return result, resolved, stubbed, warnings
 

@@ -32,9 +32,12 @@ JSON AST + COBOL source + copybooks
 │  coverage_strategies.py │   │  branch_instrumenter.py       │
 │  cobol_coverage.py      │   │  cobol_executor.py            │
 │  jit_value_inference.py │   │  cobol_fix_cache.py           │
-└─────────┬───────────────┘   │  llm_coverage.py (LLM calls)  │
-       │                   │  llm_test_states.py           │
-          ▼                   └──────────┬─────────────────────┘
+└─────────┬───────────────┘   │  llm_coverage.py (LLM calls) │
+          │                   │  llm_test_states.py          │
+          │                   │  supervisor_channel.py       │
+          │                   │   (teacher/student IPC on    │
+          │                   │    reviewer deadlock)        │
+          ▼                   └──────────┬───────────────────┘
    JSONL test store                      │
    (input_state + stubs + coverage)      ▼
                                Compiled COBOL executable
@@ -210,8 +213,10 @@ class Resolution:
 - **Scribe / challenger LLM review** (`specter/llm_review.py`): After the rule-based gate accepts a proposal, a second LLM call (the *challenger*) is asked to verify the fix is non-destructive against an explicit rubric (commenting out referenced lines, renaming undefined symbols, narrowing PIC clauses, mid-paragraph GOBACK/EXIT, replaced business statements, ...). The challenger returns `{"verdict": "accept" | "reject", "reason": "...", "severity": "high" | "low", "guidance": "..."}`. `ReviewVerdict` carries `verdict`, `reason`, `severity` (`high` = revise, `low` = abandon), and an optional `guidance` string the scribe can follow to find a better fix location. On `reject` the scribe is re-prompted with the reviewer's reason (and guidance if any) appended and tries again, up to `_LLM_REVIEW_MAX_REVISIONS = 3` revisions per error attempt before the proposal is recorded as failed. On `unknown` (reviewer outage / parse failure / kill switch active) the proposal passes through unblocked. Worst-case cost is 4 scribe calls + 4 reviewer calls per error attempt; most attempts pass on the first review. Bypassed via `--no-llm-review` CLI flag or `SPECTER_LLM_REVIEW=0` env var.
 - **Failed-attempt memory**: LLM sees "WHAT WORKED" and "WHAT FAILED" sections with prior attempts from this cycle (now also includes reviewer-blocked attempts).
 - **Error clustering**: Adjacent errors (within 10 lines) are treated as one root cause — failing one marks the whole cluster.
-- **Relaxed verification**: Accept if total error count drops (not just the specific line).
-- **Audit log** (`fix_audit.log`): Every accepted fix logged with BEFORE/AFTER per line, tagged [COMMENTED OUT], [ADDED], or [MODIFIED].
+- **Relaxed verification**: Accept if total error count drops (not just the specific line). **Teacher-patch parity exception**: when a patch arrives via the supervisor channel (`is_teacher_patch=True`), it is kept as long as error count doesn't *increase* — teacher authority bypasses the scribe's strict-decrease gate because the teacher can see structural context the scribe can't (e.g. the fix addresses one of N parallel errors on related lines). Teacher patches are still appended to `resolution_log.json` so they replay on future runs via `_apply_preventive_fixes()`.
+- **Supervisor escalation on reviewer deadlock**: When the scribe exhausts `_LLM_REVIEW_MAX_REVISIONS` or the compile swarm produces a duplicate, `_compile_and_fix` escalates through `specter/supervisor_channel.py` (env-gated via `SPECTER_SUPERVISOR=<run_dir>`). A teacher `patch` verdict replaces `fixes` and falls through to apply-and-verify. `skip` abandons this error. `abort`/`restart` raise `SupervisorAbort`/`SupervisorRestart` — both inherit from `BaseException` so the `except RuntimeError` fallback in `cobol_coverage.py:2463` cannot silently retry them. Disabled (no-op) when `SPECTER_SUPERVISOR` is unset.
+- **Pre-Phase-3 error deferral**: `_is_deferred_to_later_phase(line, msg, src, phase)` flags errors inside `EXEC CICS`/`EXEC SQL`/`EXEC DLI` blocks during `copy_resolution` / `mock_infrastructure` as owned by Phase 3's `_replace_exec_blocks` transform. The fix loop drops deferred errors from the actionable set (the scribe is never asked to "repair" a block Phase 3 will transform), and `_count_actionable_errors()` excludes them from the phase gate. `_normalize_phase_token()` strips suffixes (`_transformed`, `_resumed`, `_done`) and applies aliases (`mock_infra` → `mock_infrastructure`, `copy` → `copy_resolution`, etc.) so checkpoint names used by `_assert_clean` resolve to canonical phase tokens. Teacher-taught skip rules (`TeacherRulesStore`) extend this hardcoded deferral with patterns the student doesn't know about yet.
+- **Audit log** (`fix_audit.log`): Every accepted fix logged with BEFORE/AFTER per line, tagged [COMMENTED OUT], [ADDED], or [MODIFIED]. Teacher-patch acceptances are logged as "ACCEPTED — teacher patch kept at parity".
 
 **COBOL knowledge base** (`_COBOL_FIX_KNOWLEDGE`): ~90-line reference appended to every LLM prompt. Covers fixed-format rules (cols 1-72, Area A/B), section and paragraph headers, 88-level rules, qualified `FIELD OF RECORD` references, common I/O and SELECT syntax, error patterns with specific remediation, PIC clause inference rules, and hard constraints (never comment out referenced lines).
 
@@ -524,6 +529,45 @@ Soft scoring for acceptable fixes: +10 for addressing the error line, +5 per str
 `propose_compile_fix_swarm(error_line, error_msg, context, src_lines, llm_provider, llm_model)` — top-level entry. Returns `(fixes_dict, reasoning)`, signature-compatible with a single-scribe call.
 
 Configuration: `SPECTER_COMPILE_SWARM=0` to disable and fall back to single-scribe revision for all rejections.
+
+### `specter/supervisor_channel.py` — Teacher/student IPC channel (~465 lines)
+
+Env-gated JSONL channel between a long-running Specter run (the *student*) and a supervisory agent or human session (the *teacher*). The channel fires when `_compile_and_fix` hits a reviewer deadlock it cannot break on its own — scribe 3× rejected, compile swarm producing duplicates, or a phase gate about to raise — and blocks until the teacher appends a reply correlated by UUID. On timeout the student falls back to its existing abandonment path, so headless runs never deadlock.
+
+**Activation**: set `SPECTER_SUPERVISOR=<run_dir>`. When unset, `SupervisorChannel.from_env()` returns a disabled instance and every method is a no-op (zero overhead on the hot path). The teacher side is `scripts/teach.sh <run_dir>` (or any equivalent watcher that tails `escalations.jsonl` and appends replies to `resolutions.jsonl`).
+
+**Files written into `<run_dir>`**:
+| File | Producer | Purpose |
+|------|----------|---------|
+| `escalations.jsonl` | student | Append-only event log — UUID, kind, summary, full context, artifact paths, student_hints pointing at the files the teacher should consider editing, and `related_findings` (prior teacher knowledge for this class). |
+| `resolutions.jsonl` | teacher | Append-only replies — `{id, verdict, fix?, notes, save_rule?, finding?}`. Student polls for matching `id` with a bounded timeout. |
+| `status.jsonl` | student | Heartbeat snapshots (phase, round, coverage). |
+| `teacher_rules.jsonl` | channel | Durable skip rules persisted from `save_rule` replies. |
+| `teacher_findings.jsonl` | channel | Structural observations persisted from `finding` replies (lint inbox). |
+
+**Verdicts** (`_VALID_VERDICTS`): `patch` (inline `{line: content}` fix applied at error-count parity), `skip` (abandon this error and continue), `abort` (raise `SupervisorAbort`), `restart` (raise `SupervisorRestart`), `retry_with` (accept altered flags — reserved).
+
+**Exception contract**: `SupervisorAbort` and `SupervisorRestart` inherit from `BaseException`, not `Exception`. The broad `except RuntimeError:` fallback in `cobol_coverage.py:2463` (and similar `except Exception:` handlers across the codebase) cannot catch them. Only explicit `except SupervisorAbort` / `except BaseException` / bare `except:` will catch. Modeled on `KeyboardInterrupt`/`SystemExit`.
+
+**Durable teacher knowledge**:
+- **`TeacherRule`** — dataclass carrying `kind` (currently `skip_error_class`), `phase`, `msg_contains: list[str]`, optional `source_context_contains`, free-form `reason`, `issued_by`, `ts`. `matches(phase, msg, source_window)` returns True when the phase matches (wildcard `*` allowed), every token in `msg_contains` is a substring of the error message, AND (if set) the source window contains `source_context_contains` (case-insensitive).
+- **`TeacherRulesStore`** — append-only JSONL store keyed on a single file path. `reload()` re-reads, `append(rule)` writes + caches, `match(phase, msg, source_window)` returns the first matching rule or `None`. `_compile_and_fix` consults this alongside `_is_deferred_to_later_phase`, so a teacher-taught rule skips the escalation entirely on the next compile pass. `_count_actionable_errors` (used by `_assert_clean`) also honors it, so a taught skip rule passes the phase gate.
+- **`TeacherFindingsStore`** — append-only JSONL store of structural observations (never auto-applied). Each entry: `{severity, title, suggested_files?, notes, ts}`. Intended as a lint inbox the operator reviews between runs.
+
+**`Resolution`** dataclass: `id`, `verdict`, `fix: dict[int, str]`, `notes`, `raw`, plus optional `save_rule: dict` and `finding: dict` that the channel persists via `_persist_durable_fields()` before returning to the caller. JSON fix keys arrive as strings; `_parse_resolution()` coerces to `int`.
+
+**`_related_findings(kind, context)`** (called by `escalate()`): scans the findings store for entries whose title or notes mention the current error message or phase, and summarizes the rules store (`count` + `reasons[:5]`) when any rule matches the current event class. Capped at 8 items so the escalation payload stays readable.
+
+**Hook site in `incremental_mock.py`**: `_compile_and_fix` instantiates `supervisor = SupervisorChannel.from_env()` once at entry and calls `supervisor.rules_store.reload()` so any prior-run rules apply immediately. When `review_blocked=True`, the hook builds an escalation payload (error line/msg, scribe revision count, last proposed fix, ±15-line source snippet, artifact paths, student-file hints) and consumes the reply:
+- `abort` / `restart` → raise the matching `BaseException` subclass.
+- `patch` + non-empty fix → overwrite `fixes = _resolution.fix`, set `review_blocked = False` and `is_teacher_patch = True`, fall through to apply-and-verify.
+- `skip` / unknown verdict / `None` (timeout) → fall through to existing abandonment.
+
+Integration surfaces:
+- `scripts/teach.sh <run_dir>` — thin `tail -F` helper; pair with `Monitor` in a teacher session.
+- `tests/test_supervisor_channel.py` — channel round-trip, timeout, disabled mode, unknown verdict, heartbeat.
+- `tests/test_supervisor_fixes.py` — `SupervisorAbort` uncatchable by `except Exception` / `except RuntimeError`; `_is_deferred_to_later_phase` classification; phase-token normalization.
+- `tests/test_supervisor_persistence.py` — `TeacherRule.matches` (phase, tokens, source window), rules-store round-trip, findings store, full escalate → save_rule + finding persistence flow, related_findings inclusion, shorthand `msg_contains` as string.
 
 ### `specter/uncovered_report.py` — Post-run diagnostic report (~700 lines)
 
@@ -907,8 +951,11 @@ the moment a generated mock has any non-trivial syntax issue.
 | `test_end_to_end.py` | 8 | Full pipeline (skipped if AST files missing) |
 | `test_ast_parser.py` | 5 | AST deserialization |
 | `test_memory_store.py` | 3 | Memory persistence: derive_memory_dir, round-trip save/load, prune+checkpoint |
+| `test_supervisor_persistence.py` | 11 | Durable teacher knowledge: `TeacherRule.matches`, `TeacherRulesStore`/`TeacherFindingsStore` round-trip, full escalate → save_rule + finding persistence, related_findings in payload, shorthand msg_contains normalization |
+| `test_supervisor_fixes.py` | 11 | `SupervisorAbort` uncatchable by `except Exception`/`except RuntimeError`, `_is_deferred_to_later_phase` classification (msg tokens + source context + phase gating), `_normalize_phase_token` alias handling, teacher-patch verdict shape |
+| `test_supervisor_channel.py` | 6 | Channel round-trip: disabled mode, env toggle, patch reply, timeout, unknown verdict, heartbeat append |
 
-**Total: 625 tests**
+**Total: 882 tests**
 
 ### Running Tests
 ```bash
@@ -933,3 +980,5 @@ python3 -m pytest -x -q                              # Stop on first failure, qu
 9. **Stub outcome queues**: list of (var, value) pairs per operation, pop on each call
 10. **JSONL persistence**: Append-only, crash-safe, resumable with progress records
 11. **JIT scope restriction**: JIT LLM calls are allowed only when a concrete target paragraph is known AND the variable is within the per-target allowlist (gating vars ∪ backward-slice vars ∪ stub-return vars). This eliminates low-signal "Target paragraph: none" prompts and keeps semantic inference tightly coupled to the currently blocked coverage target.
+12. **Phase-owned error deferral**: Errors owned by later phases are skipped by earlier ones rather than being attempted and reverted. `_is_deferred_to_later_phase` catches EXEC CICS/SQL/DLI syntax errors during copy_resolution / mock_infrastructure, since `_replace_exec_blocks` will transform those blocks in Phase 3. Before this, reviewer-correct destructive rejections on CICS programs stalled Phase 1 indefinitely.
+13. **Teacher/student escalation over file-based IPC**: On reviewer deadlock the student doesn't give up silently — it appends an escalation to `<run_dir>/escalations.jsonl` and blocks polling `resolutions.jsonl` for a UUID-correlated reply. Durable (crash-safe, auditable), works whether the teacher is online or not. `SupervisorAbort`/`SupervisorRestart` inherit from `BaseException` so outer `except` blocks can't silently retry a terminal teacher verdict. Teacher replies may carry `save_rule` (appended to `teacher_rules.jsonl` for persistent skip patterns) and `finding` (appended to `teacher_findings.jsonl` for structural review).
