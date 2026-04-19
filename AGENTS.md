@@ -534,7 +534,15 @@ Configuration: `SPECTER_COMPILE_SWARM=0` to disable and fall back to single-scri
 
 Env-gated JSONL channel between a long-running Specter run (the *student*) and a supervisory agent or human session (the *teacher*). The channel fires when `_compile_and_fix` hits a reviewer deadlock it cannot break on its own — scribe 3× rejected, compile swarm producing duplicates, or a phase gate about to raise — and blocks until the teacher appends a reply correlated by UUID. On timeout the student falls back to its existing abandonment path, so headless runs never deadlock.
 
-**Activation**: set `SPECTER_SUPERVISOR=<run_dir>`. When unset, `SupervisorChannel.from_env()` returns a disabled instance and every method is a no-op (zero overhead on the hot path). The teacher side is `scripts/teach.sh <run_dir>` (or any equivalent watcher that tails `escalations.jsonl` and appends replies to `resolutions.jsonl`).
+**Activation — two gates**:
+1. `SPECTER_SUPERVISOR=<run_dir>` configures the channel's file location.
+2. `SPECTER_ESCALATE=1` (or pass `--escalate` on the CLI) opts in to escalation.
+
+Both must be set for `SupervisorChannel.from_env()` to return an enabled instance. The split is intentional: a mature student runs autonomously by default, even when a channel directory is available. Escalation is an explicit opt-in that you turn on when iterating with a teacher agent and off once the student handles this class of program without help. When either gate is missing every method is a no-op (zero overhead on the hot path). The teacher side is `scripts/teach.sh <run_dir>` (or any equivalent watcher that tails `escalations.jsonl` and appends replies to `resolutions.jsonl`).
+
+**Escalation sites**:
+- `_compile_and_fix` — on reviewer deadlock (scribe exhausted `_LLM_REVIEW_MAX_REVISIONS` or compile swarm produced a duplicate).
+- `branch_swarm.run_branch_swarm` — once per stubborn branch after all rounds are exhausted and the paragraph still isn't hit. The escalation is advisory: teacher verdicts are logged for human review but not applied as inline line-patches (the branch case has no line-patch semantics). `abort`/`restart` still propagate; `skip`/timeout/unknown all drop through to the normal failure-log path. Explicit design contract: *it is ok if teacher cannot help and student should not insist*.
 
 **Files written into `<run_dir>`**:
 | File | Producer | Purpose |

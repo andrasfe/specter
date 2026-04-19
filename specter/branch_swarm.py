@@ -1431,6 +1431,70 @@ def investigate_branch_swarm(
             f"(reached={para_reached}). "
             f"Approaches: {'; '.join(all_reasons[:4])}"
         )
+        # Optional escalation: after all swarm rounds are exhausted the
+        # student may ask a teacher for a fresh angle. The call is a
+        # no-op unless both SPECTER_SUPERVISOR=<dir> and SPECTER_ESCALATE
+        # are set (i.e. the operator passed --escalate). The teacher may
+        # abort the run, or reply skip/unknown/timeout in which case the
+        # student simply moves on and writes the failure log as always.
+        # We do NOT attempt to apply inline line-patches in branch
+        # context — the patch verdict's notes are logged for human
+        # review but that's it. Rationale: 'it is ok if teacher cannot
+        # help and student should not insist'.
+        from .supervisor_channel import (
+            SupervisorAbort,
+            SupervisorChannel,
+            SupervisorRestart,
+        )
+        _sup = SupervisorChannel.from_env()
+        if _sup.enabled:
+            _cond_text = getattr(bctx, "condition", "") or ""
+            _paragraph = getattr(bctx, "paragraph", "") or ""
+            try:
+                _resolution = _sup.escalate(
+                    kind="branch_unresolved",
+                    summary=(
+                        f"branch {branch_key} not hit after {max_rounds} "
+                        f"swarm rounds (paragraph={_paragraph}, "
+                        f"reached={para_reached})"
+                    ),
+                    context={
+                        "branch_key": branch_key,
+                        "paragraph": _paragraph,
+                        "condition": _cond_text[:500],
+                        "paragraph_reached": para_reached,
+                        "rounds_attempted": max_rounds,
+                        "specialist_reasoning": all_reasons[:8],
+                    },
+                    student_hints=[
+                        "specter/branch_swarm.py",
+                        "specter/coverage_strategies.py",
+                    ],
+                )
+            except (SupervisorAbort, SupervisorRestart):
+                # Write the diagnostic log before propagating so the
+                # failure state survives the raise.
+                _write_failure_log(ctx, bctx, route, journal)
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "  Swarm: supervisor escalation failed, proceeding: %s",
+                    exc,
+                )
+                _resolution = None
+            if _resolution is not None:
+                # skip / patch / unknown — student does not insist. We
+                # record the teacher's verdict for human review but do
+                # not try to apply inline patches in branch context.
+                log.info(
+                    "  Swarm: teacher responded verdict=%s notes=%s",
+                    _resolution.verdict,
+                    (_resolution.notes or "")[:160],
+                )
+                journal.final_reasoning += (
+                    f" | teacher={_resolution.verdict}: "
+                    f"{(_resolution.notes or '')[:120]}"
+                )
         _write_failure_log(ctx, bctx, route, journal)
 
     return journal, tc_count

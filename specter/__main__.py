@@ -327,6 +327,19 @@ def main(argv: list[str] | None = None) -> int:
         help="Run coverage-guided test generation against real COBOL (GnuCOBOL)",
     )
     parser.add_argument(
+        "--escalate",
+        action="store_true",
+        help=(
+            "Opt in to the teacher/student supervisor channel. Requires "
+            "SPECTER_SUPERVISOR=<run_dir> to also be set. When omitted "
+            "(the default), the student runs autonomously — on reviewer "
+            "deadlock or stubborn branches it records failure and moves "
+            "on without waiting for a teacher. Turn on when iterating "
+            "with a teacher agent; turn off once the student handles "
+            "this class of program on its own."
+        ),
+    )
+    parser.add_argument(
         "--cobol-source",
         metavar="PATH",
         help="Path to COBOL source file (.cbl) for --cobol-coverage",
@@ -407,6 +420,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.agent_iterations:
         os.environ["SPECTER_AGENT_ITERATIONS"] = str(args.agent_iterations)
+
+    # --escalate: opt in to the teacher/student supervisor channel. Must be
+    # set BEFORE any code path imports supervisor_channel and checks env
+    # state. Default behaviour is off — student runs autonomously.
+    if args.escalate:
+        os.environ["SPECTER_ESCALATE"] = "1"
 
     # --uncovered-report: base path for the post-run diagnostic report.
     # Read by cobol_coverage._run_agentic_loop finalization via the

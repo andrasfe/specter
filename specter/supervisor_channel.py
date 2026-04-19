@@ -44,9 +44,23 @@ from .persistence_utils import append_line_with_fsync
 log = logging.getLogger(__name__)
 
 SUPERVISOR_ENV = "SPECTER_SUPERVISOR"
+# Second gate: explicit opt-in for escalation. A run can have a channel
+# directory configured (heartbeats, rules reload, findings inspection)
+# without actually escalating on reviewer deadlock — that matters once
+# the student is mature enough to handle most cases on its own and the
+# round-trip to a teacher is pure cost. Default off. Set via the
+# ``--escalate`` CLI flag (which exports ``SPECTER_ESCALATE=1``) or
+# directly by the caller.
+ESCALATE_ENV = "SPECTER_ESCALATE"
 ESCALATIONS_FILE = "escalations.jsonl"
 RESOLUTIONS_FILE = "resolutions.jsonl"
 STATUS_FILE = "status.jsonl"
+
+
+def _escalation_opt_in() -> bool:
+    """Return True only when the SPECTER_ESCALATE env var is truthy."""
+    value = os.environ.get(ESCALATE_ENV, "").strip().lower()
+    return value in ("1", "true", "yes", "on")
 
 _VALID_VERDICTS = {"patch", "skip", "abort", "restart", "retry_with"}
 
@@ -329,9 +343,24 @@ class SupervisorChannel:
 
     @classmethod
     def from_env(cls, **kwargs: Any) -> "SupervisorChannel":
-        """Build a channel from ``SPECTER_SUPERVISOR``; disabled if unset."""
+        """Build a channel from environment configuration.
+
+        Two independent gates:
+
+        1. ``SPECTER_SUPERVISOR=<run_dir>`` configures the channel's file
+           location.
+        2. ``SPECTER_ESCALATE`` (truthy) opts in to escalation.
+
+        **Both** must be set to return an enabled channel. If either is
+        missing the returned channel is disabled (all methods are
+        no-ops). This lets a mature student run autonomously even when
+        a channel directory is available — escalation is an explicit
+        opt-in, not a side-effect of configuration.
+        """
         run_dir = os.environ.get(SUPERVISOR_ENV)
-        return cls(run_dir or None, **kwargs)
+        if not run_dir or not _escalation_opt_in():
+            return cls(None, **kwargs)
+        return cls(run_dir, **kwargs)
 
     # ------------------------------------------------------------------ I/O
 

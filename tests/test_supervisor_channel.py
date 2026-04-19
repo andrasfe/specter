@@ -12,6 +12,7 @@ import pytest
 
 from specter.persistence_utils import append_line_with_fsync
 from specter.supervisor_channel import (
+    ESCALATE_ENV,
     RESOLUTIONS_FILE,
     STATUS_FILE,
     SupervisorChannel,
@@ -30,13 +31,37 @@ def test_disabled_when_no_run_dir() -> None:
 
 def test_from_env_respects_toggle(monkeypatch: pytest.MonkeyPatch,
                                   tmp_path: Path) -> None:
+    # Neither var set → disabled.
     monkeypatch.delenv(SUPERVISOR_ENV, raising=False)
+    monkeypatch.delenv(ESCALATE_ENV, raising=False)
     assert SupervisorChannel.from_env().enabled is False
 
+    # Only SPECTER_SUPERVISOR set → still disabled. Escalation is an
+    # explicit opt-in; configuring the channel dir alone is not enough.
     monkeypatch.setenv(SUPERVISOR_ENV, str(tmp_path))
+    assert SupervisorChannel.from_env().enabled is False
+
+    # Only SPECTER_ESCALATE set → still disabled (no channel dir).
+    monkeypatch.delenv(SUPERVISOR_ENV, raising=False)
+    monkeypatch.setenv(ESCALATE_ENV, "1")
+    assert SupervisorChannel.from_env().enabled is False
+
+    # Both set → enabled.
+    monkeypatch.setenv(SUPERVISOR_ENV, str(tmp_path))
+    monkeypatch.setenv(ESCALATE_ENV, "1")
     c = SupervisorChannel.from_env()
     assert c.enabled is True
     assert c.run_dir == tmp_path
+
+    # Truthy variations all work.
+    for value in ("true", "yes", "on", "TRUE"):
+        monkeypatch.setenv(ESCALATE_ENV, value)
+        assert SupervisorChannel.from_env().enabled is True
+
+    # Explicit 0 / false / empty disables.
+    for value in ("0", "false", "no", ""):
+        monkeypatch.setenv(ESCALATE_ENV, value)
+        assert SupervisorChannel.from_env().enabled is False
 
 
 def test_escalate_writes_event_and_waits(tmp_path: Path) -> None:
