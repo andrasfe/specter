@@ -218,6 +218,13 @@ class CobolExecutionContext:
     coverage_mode: bool = False
     mock_operations: list[str] = field(default_factory=list)  # ordered SPECTER-MOCK op keys
     fd_record_fields: dict[str, str] = field(default_factory=dict)  # FD field -> "alpha"|"numeric"
+    # Unified branch registry — source of truth for branch identification
+    # across Python (code_generator) and COBOL (branch_instrumenter after
+    # Phase 3). When present, downstream consumers should prefer this
+    # over ``branch_meta`` (which is the legacy shape derived from the
+    # same data). Set by ``prepare_context`` when the caller provides
+    # the AST program; ``None`` for older call sites.
+    branch_registry: object = None
     # Maps 88-level condition-name (child, uppercase) to its activating
     # value as a string. Used by ``run_test_case`` to coerce Python
     # bool values in input_state (shorthand for "activate this flag")
@@ -279,6 +286,7 @@ def prepare_context(
     allow_hardening_fallback: bool = True,
     llm_provider=None,
     llm_model: str | None = None,
+    program=None,  # optional specter.models.Program — builds branch registry
 ) -> CobolExecutionContext:
     """Instrument and compile a COBOL source for repeated execution.
 
@@ -512,6 +520,31 @@ def prepare_context(
     except Exception:  # noqa: BLE001
         pass
 
+    # Build and persist the unified branch registry when the caller
+    # supplied the AST. Downstream consumers (cobol_coverage, swarm,
+    # the Phase-3 COBOL instrumenter) can look up bid by content hash
+    # or by anchor, eliminating the Python/COBOL ID-mismatch bug. The
+    # JSON file next to the build artifacts makes the registry
+    # available to out-of-process tooling (CLI inspectors etc.).
+    branch_registry = None
+    if program is not None:
+        try:
+            from .branch_registry import build_registry as _build_reg
+            from .persistence_utils import atomic_write_json
+            branch_registry = _build_reg(program)
+            atomic_write_json(
+                work_dir / "branch_registry.json",
+                branch_registry.to_dict(),
+            )
+            log.debug(
+                "branch_registry: wrote %d entries to %s",
+                len(branch_registry.entries),
+                work_dir / "branch_registry.json",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("branch_registry: build/persist failed: %s", exc)
+            branch_registry = None
+
     return CobolExecutionContext(
         executable_path=executable_path,
         instrumented_source_path=instrumented_path,
@@ -532,6 +565,7 @@ def prepare_context(
         mock_operations=mock_ops,
         fd_record_fields=fd_fields,
         condition_names_88=condition_names_88,
+        branch_registry=branch_registry,
     )
 
 

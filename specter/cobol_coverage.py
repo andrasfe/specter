@@ -2485,6 +2485,7 @@ def run_cobol_coverage(
             allow_hardening_fallback=not strict_branch_coverage,
             llm_provider=llm_provider,
             llm_model=llm_model,
+            program=program,
         )
     except RuntimeError as e:
         if replay_injectable:
@@ -2503,6 +2504,7 @@ def run_cobol_coverage(
                 allow_hardening_fallback=not strict_branch_coverage,
                 llm_provider=llm_provider,
                 llm_model=llm_model,
+                program=program,
             )
         else:
             log.error("COBOL compilation failed: %s", e)

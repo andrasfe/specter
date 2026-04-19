@@ -512,6 +512,7 @@ def run_pipeline(
         coverage_mode=True,
         llm_provider=llm_provider,
         llm_model=llm_model,
+        program=program,
     )
     # Build PIC info so input_state values are truncated to COBOL field
     # widths in BOTH the Python pre-run and the COBOL binary execution.
