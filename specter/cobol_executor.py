@@ -225,6 +225,14 @@ class CobolExecutionContext:
     # same data). Set by ``prepare_context`` when the caller provides
     # the AST program; ``None`` for older call sites.
     branch_registry: object = None
+    # Translation table from a Python-side branch id (the one in
+    # ``branch_registry.by_bid``) to the matching COBOL probe
+    # ``(cobol_bid, direction)``. For IF branches that's the bid plus
+    # ``"T"`` (firing direction); for EVALUATE WHEN arms it's the
+    # shared EVALUATE bid plus the arm direction (``"W1"``, ``"WO"``,
+    # ...). Built by ``prepare_context`` via content-hash lookup. Empty
+    # dict when the caller didn't supply the AST program.
+    python_to_cobol_bid: dict = field(default_factory=dict)
     # Maps 88-level condition-name (child, uppercase) to its activating
     # value as a string. Used by ``run_test_case`` to coerce Python
     # bool values in input_state (shorthand for "activate this flag")
@@ -233,6 +241,38 @@ class CobolExecutionContext:
     # the ``SET <flag> TO TRUE`` branch. Falls back to Y/N when the
     # variable isn't a known 88-level.
     condition_names_88: dict[str, str] = field(default_factory=dict)
+
+    def translate_py_branch(self, py_branch: str) -> str | None:
+        """Translate a ``py:<bid>:<direction>`` label to its COBOL equivalent.
+
+        Returns the COBOL branch label (``"<cbid>:<direction>"``) that covers
+        the same source construct, or ``None`` when there is no counterpart
+        (e.g. PERFORM UNTIL/VARYING, or an EVALUATE WHEN arm's ``:F`` — the
+        "arm not taken" case doesn't correspond to a single COBOL probe
+        since it's expressed by some other arm firing).
+        """
+        if not py_branch.startswith("py:") or not self.python_to_cobol_bid:
+            return None
+        parts = py_branch[3:].split(":", 1)
+        if len(parts) != 2:
+            return None
+        try:
+            py_bid = int(parts[0])
+        except ValueError:
+            return None
+        py_dir = parts[1].upper()
+        hit = self.python_to_cobol_bid.get(py_bid)
+        if hit is None:
+            return None
+        cobol_bid, cobol_dir = hit
+        # EVALUATE arms store the actual W1/WO direction; only Python :T
+        # (arm taken) maps to that probe.
+        if cobol_dir and cobol_dir.startswith("W"):
+            if py_dir != "T":
+                return None
+            return f"{cobol_bid}:{cobol_dir}"
+        # IF branches use pass-through direction (T ↔ T, F ↔ F).
+        return f"{cobol_bid}:{py_dir}"
 
 
 @dataclass
@@ -527,6 +567,7 @@ def prepare_context(
     # JSON file next to the build artifacts makes the registry
     # available to out-of-process tooling (CLI inspectors etc.).
     branch_registry = None
+    python_to_cobol_bid: dict[int, tuple[str, str]] = {}
     if program is not None:
         try:
             from .branch_registry import build_registry as _build_reg
@@ -541,9 +582,38 @@ def prepare_context(
                 len(branch_registry.entries),
                 work_dir / "branch_registry.json",
             )
+            # Build the Python-bid → COBOL-(bid, direction) translation
+            # map via content-hash. For IF branches the COBOL tracer
+            # stores one hash per bid; for EVALUATE it stores one hash
+            # per WHEN arm under ``when_hashes[direction]``.
+            cobol_by_hash: dict[str, tuple[str, str]] = {}
+            for cobol_bid, meta in (branch_meta or {}).items():
+                if not isinstance(meta, dict):
+                    continue
+                if meta.get("type") == "EVALUATE":
+                    for direction, h in (meta.get("when_hashes") or {}).items():
+                        cobol_by_hash[h] = (str(cobol_bid), direction)
+                else:
+                    h = meta.get("content_hash")
+                    if h:
+                        # IF maps to T direction on fire (false to F).
+                        cobol_by_hash[h] = (str(cobol_bid), "T")
+            matched = 0
+            for e in branch_registry.entries:
+                hit = cobol_by_hash.get(e.content_hash)
+                if hit is not None:
+                    python_to_cobol_bid[e.bid] = hit
+                    matched += 1
+            log.info(
+                "branch_registry: translated %d/%d Python bids to COBOL probes "
+                "(%d COBOL-only)",
+                matched, len(branch_registry.entries),
+                len(cobol_by_hash) - matched,
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("branch_registry: build/persist failed: %s", exc)
             branch_registry = None
+            python_to_cobol_bid = {}
 
     return CobolExecutionContext(
         executable_path=executable_path,
@@ -566,6 +636,7 @@ def prepare_context(
         fd_record_fields=fd_fields,
         condition_names_88=condition_names_88,
         branch_registry=branch_registry,
+        python_to_cobol_bid=python_to_cobol_bid,
     )
 
 

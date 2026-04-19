@@ -86,6 +86,8 @@ Generates a complete Python module with:
 
 **Branch Instrumentation**: Every IF/EVALUATE gets a unique branch ID. Positive = TRUE taken, negative = FALSE taken. Stored in `state['_branches']` (set of int). Module-level `_BRANCH_META` maps IDs to metadata.
 
+**Unified Branch Registry (`specter/branch_registry.py`)**: Single source of truth for branch identity across Python (`code_generator`) and COBOL (`cobol_mock._add_branch_tracing`). Each branch gets a content hash — `sha1(paragraph || normalized_condition || type || per-paragraph-per-type ordinal)` — computed identically on both sides. `code_generator` emits `_BRANCH_META` and `_BRANCH_CONTENT_HASHES` from the registry; `cobol_mock` stamps `content_hash` (IF) and `when_hashes[direction]` (EVALUATE WHEN arms) onto its `branch_meta` entries; `cobol_executor.prepare_context` joins the two by hash and stores the result in `CobolExecutionContext.python_to_cobol_bid`. `ctx.translate_py_branch("py:<N>:T")` returns the matching `"<cobol_bid>:<direction>"` probe (or `None` when there is no counterpart, e.g. PERFORM VARYING or EVALUATE `:F`).
+
 **State Dictionary Convention**:
 ```python
 state['MY-VAR']           # COBOL variables (uppercase, safe access)

@@ -1659,10 +1659,43 @@ def _add_branch_tracing(
     can determine which branches were taken during execution.
     Also emits @@V: variable snapshots alongside each @@B: probe.
 
+    Each branch entry also carries a ``content_hash`` computed the same way
+    :class:`specter.branch_registry.BranchEntry` does (sha1 of paragraph ||
+    normalized condition || type || per-paragraph-per-type ordinal). That
+    hash is the bridge between the COBOL tracer's sequential ids and the
+    Python code generator's registry ids — downstream code looks up the
+    matching entry by hash to translate a Python-side target (``bid=11``)
+    into the COBOL probe (``@@B:<cobol_bid>:<direction>``) that actually
+    measures that branch.
+
     Returns:
         (modified_lines, branch_meta, total_branch_probes)
-        branch_meta maps branch_id (str) to {paragraph, condition, type}.
+        branch_meta maps branch_id (str) to
+        {paragraph, condition, type, content_hash, when_hashes?}.
     """
+    from .branch_registry import _canon_condition, _canon_paragraph
+    import hashlib as _hashlib
+
+    def _hash_anchor(paragraph: str, condition: str, type_: str,
+                     ordinal: int) -> str:
+        """Same hash formula as BranchEntry.content_hash."""
+        payload = (
+            f"{_canon_paragraph(paragraph)}\x00"
+            f"{_canon_condition(condition)}\x00"
+            f"{type_}\x00"
+            f"{ordinal}"
+        )
+        return _hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+    # Per-paragraph-per-type ordinal counter, matching the Python walker.
+    _ordinals: dict[tuple[str, str], int] = {}
+
+    def _next_ordinal(paragraph: str, type_: str) -> int:
+        key = (_canon_paragraph(paragraph), type_)
+        n = _ordinals.get(key, 0)
+        _ordinals[key] = n + 1
+        return n
+
     result: list[str] = []
     branch_id = 0
     branch_meta: dict[str, dict] = {}
@@ -1789,10 +1822,15 @@ def _add_branch_tracing(
             _stats["probed"] = _stats.get("probed", 0) + 1
             branch_id += 1
             bid = str(branch_id)
+            _if_ord = _next_ordinal(current_para, "IF")
             branch_meta[bid] = {
                 "paragraph": current_para,
                 "condition": full_condition,
                 "type": "IF",
+                "ordinal": _if_ord,
+                "content_hash": _hash_anchor(
+                    current_para, full_condition, "IF", _if_ord,
+                ),
             }
             branch_directions.setdefault(bid, set())
 
@@ -1889,6 +1927,11 @@ def _add_branch_tracing(
                 "paragraph": current_para,
                 "condition": subject,
                 "type": "EVALUATE",
+                # ``when_hashes`` gets populated as each WHEN arm is
+                # detected below — maps direction ("W1", "WO", ...) to
+                # the per-arm content hash that matches the Python
+                # registry's per-arm entry.
+                "when_hashes": {},
             }
             branch_directions.setdefault(bid, set())
             eval_stack.append((bid, 0))
@@ -1902,17 +1945,27 @@ def _add_branch_tracing(
             when_count += 1
             eval_stack[-1] = (base_bid, when_count)
 
-            if content.startswith("WHEN OTHER"):
-                direction = "WO"
-            else:
-                direction = f"W{when_count}"
+            is_other = content.startswith("WHEN OTHER")
+            direction = "WO" if is_other else f"W{when_count}"
 
             # Consume multi-line WHEN condition before inserting probe.
             # A WHEN condition can span multiple lines (e.g.,
             #   WHEN WS-PROD-CODE =
             #        SOME-OTHER-VARIABLE
-            # Inserting a probe between those lines would split the expression.
+            # or
+            #   WHEN SDTMMI OF CORPT0AI = SPACES OR
+            #                             LOW-VALUES
+            # We must collect the FULL condition before hashing, otherwise
+            # the Python registry walker (which sees the joined AST text)
+            # and the COBOL tracer produce different hashes for the same
+            # WHEN arm.
             result.append(line)
+            # Strip "WHEN " (5 chars) from the first line; continuations
+            # are appended as-is so the final canonicalizer can collapse
+            # whitespace the same way ``parse_when_value`` does.
+            cond_parts: list[str] = [
+                content[5:].rstrip(".") if len(content) > 5 else ""
+            ]
             j = i + 1
             while j < len(lines):
                 next_line = lines[j]
@@ -1934,7 +1987,22 @@ def _add_branch_tracing(
                     break
                 # Otherwise it's a continuation of the WHEN condition
                 result.append(next_line)
+                cond_parts.append(next_content.rstrip("."))
                 j += 1
+
+            if is_other:
+                _arm_cond = "OTHER"
+            else:
+                _arm_cond = " ".join(p for p in cond_parts if p)
+
+            # Per-arm content hash so downstream code can match this
+            # specific WHEN arm to the Python registry entry for the
+            # same arm (Python assigns one registry bid per arm).
+            _arm_ord = _next_ordinal(current_para, "EVALUATE")
+            _arm_hash = _hash_anchor(
+                current_para, _arm_cond, "EVALUATE", _arm_ord,
+            )
+            branch_meta[base_bid].setdefault("when_hashes", {})[direction] = _arm_hash
 
             result.append(
                 f"{_B}DISPLAY '@@B:{base_bid}:{direction}'\n"

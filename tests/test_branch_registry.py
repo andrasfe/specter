@@ -232,3 +232,41 @@ def test_registry_matches_code_generator_on_every_carddemo_ast() -> None:
             assert _canon_paragraph(row["paragraph"]) == e.paragraph
             assert _canon_condition(row["condition"]) == e.condition
             assert row["type"] == e.type
+
+
+# ---------------------------------------------------------------- translation
+# CobolExecutionContext.translate_py_branch
+
+def test_translate_py_branch_if() -> None:
+    from specter.cobol_executor import CobolExecutionContext
+    ctx = CobolExecutionContext(
+        executable_path=Path("/tmp/x"),
+        instrumented_source_path=Path("/tmp/y"),
+        python_to_cobol_bid={5: ("17", "T")},  # IF probe direction stored as "T"
+    )
+    assert ctx.translate_py_branch("py:5:T") == "17:T"
+    assert ctx.translate_py_branch("py:5:F") == "17:F"
+    assert ctx.translate_py_branch("py:99:T") is None
+    assert ctx.translate_py_branch("not-a-py-branch") is None
+
+
+def test_translate_py_branch_evaluate_arm() -> None:
+    from specter.cobol_executor import CobolExecutionContext
+    ctx = CobolExecutionContext(
+        executable_path=Path("/tmp/x"),
+        instrumented_source_path=Path("/tmp/y"),
+        python_to_cobol_bid={12: ("30", "W2")},  # EVALUATE arm 2
+    )
+    # "arm taken" maps to the specific W-direction probe
+    assert ctx.translate_py_branch("py:12:T") == "30:W2"
+    # "arm not taken" has no direct COBOL probe (other arm fires instead)
+    assert ctx.translate_py_branch("py:12:F") is None
+
+
+def test_translate_py_branch_empty_map_returns_none() -> None:
+    from specter.cobol_executor import CobolExecutionContext
+    ctx = CobolExecutionContext(
+        executable_path=Path("/tmp/x"),
+        instrumented_source_path=Path("/tmp/y"),
+    )
+    assert ctx.translate_py_branch("py:1:T") is None
