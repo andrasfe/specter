@@ -2486,8 +2486,31 @@ def generate_code(
             _logger.debug("generate_code: paragraph %d/%d '%s' took %.3fs",
                           _pi + 1, _para_count, para.name, _para_elapsed)
 
-    # Branch metadata for concolic engine (maps branch ID -> condition info)
-    cb.line(f"_BRANCH_META = {repr(cb.branch_meta)}")
+    # Branch metadata: emit from the unified branch registry so Python
+    # and (eventually) the COBOL instrumenter agree on bid → condition.
+    # The internal counter (``cb.branch_meta``) stays around as a
+    # cross-check: in Phase 1 the two walks produce identical output,
+    # so any divergence is a regression worth catching at gen time.
+    from .branch_registry import build_registry as _build_registry
+    _registry = _build_registry(program)
+    _registry_meta = _registry.as_branch_meta()
+    if cb.branch_meta and cb.branch_meta != _registry_meta:
+        # Informational: registry vs counter disagreement is a sign
+        # that one of the two walkers handled a COBOL construct the
+        # other didn't. Log with a compact diff so the drift surfaces.
+        _only_cb = sorted(set(cb.branch_meta) - set(_registry_meta))
+        _only_reg = sorted(set(_registry_meta) - set(cb.branch_meta))
+        _logger.warning(
+            "branch_registry drift: cb=%d registry=%d cb-only=%s reg-only=%s",
+            len(cb.branch_meta), len(_registry_meta),
+            _only_cb[:10], _only_reg[:10],
+        )
+    cb.line(f"_BRANCH_META = {repr(_registry_meta)}")
+    # Emit a content-hash map so downstream tooling (and Phase 3's
+    # COBOL instrumenter) can look up bids by (paragraph, condition,
+    # type, ordinal) without re-deriving the bid assignment logic.
+    _hash_map = {e.bid: e.content_hash for e in _registry.entries}
+    cb.line(f"_BRANCH_CONTENT_HASHES = {repr(_hash_map)}")
     cb.blank()
     cb.blank()
 
