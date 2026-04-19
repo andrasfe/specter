@@ -24,12 +24,34 @@ from .variable_domain import VariableDomain, _coerce_numeric_value
 logger = logging.getLogger(__name__)
 
 
+def _facts_digest(facts: list[object] | None) -> str:
+    """Stable short digest over the facts applicable to an inference call.
+
+    Included in the cache key so a newly-recorded teacher fact invalidates
+    any cached profile that was produced without it. Uses only the
+    user-visible fields (kind, content, examples) — timestamps and issuer
+    are intentionally excluded so identical fact text from different
+    rounds still hits the cache.
+    """
+    if not facts:
+        return ""
+    parts: list[str] = []
+    for f in facts:
+        parts.append(str(getattr(f, "kind", "")))
+        parts.append(str(getattr(f, "content", "")))
+        ex = getattr(f, "examples", None) or []
+        parts.append("|".join(str(x) for x in ex))
+    payload = "\x00".join(parts)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def _cache_key(
     var_name: str,
     domain: VariableDomain,
     target_paragraph: str | None,
     op_key: str | None,
     comment_hints: list[str] | None,
+    fact_digest: str | None = None,
 ) -> str:
     payload = {
         "variable": var_name.upper(),
@@ -44,6 +66,10 @@ def _cache_key(
         "target": target_paragraph or "",
         "op_key": op_key or "",
         "comments": list(comment_hints or []),
+        # Facts are part of the cache key — a new teacher fact must invalidate
+        # previously cached profiles for this variable, otherwise the student
+        # would keep generating pre-fact values in future rounds.
+        "facts": fact_digest or "",
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -55,6 +81,7 @@ def _build_inference_prompt(
     target_paragraph: str | None = None,
     op_key: str | None = None,
     comment_hints: list[str] | None = None,
+    teacher_facts: list[object] | None = None,
 ) -> str:
     literal_text = list(domain.condition_literals)[:10]
     values_88 = dict(list(domain.valid_88_values.items())[:8])
@@ -63,11 +90,29 @@ def _build_inference_prompt(
     if domain.min_value is not None or domain.max_value is not None:
         range_text = f"min={domain.min_value!r}, max={domain.max_value!r}"
 
+    # Teacher facts: system-specific knowledge curated across rounds. The
+    # block is omitted when empty so the prompt stays quiet in the common
+    # case where no facts have been recorded yet.
+    facts_block = ""
+    if teacher_facts:
+        lines = []
+        for f in teacher_facts[:8]:
+            examples = getattr(f, "examples", None) or []
+            ex_part = f" (examples: {examples[:3]!r})" if examples else ""
+            lines.append(
+                f"- [{getattr(f, 'kind', 'note')}] "
+                f"{getattr(f, 'content', '')}{ex_part}"
+            )
+        facts_block = (
+            "Teacher-curated domain facts (authoritative — use verbatim "
+            "when generating values):\n" + "\n".join(lines) + "\n\n"
+        )
+
     return f"""\
 You are inferring realistic candidate values for one COBOL variable used during
 coverage-guided test generation.
 
-Variable: {var_name}
+{facts_block}Variable: {var_name}
 Classification: {domain.classification}
 COBOL type facts:
 - data_type: {domain.data_type}
@@ -159,10 +204,16 @@ class JITValueInferenceService:
         provider: object | None,
         model: str | None = None,
         cache_path: str | Path | None = None,
+        facts_store: object | None = None,
     ):
         self.provider = provider
         self.model = model
         self.cache_path = Path(cache_path) if cache_path else None
+        # ``facts_store`` is typed as ``object`` to avoid a hard dependency
+        # from this module on ``supervisor_channel``. The duck-typed interface
+        # expected is ``match(scope=..., target=...) -> list[TeacherFact]``
+        # and each fact exposes ``kind``, ``content``, ``examples``.
+        self.facts_store = facts_store
         self._profiles: dict[str, SemanticProfile] = {}
         self.cache_hits = 0
         self.cache_misses = 0
@@ -287,6 +338,40 @@ class JITValueInferenceService:
         except Exception as exc:
             logger.warning("JIT inference cache write failed: %s", exc)
 
+    def _lookup_facts(
+        self,
+        var_name: str,
+        op_key: str | None,
+    ) -> list[object]:
+        """Collect teacher facts relevant to this variable and op context.
+
+        Returns a de-duplicated list of facts whose scope matches the
+        current query: facts with ``scope=variable target=<var_name>``,
+        plus any ``scope=stub_op target=<op_key>`` when an op key is
+        present, plus every ``scope=global`` fact. Empty list when no
+        facts store is configured or none match.
+        """
+        if self.facts_store is None:
+            return []
+        matcher = getattr(self.facts_store, "match", None)
+        if not callable(matcher):
+            return []
+        seen: set[int] = set()
+        out: list[object] = []
+        try:
+            for fact in matcher(scope="variable", target=var_name):
+                if id(fact) not in seen:
+                    seen.add(id(fact))
+                    out.append(fact)
+            if op_key:
+                for fact in matcher(scope="stub_op", target=op_key):
+                    if id(fact) not in seen:
+                        seen.add(id(fact))
+                        out.append(fact)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("JIT facts lookup failed: %s", exc)
+        return out
+
     def infer_profile(
         self,
         var_name: str,
@@ -335,7 +420,18 @@ class JITValueInferenceService:
                     self._emit_periodic_summary()
                     return None
 
-        key = _cache_key(var_name, domain, target_paragraph, op_key, comment_hints)
+        # Look up any teacher-curated facts for this variable. Facts are
+        # policy-bound to describe program-specific knowledge the student
+        # can't generalize through code — they are authoritative context
+        # for the LLM and part of the cache key so a newly-learned fact
+        # invalidates stale cached profiles.
+        teacher_facts = self._lookup_facts(var_name, op_key)
+        fact_digest = _facts_digest(teacher_facts)
+
+        key = _cache_key(
+            var_name, domain, target_paragraph, op_key, comment_hints,
+            fact_digest=fact_digest,
+        )
         cached = self._profiles.get(key)
         if cached is not None:
             self.cache_hits += 1
@@ -376,6 +472,7 @@ class JITValueInferenceService:
             target_paragraph=target_paragraph,
             op_key=op_key,
             comment_hints=comment_hints,
+            teacher_facts=teacher_facts,
         )
         infer_start = time.time()
         try:

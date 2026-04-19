@@ -2550,12 +2550,36 @@ def run_cobol_coverage(
     memory_state = memory_store.load_state()
     memory_state.meta.setdefault("program_id", program.program_id)
     memory_state.meta.setdefault("mode", "cobol")
+    # Load any durable teacher facts from the supervisor run directory
+    # and feed them to the JIT service. Facts are program-specific domain
+    # knowledge the student is not yet able to generalize through code
+    # (e.g. "DATEIN is a DDMMYY string" for this particular program); the
+    # LLM uses them as authoritative context when it infers candidate
+    # values. When the supervisor channel isn't configured the store is
+    # None and JIT inference proceeds exactly as before.
+    facts_store = None
+    _sup_run_dir_env = os.environ.get("SPECTER_SUPERVISOR")
+    if _sup_run_dir_env:
+        try:
+            from .supervisor_channel import TeacherFactsStore, FACTS_FILE
+            facts_store = TeacherFactsStore(Path(_sup_run_dir_env) / FACTS_FILE)
+            if facts_store.facts:
+                log.info(
+                    "Loaded %d teacher fact(s) from %s",
+                    len(facts_store.facts),
+                    Path(_sup_run_dir_env) / FACTS_FILE,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not load teacher facts: %s", exc)
+            facts_store = None
+
     jit_inference = None
     if llm_provider is not None:
         jit_inference = JITValueInferenceService(
             llm_provider,
             llm_model,
             cache_path=store_path.with_name(store_path.stem + "_jit_profiles.json"),
+            facts_store=facts_store,
         )
 
     # Load existing coverage
@@ -3161,8 +3185,125 @@ def _run_agentic_loop(
     # loop's terminal state.
     _emit_uncovered_report(ctx, cov, report, reason="final")
 
+    # --- End-of-cycle teacher review (opt-in) ---
+    # Only runs when both ``SPECTER_SUPERVISOR`` and ``SPECTER_ESCALATE``
+    # are set — this is a heavyweight request, not a default path. Sends
+    # the top uncovered branches to the teacher so they can contribute
+    # program-specific domain facts (e.g. "DATEIN is DDMMYY format") for
+    # things the student *can't* generalize in code. Facts carried back
+    # in the reply are persisted by ``_persist_durable_fields`` and apply
+    # automatically on the next run.
+    try:
+        _end_of_cycle_review(ctx, cov, report)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("End-of-cycle teacher review failed: %s", exc)
+
     log.info("Coverage complete: %s", report.summary())
     return report
+
+
+def _end_of_cycle_review(
+    ctx: StrategyContext,
+    cov: "CoverageState",
+    report: "CobolCoverageReport",
+) -> None:
+    """Ask the teacher for domain facts that might unlock uncovered branches.
+
+    Fires once per coverage run, after the final uncovered-branch report is
+    written. A no-op unless both ``SPECTER_SUPERVISOR`` and
+    ``SPECTER_ESCALATE`` are set, matching the existing mid-run escalation
+    gating. The request carries a compact summary of uncovered branches
+    (condition text, paragraph, variable dependencies) plus a reminder that
+    facts are only for program-specific knowledge — anything that should be
+    generalized belongs in the student's code, not in facts.
+    """
+    from .supervisor_channel import SupervisorChannel
+
+    channel = SupervisorChannel.from_env()
+    if not channel.enabled:
+        return
+
+    uncovered = _collect_uncovered_for_review(ctx, cov)
+    if not uncovered:
+        log.debug("End-of-cycle review skipped: no uncovered branches.")
+        return
+
+    summary = (
+        f"Coverage plateau: {report.paragraphs_hit}/{report.total_paragraphs} paras, "
+        f"{report.branches_hit} branches hit, {len(uncovered)} uncovered. "
+        "Review the uncovered list and contribute ONLY program-specific domain "
+        "facts the student cannot generalize in code (e.g. input formats, "
+        "valid enumerations, stub semantics). Anything that should become a "
+        "code heuristic belongs in a `finding`, not a `save_fact`."
+    )
+    context = {
+        "program_id": getattr(ctx, "program_id", ""),
+        "paragraph_coverage": report.paragraph_coverage,
+        "branch_coverage": report.branch_coverage,
+        "uncovered_branches": uncovered[:25],
+    }
+    resolution = channel.escalate(
+        kind="end_of_cycle_review",
+        summary=summary,
+        context=context,
+        student_hints=[
+            "Reply with verdict=skip plus optional save_fact=[{...}].",
+            "save_fact fields: kind, target, scope (variable|stub_op|global), "
+            "content, examples.",
+            "Use `finding` for student-code improvements; `save_fact` for "
+            "program-specific knowledge.",
+        ],
+        timeout_sec=float(os.environ.get("SPECTER_ESCALATE_TIMEOUT", "900")),
+    )
+    if resolution is None:
+        log.info("End-of-cycle review: no teacher reply (or channel disabled).")
+        return
+    if resolution.save_fact:
+        log.info(
+            "End-of-cycle review: teacher contributed %d fact(s).",
+            len(resolution.save_fact),
+        )
+
+
+def _collect_uncovered_for_review(
+    ctx: StrategyContext,
+    cov: "CoverageState",
+) -> list[dict[str, Any]]:
+    """Build a compact uncovered-branch list for end-of-cycle review.
+
+    Each entry carries enough context for the teacher to decide whether a
+    fact would help: branch id+direction, paragraph, condition text, and
+    the variable names parsed out of the condition. Kept small — the top
+    25 are enough for a practical review.
+    """
+    branch_meta = getattr(getattr(ctx, "context", None), "branch_meta", None) or {}
+    if not branch_meta:
+        return []
+    hit = cov.branches_hit
+    items: list[dict[str, Any]] = []
+    for bid, meta in branch_meta.items():
+        if not isinstance(meta, dict):
+            continue
+        paragraph = str(meta.get("paragraph", ""))
+        condition = str(meta.get("condition", "") or meta.get("subject", ""))
+        btype = str(meta.get("type", ""))
+        # Directions differ by construct: IF has T/F, EVALUATE has W1..Wn/WO.
+        if btype == "EVALUATE":
+            directions = list((meta.get("when_hashes") or {}).keys()) or ["W1"]
+        else:
+            directions = ["T", "F"]
+        for d in directions:
+            key = f"{bid}:{d}"
+            if key in hit:
+                continue
+            items.append({
+                "bid": str(bid),
+                "direction": d,
+                "paragraph": paragraph,
+                "condition": condition[:200],
+                "type": btype,
+            })
+    return items
 
 
 # ---------------------------------------------------------------------------

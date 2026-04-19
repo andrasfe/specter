@@ -554,6 +554,7 @@ Both must be set for `SupervisorChannel.from_env()` to return an enabled instanc
 | `status.jsonl` | student | Heartbeat snapshots (phase, round, coverage). |
 | `teacher_rules.jsonl` | channel | Durable skip rules persisted from `save_rule` replies. |
 | `teacher_findings.jsonl` | channel | Structural observations persisted from `finding` replies (lint inbox). |
+| `teacher_facts.jsonl` | channel | Program-specific domain facts persisted from `save_fact` replies (shape values on the next run). |
 
 **Verdicts** (`_VALID_VERDICTS`): `patch` (inline `{line: content}` fix applied at error-count parity), `skip` (abandon this error and continue), `abort` (raise `SupervisorAbort`), `restart` (raise `SupervisorRestart`), `retry_with` (accept altered flags — reserved).
 
@@ -563,8 +564,12 @@ Both must be set for `SupervisorChannel.from_env()` to return an enabled instanc
 - **`TeacherRule`** — dataclass carrying `kind` (currently `skip_error_class`), `phase`, `msg_contains: list[str]`, optional `source_context_contains`, free-form `reason`, `issued_by`, `ts`. `matches(phase, msg, source_window)` returns True when the phase matches (wildcard `*` allowed), every token in `msg_contains` is a substring of the error message, AND (if set) the source window contains `source_context_contains` (case-insensitive).
 - **`TeacherRulesStore`** — append-only JSONL store keyed on a single file path. `reload()` re-reads, `append(rule)` writes + caches, `match(phase, msg, source_window)` returns the first matching rule or `None`. `_compile_and_fix` consults this alongside `_is_deferred_to_later_phase`, so a teacher-taught rule skips the escalation entirely on the next compile pass. `_count_actionable_errors` (used by `_assert_clean`) also honors it, so a taught skip rule passes the phase gate.
 - **`TeacherFindingsStore`** — append-only JSONL store of structural observations (never auto-applied). Each entry: `{severity, title, suggested_files?, notes, ts}`. Intended as a lint inbox the operator reviews between runs.
+- **`TeacherFact`** — dataclass carrying `kind` (`variable_format` / `variable_values` / `stub_outcome` / `note` / free-form), `target` (variable name / paragraph / stub op key, uppercased), `scope` (`variable` | `paragraph` | `stub_op` | `global`), `content` (human-readable rule), `examples: list[str]`, `reason`, `issued_by`, `ts`. Represents program-specific domain knowledge the student can't derive from names or PIC clauses.
+- **`TeacherFactsStore`** — append-only JSONL store at `<run_dir>/teacher_facts.jsonl`. `match(scope, target)` returns every fact matching that scope/target plus every `scope=global` fact, so generic system-wide notes get threaded into every prompt. Consumed by `JITValueInferenceService` via its `facts_store` constructor parameter: matching facts are rendered into the LLM inference prompt as "Teacher-curated domain facts" (authoritative), and a short digest over the facts is mixed into `_cache_key` so a newly-learned fact invalidates previously cached profiles.
 
-**`Resolution`** dataclass: `id`, `verdict`, `fix: dict[int, str]`, `notes`, `raw`, plus optional `save_rule: dict` and `finding: dict` that the channel persists via `_persist_durable_fields()` before returning to the caller. JSON fix keys arrive as strings; `_parse_resolution()` coerces to `int`.
+**End-of-cycle review** (`cobol_coverage._end_of_cycle_review`): fires once after the final uncovered-branch report is written, gated on `SPECTER_SUPERVISOR` + `SPECTER_ESCALATE`. Packages a compact summary of up to 25 uncovered branches (bid, direction, paragraph, condition text) and escalates with `kind="end_of_cycle_review"`. The teacher reviews and optionally replies with `save_fact` entries; the channel persists them automatically. Policy is explicit in the summary text: facts are for **program-specific** knowledge only — if something should become a code heuristic (e.g. any variable whose name ends in `-DATE` should default to a 6-digit date), the teacher records a `finding` and edits student code instead.
+
+**`Resolution`** dataclass: `id`, `verdict`, `fix: dict[int, str]`, `notes`, `raw`, plus optional `save_rule: dict`, `finding: dict`, and `save_fact: list[dict]` (accepted as a single dict or a list) that the channel persists via `_persist_durable_fields()` before returning to the caller. JSON fix keys arrive as strings; `_parse_resolution()` coerces to `int`.
 
 **`_related_findings(kind, context)`** (called by `escalate()`): scans the findings store for entries whose title or notes mention the current error message or phase, and summarizes the rules store (`count` + `reasons[:5]`) when any rule matches the current event class. Capped at 8 items so the escalation payload stays readable.
 
@@ -577,7 +582,7 @@ Integration surfaces:
 - `scripts/teach.sh <run_dir>` — thin `tail -F` helper; pair with `Monitor` in a teacher session.
 - `tests/test_supervisor_channel.py` — channel round-trip, timeout, disabled mode, unknown verdict, heartbeat.
 - `tests/test_supervisor_fixes.py` — `SupervisorAbort` uncatchable by `except Exception` / `except RuntimeError`; `_is_deferred_to_later_phase` classification; phase-token normalization.
-- `tests/test_supervisor_persistence.py` — `TeacherRule.matches` (phase, tokens, source window), rules-store round-trip, findings store, full escalate → save_rule + finding persistence flow, related_findings inclusion, shorthand `msg_contains` as string.
+- `tests/test_supervisor_persistence.py` — `TeacherRule.matches` (phase, tokens, source window), rules-store round-trip, findings store, `TeacherFact` round-trip, `TeacherFactsStore.match` (scope-specific + global fallthrough), full escalate → `save_rule` / `finding` / `save_fact` persistence flows, related_findings inclusion, shorthand `msg_contains` as string, JIT prompt includes facts, `_facts_digest` cache-key invalidation.
 
 ### `specter/uncovered_report.py` — Post-run diagnostic report (~700 lines)
 

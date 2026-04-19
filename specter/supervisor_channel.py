@@ -118,11 +118,17 @@ class Resolution:
     raw: dict[str, Any] = field(default_factory=dict)
     save_rule: dict[str, Any] | None = None
     finding: dict[str, Any] | None = None
+    # ``save_fact`` carries durable domain/system knowledge that the student
+    # should apply on its own in future rounds, e.g. "variable DATEIN is a
+    # DDMMYY string" or "stub op DFHRESP success code is SPACES". Accepts a
+    # single fact dict or a list of facts.
+    save_fact: list[dict[str, Any]] = field(default_factory=list)
 
 
 # -------------------------------------------------------------- file names
 RULES_FILE = "teacher_rules.jsonl"
 FINDINGS_FILE = "teacher_findings.jsonl"
+FACTS_FILE = "teacher_facts.jsonl"
 
 
 @dataclass
@@ -297,6 +303,155 @@ class TeacherFindingsStore:
         return out
 
 
+@dataclass
+class TeacherFact:
+    """Durable domain/system knowledge the student should apply.
+
+    Unlike :class:`TeacherRule` (which silences compile errors) or findings
+    (which are inbox items for a human), facts are *active* knowledge that
+    shape value generation on the next round. Examples::
+
+        {"kind": "variable_format", "target": "DATEIN", "scope": "variable",
+         "content": "DDMMYY string, e.g. '150425' for 15 April 2025"}
+
+        {"kind": "variable_values", "target": "WS-DLG-ACT", "scope": "variable",
+         "content": "One of 'U' (update), 'D' (delete), 'I' (inquire)",
+         "examples": ["U", "D", "I"]}
+
+        {"kind": "stub_outcome", "target": "CICS-READ", "scope": "stub_op",
+         "content": "Success status is SPACES; '23' signals not-found"}
+
+    The student's JIT value-inference service looks up facts by
+    ``(scope, target)`` and threads them into its LLM prompts so the model
+    generates values consistent with the domain without the teacher having
+    to re-explain every round.
+
+    Fields:
+        kind: short category tag (``variable_format``, ``variable_values``,
+            ``stub_outcome``, ``note``, ...). Free-form for forward
+            compatibility; consumers match loosely.
+        target: name of the thing this fact describes — a variable, a
+            paragraph, or a stub operation key. Case-insensitive; stored
+            uppercased for matching.
+        scope: one of ``variable`` | ``paragraph`` | ``stub_op`` | ``global``.
+            ``global`` facts match every lookup and are appended to every
+            prompt as overall-system guidance.
+        content: the knowledge itself, human-readable.
+        examples: optional list of concrete example values the generator
+            can use verbatim if it otherwise has nothing better.
+        reason: free-form text explaining why the fact holds (surfaces in
+            logs to help the next teacher understand provenance).
+        issued_by: informational, defaults to ``"teacher"``.
+        ts: creation timestamp (seconds since epoch).
+    """
+
+    kind: str
+    target: str
+    scope: str = "variable"
+    content: str = ""
+    examples: list[str] = field(default_factory=list)
+    reason: str = ""
+    issued_by: str = "teacher"
+    ts: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "target": self.target,
+            "scope": self.scope,
+            "content": self.content,
+            "examples": list(self.examples),
+            "reason": self.reason,
+            "issued_by": self.issued_by,
+            "ts": self.ts,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TeacherFact | None":
+        try:
+            return cls(
+                kind=str(data.get("kind", "note")),
+                target=str(data.get("target", "")).strip().upper(),
+                scope=str(data.get("scope", "variable")).strip().lower() or "variable",
+                content=str(data.get("content", "")),
+                examples=[str(x) for x in data.get("examples", []) or []],
+                reason=str(data.get("reason", "")),
+                issued_by=str(data.get("issued_by", "teacher")),
+                ts=float(data.get("ts", 0.0) or 0.0),
+            )
+        except (TypeError, ValueError):
+            return None
+
+
+class TeacherFactsStore:
+    """Append-only JSONL store of durable domain facts, with lookup.
+
+    Like :class:`TeacherRulesStore` this is safe to construct against a
+    missing file. ``match()`` returns every fact whose ``scope``/``target``
+    matches the query, plus any ``global`` facts. Consumers typically pass
+    the resulting list straight into an LLM prompt.
+    """
+
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        self._facts: list[TeacherFact] = []
+        self.reload()
+
+    @property
+    def facts(self) -> list[TeacherFact]:
+        return list(self._facts)
+
+    def reload(self) -> None:
+        self._facts = []
+        if not self.path.exists():
+            return
+        try:
+            for raw in self.path.read_text(encoding="utf-8").splitlines():
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                fact = TeacherFact.from_dict(data)
+                if fact is not None:
+                    self._facts.append(fact)
+        except OSError as exc:
+            log.warning("supervisor: failed to read facts file: %s", exc)
+
+    def append(self, fact: TeacherFact) -> None:
+        try:
+            append_line_with_fsync(
+                self.path, json.dumps(fact.to_dict(), default=str) + "\n"
+            )
+            self._facts.append(fact)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("supervisor: failed to persist fact: %s", exc)
+
+    def match(
+        self,
+        *,
+        scope: str,
+        target: str,
+    ) -> list[TeacherFact]:
+        """Return facts matching this query, plus any ``global`` facts.
+
+        Scope/target match is case-insensitive. Facts with scope ``global``
+        match every query — they're applied as overall system guidance.
+        """
+        target_upper = (target or "").strip().upper()
+        scope_lower = (scope or "").strip().lower()
+        out: list[TeacherFact] = []
+        for fact in self._facts:
+            if fact.scope == "global":
+                out.append(fact)
+                continue
+            if fact.scope == scope_lower and fact.target == target_upper:
+                out.append(fact)
+        return out
+
+
 class SupervisorChannel:
     """Append-only JSONL channel between Specter and a teacher agent.
 
@@ -321,6 +476,7 @@ class SupervisorChannel:
         self._resolutions_offset = 0
         self.rules_store: TeacherRulesStore | None = None
         self.findings_store: TeacherFindingsStore | None = None
+        self.facts_store: TeacherFactsStore | None = None
 
         if self.run_dir is not None:
             self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -336,6 +492,7 @@ class SupervisorChannel:
             self.findings_store = TeacherFindingsStore(
                 self.run_dir / FINDINGS_FILE
             )
+            self.facts_store = TeacherFactsStore(self.run_dir / FACTS_FILE)
 
     @property
     def enabled(self) -> bool:
@@ -503,6 +660,22 @@ class SupervisorChannel:
                 "supervisor: persisted teacher finding: %s",
                 str(resolution.finding.get("title", ""))[:120],
             )
+        if resolution.save_fact and self.facts_store is not None:
+            for raw in resolution.save_fact:
+                fact_data = dict(raw)
+                fact_data.setdefault("ts", time.time())
+                fact_data.setdefault("issued_by", "teacher")
+                fact = TeacherFact.from_dict(fact_data)
+                if fact is None:
+                    continue
+                self.facts_store.append(fact)
+                log.info(
+                    "supervisor: persisted teacher fact scope=%s target=%s "
+                    "kind=%s content=%r",
+                    fact.scope, fact.target, fact.kind,
+                    (fact.content[:80] + "…") if len(fact.content) > 80
+                    else fact.content,
+                )
 
     def _wait_for_resolution(
         self, event_id: str, deadline: float
@@ -572,6 +745,15 @@ def _parse_resolution(msg: dict[str, Any]) -> Resolution | None:
     if finding is not None and not isinstance(finding, dict):
         finding = None
 
+    # Facts may arrive as a single dict or as a list of dicts — normalize
+    # to a list so downstream callers can iterate unconditionally.
+    save_fact_raw = msg.get("save_fact")
+    save_fact: list[dict[str, Any]] = []
+    if isinstance(save_fact_raw, dict):
+        save_fact = [save_fact_raw]
+    elif isinstance(save_fact_raw, list):
+        save_fact = [f for f in save_fact_raw if isinstance(f, dict)]
+
     return Resolution(
         id=str(msg.get("id", "")),
         verdict=verdict,
@@ -580,4 +762,5 @@ def _parse_resolution(msg: dict[str, Any]) -> Resolution | None:
         raw=msg,
         save_rule=save_rule,
         finding=finding,
+        save_fact=save_fact,
     )

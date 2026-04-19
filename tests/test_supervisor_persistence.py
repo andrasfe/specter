@@ -11,10 +11,13 @@ import pytest
 
 from specter.persistence_utils import append_line_with_fsync
 from specter.supervisor_channel import (
+    FACTS_FILE,
     FINDINGS_FILE,
     RESOLUTIONS_FILE,
     RULES_FILE,
     SupervisorChannel,
+    TeacherFact,
+    TeacherFactsStore,
     TeacherFindingsStore,
     TeacherRule,
     TeacherRulesStore,
@@ -303,3 +306,187 @@ def test_shorthand_msg_contains_string_is_accepted(tmp_path: Path) -> None:
     rules = TeacherRulesStore(tmp_path / RULES_FILE).rules
     assert len(rules) == 1
     assert rules[0].msg_contains == ["quick-shorthand"]
+
+
+# ------------------------------ TeacherFact --------------------------------
+
+
+def test_fact_round_trip(tmp_path: Path) -> None:
+    store = TeacherFactsStore(tmp_path / FACTS_FILE)
+    store.append(TeacherFact(
+        kind="variable_format",
+        target="DATEIN",
+        scope="variable",
+        content="DDMMYY string",
+        examples=["150425", "010101"],
+        reason="copybook comment",
+    ))
+    reloaded = TeacherFactsStore(tmp_path / FACTS_FILE)
+    assert len(reloaded.facts) == 1
+    f = reloaded.facts[0]
+    assert f.target == "DATEIN"
+    assert f.content == "DDMMYY string"
+    assert f.examples == ["150425", "010101"]
+
+
+def test_fact_match_scope_and_global(tmp_path: Path) -> None:
+    store = TeacherFactsStore(tmp_path / FACTS_FILE)
+    store.append(TeacherFact(
+        kind="variable_format", target="DATEIN", scope="variable",
+        content="DDMMYY",
+    ))
+    store.append(TeacherFact(
+        kind="stub_outcome", target="CICS-READ", scope="stub_op",
+        content="SPACES is success",
+    ))
+    store.append(TeacherFact(
+        kind="note", target="", scope="global",
+        content="All money fields are signed PIC S9(9)V99 COMP-3",
+    ))
+
+    var_hits = store.match(scope="variable", target="DATEIN")
+    assert len(var_hits) == 2  # matched variable + global
+    assert any(f.scope == "global" for f in var_hits)
+
+    other_var_hits = store.match(scope="variable", target="SOMETHING-ELSE")
+    # Only the global fact — the variable-scoped one is for DATEIN.
+    assert [f.scope for f in other_var_hits] == ["global"]
+
+    stub_hits = store.match(scope="stub_op", target="CICS-READ")
+    assert any(f.target == "CICS-READ" for f in stub_hits)
+
+
+def test_escalate_persists_save_fact(tmp_path: Path) -> None:
+    c = SupervisorChannel(tmp_path, poll_interval_sec=0.05)
+
+    def teacher() -> None:
+        esc_path = tmp_path / "escalations.jsonl"
+        for _ in range(100):
+            if esc_path.exists() and esc_path.stat().st_size > 0:
+                evt = json.loads(esc_path.read_text().splitlines()[0])
+                reply = {
+                    "id": evt["id"],
+                    "verdict": "skip",
+                    "notes": "date format is program-specific",
+                    # Both list and single-dict shapes are accepted.
+                    "save_fact": [
+                        {
+                            "kind": "variable_format",
+                            "target": "DATEIN",
+                            "scope": "variable",
+                            "content": "DDMMYY string",
+                            "examples": ["150425"],
+                        },
+                        {
+                            "kind": "note",
+                            "scope": "global",
+                            "content": "money fields are PIC S9(9)V99 COMP-3",
+                        },
+                    ],
+                }
+                append_line_with_fsync(
+                    tmp_path / RESOLUTIONS_FILE, json.dumps(reply) + "\n",
+                )
+                return
+            time.sleep(0.02)
+
+    t = threading.Thread(target=teacher)
+    t.start()
+    try:
+        res = c.escalate(kind="end_of_cycle_review", summary="x", timeout_sec=5)
+    finally:
+        t.join(timeout=5)
+
+    assert res is not None
+    assert len(res.save_fact) == 2
+
+    # Both facts persisted — reload from disk.
+    facts = TeacherFactsStore(tmp_path / FACTS_FILE).facts
+    assert len(facts) == 2
+    targets = {f.target for f in facts}
+    assert "DATEIN" in targets
+
+
+def test_save_fact_accepts_single_dict_shorthand(tmp_path: Path) -> None:
+    c = SupervisorChannel(tmp_path, poll_interval_sec=0.05)
+
+    def teacher() -> None:
+        esc_path = tmp_path / "escalations.jsonl"
+        for _ in range(100):
+            if esc_path.exists() and esc_path.stat().st_size > 0:
+                evt = json.loads(esc_path.read_text().splitlines()[0])
+                append_line_with_fsync(
+                    tmp_path / RESOLUTIONS_FILE,
+                    json.dumps({
+                        "id": evt["id"],
+                        "verdict": "skip",
+                        # Single dict (not a list) should be accepted.
+                        "save_fact": {
+                            "kind": "variable_values",
+                            "target": "WS-DLG-ACT",
+                            "scope": "variable",
+                            "content": "One of U, D, I",
+                        },
+                    }) + "\n",
+                )
+                return
+            time.sleep(0.02)
+
+    t = threading.Thread(target=teacher)
+    t.start()
+    try:
+        res = c.escalate(kind="end_of_cycle_review", summary="x", timeout_sec=5)
+    finally:
+        t.join(timeout=5)
+
+    assert res is not None and len(res.save_fact) == 1
+    facts = TeacherFactsStore(tmp_path / FACTS_FILE).facts
+    assert len(facts) == 1
+    assert facts[0].target == "WS-DLG-ACT"
+
+
+# ------------------------------ JIT integration ----------------------------
+
+
+def test_jit_prompt_includes_teacher_facts(tmp_path: Path) -> None:
+    """The JIT prompt for a variable should surface matching facts."""
+    from specter.jit_value_inference import _build_inference_prompt
+    from specter.variable_domain import VariableDomain
+
+    store = TeacherFactsStore(tmp_path / FACTS_FILE)
+    store.append(TeacherFact(
+        kind="variable_format", target="DATEIN", scope="variable",
+        content="DDMMYY string", examples=["150425"],
+    ))
+    facts = store.match(scope="variable", target="DATEIN")
+
+    domain = VariableDomain(
+        name="DATEIN", data_type="alpha", max_length=6,
+        classification="input",
+    )
+    prompt = _build_inference_prompt(
+        "DATEIN", domain,
+        target_paragraph="PROCESS-ENTER-KEY",
+        teacher_facts=facts,
+    )
+    assert "Teacher-curated domain facts" in prompt
+    assert "DDMMYY string" in prompt
+    assert "150425" in prompt
+
+
+def test_jit_facts_digest_changes_with_fact(tmp_path: Path) -> None:
+    """Adding a fact must change the cache key so stale profiles drop."""
+    from specter.jit_value_inference import _facts_digest
+
+    class _F:
+        def __init__(self, kind: str, content: str, examples: list[str]) -> None:
+            self.kind = kind
+            self.content = content
+            self.examples = examples
+
+    d_empty = _facts_digest([])
+    d_one = _facts_digest([_F("variable_format", "DDMMYY", ["150425"])])
+    d_other = _facts_digest([_F("variable_format", "YYYYMMDD", [])])
+    assert d_empty == ""
+    assert d_one != ""
+    assert d_one != d_other
