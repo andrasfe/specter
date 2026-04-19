@@ -218,6 +218,14 @@ class CobolExecutionContext:
     coverage_mode: bool = False
     mock_operations: list[str] = field(default_factory=list)  # ordered SPECTER-MOCK op keys
     fd_record_fields: dict[str, str] = field(default_factory=dict)  # FD field -> "alpha"|"numeric"
+    # Maps 88-level condition-name (child, uppercase) to its activating
+    # value as a string. Used by ``run_test_case`` to coerce Python
+    # bool values in input_state (shorthand for "activate this flag")
+    # into the actual value the runtime will MOVE to MOCK-ALPHA-STATUS
+    # so the mock's SPECTER-READ-INIT-VARS dispatcher actually fires
+    # the ``SET <flag> TO TRUE`` branch. Falls back to Y/N when the
+    # variable isn't a known 88-level.
+    condition_names_88: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -481,6 +489,29 @@ def prepare_context(
     log.info("Compiled COBOL: %s (%d paragraphs traced, %d branch probes, %d mock ops, %d FD fields)",
              executable_path, total_paragraphs, total_branches, len(mock_ops), len(fd_fields))
 
+    # Re-derive 88-level condition-name → activating-value map from the
+    # same copybook set the instrumenter used, so `run_test_case` can
+    # coerce Python bool input_state values (specialist shorthand for
+    # "activate this flag") into the activating literal the runtime
+    # dispatcher actually checks against.
+    condition_names_88: dict[str, str] = {}
+    try:
+        from .copybook_parser import parse_copybook
+        for cpy_dir in copybook_paths or []:
+            for cpy_file in Path(cpy_dir).glob("*.[cC][pP][yY]"):
+                try:
+                    rec = parse_copybook(cpy_file.read_text(errors="replace"))
+                    for fld in rec.fields:
+                        if fld.values_88:
+                            for child_name, child_value in fld.values_88.items():
+                                condition_names_88.setdefault(
+                                    child_name.upper(), str(child_value),
+                                )
+                except Exception:  # noqa: BLE001
+                    continue
+    except Exception:  # noqa: BLE001
+        pass
+
     return CobolExecutionContext(
         executable_path=executable_path,
         instrumented_source_path=instrumented_path,
@@ -500,6 +531,7 @@ def prepare_context(
         coverage_mode=coverage_mode,
         mock_operations=mock_ops,
         fd_record_fields=fd_fields,
+        condition_names_88=condition_names_88,
     )
 
 
@@ -547,7 +579,48 @@ def run_test_case(
     # (1065 WHEN comparisons each) adding massive overhead — 1895 records
     # takes >5 seconds just for INIT processing, causing every baseline
     # test case to timeout before reaching application code.
-    init_values = {k: str(v) for k, v in input_state.items()
+    # Convert input_state values for INIT records. Two specialist
+    # shorthands need translation before they can reach the COBOL
+    # runtime meaningfully:
+    #
+    # 1. Python bool → activating value. ``CDEMO-PGM-REENTER: True``
+    #    means "activate this 88-level / set the flag on". Look up the
+    #    activating literal from ``context.condition_names_88`` if the
+    #    variable is a known 88-level; otherwise fall back to 'Y'/'N'
+    #    (the common CICS flag convention).
+    #
+    # 2. AID constant name → byte value. ``EIBAID: 'DFHENTER'`` is a
+    #    specialist naming the AID key by its DFH* constant. The mock
+    #    stub defines DFHENTER as VALUE X'7D' (one byte), so MOVEing
+    #    the 8-char string "DFHENTER" into EIBAID (PIC X) would only
+    #    land 'D' and EVALUATE EIBAID WHEN DFHENTER would never match.
+    #    Substitute the single-byte value so the comparison fires.
+    _AID_NAME_TO_BYTE: dict[str, str] = {
+        "DFHENTER": "\x7D",  "DFHCLEAR": "\x6D",
+        "DFHPA1":   "\x6C",  "DFHPA2":   "\x6E",  "DFHPA3":   "\x6B",
+        "DFHPF1":   "\xF1",  "DFHPF2":   "\xF2",  "DFHPF3":   "\xF3",
+        "DFHPF4":   "\xF4",  "DFHPF5":   "\xF5",  "DFHPF6":   "\xF6",
+        "DFHPF7":   "\xF7",  "DFHPF8":   "\xF8",  "DFHPF9":   "\xF9",
+        "DFHPF10":  "\x7A",  "DFHPF11":  "\x7B",  "DFHPF12":  "\x7C",
+        "DFHPF13":  "\xC1",  "DFHPF14":  "\xC2",  "DFHPF15":  "\xC3",
+        "DFHPF16":  "\xC4",  "DFHPF17":  "\xC5",  "DFHPF18":  "\xC6",
+        "DFHPF19":  "\xC7",  "DFHPF20":  "\xC8",  "DFHPF21":  "\xC9",
+        "DFHPF22":  "\x4A",  "DFHPF23":  "\x4B",  "DFHPF24":  "\x4C",
+    }
+
+    def _coerce_for_init(name: str, v: object) -> str:
+        if isinstance(v, bool):
+            act = context.condition_names_88.get(name.upper())
+            if act is not None:
+                return str(act) if v else ""
+            return "Y" if v else "N"
+        if isinstance(v, str):
+            aid = _AID_NAME_TO_BYTE.get(v.strip().upper())
+            if aid is not None:
+                return aid
+        return str(v)
+
+    init_values = {k: _coerce_for_init(k, v) for k, v in input_state.items()
                    if not str(k).startswith("_")}
     if context.injectable_vars:
         injectable_set = set(context.injectable_vars)

@@ -1051,6 +1051,97 @@ def _build_tape(
                     if values and not negated:
                         merged_input[var] = values[0]
 
+    # Expand 88-level condition-name keys. When a specialist proposes
+    # ``CDEMO-PGM-REENTER: True`` they mean "activate this 88-level
+    # condition". The generated Python code (and real COBOL) check the
+    # PARENT variable, so without expansion `state['CDEMO-PGM-CONTEXT']`
+    # stays at default and `IF NOT CDEMO-PGM-REENTER` evaluates TRUE —
+    # the program short-circuits before reaching PROCESS-ENTER-KEY. Walk
+    # the domain map to find each 88-level's parent + activating value,
+    # then set the parent in merged_input alongside the child key.
+    if domains:
+        reverse_88: dict[str, tuple[str, object]] = {}
+        for parent_name, parent_dom in domains.items():
+            vals88 = getattr(parent_dom, "valid_88_values", None) or {}
+            for child, act_val in vals88.items():
+                reverse_88[str(child).upper()] = (
+                    str(parent_name).upper(), act_val,
+                )
+
+        def _is_truthy(v: object) -> bool:
+            if isinstance(v, bool):
+                return v
+            s = str(v).strip().upper()
+            return s in ("1", "TRUE", "YES", "Y", "T")
+
+        for key in list(merged_input.keys()):
+            parent_act = reverse_88.get(str(key).upper())
+            if parent_act is None:
+                continue
+            parent_name, act_val = parent_act
+            if parent_name in merged_input:
+                continue  # specialist already set the parent explicitly
+            if _is_truthy(merged_input[key]):
+                merged_input[parent_name] = act_val
+
+    # Minimal heuristic for CICS AID-key branches:
+    # The EXEC CICS RECEIVE MAP mock does
+    #   PERFORM SPECTER-NEXT-MOCK-RECORD
+    #   MOVE MOCK-ALPHA-STATUS(1:1) TO EIBAID
+    # so the startup INIT:EIBAID set by `run_test_case._coerce_for_init`
+    # is clobbered BEFORE the `EVALUATE EIBAID WHEN DFHENTER` check
+    # downstream can read it. When a specialist proposes an AID name for
+    # EIBAID in input_state AND the route consumes a CICS-RECEIVE:* op,
+    # pre-populate a stub_outcome for that op carrying the AID byte so
+    # the post-RECEIVE EIBAID lands on the intended value. This runs
+    # BEFORE `_python_pre_run` so the Python forward-run sees the same
+    # behavior and can actually reach the target paragraph.
+    #
+    # Note: this is a deterministic heuristic (not a specialist output
+    # shape change). The longer-term fix is to extend each specialist's
+    # prompt with a ``stub_outcome_overrides`` field and merge those
+    # across specialists — documented in rounds.md.
+    _AID_NAME_TO_BYTE: dict[str, str] = {
+        "DFHENTER": "\x7D",  "DFHCLEAR": "\x6D",
+        "DFHPA1":   "\x6C",  "DFHPA2":   "\x6E",  "DFHPA3":   "\x6B",
+        "DFHPF1":   "\xF1",  "DFHPF2":   "\xF2",  "DFHPF3":   "\xF3",
+        "DFHPF4":   "\xF4",  "DFHPF5":   "\xF5",  "DFHPF6":   "\xF6",
+        "DFHPF7":   "\xF7",  "DFHPF8":   "\xF8",  "DFHPF9":   "\xF9",
+        "DFHPF10":  "\x7A",  "DFHPF11":  "\x7B",  "DFHPF12":  "\x7C",
+        "DFHPF13":  "\xC1",  "DFHPF14":  "\xC2",  "DFHPF15":  "\xC3",
+        "DFHPF16":  "\xC4",  "DFHPF17":  "\xC5",  "DFHPF18":  "\xC6",
+        "DFHPF19":  "\xC7",  "DFHPF20":  "\xC8",  "DFHPF21":  "\xC9",
+        "DFHPF22":  "\x4A",  "DFHPF23":  "\x4B",  "DFHPF24":  "\x4C",
+    }
+    aid_in_input = merged_input.get("EIBAID")
+    if isinstance(aid_in_input, str):
+        aid_byte = _AID_NAME_TO_BYTE.get(aid_in_input.strip().upper())
+        if aid_byte is not None:
+            # Generated Python emits generic ``_dummy_exec('CICS', ...)``
+            # for every CICS verb, so the op_key in the stub_log /
+            # stub_outcomes is just ``"CICS"`` — not ``CICS-RECEIVE:X``.
+            # Inject the AID pair into the 'CICS' queue. If the queue
+            # already has entries (e.g. CICS SEND outcomes synthesised
+            # elsewhere), prepend a fresh outcome carrying only the AID
+            # pair so the FIRST CICS op (the RECEIVE in MAIN-PARA's
+            # re-entry arm) consumes it.
+            stub_outcomes = dict(stub_outcomes)
+            existing = list(stub_outcomes.get("CICS", []))
+            new_outcome = [("EIBAID", aid_byte)]
+            already = False
+            if existing:
+                first_raw = existing[0]
+                first = (list(first_raw)
+                         if isinstance(first_raw, list)
+                         else [first_raw])
+                already = any(
+                    isinstance(p, (list, tuple)) and len(p) == 2
+                    and str(p[0]).upper() == "EIBAID"
+                    for p in first
+                )
+            if not already:
+                stub_outcomes["CICS"] = [new_outcome] + existing
+
     # Run the full Python program from entry with the proposed
     # stub_outcomes to get the execution-ordered stub_log.
     stub_log = _python_pre_run(module, merged_input, stub_outcomes)
@@ -1072,6 +1163,36 @@ def _build_tape(
         for op_key, entries in stub_outcomes.items():
             if op_key not in logged_ops and entries:
                 stub_log.append((op_key, entries[0] if entries else []))
+
+    # CICS-RECEIVE AID override lands at position 0 of the COBOL mock
+    # data file. The generated Python uses a generic `_dummy_exec('CICS',
+    # ...)` that doesn't participate in op-keyed stub_log tracking, so
+    # `_python_pre_run` never emits a CICS-RECEIVE entry and the padding
+    # loop above appends our override at the END — but COBOL reads mock
+    # records sequentially and the FIRST non-INIT record the RECEIVE
+    # mock consumes is the one at position 0. Hoist the override so the
+    # byte we placed actually reaches EIBAID at the right moment.
+    if isinstance(aid_in_input, str):
+        _aid_b = _AID_NAME_TO_BYTE.get(aid_in_input.strip().upper())
+        if _aid_b is not None:
+            # Find the first stub_log entry whose outcome carries our
+            # injected EIBAID pair and hoist it to position 0 so the
+            # COBOL mock's FIRST CICS-op read (the RECEIVE in MAIN-PARA)
+            # consumes it before any other CICS outcome.
+            for _idx, (_op, _ent) in enumerate(stub_log):
+                if _idx == 0:
+                    break
+                ent_pairs = _ent if isinstance(_ent, list) else [_ent]
+                has_eibaid = any(
+                    isinstance(p, (list, tuple)) and len(p) == 2
+                    and str(p[0]).upper() == "EIBAID"
+                    for p in ent_pairs
+                )
+                if has_eibaid:
+                    stub_log = [stub_log[_idx]] + [
+                        item for i, item in enumerate(stub_log) if i != _idx
+                    ]
+                    break
 
     return merged_input, stub_log
 
