@@ -2381,6 +2381,28 @@ def run_cobol_coverage(
         "FALSE", "ZERO", "ZEROS", "ZEROES", "SPACE", "SPACES",
         "CORRESPONDING", "SECTION", "DIVISION", "PROGRAM", "DATA",
         "WORKING", "STORAGE", "PROCEDURE", "FILE", "COPY", "VALUE",
+        # CICS / condition-name reserved words appearing as arguments
+        # to the ``DFHRESP`` macro (``EVALUATE WS-RESP-CD WHEN
+        # DFHRESP(NORMAL)``). The variable extractor sees bare
+        # ``NORMAL`` as an identifier; it's actually a CICS condition.
+        "NORMAL", "NOTFND", "DUPREC", "DUPKEY", "QIDERR", "MAPFAIL",
+        "INVREQ", "LENGERR", "IOERR", "NOTOPEN", "DISABLED",
+        "FILENOTFOUND", "NOSPACE", "EOF", "ERROR",
+        # DFH* macro names used as identifier-like tokens in
+        # ``EVALUATE EIBAID WHEN DFHENTER`` — already handled by the
+        # EIB whitelist for the specific constants, but the macro
+        # itself (``DFHRESP``) occasionally leaks through.
+        "DFHRESP",
+        # COBOL intrinsic functions that appear bare when extractor
+        # sees them in expressions like ``COMPUTE X = FUNCTION
+        # NUMVAL-C(...)``. They're not variables; MOVEing into them
+        # would produce ``'NUMVAL-C' is not defined`` at compile.
+        "NUMVAL-C", "NUMVAL", "NUMVAL-F",
+        "INTEGER-OF-DATE", "DATE-OF-INTEGER",
+        "INTEGER-OF-DAY",  "DAY-OF-INTEGER",
+        "CURRENT-DATE", "WHEN-COMPILED",
+        "LENGTH", "REVERSE", "UPPER-CASE", "LOWER-CASE",
+        "TRIM",   "CONCAT",
     }
 
     # Build set of 88-level condition names — these are NOT real storage
@@ -2450,9 +2472,25 @@ def run_cobol_coverage(
                 return False
         if dom.classification == "internal-no-inject":
             return False
-        # Must carry actionable signal.
-        if not dom.condition_literals and not dom.valid_88_values:
-            return False
+        # Must carry actionable signal — with one type-aware relaxation
+        # for input-classified ALPHA vars that don't yet have literals.
+        # Typical case: screen-input fields referenced only in
+        # ``EVALUATE TRUE WHEN <var> = SPACES OR LOW-VALUES`` conditions
+        # that the literal-harvester didn't capture (for the subject=TRUE
+        # form, the per-arm harvesting sometimes misses these). The
+        # runtime move is ``MOVE MOCK-ALPHA-STATUS TO <var>``; restricting
+        # the relaxation to ``data_type in {"alpha", "unknown", "group"}``
+        # avoids the alpha-into-numeric corruption that broke the
+        # previous broad attempt. Any numeric or packed-decimal variable
+        # still needs an explicit literal signal to be admitted.
+        has_signal = bool(dom.condition_literals or dom.valid_88_values)
+        if not has_signal:
+            is_input_alpha = (
+                getattr(dom, "classification", "") == "input"
+                and getattr(dom, "data_type", "") in ("alpha", "unknown", "group")
+            )
+            if not is_input_alpha:
+                return False
         # Null-sentinel check: if ALL 88-level values resolve to
         # empty-string / LOW-VALUES, the variable is almost certainly
         # a pointer-null guard (e.g. 88 END-OF-TIOT VALUE LOW-VALUES)
@@ -2717,17 +2755,19 @@ def run_cobol_coverage(
     if coverage_config.strategies or coverage_config.rounds:
         strategies = build_strategies(coverage_config, llm_provider, llm_model)
     else:
-        # Note: SiblingWhenFanoutStrategy is implemented and registered in
-        # ``coverage_config``, but intentionally NOT in the default
-        # rotation. Broader ``_is_safe_to_inject`` relaxation breaks the
-        # runtime on many programs (numeric fields getting alpha values
-        # from MOCK-ALPHA-STATUS); the narrow case where the strategy
-        # helps isn't worth the default-behavior regression. Opt in
-        # explicitly via ``--coverage-config`` when targeting a program
-        # whose fanout variables are known to be injectable.
+        # SiblingWhenFanoutStrategy targets partially-covered EVALUATE
+        # WHEN groups by reusing a successful sibling's input + stubs
+        # and swapping just the arm-specific variables. Enabled by
+        # default now that ``_is_safe_to_inject`` admits input-alpha
+        # vars without literals; the strategy is also precondition-
+        # gated (``should_run`` returns False until a WHEN arm is
+        # covered AND un-attempted siblings exist), idempotent per
+        # target, and the selector's staleness guard prevents it
+        # from being locked out before prerequisites are met.
         strategies: list[Strategy] = [
             BaselineStrategy(),
             DirectParagraphStrategy(),
+            SiblingWhenFanoutStrategy(),
             TranscriptSearchStrategy(),
             CorpusFuzzStrategy(),
             FaultInjectionStrategy(),
@@ -3629,17 +3669,19 @@ def run_coverage(
     if coverage_config.strategies or coverage_config.rounds:
         strategies = build_strategies(coverage_config, llm_provider, llm_model)
     else:
-        # Note: SiblingWhenFanoutStrategy is implemented and registered in
-        # ``coverage_config``, but intentionally NOT in the default
-        # rotation. Broader ``_is_safe_to_inject`` relaxation breaks the
-        # runtime on many programs (numeric fields getting alpha values
-        # from MOCK-ALPHA-STATUS); the narrow case where the strategy
-        # helps isn't worth the default-behavior regression. Opt in
-        # explicitly via ``--coverage-config`` when targeting a program
-        # whose fanout variables are known to be injectable.
+        # SiblingWhenFanoutStrategy targets partially-covered EVALUATE
+        # WHEN groups by reusing a successful sibling's input + stubs
+        # and swapping just the arm-specific variables. Enabled by
+        # default now that ``_is_safe_to_inject`` admits input-alpha
+        # vars without literals; the strategy is also precondition-
+        # gated (``should_run`` returns False until a WHEN arm is
+        # covered AND un-attempted siblings exist), idempotent per
+        # target, and the selector's staleness guard prevents it
+        # from being locked out before prerequisites are met.
         strategies: list[Strategy] = [
             BaselineStrategy(),
             DirectParagraphStrategy(),
+            SiblingWhenFanoutStrategy(),
             TranscriptSearchStrategy(),
             CorpusFuzzStrategy(),
             FaultInjectionStrategy(),

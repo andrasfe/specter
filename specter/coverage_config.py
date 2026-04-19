@@ -269,11 +269,8 @@ def build_strategies(
         names = list(config.strategies)
     else:
         # Default set
-        # sibling_when_fanout is registered (opt-in via config) but not
-        # in the default set — see the comment in cobol_coverage.py
-        # run_cobol_coverage for rationale.
         names = [
-            "baseline", "direct_paragraph",
+            "baseline", "direct_paragraph", "sibling_when_fanout",
             "transcript_search", "corpus_fuzz", "fault_injection",
         ]
 
