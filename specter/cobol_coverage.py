@@ -34,6 +34,7 @@ from .coverage_strategies import (
     DirectParagraphStrategy,
     FaultInjectionStrategy,
     HeuristicSelector,
+    SiblingWhenFanoutStrategy,
     Strategy,
     StrategyContext,
     StrategyYield,
@@ -2716,6 +2717,14 @@ def run_cobol_coverage(
     if coverage_config.strategies or coverage_config.rounds:
         strategies = build_strategies(coverage_config, llm_provider, llm_model)
     else:
+        # Note: SiblingWhenFanoutStrategy is implemented and registered in
+        # ``coverage_config``, but is intentionally NOT in the default
+        # rotation. Its cases never reach new coverage on programs whose
+        # WHEN-arm variables are absent from ``context.injectable_vars``
+        # (the common case today); including it regressed CORPT00C from
+        # 43/123 to 39/123 by starving corpus_fuzz out of later rounds.
+        # Opt in explicitly via ``--coverage-config`` when targeting a
+        # program whose fanout variables are known to be injectable.
         strategies: list[Strategy] = [
             BaselineStrategy(),
             DirectParagraphStrategy(),
@@ -3620,6 +3629,14 @@ def run_coverage(
     if coverage_config.strategies or coverage_config.rounds:
         strategies = build_strategies(coverage_config, llm_provider, llm_model)
     else:
+        # Note: SiblingWhenFanoutStrategy is implemented and registered in
+        # ``coverage_config``, but is intentionally NOT in the default
+        # rotation. Its cases never reach new coverage on programs whose
+        # WHEN-arm variables are absent from ``context.injectable_vars``
+        # (the common case today); including it regressed CORPT00C from
+        # 43/123 to 39/123 by starving corpus_fuzz out of later rounds.
+        # Opt in explicitly via ``--coverage-config`` when targeting a
+        # program whose fanout variables are known to be injectable.
         strategies: list[Strategy] = [
             BaselineStrategy(),
             DirectParagraphStrategy(),

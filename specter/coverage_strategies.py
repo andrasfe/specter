@@ -2554,6 +2554,390 @@ def _apply_llm_stub_overrides(
 
 
 # ---------------------------------------------------------------------------
+# SiblingWhenFanoutStrategy — enumerate uncovered sibling WHEN arms
+# ---------------------------------------------------------------------------
+
+class SiblingWhenFanoutStrategy(Strategy):
+    """Fan out to uncovered WHEN arms of a partially-covered EVALUATE.
+
+    Motivation: a single EVALUATE TRUE with N WHEN arms like
+    ``WHEN <var> = SPACES OR LOW-VALUES`` needs N distinct test cases
+    (one per arm) to achieve full coverage. Existing strategies tend to
+    hit the FIRST arm and never fan out to the siblings — they propose
+    one input_state per round and never systematically perturb the
+    variable list across arms.
+
+    This strategy observes every EVALUATE that has **at least one
+    covered arm** and **at least one uncovered sibling**, then for each
+    uncovered arm:
+
+    1. Picks a successful test case from a covered sibling arm as the
+       seed (so CICS-RECEIVE stubs, EIBCALEN, EIBAID, CUSTOMI, etc. are
+       already in the right state to reach the EVALUATE).
+    2. Parses the uncovered arm's condition to find the variable and
+       required value (e.g. ``SDTDDI = SPACES`` → set ``SDTDDI`` to
+       blanks).
+    3. For all covered siblings, also sets their variable to a **non-
+       blank** value (from the seed TC) so only the target arm's
+       condition evaluates TRUE in this EVALUATE.
+    4. Yields the modified input_state + seed's stubs/defaults.
+
+    When no seed TC exists for the EVALUATE (no arm covered yet),
+    nothing is yielded — other strategies need to make first contact
+    before this one can fan out.
+    """
+
+    name = "sibling_when_fanout"
+    # Priority 38 — between direct_paragraph (35) and transcript_search (40).
+    # Kept modest intentionally: the strategy is cheap but its cases only
+    # pay off when the fanout variables are in the runtime's
+    # ``injectable_vars``. When they're not, generated cases hit no new
+    # coverage, and a higher priority would starve more productive
+    # strategies out of later rounds.
+    priority = 38
+
+    def __init__(self) -> None:
+        # Per-arm attempt counter so a stubborn arm doesn't starve others.
+        self._attempts: dict[str, int] = {}
+        # Remember which (evaluate_bid, direction) targets we have
+        # already attempted — the strategy is idempotent per target,
+        # so replaying them on future rounds never reveals new
+        # coverage. Tracking and skipping them prevents the strategy
+        # from hogging the selector with repeat no-op rounds.
+        self._attempted_targets: set[str] = set()
+
+    def should_run(self, cov, round_num: int) -> bool:
+        """Eligible only when there's an un-attempted fanout target.
+
+        The strategy is idempotent per ``(evaluate_bid, direction)`` —
+        rerunning the same target never reveals new coverage. Once every
+        visible target has been attempted, ``should_run`` returns False,
+        which both avoids wasted rounds and lets the selector move on to
+        more productive strategies without staleness penalties piling up.
+        """
+        if len(cov.test_cases) < 1:
+            return False
+        for b in cov.branches_hit:
+            if not isinstance(b, str):
+                continue
+            if b.startswith("py:"):
+                continue
+            parts = b.split(":", 1)
+            if len(parts) != 2:
+                continue
+            direction = parts[1].upper()
+            is_when = direction == "WO" or (
+                direction.startswith("W") and direction[1:].isdigit()
+            )
+            if not is_when:
+                continue
+            # Found a covered WHEN arm. Check whether any of its sibling
+            # directions are BOTH uncovered AND not already attempted.
+            cobol_bid = parts[0]
+            # Cheap scan of the same bid's neighbors; exact enumeration
+            # happens in generate_cases.
+            for b2 in cov.branches_hit:
+                if not isinstance(b2, str) or ":" not in b2:
+                    continue
+                if b2.startswith("py:"):
+                    continue
+                if b2.split(":", 1)[0] != cobol_bid:
+                    continue
+            # Conservative approximation: any sibling we haven't yet
+            # attempted on this bid is potential work. We can't cheaply
+            # enumerate "all directions of this EVALUATE" from cov alone
+            # (that needs branch_meta), so we defer to generate_cases
+            # but gate on "have we attempted every direction we've ever
+            # seen?". If any seen direction isn't in _attempted_targets,
+            # the generator might have work.
+            for direction_seen in ("W1", "W2", "W3", "W4", "W5", "W6",
+                                    "W7", "W8", "W9", "W10", "WO"):
+                if f"{cobol_bid}:{direction_seen}" in self._attempted_targets:
+                    continue
+                if f"{cobol_bid}:{direction_seen}" in cov.branches_hit:
+                    continue
+                return True
+        return False
+
+    def generate_cases(self, ctx, cov, batch_size) -> Iterator[CaseT]:
+        branch_meta = ctx.branch_meta or {}
+        if not branch_meta:
+            return
+
+        # --- Step 1: index EVALUATEs and their arms ---
+        # Each EVALUATE entry has ``when_hashes: {direction: hash}`` per
+        # WHEN arm, plus ``condition`` (the full subject) and
+        # ``paragraph``. Arms we need to re-derive by scanning mock
+        # source for the WHEN text isn't necessary — the registry's
+        # entries have the per-arm condition text on the PYTHON side,
+        # but ``ctx.branch_meta`` here is COBOL-side (no per-arm
+        # text). Instead we look up arm text from the branch_registry
+        # when available and fall back to registry-less heuristics.
+        registry = getattr(ctx.context, "branch_registry", None) if ctx.context else None
+        # Map cobol EVALUATE bid → list of (direction, arm_condition).
+        arms_by_eval: dict[str, list[tuple[str, str]]] = {}
+        eval_para: dict[str, str] = {}
+        for raw_bid, meta in branch_meta.items():
+            if not isinstance(meta, dict) or meta.get("type") != "EVALUATE":
+                continue
+            cobol_bid = str(raw_bid)
+            whens = (meta.get("when_hashes") or {})
+            paragraph = str(meta.get("paragraph", ""))
+            eval_para[cobol_bid] = paragraph
+            arms: list[tuple[str, str]] = []
+            if registry is not None:
+                for direction, wh_hash in whens.items():
+                    entry = registry.by_hash.get(wh_hash)
+                    if entry is None:
+                        continue
+                    arms.append((direction, entry.condition))
+            arms_by_eval[cobol_bid] = arms
+
+        if not arms_by_eval:
+            return
+
+        # --- Step 2: classify arms as covered / uncovered ---
+        hit: set[str] = set(cov.branches_hit)
+        # Also index hits by COBOL bid (strip py: prefix for equivalence).
+        fanout_targets: list[tuple[str, str, str, str]] = []  # (cobol_bid, para, direction, arm_cond)
+        for cobol_bid, arms in arms_by_eval.items():
+            covered_directions = {d for d, _ in arms if f"{cobol_bid}:{d}" in hit}
+            uncovered = [(d, c) for d, c in arms if d not in covered_directions]
+            if not covered_directions or not uncovered:
+                continue
+            for direction, arm_cond in uncovered:
+                target_id = f"{cobol_bid}:{direction}"
+                if target_id in self._attempted_targets:
+                    continue
+                # Mark EVERY uncovered arm we see in this classification
+                # loop as attempted — even arms we can't parse (WHEN
+                # OTHER, `NOT = SPACES AND LOW-VALUES`, literal VALUE
+                # forms, etc.). The strategy is idempotent per
+                # ``(bid, direction)``; re-scanning them next round
+                # would just trip ``should_run`` again without producing
+                # new output. Marking here rather than inside the yield
+                # loop means parse failures also bail out cleanly.
+                self._attempted_targets.add(target_id)
+                fanout_targets.append(
+                    (cobol_bid, eval_para[cobol_bid], direction, arm_cond),
+                )
+
+        if not fanout_targets:
+            return
+
+        # --- Step 3: for each uncovered arm, build a fanout TC ---
+        # Cap total cases per run to avoid runaway batches; cov.test_cases
+        # also provides natural seed pool bound.
+        max_cases = min(batch_size, len(fanout_targets))
+        for cobol_bid, paragraph, direction, arm_cond in fanout_targets[:max_cases]:
+            target_key = f"branch:{cobol_bid}:{direction}"
+            self._attempts[target_key] = self._attempts.get(target_key, 0) + 1
+            # Mark as attempted so subsequent rounds skip this target
+            # (see should_run's "has new opportunity" gate). Tests that
+            # actually land the branch will show up in cov.branches_hit
+            # and the `covered_directions` filter above will drop them
+            # from future fanout lists.
+            self._attempted_targets.add(f"{cobol_bid}:{direction}")
+
+            # Find a seed TC: ideally one that hit ANY sibling of this
+            # EVALUATE. That TC already has the prerequisites (EIBCALEN,
+            # EIBAID, CICS-RECEIVE stubs, outer-EVALUATE arm variables
+            # in the right state) to reach the EVALUATE.
+            seed = _find_sibling_seed(cov, cobol_bid, arms_by_eval[cobol_bid])
+            if seed is None:
+                continue
+
+            arm_var, arm_values = _parse_arm_requirement(arm_cond)
+            if not arm_var:
+                continue
+
+            input_state = dict(seed.get("input_state") or {})
+            # Set the target arm's variable to the required value (pick
+            # the first listed option — typically SPACES for empty-field
+            # WHEN arms).
+            input_state[arm_var.upper()] = (
+                arm_values[0] if arm_values else _default_value_for(arm_var)
+            )
+            # For every COVERED sibling, set its variable to a NON-blank
+            # value so the dispatcher doesn't match it first and short-
+            # circuit past our target arm.
+            for sib_dir, sib_cond in arms_by_eval[cobol_bid]:
+                if sib_dir == direction:
+                    continue
+                sib_var, sib_values = _parse_arm_requirement(sib_cond)
+                if not sib_var:
+                    continue
+                # Use the seed's value when present, otherwise a safe
+                # non-blank placeholder matching the variable's shape.
+                val = seed.get("input_state", {}).get(sib_var.upper())
+                if val is None or (isinstance(val, str) and not val.strip()):
+                    val = _non_blank_value_for(sib_var, ctx)
+                input_state[sib_var.upper()] = val
+
+            # Persisted test cases store ``stub_outcomes`` as a list of
+            # ``[op_key, pairs]`` entries, but downstream ``_python_pre_run``
+            # expects a dict ``{op_key: [outcomes...]}``. Convert when
+            # needed; fall back to the success stubs when the seed lacks
+            # them.
+            stub_outcomes = _normalize_stub_outcomes(
+                seed.get("stub_outcomes"), ctx.success_stubs,
+            )
+            stub_defaults = seed.get("stub_defaults") or ctx.success_defaults
+            yield input_state, stub_outcomes, stub_defaults, target_key
+
+
+def _find_sibling_seed(
+    cov,
+    eval_bid: str,
+    arms: list[tuple[str, str]],
+) -> dict | None:
+    """Pick the test case that covers the most sibling arms of this EVALUATE.
+
+    More-covered seeds already satisfy the prerequisites to reach the
+    EVALUATE, so they're the best starting point for fanning out to the
+    remaining arms.
+    """
+    best: dict | None = None
+    best_hits = -1
+    for tc in cov.test_cases:
+        branches = set(tc.get("branches_hit", []))
+        sib_hits = sum(
+            1 for d, _ in arms if f"{eval_bid}:{d}" in branches
+        )
+        if sib_hits > best_hits:
+            best = tc
+            best_hits = sib_hits
+    return best if best_hits > 0 else None
+
+
+def _parse_arm_requirement(condition: str) -> tuple[str, list[object]]:
+    """Extract (variable, required_values) from a WHEN arm condition.
+
+    Handles the common patterns that appear in coverage-stubborn WHEN
+    arms:
+
+    * ``<var> = SPACES OR LOW-VALUES`` → (var, ['  ', ''])
+    * ``<var> = <literal>`` → (var, [literal])
+    * ``<var> IS NOT NUMERIC`` → (var, ['X'])  (non-numeric sentinel)
+
+    Returns ``("", [])`` when the pattern isn't recognized; the caller
+    skips that arm silently. Keeping the matcher narrow is intentional
+    — this strategy handles the common empty-field fanout case and
+    leaves richer conditions to the swarm.
+    """
+    import re as _re
+    text = (condition or "").strip()
+    # Strip leading "WHEN " if present (some call sites pass the raw
+    # arm text including the verb).
+    if text.upper().startswith("WHEN "):
+        text = text[5:].strip()
+
+    # Pattern 1: "var = SPACES OR LOW-VALUES" / "var = SPACES"
+    m = _re.match(
+        r"([A-Z][A-Z0-9_-]*(?:\s+OF\s+[A-Z][A-Z0-9_-]*)?)\s*=\s*SPACES\b",
+        text, _re.IGNORECASE,
+    )
+    if m:
+        var = _extract_leaf_name(m.group(1))
+        return var, ["  ", ""]
+
+    # Pattern 2: "var = LOW-VALUES"
+    m = _re.match(
+        r"([A-Z][A-Z0-9_-]*(?:\s+OF\s+[A-Z][A-Z0-9_-]*)?)\s*=\s*LOW-VALUES\b",
+        text, _re.IGNORECASE,
+    )
+    if m:
+        var = _extract_leaf_name(m.group(1))
+        return var, [""]
+
+    # Pattern 3: "var = 'literal'" or "var = literal"
+    m = _re.match(
+        r"([A-Z][A-Z0-9_-]*(?:\s+OF\s+[A-Z][A-Z0-9_-]*)?)\s*=\s*"
+        r"(?:'([^']*)'|\"([^\"]*)\"|(\S+))",
+        text, _re.IGNORECASE,
+    )
+    if m:
+        var = _extract_leaf_name(m.group(1))
+        literal = m.group(2) or m.group(3) or m.group(4) or ""
+        return var, [literal]
+
+    # Pattern 4: "var IS NOT NUMERIC" → any non-numeric value
+    m = _re.match(
+        r"([A-Z][A-Z0-9_-]*(?:\s+OF\s+[A-Z][A-Z0-9_-]*)?)\s+IS\s+NOT\s+NUMERIC",
+        text, _re.IGNORECASE,
+    )
+    if m:
+        var = _extract_leaf_name(m.group(1))
+        return var, ["X"]
+
+    return "", []
+
+
+def _extract_leaf_name(qualified: str) -> str:
+    """From ``SDTMMI OF CORPT0AI`` return the leaf ``SDTMMI``.
+
+    The coverage pipeline keys variables by their leaf name (the name
+    that appears in ``input_state`` and the mock's SPECTER-READ-INIT-VARS
+    dispatch). The ``OF <group>`` qualifier is COBOL scoping, not part
+    of the runtime variable identity.
+    """
+    return qualified.split()[0].upper()
+
+
+def _default_value_for(var_name: str) -> str:
+    """Fallback value when the arm condition doesn't pin one down."""
+    return "  "
+
+
+def _normalize_stub_outcomes(raw, fallback):
+    """Convert persisted ``stub_outcomes`` list back to dict shape.
+
+    Test cases stored on disk have ``stub_outcomes`` serialized as a
+    list of ``[op_key, pairs]`` entries (the execution-order sequence).
+    The pipeline's ``_python_pre_run`` expects a dict ``{op_key:
+    [outcomes...]}`` so it can ``.popleft()`` per op. Convert here and
+    fall back to the supplied default when the seed has no stubs.
+    """
+    if not raw:
+        return fallback
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, list):
+        out: dict[str, list] = {}
+        for entry in raw:
+            if not (isinstance(entry, (list, tuple)) and len(entry) == 2):
+                continue
+            op_key, pairs = entry
+            # ``pairs`` can be None or a non-iterable when the original
+            # test case had a scalar outcome. Coerce to an empty list
+            # so the pipeline sees a valid shape.
+            if pairs is None:
+                pairs_list: list = []
+            elif isinstance(pairs, (list, tuple)):
+                pairs_list = list(pairs)
+            else:
+                pairs_list = [pairs]
+            out.setdefault(str(op_key), []).append(pairs_list)
+        return out if out else fallback
+    return fallback
+
+
+def _non_blank_value_for(var_name: str, ctx) -> str:
+    """Pick a safe non-blank value to disqualify a sibling WHEN arm.
+
+    Prefers a value from the variable's domain ``condition_literals``
+    (stripped of blanks); falls back to "X" when none are available.
+    """
+    dom = (ctx.domains or {}).get(var_name.upper()) if ctx else None
+    if dom is not None:
+        for lit in getattr(dom, "condition_literals", []) or []:
+            s = str(lit)
+            if s.strip():
+                return s
+    return "X"
+
+
+# ---------------------------------------------------------------------------
 # Strategy selectors
 # ---------------------------------------------------------------------------
 
@@ -2614,9 +2998,18 @@ class HeuristicSelector(StrategySelector):
             hit_rate = yields.total_new_coverage / max(yields.total_cases, 1)
             score -= hit_rate * 30
 
-            rounds_since_yield = round_num - yields.last_yield_round
-            if rounds_since_yield > 3:
-                score += rounds_since_yield * 5
+            # Staleness only penalizes strategies that have *actually*
+            # yielded at least once. A strategy that ran with 0 test
+            # cases was waiting for prerequisites (see should_run); it
+            # shouldn't be treated as "stale" just because it hasn't
+            # had the chance to produce output yet. Without this guard,
+            # precondition-gated strategies like sibling_when_fanout
+            # get locked out after their first no-op round and never
+            # recover when the prerequisite arm finally gets covered.
+            if yields.total_new_coverage > 0:
+                rounds_since_yield = round_num - yields.last_yield_round
+                if rounds_since_yield > 3:
+                    score += rounds_since_yield * 5
 
         return score
 

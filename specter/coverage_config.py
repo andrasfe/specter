@@ -234,12 +234,14 @@ def _get_strategy_registry() -> dict[str, Any]:
         CorpusFuzzStrategy,
         DirectParagraphStrategy,
         FaultInjectionStrategy,
+        SiblingWhenFanoutStrategy,
         TranscriptSearchStrategy,
     )
 
     return {
         "baseline": lambda **kw: BaselineStrategy(),
         "direct_paragraph": lambda **kw: DirectParagraphStrategy(),
+        "sibling_when_fanout": lambda **kw: SiblingWhenFanoutStrategy(),
         "transcript_search": lambda **kw: TranscriptSearchStrategy(),
         "corpus_fuzz": lambda **kw: CorpusFuzzStrategy(),
         "fault_injection": lambda **kw: FaultInjectionStrategy(),
@@ -267,8 +269,12 @@ def build_strategies(
         names = list(config.strategies)
     else:
         # Default set
+        # sibling_when_fanout is registered (opt-in via config) but not
+        # in the default set — see the comment in cobol_coverage.py
+        # run_cobol_coverage for rationale.
         names = [
-            "baseline", "direct_paragraph", "transcript_search", "corpus_fuzz", "fault_injection",
+            "baseline", "direct_paragraph",
+            "transcript_search", "corpus_fuzz", "fault_injection",
         ]
 
     strategies = []
