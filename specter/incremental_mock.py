@@ -3134,6 +3134,15 @@ def _compile_and_fix(
                     "specter/incremental_mock.py:_compile_and_fix",
                     "specter/llm_review.py:review_fix",
                     "specter/compile_swarm.py:propose_compile_fix_swarm",
+                    # If you noticed a program-specific pattern while "
+                    # investigating this compile error (e.g. 'this program "
+                    # uses packed-decimal for account balances'), attach it "
+                    # as save_fact=[{kind,target,scope,content,examples}] "
+                    # so the student applies it on future runs.
+                    "Teacher may include save_fact=[{...}] in the reply to "
+                    "teach program-specific domain knowledge (variable "
+                    "format, valid values, stub semantics) that can't be "
+                    "generalized in student code.",
                 ],
             )
             if _resolution is not None:

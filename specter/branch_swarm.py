@@ -130,6 +130,13 @@ class BranchContext:
     # Full ordered stub operation sequence from the backward slice,
     # preserving duplicates (e.g. OPEN then READ then REWRITE).
     stub_op_sequence: list[str] = field(default_factory=list)
+    # Teacher-curated domain facts applicable to variables in this branch
+    # (plus any scope=global facts). Populated lazily from the facts store
+    # in ``_run_specialists_parallel`` just before the prompts are built,
+    # so a fact appended mid-run is applied on the very next branch.
+    # Each entry is a dict with keys ``kind``, ``content``, ``examples``,
+    # ``target``, ``scope`` so the specialists can render them uniformly.
+    teacher_facts: list[dict[str, Any]] = field(default_factory=list)
 
 
 # Backward-compatible journal (wraps SwarmRound list into AgentIteration list)
@@ -321,6 +328,55 @@ def _gather_branch_context(
                         child_name.upper(), (parent_name, child_value),
                     )
 
+    # --- teacher facts for the variables in this branch ---
+    # Pull from the run-level facts store if one is configured, so mid-run
+    # teaching flows into every specialist prompt. The store exposes
+    # ``reload_if_changed`` for cheap mtime-gated refresh; we call it here
+    # so a fact appended between branches is live on the very next build.
+    teacher_fact_dicts: list[dict[str, Any]] = []
+    facts_store = getattr(ctx, "teacher_facts_store", None)
+    if facts_store is not None:
+        refresher = getattr(facts_store, "reload_if_changed", None)
+        if callable(refresher):
+            try:
+                refresher()
+            except Exception:  # noqa: BLE001
+                pass
+        matcher = getattr(facts_store, "match", None)
+        if callable(matcher):
+            seen_ids: set[int] = set()
+            candidates: list[Any] = []
+            # Variables referenced in the condition or in the domain info.
+            targets = set(var_domain_info.keys())
+            targets.update(
+                v.upper() for v in _extract_condition_vars(condition_text)
+            )
+            try:
+                for var in targets:
+                    for f in matcher(scope="variable", target=var):
+                        if id(f) in seen_ids:
+                            continue
+                        seen_ids.add(id(f))
+                        candidates.append(f)
+                # Plus any scope=global facts (match() with any target
+                # returns them; use a sentinel target so we only fetch
+                # globals once without matching a variable).
+                for f in matcher(scope="global", target=""):
+                    if id(f) in seen_ids:
+                        continue
+                    seen_ids.add(id(f))
+                    candidates.append(f)
+            except Exception:  # noqa: BLE001
+                candidates = []
+            for f in candidates[:12]:
+                teacher_fact_dicts.append({
+                    "kind": getattr(f, "kind", "note"),
+                    "target": getattr(f, "target", ""),
+                    "scope": getattr(f, "scope", ""),
+                    "content": getattr(f, "content", ""),
+                    "examples": list(getattr(f, "examples", []) or []),
+                })
+
     # --- stub operations in the slice ---
     # Deduplicated list for prompt summaries.
     stub_ops_in_slice: list[str] = []
@@ -366,6 +422,7 @@ def _gather_branch_context(
         solution_patterns=patterns,
         parent_88_lookup=parent_88_lookup,
         stub_op_sequence=stub_op_sequence,
+        teacher_facts=teacher_fact_dicts,
     )
 
 
@@ -499,6 +556,37 @@ _JSON_RESPONSE_FORMAT = (
 )
 
 
+def _format_teacher_facts(bctx: BranchContext) -> str:
+    """Render teacher facts as an authoritative prompt block, or "" if none.
+
+    Facts are program-specific knowledge the student can't generalize in
+    code — kept short (8 max) so they stay readable in the prompt. The
+    block is placed near the top of every specialist prompt so the LLM
+    treats them as hard constraints on value generation.
+    """
+    facts = bctx.teacher_facts or []
+    if not facts:
+        return ""
+    lines = ["Teacher-curated domain facts for this program "
+             "(authoritative — prefer these values when generating candidates):"]
+    for f in facts[:8]:
+        target = f.get("target", "")
+        scope = f.get("scope", "")
+        kind = f.get("kind", "note")
+        content = f.get("content", "")
+        examples = f.get("examples") or []
+        ex_part = ""
+        if examples:
+            rendered = ", ".join(repr(str(x)) for x in examples[:4])
+            ex_part = f" (examples: {rendered})"
+        if scope == "global" or not target:
+            head = f"[{kind}]"
+        else:
+            head = f"[{kind} {target}]"
+        lines.append(f"  {head} {content}{ex_part}")
+    return "\n".join(lines) + "\n\n"
+
+
 def _build_condition_cracker_prompt(bctx: BranchContext, prior_feedback: list[JudgeFeedback] | None = None) -> str:
     """Specialist 1: what values satisfy the branch condition?"""
     parts: list[str] = []
@@ -508,6 +596,7 @@ def _build_condition_cracker_prompt(bctx: BranchContext, prior_feedback: list[Ju
         f"{'TRUE' if bctx.direction == 'T' else 'FALSE'}.\n\n"
         f"Branch {bctx.branch_key} in paragraph {bctx.paragraph}.\n"
     )
+    parts.append(_format_teacher_facts(bctx))
     if bctx.condition_text:
         parts.append(f"Condition: {bctx.condition_text}\n\n")
     if bctx.backward_slice_code:
@@ -542,6 +631,7 @@ def _build_path_finder_prompt(bctx: BranchContext, prior_feedback: list[JudgeFee
     """Specialist 2: how to reach the target paragraph?"""
     parts: list[str] = []
     parts.append(f"You are a COBOL reachability analyst.\n\nTarget: {bctx.paragraph}, branch {bctx.branch_key}\n\n")
+    parts.append(_format_teacher_facts(bctx))
     if bctx.call_graph_path:
         parts.append(f"Call graph path: {' → '.join(bctx.call_graph_path)}\n\n")
     else:
@@ -562,6 +652,7 @@ def _build_stub_architect_prompt(bctx: BranchContext, prior_feedback: list[Judge
     """Specialist 3: what stub I/O outcomes set up the right state?"""
     parts: list[str] = []
     parts.append(f"You are a COBOL I/O stub specialist.\n\nTarget: {bctx.branch_key} in {bctx.paragraph}\n")
+    parts.append(_format_teacher_facts(bctx))
     if bctx.condition_text: parts.append(f"Condition: {bctx.condition_text}\n\n")
     if bctx.stub_op_sequence and len(bctx.stub_op_sequence) > 1:
         parts.append("Operations fire in this order (ALL need stubs):\n")
@@ -591,6 +682,7 @@ def _build_stub_architect_prompt(bctx: BranchContext, prior_feedback: list[Judge
 def _build_history_miner_prompt(bctx: BranchContext, prior_feedback: list[JudgeFeedback] | None = None) -> str:
     """Specialist 4: what mutations of near-miss cases would work?"""
     parts: list[str] = []
+    parts.append(_format_teacher_facts(bctx))
     parts.append(f"You are a test-case mutation specialist.\n\nTarget: {bctx.branch_key} in {bctx.paragraph}\n")
     if bctx.condition_text: parts.append(f"Condition: {bctx.condition_text}\n\n")
     if bctx.nearest_hit:
@@ -1658,6 +1750,17 @@ def investigate_branch_swarm(
                     student_hints=[
                         "specter/branch_swarm.py",
                         "specter/coverage_strategies.py",
+                        # Include save_fact=[{...}] in the reply to teach
+                        # any program-specific knowledge about the
+                        # variables in this branch (e.g. '"DATEIN is a
+                        # DDMMYY string"'). Facts apply on the next
+                        # branch and persist across runs. Reserve for
+                        # knowledge the student cannot generalize in
+                        # code — generic patterns belong in `finding`.
+                        "Teacher may include save_fact=[{kind,target,"
+                        "scope (variable|stub_op|global),content,examples}] "
+                        "to teach the student program-specific domain facts; "
+                        "facts are read live on the next branch.",
                     ],
                 )
             except (SupervisorAbort, SupervisorRestart):

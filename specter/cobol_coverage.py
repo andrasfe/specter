@@ -2691,6 +2691,11 @@ def run_cobol_coverage(
     )
     setattr(ctx, "execution_timeout", max(1, int(execution_timeout)))
     setattr(ctx, "strict_branch_coverage", bool(strict_branch_coverage))
+    # Expose the facts store on ctx so branch_swarm (and any other consumer)
+    # can pick up teacher-taught facts without a second SPECTER_SUPERVISOR
+    # lookup. When the channel isn't configured this is None and every
+    # consumer no-ops its facts path.
+    setattr(ctx, "teacher_facts_store", facts_store)
 
     # --- REGISTER STRATEGIES ---
     if jit_inference is not None and jit_cfg is not None:

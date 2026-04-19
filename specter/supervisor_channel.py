@@ -395,6 +395,7 @@ class TeacherFactsStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self._facts: list[TeacherFact] = []
+        self._last_mtime: float = 0.0
         self.reload()
 
     @property
@@ -404,8 +405,10 @@ class TeacherFactsStore:
     def reload(self) -> None:
         self._facts = []
         if not self.path.exists():
+            self._last_mtime = 0.0
             return
         try:
+            self._last_mtime = self.path.stat().st_mtime
             for raw in self.path.read_text(encoding="utf-8").splitlines():
                 raw = raw.strip()
                 if not raw:
@@ -420,12 +423,43 @@ class TeacherFactsStore:
         except OSError as exc:
             log.warning("supervisor: failed to read facts file: %s", exc)
 
+    def reload_if_changed(self) -> bool:
+        """Cheap mtime-gated reload for the hot path.
+
+        Consumers (JIT, branch swarm, seed generation) call this before
+        every fact lookup so a teacher who appends a new fact mid-run has
+        it applied on the next LLM call. One ``stat()`` per call when the
+        store is unchanged; a full re-read when the mtime advances. Returns
+        True if facts were actually reloaded.
+        """
+        if not self.path.exists():
+            if self._facts:
+                self._facts = []
+                self._last_mtime = 0.0
+                return True
+            return False
+        try:
+            current_mtime = self.path.stat().st_mtime
+        except OSError:
+            return False
+        if current_mtime == self._last_mtime:
+            return False
+        self.reload()
+        return True
+
     def append(self, fact: TeacherFact) -> None:
         try:
             append_line_with_fsync(
                 self.path, json.dumps(fact.to_dict(), default=str) + "\n"
             )
             self._facts.append(fact)
+            # Keep mtime cached in sync with our own write so a concurrent
+            # reload_if_changed doesn't redundantly re-read the file we
+            # just wrote.
+            try:
+                self._last_mtime = self.path.stat().st_mtime
+            except OSError:
+                pass
         except Exception as exc:  # noqa: BLE001
             log.warning("supervisor: failed to persist fact: %s", exc)
 

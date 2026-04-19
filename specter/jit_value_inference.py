@@ -353,6 +353,16 @@ class JITValueInferenceService:
         """
         if self.facts_store is None:
             return []
+        # Cheap mtime-gated refresh — the teacher may be appending facts
+        # to ``teacher_facts.jsonl`` concurrently as the coverage loop
+        # progresses. A single stat() call picks up any new fact on the
+        # next inference without explicit IPC.
+        refresher = getattr(self.facts_store, "reload_if_changed", None)
+        if callable(refresher):
+            try:
+                refresher()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("JIT facts reload_if_changed failed: %s", exc)
         matcher = getattr(self.facts_store, "match", None)
         if not callable(matcher):
             return []
