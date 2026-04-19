@@ -723,22 +723,40 @@ def _run_specialists_parallel(bctx, prior_feedback, llm_provider, llm_model):
     return proposals
 
 
+_SPECIALIST_PRIORITY: dict[str, int] = {
+    "path_finder":       0,   # best at program-flow gates (EIBCALEN, reentry)
+    "condition_cracker": 1,   # best at target-branch conditions
+    "stub_architect":    2,   # best at stub outcome values
+    "history_miner":     3,   # best at warm-starts from known-passing TCs
+}
+
+
 def _merge_proposals(proposals: list[SpecialistProposal]) -> tuple[dict, dict]:
     """Merge specialist proposals into a single (input_state, stub_outcomes).
 
-    Priority: path_finder (reach first) > condition_cracker > stub_architect
-    > history_miner.  Later specialists override earlier ones for shared keys.
+    Field-union merge: each key is owned by the FIRST-PRIORITY specialist
+    who proposed it. Lower-priority specialists can add NEW keys but
+    cannot overwrite an earlier specialist's value. This matters when
+    different specialists contribute different gates for the same TC —
+    e.g. path_finder proposes ``EIBCALEN: 1`` and ``EIBAID: 'DFHENTER'``,
+    condition_cracker proposes ``EDTMMI: '13'``, stub_architect
+    proposes ``EDTDDI: '31'``. The prior priority-overwrite merge
+    silently replaced earlier-specialist values whenever a later
+    specialist re-proposed the same key with a different (often worse)
+    guess (e.g. history_miner saying ``EIBAID: 'ENTER'`` instead of
+    ``'DFHENTER'``), causing the merged TC to miss one or more gates.
     """
     merged_input: dict = {}
     merged_stubs: dict = {}
-    for p in sorted(proposals, key=lambda p: {
-        "path_finder": 0, "condition_cracker": 1,
-        "stub_architect": 2, "history_miner": 3,
-    }.get(p.specialist, 4)):
+    for p in sorted(
+        proposals, key=lambda p: _SPECIALIST_PRIORITY.get(p.specialist, 4),
+    ):
         if p.input_state:
-            merged_input.update(p.input_state)
+            for k, v in p.input_state.items():
+                merged_input.setdefault(k, v)
         if p.stub_outcomes:
-            merged_stubs.update(p.stub_outcomes)
+            for k, v in p.stub_outcomes.items():
+                merged_stubs.setdefault(k, v)
     return merged_input, merged_stubs
 
 
