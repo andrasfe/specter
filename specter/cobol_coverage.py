@@ -1824,11 +1824,18 @@ def _execute_and_save(
             # variables so COBOL replays are not polluted by Python locals.
             py_new = {b for b in result.branches_hit if b.startswith("py:")} - cov.branches_hit
             # Check if any py: branches have uncovered COBOL equivalents.
-            # When the unified branch registry is populated the translation
-            # map knows the real COBOL bid for each Python bid (they differ
-            # after Option B because each side walks its own source). Fall
-            # back to the legacy "strip the prefix" heuristic only when the
-            # map is empty (e.g. AST-less callers).
+            # We need to be PERMISSIVE here: any py: branch that doesn't
+            # clearly correspond to an already-covered COBOL probe is a
+            # candidate for triggering a replay, because the replay may
+            # also exercise OTHER COBOL probes incidentally (the translation
+            # map only knows the primary probe).
+            #
+            # When the registry is populated we translate each py: branch
+            # to its known COBOL counterpart and drop it from the candidate
+            # set only when that specific probe is already covered. A py:
+            # branch with no known translation (PERFORM VARYING, EVALUATE
+            # `:F`) stays in the candidate set — it still deserves a replay
+            # since it represents genuinely-new Python-side reachability.
             translate = getattr(ctx.context, "translate_py_branch", None)
             cobol_missing: set[str] = set()
             for b in result.branches_hit:
@@ -1836,11 +1843,11 @@ def _execute_and_save(
                     continue
                 equiv = translate(b) if callable(translate) else None
                 if equiv is None:
-                    # No known counterpart — fall back to bid-equivalence
-                    # heuristic for non-registry runs.
-                    if not getattr(ctx.context, "python_to_cobol_bid", None):
-                        equiv = b[3:]
-                if equiv and equiv not in cov.branches_hit:
+                    # Fall back to bid-stripping — approximate but matches
+                    # pre-Option-B behavior that empirically triggers useful
+                    # replays even when the bids don't align perfectly.
+                    equiv = b[3:]
+                if equiv not in cov.branches_hit:
                     cobol_missing.add(equiv)
             force_cobol_replay = strategy_name == "branch_swarm" and stub_outcomes
             if py_new or cobol_missing or force_cobol_replay:

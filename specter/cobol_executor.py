@@ -400,6 +400,32 @@ def prepare_context(
                 branch_meta: dict = {}
                 total_branches = 0
                 total_paragraphs = 0
+                # When the caller passed the AST program, rebuild the
+                # hash-annotated branch_meta by re-running ``_add_branch_tracing``
+                # on a probe-stripped copy of the cached source. This is
+                # necessary for the Python↔COBOL branch translation map to
+                # be populated on cache hits — otherwise the reconstructed
+                # branch_meta below has no ``content_hash`` / ``when_hashes``
+                # fields and the hash-based lookup later returns empty.
+                hash_rich_meta: dict | None = None
+                if enable_branch_tracing and program is not None:
+                    try:
+                        from .cobol_mock import _add_branch_tracing as _abt
+                        import re as _re2
+                        _probe_re = _re2.compile(
+                            r"\bDISPLAY\s+'@@[BV]:", _re2.IGNORECASE
+                        )
+                        stripped = [
+                            ln + "\n" for ln in source_text.splitlines()
+                            if not _probe_re.search(ln)
+                        ]
+                        _, hash_rich_meta, _ = _abt(stripped)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "cache: could not rebuild hash-rich branch_meta: %s",
+                            exc,
+                        )
+                        hash_rich_meta = None
                 if enable_branch_tracing:
                     # Count @@B: probes and extract conditions from the source
                     import re as _re
@@ -455,6 +481,61 @@ def prepare_context(
                 fd_fields = _extract_fd_record_fields(
                     source_text.splitlines(keepends=True)
                 )
+                # Merge content_hash / when_hashes from the rebuild into
+                # the probe-scanned branch_meta so downstream hash lookups
+                # work on cache hits.
+                if hash_rich_meta:
+                    for bid_key, enriched in hash_rich_meta.items():
+                        row = branch_meta.get(str(bid_key))
+                        if row is None:
+                            continue
+                        if enriched.get("content_hash"):
+                            row["content_hash"] = enriched["content_hash"]
+                        if enriched.get("when_hashes"):
+                            row["when_hashes"] = dict(enriched["when_hashes"])
+
+                # Build the branch registry + translation map for the
+                # cached path too (mirrors the non-cached return below).
+                cached_reg = None
+                cached_translation: dict[int, tuple[str, str]] = {}
+                if program is not None:
+                    try:
+                        from .branch_registry import build_registry as _build_reg
+                        from .persistence_utils import atomic_write_json
+                        cached_reg = _build_reg(program)
+                        atomic_write_json(
+                            work_dir / "branch_registry.json",
+                            cached_reg.to_dict(),
+                        )
+                        cobol_by_hash: dict[str, tuple[str, str]] = {}
+                        for cobol_bid, meta in (branch_meta or {}).items():
+                            if not isinstance(meta, dict):
+                                continue
+                            if meta.get("type") == "EVALUATE":
+                                for direction, h in (meta.get("when_hashes") or {}).items():
+                                    cobol_by_hash[h] = (str(cobol_bid), direction)
+                            else:
+                                h = meta.get("content_hash")
+                                if h:
+                                    cobol_by_hash[h] = (str(cobol_bid), "T")
+                        matched = 0
+                        for e in cached_reg.entries:
+                            hit = cobol_by_hash.get(e.content_hash)
+                            if hit is not None:
+                                cached_translation[e.bid] = hit
+                                matched += 1
+                        log.info(
+                            "branch_registry (cached): translated %d/%d Python "
+                            "bids to COBOL probes",
+                            matched, len(cached_reg.entries),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "branch_registry (cached): build failed: %s", exc,
+                        )
+                        cached_reg = None
+                        cached_translation = {}
+
                 return CobolExecutionContext(
                     executable_path=executable_path,
                     instrumented_source_path=instrumented_path,
@@ -466,6 +547,8 @@ def prepare_context(
                     coverage_mode=coverage_mode,
                     mock_operations=mock_ops,
                     fd_record_fields=fd_fields,
+                    branch_registry=cached_reg,
+                    python_to_cobol_bid=cached_translation,
                 )
 
     # No pre-clean — the incremental pipeline handles errors via LLM.
