@@ -217,6 +217,14 @@ def _harvest_condition_literals(
         if not lhs_raw or not rhs_raw:
             continue
 
+        # Handle qualified COBOL references. `EDTMMI OF CORPT0AI > '12'` is
+        # a comparison on the field EDTMMI; without this, `reversed()` below
+        # picks the record qualifier CORPT0AI and the harvester attributes
+        # the literal to the wrong variable. Truncate LHS at the ' OF ' /
+        # ' IN ' boundary so only the field name reaches tokenisation.
+        lhs_raw = re.split(r"\s+(?:OF|IN)\s+", lhs_raw, maxsplit=1,
+                           flags=re.IGNORECASE)[0].strip()
+
         # Extract the variable name from LHS (last token, since earlier tokens
         # may be leftover logical connectors)
         lhs_tokens = re.findall(r"[A-Z][A-Z0-9-]*(?:\([^)]*\))?|'[^']*'|-?\d+\.?\d*", lhs_raw, re.IGNORECASE)
@@ -283,11 +291,33 @@ def _harvest_condition_literals(
                 info.condition_literals.append(lit)
                 existing.add(lit)
             # For ordering comparisons with numeric literals, add boundary
-            if is_ordering and isinstance(lit, int):
-                for boundary in (lit - 1, lit, lit + 1):
-                    if boundary not in existing:
-                        info.condition_literals.append(boundary)
-                        existing.add(boundary)
+            # values so branches like ``EDTMMI > '12'`` get a ``'13'`` in
+            # the pool. COBOL ordered comparisons on quoted numeric
+            # strings (``> '12'``, ``>= '31'``) are common in CICS
+            # date/input validation paths, and `_harvest_condition_literals`
+            # used to only boundary-expand `int` literals — not the
+            # string form that COBOL source usually uses. Expand both.
+            if is_ordering:
+                if isinstance(lit, int):
+                    for boundary in (lit - 1, lit, lit + 1):
+                        if boundary not in existing:
+                            info.condition_literals.append(boundary)
+                            existing.add(boundary)
+                elif isinstance(lit, str) and lit.lstrip("-").isdigit():
+                    # Same-width zero-padded adjacent values so the
+                    # fuzzer tries e.g. {'11','12','13'} for `> '12'`.
+                    try:
+                        n = int(lit)
+                    except ValueError:
+                        continue
+                    width = len(lit.lstrip("-"))
+                    for b in (n - 1, n + 1):
+                        if b < 0:
+                            continue
+                        bstr = str(b).zfill(width)
+                        if bstr not in existing:
+                            info.condition_literals.append(bstr)
+                            existing.add(bstr)
 
 
 def _harvest_evaluate_when_literals(

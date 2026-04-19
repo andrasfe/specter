@@ -422,8 +422,16 @@ def prepare_context(
     # Actual values come from INIT records in the mock data file at runtime.
     # Use a non-numeric placeholder so the generated COBOL uses
     # MOVE MOCK-ALPHA-STATUS TO <var> (reads from the data file).
-    # Exclude EIB fields — those are set via VALUE clauses in the stubs.
-    _EIB_FIELDS = {"EIBCALEN", "EIBAID", "EIBTRNID", "EIBTIME", "EIBDATE",
+    #
+    # Exclude most EIB fields — those are set via VALUE clauses in the
+    # stubs and faking them corrupts CICS semantics. EIBCALEN and EIBAID
+    # are the exception: they are primary branch drivers (first-entry
+    # vs re-entry, AID key dispatch) and must be injectable when the
+    # program branches on them. If the caller included them in
+    # injectable_vars (via `_is_safe_to_inject` / `_is_replay_injectable_var`
+    # having cleared them), let them through so SPECTER-READ-INIT-VARS
+    # dispatches on their INIT:* records.
+    _EIB_FIELDS = {"EIBTRNID", "EIBTIME", "EIBDATE",
                    "EIBTASKN", "EIBTRMID", "EIBCPOSN", "EIBFN", "EIBRCODE",
                    "EIBDS", "EIBREQID", "EIBRSRCE", "EIBSYNC", "EIBFREE",
                    "EIBRECV", "EIBSIG", "EIBCONF", "EIBERR", "EIBERRCD",

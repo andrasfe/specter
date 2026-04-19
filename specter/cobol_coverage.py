@@ -669,13 +669,22 @@ def _is_replay_injectable_var(name: str, dom, eib_names: set) -> bool:
     Internal variables are typically less useful, but internal parents with
     88-level values remain actionable because replay can activate those named
     conditions by setting the parent directly.
+
+    EIB registers are normally excluded (they are CICS control-block
+    fields that should not be faked). Exception: ``EIBCALEN`` and
+    ``EIBAID`` are primary branch drivers in CICS transaction programs
+    (first-entry vs re-entry, AID key dispatch) — if the program
+    actually conditions on them, we let those two through so the
+    coverage loop can vary them. Kept aligned with the whitelist in
+    `_is_safe_to_inject` below.
     """
     if not (getattr(dom, 'condition_literals', None) or getattr(dom, 'valid_88_values', None)):
         return False
     if getattr(dom, 'set_by_stub', None):
         return False
     if name.upper() in eib_names:
-        return False
+        if name.upper() not in {"EIBCALEN", "EIBAID"}:
+            return False
     classification = getattr(dom, 'classification', '')
     if classification in ("input", "status", "flag"):
         return True
@@ -2329,6 +2338,15 @@ def run_cobol_coverage(
     _EIB_NAMES = {"EIBCALEN", "EIBAID", "EIBTRNID", "EIBTIME", "EIBDATE",
                   "EIBTASKN", "EIBTRMID", "EIBCPOSN", "EIBFN", "EIBRCODE",
                   "EIBDS", "EIBREQID", "EIBRSRCE", "EIBRESP", "EIBRESP2"}
+    # EIB fields whose values are primary branch drivers in CICS
+    # transaction programs — EIBCALEN governs first-entry vs re-entry
+    # (IF EIBCALEN = 0), EIBAID governs which AID key was pressed
+    # (EVALUATE EIBAID WHEN DFHENTER / DFHPF3 / ...). We let those two
+    # through the EIB exclusion when the program actually conditions
+    # on them (i.e. the harvester recorded condition_literals or
+    # valid_88_values). Other EIB registers remain excluded — they
+    # are not branch drivers and faking them corrupts CICS semantics.
+    _EIB_INJECTABLE_WHITELIST = {"EIBCALEN", "EIBAID"}
     # Bare COBOL reserved words that would break MOVE targets in the
     # generated SPECTER-READ-INIT-VARS dispatcher.  Only exact matches —
     # hyphenated names like ``CLOSE-BAL`` are valid COBOL identifiers.
@@ -2381,7 +2399,15 @@ def run_cobol_coverage(
         if upper == "FILLER" or upper.startswith("FILLER-"):
             return False
         if upper in _EIB_NAMES:
-            return False
+            # Allow EIBCALEN / EIBAID when the program branches on
+            # them. Everything else in the EIB stays excluded.
+            if upper in _EIB_INJECTABLE_WHITELIST and (
+                getattr(dom, "condition_literals", None)
+                or getattr(dom, "valid_88_values", None)
+            ):
+                pass  # fall through to the usual safety checks
+            else:
+                return False
         if upper in _COBOL_RESERVED_WORDS:
             return False
         if upper in _88_level_child_names:
