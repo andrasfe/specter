@@ -55,15 +55,27 @@ _DFHRESP = {
     "NOTAUTH": "70",
 }
 
-# CICS AID key constants — resolve as string literals
-_CICS_AID_KEYS = frozenset({
-    "DFHENTER", "DFHCLEAR",
-    "DFHPF1", "DFHPF2", "DFHPF3", "DFHPF4", "DFHPF5", "DFHPF6",
-    "DFHPF7", "DFHPF8", "DFHPF9", "DFHPF10", "DFHPF11", "DFHPF12",
-    "DFHPF13", "DFHPF14", "DFHPF15", "DFHPF16", "DFHPF17", "DFHPF18",
-    "DFHPF19", "DFHPF20", "DFHPF21", "DFHPF22", "DFHPF23", "DFHPF24",
-    "DFHPA1", "DFHPA2", "DFHPA3",
-})
+# CICS AID key constants — resolve to the single-byte value the COBOL
+# stub (cobol_mock._add_common_stubs) uses in its ``PIC X VALUE X'..'``
+# clause, NOT the DFH name as a string. Generated Python comparisons
+# like ``state['EIBAID'] == <resolved>`` must match what the COBOL
+# runtime's EVALUATE EIBAID WHEN DFHENTER actually compares — a byte
+# value, not the 8-char token. Without this the Python forward-run
+# disagrees with the COBOL runtime on AID-dispatch branches and the
+# swarm's pre-run can never reach the post-EVALUATE paragraph.
+_CICS_AID_BYTES: dict[str, str] = {
+    "DFHENTER": "\x7D", "DFHCLEAR": "\x6D",
+    "DFHPA1":   "\x6C", "DFHPA2":   "\x6E", "DFHPA3":   "\x6B",
+    "DFHPF1":   "\xF1", "DFHPF2":   "\xF2", "DFHPF3":   "\xF3",
+    "DFHPF4":   "\xF4", "DFHPF5":   "\xF5", "DFHPF6":   "\xF6",
+    "DFHPF7":   "\xF7", "DFHPF8":   "\xF8", "DFHPF9":   "\xF9",
+    "DFHPF10":  "\x7A", "DFHPF11":  "\x7B", "DFHPF12":  "\x7C",
+    "DFHPF13":  "\xC1", "DFHPF14":  "\xC2", "DFHPF15":  "\xC3",
+    "DFHPF16":  "\xC4", "DFHPF17":  "\xC5", "DFHPF18":  "\xC6",
+    "DFHPF19":  "\xC7", "DFHPF20":  "\xC8", "DFHPF21":  "\xC9",
+    "DFHPF22":  "\x4A", "DFHPF23":  "\x4B", "DFHPF24":  "\x4C",
+}
+_CICS_AID_KEYS = frozenset(_CICS_AID_BYTES.keys())
 
 # Comparison operator words
 _CMP_WORDS = frozenset({
@@ -103,9 +115,11 @@ def _resolve_value(token: str) -> str:
     if upper in _FIGURATIVE:
         return _FIGURATIVE[upper]
 
-    # CICS AID key constants
-    if upper in _CICS_AID_KEYS:
-        return f"'{upper}'"
+    # CICS AID key constants — emit the byte value in Python source so
+    # comparisons like ``state['EIBAID'] == <byte>`` match the COBOL
+    # runtime's byte-level EVALUATE WHEN dispatch.
+    if upper in _CICS_AID_BYTES:
+        return repr(_CICS_AID_BYTES[upper])
 
     # DFHRESP(...)
     m = re.match(r"DFHRESP\((\w+)\)", token, re.IGNORECASE)

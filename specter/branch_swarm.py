@@ -1115,32 +1115,55 @@ def _build_tape(
     }
     aid_in_input = merged_input.get("EIBAID")
     if isinstance(aid_in_input, str):
-        aid_byte = _AID_NAME_TO_BYTE.get(aid_in_input.strip().upper())
+        # Try direct name then DFH-prefix fallback. LLM specialists
+        # sometimes drop the DFH prefix and propose just ``ENTER`` or
+        # ``PF3`` — resolve those the same way.
+        _key = aid_in_input.strip().upper()
+        aid_byte = (
+            _AID_NAME_TO_BYTE.get(_key)
+            or _AID_NAME_TO_BYTE.get("DFH" + _key)
+        )
         if aid_byte is not None:
-            # Generated Python emits generic ``_dummy_exec('CICS', ...)``
-            # for every CICS verb, so the op_key in the stub_log /
-            # stub_outcomes is just ``"CICS"`` — not ``CICS-RECEIVE:X``.
-            # Inject the AID pair into the 'CICS' queue. If the queue
-            # already has entries (e.g. CICS SEND outcomes synthesised
-            # elsewhere), prepend a fresh outcome carrying only the AID
-            # pair so the FIRST CICS op (the RECEIVE in MAIN-PARA's
-            # re-entry arm) consumes it.
-            stub_outcomes = dict(stub_outcomes)
-            existing = list(stub_outcomes.get("CICS", []))
-            new_outcome = [("EIBAID", aid_byte)]
-            already = False
-            if existing:
-                first_raw = existing[0]
-                first = (list(first_raw)
-                         if isinstance(first_raw, list)
-                         else [first_raw])
-                already = any(
-                    isinstance(p, (list, tuple)) and len(p) == 2
-                    and str(p[0]).upper() == "EIBAID"
-                    for p in first
-                )
-            if not already:
-                stub_outcomes["CICS"] = [new_outcome] + existing
+            # The Python generator emits generic ``_dummy_exec('CICS', ...)``
+            # with op_key ``"CICS"``. But the COBOL-side mock_operations
+            # uses specific op_keys like ``"CICS-RECEIVE"``. `run_test_case`
+            # filters stub_log against mock_operations — any entry whose
+            # op_key isn't in that set gets DROPPED, so injecting into
+            # ``"CICS"`` never reaches the mock file. Instead inject
+            # under every ``CICS-RECEIVE*`` op_key available on this
+            # program, so the override actually lands in the mock data
+            # when the COBOL binary reads it.
+            cobol_ctx = getattr(ctx, "context", None)
+            mock_ops = getattr(cobol_ctx, "mock_operations", []) or []
+            receive_ops = [op for op in mock_ops
+                           if op.upper().startswith("CICS-RECEIVE")]
+            # Always also inject into generic "CICS" so the Python
+            # forward-run's ``_dummy_exec('CICS', ...)`` pops our
+            # EIBAID pair and Python's EVAL matches. The COBOL-side
+            # run_test_case filter drops "CICS" (not in mock_operations),
+            # but keeps "CICS-RECEIVE*" — so we cover both runtimes.
+            targets = receive_ops + ["CICS"]
+            for op_key in targets:
+                existing = list(stub_outcomes.get(op_key, []))
+                new_outcome = [("EIBAID", aid_byte)]
+                already = False
+                if existing:
+                    first_raw = existing[0]
+                    first = (list(first_raw)
+                             if isinstance(first_raw, list)
+                             else [first_raw])
+                    already = any(
+                        isinstance(p, (list, tuple)) and len(p) == 2
+                        and str(p[0]).upper() == "EIBAID"
+                        for p in first
+                    )
+                if not already:
+                    stub_outcomes[op_key] = [new_outcome] + existing
+                    log.info(
+                        "  Swarm: AID override — injected ('EIBAID', byte) "
+                        "into %s queue for %s (aid=%s -> %r)",
+                        op_key, bctx.branch_key, aid_in_input, aid_byte,
+                    )
 
     # Run the full Python program from entry with the proposed
     # stub_outcomes to get the execution-ordered stub_log.
@@ -1154,11 +1177,15 @@ def _build_tape(
         if filtered_log:
             stub_log = filtered_log
 
-    # If the stub_log is very short but stub_outcomes has entries,
-    # the program may have aborted early.  Try padding with success
-    # stubs for operations the program didn't reach.
-    if stub_outcomes and len(stub_log) < len(stub_outcomes):
-        # Add missing operations with success status.
+    # Pad stub_log with stub_outcomes entries whose op_key wasn't
+    # consumed by the Python sim. This covers two cases: (a) the
+    # program aborted before reaching the op, (b) the op exists only
+    # on the COBOL side (e.g. CICS-RECEIVE) and the Python sim used a
+    # different generic op_key (e.g. CICS). Previously the outer
+    # `len(stub_log) < len(stub_outcomes)` guard suppressed padding
+    # whenever stub_log had more entries than stub_outcomes had keys,
+    # which silently dropped COBOL-only ops.
+    if stub_outcomes:
         logged_ops = {op for op, _ in stub_log}
         for op_key, entries in stub_outcomes.items():
             if op_key not in logged_ops and entries:
@@ -1173,15 +1200,31 @@ def _build_tape(
     # mock consumes is the one at position 0. Hoist the override so the
     # byte we placed actually reaches EIBAID at the right moment.
     if isinstance(aid_in_input, str):
-        _aid_b = _AID_NAME_TO_BYTE.get(aid_in_input.strip().upper())
+        _key2 = aid_in_input.strip().upper()
+        _aid_b = (
+            _AID_NAME_TO_BYTE.get(_key2)
+            or _AID_NAME_TO_BYTE.get("DFH" + _key2)
+        )
         if _aid_b is not None:
-            # Find the first stub_log entry whose outcome carries our
-            # injected EIBAID pair and hoist it to position 0 so the
-            # COBOL mock's FIRST CICS-op read (the RECEIVE in MAIN-PARA)
-            # consumes it before any other CICS outcome.
+            # Find the stub_log entry that (a) carries our EIBAID pair
+            # AND (b) will SURVIVE `run_test_case`'s filter against
+            # `mock_operations`. The generic "CICS" entries that Python
+            # forward-run consumed get dropped by that filter, so
+            # hoisting one of those to position 0 doesn't help COBOL —
+            # the COBOL binary will read whatever other op sits at the
+            # front. Only CICS-RECEIVE* (or any op_key actually in
+            # mock_operations) will land in the mock data file.
+            cobol_ctx2 = getattr(ctx, "context", None)
+            mock_op_set = set(getattr(cobol_ctx2, "mock_operations", []) or [])
+            log.info(
+                "  Swarm: hoist search — mock_op_set_size=%d "
+                "stub_log_len=%d first_ops=%s",
+                len(mock_op_set), len(stub_log),
+                [op for op, _ in stub_log[:5]],
+            )
             for _idx, (_op, _ent) in enumerate(stub_log):
-                if _idx == 0:
-                    break
+                if mock_op_set and _op not in mock_op_set:
+                    continue  # would be dropped later, skip
                 ent_pairs = _ent if isinstance(_ent, list) else [_ent]
                 has_eibaid = any(
                     isinstance(p, (list, tuple)) and len(p) == 2
@@ -1189,9 +1232,16 @@ def _build_tape(
                     for p in ent_pairs
                 )
                 if has_eibaid:
-                    stub_log = [stub_log[_idx]] + [
-                        item for i, item in enumerate(stub_log) if i != _idx
-                    ]
+                    if _idx != 0:
+                        stub_log = [stub_log[_idx]] + [
+                            item for i, item in enumerate(stub_log)
+                            if i != _idx
+                        ]
+                        log.info(
+                            "  Swarm: hoisted %s entry with EIBAID to "
+                            "position 0 (was at %d)",
+                            _op, _idx,
+                        )
                     break
 
     return merged_input, stub_log

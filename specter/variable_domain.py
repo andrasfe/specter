@@ -485,8 +485,25 @@ def payload_kind_for_domain(domain: VariableDomain | None) -> str:
     SPECTER-APPLY-MOCK-PAYLOAD was doing
     ``MOVE MOCK-NUM-STATUS TO <STATUS-VAR>`` instead of
     ``MOVE MOCK-ALPHA-STATUS TO <STATUS-VAR>``.
+
+    CICS EIB / DFH* constants are declared ``PIC X`` in the mock stubs
+    (``DFHENTER PIC X VALUE X'7D'``, ``EIBAID PIC X``, etc.). Without
+    copybook definitions the variable extractor sometimes classifies
+    them as numeric (because conditions like ``EIBCALEN = 0`` look
+    numeric-ish), which causes SPECTER-APPLY-MOCK-PAYLOAD to emit
+    ``MOVE MOCK-NUM-STATUS TO EIBAID`` — clobbering the byte value an
+    upstream RECEIVE mock already wrote via MOCK-ALPHA-STATUS(1:1).
+    Force them back to alpha so the byte survives the payload-apply
+    pass.
     """
     if domain is None:
+        return "alpha"
+    name_upper = (domain.name or "").upper()
+    # EIB* (except EIBCALEN which IS numeric PIC S9(4) COMP) and all
+    # DFH-prefixed AID/BMSCA constants are PIC X.
+    if name_upper.startswith("EIB") and name_upper != "EIBCALEN":
+        return "alpha"
+    if name_upper.startswith("DFH"):
         return "alpha"
     # File-status variables are always alphanumeric (PIC XX).
     if domain.semantic_type == "status_file":

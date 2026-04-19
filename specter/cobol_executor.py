@@ -615,7 +615,11 @@ def run_test_case(
                 return str(act) if v else ""
             return "Y" if v else "N"
         if isinstance(v, str):
-            aid = _AID_NAME_TO_BYTE.get(v.strip().upper())
+            _k = v.strip().upper()
+            aid = (
+                _AID_NAME_TO_BYTE.get(_k)
+                or _AID_NAME_TO_BYTE.get("DFH" + _k)
+            )
             if aid is not None:
                 return aid
         return str(v)

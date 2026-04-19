@@ -126,8 +126,11 @@ class TestResolveWhenValue(unittest.TestCase):
         self.assertEqual(result, "'S'")
 
     def test_variable_value(self):
+        # DFH* AID names resolve to their byte value so Python
+        # comparisons match COBOL's byte-level EVALUATE WHEN dispatch.
+        # DFHENTER → X'7D' → '}' (byte 0x7D in ASCII).
         result = resolve_when_value("DFHENTER", is_evaluate_true=False)
-        self.assertEqual(result, "'DFHENTER'")
+        self.assertEqual(result, "'}'")
 
     def test_condition_for_true(self):
         result = resolve_when_value(
