@@ -724,6 +724,8 @@ Run-local memory storage with atomic writes:
 - `checkpoint(...)`: writes round/final progress markers into memory `meta`
 - `prune_state(...)`: bounded retention for successes/failures
 
+**Multi-loop coverage**: invoking `run_cobol_coverage` repeatedly against the same `--test-store` path accumulates coverage across runs. Each invocation loads the existing test store via `load_existing_coverage()` (seeding `cov.test_cases`, `cov.paragraphs_hit`, `cov.branches_hit`), loads the corresponding memory state (success patterns, failure fragments, strategy stats, API ledger), and appends new successes without overwriting. Fresh LLM sampling per loop — combined with the memory-guided seed-selection bias toward near-miss TCs — often breaks past plateaus that a single long run can't. Observed on CORPT00C (500-TC budget, 7 teacher facts seeded): loop 1 hit 57/147 branches 9/10 paragraphs, loop 3 hit 10/10 paragraphs, loop 5 ended at 61/147 branches (41.5%). Practical recipe for stubborn programs: run 5-10 loops in a shell for-loop, each reusing the same `--test-store`.
+
 ### `specter/persistence_utils.py` — Atomic File I/O Helpers
 
 Shared persistence primitives for crash-safe writes:
