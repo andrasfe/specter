@@ -490,3 +490,154 @@ def test_jit_facts_digest_changes_with_fact(tmp_path: Path) -> None:
     assert d_empty == ""
     assert d_one != ""
     assert d_one != d_other
+
+
+# ------------------------------ Teacher test_cases --------------------------
+
+
+def test_resolution_parses_test_cases_list(tmp_path: Path) -> None:
+    """``test_cases`` in reply JSON flows through to Resolution field."""
+    c = SupervisorChannel(tmp_path, poll_interval_sec=0.05)
+
+    def teacher() -> None:
+        esc_path = tmp_path / "escalations.jsonl"
+        for _ in range(100):
+            if esc_path.exists() and esc_path.stat().st_size > 0:
+                evt = json.loads(esc_path.read_text().splitlines()[0])
+                reply = {
+                    "id": evt["id"],
+                    "verdict": "skip",
+                    "notes": "teacher validated these TCs",
+                    "test_cases": [
+                        {
+                            "input_state": {
+                                "EIBCALEN": 1,
+                                "EIBAID": "DFHENTER",
+                                "CUSTOMI": "X",
+                                "SDTMMI": "  ",
+                            },
+                            "stub_log": [
+                                ["CICS-RECEIVE", [["EIBAID", "\x7d"]]],
+                            ],
+                            "target": "branch:7:W1",
+                            "notes": "hits SDTMMI=SPACES arm",
+                        },
+                        {
+                            "input_state": {"SDTDDI": "  "},
+                            "stub_log": [],
+                        },
+                    ],
+                }
+                append_line_with_fsync(
+                    tmp_path / RESOLUTIONS_FILE, json.dumps(reply) + "\n",
+                )
+                return
+            time.sleep(0.02)
+
+    t = threading.Thread(target=teacher)
+    t.start()
+    try:
+        res = c.escalate(kind="branch_unresolved", summary="x", timeout_sec=5)
+    finally:
+        t.join(timeout=5)
+
+    assert res is not None
+    assert len(res.test_cases) == 2
+    assert res.test_cases[0]["input_state"]["SDTMMI"] == "  "
+    assert res.test_cases[0]["target"] == "branch:7:W1"
+
+
+def test_resolution_accepts_single_test_case_shorthand(tmp_path: Path) -> None:
+    """``test_cases`` as a single dict is normalized to a list."""
+    c = SupervisorChannel(tmp_path, poll_interval_sec=0.05)
+
+    def teacher() -> None:
+        esc_path = tmp_path / "escalations.jsonl"
+        for _ in range(100):
+            if esc_path.exists() and esc_path.stat().st_size > 0:
+                evt = json.loads(esc_path.read_text().splitlines()[0])
+                append_line_with_fsync(
+                    tmp_path / RESOLUTIONS_FILE,
+                    json.dumps({
+                        "id": evt["id"],
+                        "verdict": "skip",
+                        # Single dict (not a list) should be accepted.
+                        "test_cases": {
+                            "input_state": {"SDTMMI": "  "},
+                            "stub_log": [],
+                        },
+                    }) + "\n",
+                )
+                return
+            time.sleep(0.02)
+
+    t = threading.Thread(target=teacher)
+    t.start()
+    try:
+        res = c.escalate(kind="branch_unresolved", summary="x", timeout_sec=5)
+    finally:
+        t.join(timeout=5)
+
+    assert res is not None
+    assert len(res.test_cases) == 1
+    assert res.test_cases[0]["input_state"] == {"SDTMMI": "  "}
+
+
+def test_resolution_drops_malformed_test_case_entries(tmp_path: Path) -> None:
+    """Entries missing input_state (or not dict-shaped) are dropped silently."""
+    c = SupervisorChannel(tmp_path, poll_interval_sec=0.05)
+
+    def teacher() -> None:
+        esc_path = tmp_path / "escalations.jsonl"
+        for _ in range(100):
+            if esc_path.exists() and esc_path.stat().st_size > 0:
+                evt = json.loads(esc_path.read_text().splitlines()[0])
+                append_line_with_fsync(
+                    tmp_path / RESOLUTIONS_FILE,
+                    json.dumps({
+                        "id": evt["id"],
+                        "verdict": "skip",
+                        "test_cases": [
+                            {"input_state": {"SDTMMI": "  "}},  # valid
+                            "not a dict",                        # dropped
+                            {"stub_log": []},                    # no input_state
+                            {"input_state": "not a dict"},       # bad type
+                        ],
+                    }) + "\n",
+                )
+                return
+            time.sleep(0.02)
+
+    t = threading.Thread(target=teacher)
+    t.start()
+    try:
+        res = c.escalate(kind="x", summary="x", timeout_sec=5)
+    finally:
+        t.join(timeout=5)
+
+    assert res is not None and len(res.test_cases) == 1
+    assert res.test_cases[0]["input_state"] == {"SDTMMI": "  "}
+
+
+def test_normalize_stub_log_accepts_list_and_dict_shapes() -> None:
+    """The branch_swarm-side stub_log normalizer handles both shapes."""
+    from specter.branch_swarm import _normalize_stub_log_from_teacher
+
+    assert _normalize_stub_log_from_teacher(None) == []
+    assert _normalize_stub_log_from_teacher([]) == []
+
+    list_form = [["CICS-RECEIVE", [["EIBAID", "\x7d"]]]]
+    assert _normalize_stub_log_from_teacher(list_form) == [
+        ("CICS-RECEIVE", [["EIBAID", "\x7d"]]),
+    ]
+
+    dict_form = {"CICS-RECEIVE": [[["EIBAID", "\x7d"]]]}
+    assert _normalize_stub_log_from_teacher(dict_form) == [
+        ("CICS-RECEIVE", [["EIBAID", "\x7d"]]),
+    ]
+
+    # Inner pairs may arrive as a dict too.
+    pairs_as_dict = [["CICS-RECEIVE", {"EIBAID": "\x7d"}]]
+    out = _normalize_stub_log_from_teacher(pairs_as_dict)
+    assert out[0][0] == "CICS-RECEIVE"
+    assert ["EIBAID", "\x7d"] in out[0][1]

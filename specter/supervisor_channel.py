@@ -123,6 +123,17 @@ class Resolution:
     # DDMMYY string" or "stub op DFHRESP success code is SPACES". Accepts a
     # single fact dict or a list of facts.
     save_fact: list[dict[str, Any]] = field(default_factory=list)
+    # ``test_cases`` lets the teacher return concrete, validated test
+    # inputs that hit a branch the student couldn't crack on its own.
+    # Each entry is ``{"input_state": {...}, "stub_log": [[op_key,
+    # pairs], ...], "target"?: "branch:<bid>:<dir>", "notes"?: "..."}``.
+    # The teacher runs its own Python investigation (it already has
+    # access to the student's ``branch_registry.json``,
+    # ``.mock.cbl``, uncovered reports, and facts store) and sends the
+    # result back — no code execution on the student side, only data.
+    # The student feeds each entry through ``_execute_and_save`` like
+    # any other generated test case, so coverage is measured uniformly.
+    test_cases: list[dict[str, Any]] = field(default_factory=list)
 
 
 # -------------------------------------------------------------- file names
@@ -788,6 +799,22 @@ def _parse_resolution(msg: dict[str, Any]) -> Resolution | None:
     elif isinstance(save_fact_raw, list):
         save_fact = [f for f in save_fact_raw if isinstance(f, dict)]
 
+    # Test cases from the teacher: single dict or list of dicts, each
+    # with at least ``input_state``. Missing/malformed entries are
+    # silently dropped — the caller checks ``len(test_cases)`` and
+    # logs what it consumed.
+    tc_raw = msg.get("test_cases")
+    test_cases: list[dict[str, Any]] = []
+    if isinstance(tc_raw, dict):
+        tc_raw = [tc_raw]
+    if isinstance(tc_raw, list):
+        for entry in tc_raw:
+            if not isinstance(entry, dict):
+                continue
+            if not isinstance(entry.get("input_state"), dict):
+                continue
+            test_cases.append(entry)
+
     return Resolution(
         id=str(msg.get("id", "")),
         verdict=verdict,
@@ -797,4 +824,5 @@ def _parse_resolution(msg: dict[str, Any]) -> Resolution | None:
         save_rule=save_rule,
         finding=finding,
         save_fact=save_fact,
+        test_cases=test_cases,
     )

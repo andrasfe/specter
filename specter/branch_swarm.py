@@ -1358,6 +1358,119 @@ def _build_tape(
 
 
 # ---------------------------------------------------------------------------
+# Teacher-provided test cases (from supervisor-channel replies)
+# ---------------------------------------------------------------------------
+
+def _normalize_stub_log_from_teacher(raw: object) -> list[tuple[str, list]]:
+    """Coerce a teacher-supplied ``stub_log`` value to ``[(op_key, pairs), ...]``.
+
+    JSON arrives with everything as lists. Pairs may be ``[[var, val], ...]``
+    or a dict ``{var: val}``. Missing / malformed entries are dropped.
+    """
+    out: list[tuple[str, list]] = []
+    if not raw:
+        return out
+    if isinstance(raw, dict):
+        # Shape: ``{op_key: [[var, val], ...]}`` — expand each op into its
+        # own entries preserving outer dict order.
+        for op_key, entries in raw.items():
+            if isinstance(entries, list):
+                for entry in entries:
+                    if isinstance(entry, (list, tuple)):
+                        out.append((str(op_key), list(entry)))
+        return out
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                op_key, pairs = item
+                pair_list: list = []
+                if isinstance(pairs, (list, tuple)):
+                    pair_list = [list(p) if isinstance(p, (list, tuple)) else p
+                                 for p in pairs]
+                elif isinstance(pairs, dict):
+                    pair_list = [[k, v] for k, v in pairs.items()]
+                out.append((str(op_key), pair_list))
+    return out
+
+
+def _consume_teacher_test_cases(
+    ctx,
+    cov,
+    report,
+    tc_count: int,
+    bctx: "BranchContext",
+    teacher_tcs: list[dict],
+) -> int:
+    """Run each teacher-supplied test case through the execution pipeline.
+
+    The teacher runs its own Python investigation (it already has access
+    to the student's ``branch_registry.json``, ``.mock.cbl``, uncovered
+    reports, and facts store) and returns concrete inputs it validated.
+    This function is DATA-only — no code supplied by the teacher runs
+    here. Each entry is fed to ``_execute_directly`` exactly like a
+    strategy-generated case so coverage is measured uniformly and
+    successful cases persist into the test store under
+    ``target="teacher:branch:<bid>:<dir>"`` for audit.
+
+    Returns the updated ``tc_count`` so caller can continue bookkeeping.
+    """
+    if not teacher_tcs:
+        return tc_count
+    log.info(
+        "  Swarm: consuming %d teacher-supplied test case(s) for branch %s",
+        len(teacher_tcs), bctx.branch_key,
+    )
+    for idx, entry in enumerate(teacher_tcs):
+        input_state = entry.get("input_state") or {}
+        if not isinstance(input_state, dict) or not input_state:
+            log.warning(
+                "  Swarm: teacher TC %d has empty/invalid input_state, skipping",
+                idx,
+            )
+            continue
+        # Uppercase variable keys for consistency with specter's conventions.
+        normalized_input = {
+            str(k).upper(): v for k, v in input_state.items()
+        }
+        stub_log = _normalize_stub_log_from_teacher(entry.get("stub_log"))
+        notes = str(entry.get("notes", ""))[:160]
+        log.info(
+            "  Swarm: running teacher TC %d/%d (%d stubs, notes=%r)",
+            idx + 1, len(teacher_tcs), len(stub_log), notes,
+        )
+        try:
+            feedback, tc_count = _execute_directly(
+                ctx, cov, report, tc_count,
+                normalized_input, stub_log, bctx,
+                stub_defaults=None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "  Swarm: teacher TC %d execution failed: %s",
+                idx, exc,
+            )
+            continue
+        if feedback.error:
+            log.info(
+                "  Swarm: teacher TC %d error=%s",
+                idx, feedback.error[:120],
+            )
+        elif feedback.branch_hit:
+            log.info(
+                "  Swarm: teacher TC %d HIT target branch %s",
+                idx, bctx.branch_key,
+            )
+        else:
+            log.info(
+                "  Swarm: teacher TC %d ran (paras=%d, branches=%d) "
+                "but did not hit %s",
+                idx, len(feedback.paragraphs_hit),
+                len(feedback.branches_hit), bctx.branch_key,
+            )
+    return tc_count
+
+
+# ---------------------------------------------------------------------------
 # Direct execution (bypasses _execute_and_save)
 # ---------------------------------------------------------------------------
 
@@ -1761,6 +1874,23 @@ def investigate_branch_swarm(
                         "scope (variable|stub_op|global),content,examples}] "
                         "to teach the student program-specific domain facts; "
                         "facts are read live on the next branch.",
+                        # NEW: teacher can return concrete test cases it
+                        # validated in its own environment. Each entry:
+                        #   {input_state: {VAR: VALUE, ...},
+                        #    stub_log:    [[op_key, [[var, val], ...]], ...],
+                        #    target?:     "branch:<bid>:<dir>",
+                        #    notes?:      "..."}
+                        # The student feeds each entry through its normal
+                        # execution pipeline. No code executes on the
+                        # student side — the field carries DATA only.
+                        "Teacher may include test_cases=[{input_state, "
+                        "stub_log, target?, notes?}] — concrete inputs the "
+                        "teacher validated in its own Python that should "
+                        "hit this branch. The student will run each one "
+                        "through the normal pipeline and persist any that "
+                        "add coverage. Use this after exhausting investigation "
+                        "on the student side; it bypasses specialist "
+                        "guessing with a verified answer.",
                     ],
                 )
             except (SupervisorAbort, SupervisorRestart):
@@ -1787,6 +1917,17 @@ def investigate_branch_swarm(
                     f" | teacher={_resolution.verdict}: "
                     f"{(_resolution.notes or '')[:120]}"
                 )
+                # When the teacher returns concrete test cases in
+                # ``test_cases``, run each one through the normal
+                # execution path. The teacher validated the inputs in
+                # its own Python environment; the student just records
+                # coverage from them. Any case that hits new branches
+                # persists into the test store like any strategy output.
+                if _resolution.test_cases:
+                    tc_count = _consume_teacher_test_cases(
+                        ctx, cov, report, tc_count, bctx,
+                        _resolution.test_cases,
+                    )
         _write_failure_log(ctx, bctx, route, journal)
 
     return journal, tc_count
